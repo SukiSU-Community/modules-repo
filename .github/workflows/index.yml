@@ -270,9 +270,37 @@ jobs:
           PR_NUMBER: ${{ steps.openpr.outputs.pr_number }}
         run: |
           set -euo pipefail
-          # --watch blocking：任何一个 required check 失败都会让这里非 0 退出，
-          # 于是这个 run 红、PR 留着给人看 —— 而不是「静默合了一个没过检的索引改动」。
+          HEAD_SHA=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
+
+          # 先有界地等 check runs **出现**，再 --watch：PR 刚建出来的那几秒列表是空的，而
+          # `gh pr checks --watch` 碰到空列表是立刻退出 1，不会等第一个 check 冒出来。
+          # 实测 run 38068977342 —— 索引 PR #16 建好后 0.9 秒这一步就报
+          # `no checks reported` 红掉了，而 checks 本身后来是会在的。
+          DEADLINE=$((SECONDS + 300))
+          while :; do
+            HAVE=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs" --jq .total_count 2>/dev/null || echo 0)
+            if [ "${HAVE:-0}" -gt 0 ]; then break; fi
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              echo "::error::索引 PR #${PR_NUMBER}（${HEAD_SHA:0:8}）上 5 分钟没有任何 check：approve 不会出现，因此不合并。"
+              echo "::error::先看那次提交的信息里有没有 [skip ci] 之类的标记 —— 它会让 GitHub 干脆不为这条 PR 创建任何 workflow run。"
+              exit 1
+            fi
+            sleep 10
+          done
+
+          # 任何一个 required check 失败都会让这里非 0 退出：这个 run 红、PR 留着给人看，
+          # 而不是「静默合了一个没过检的索引改动」。
           gh pr checks "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --watch --interval 15
+
+          # --watch 只覆盖它当时看到的那些 check；approve 是链尾的 job，理论上可能晚于其它
+          # job 才建出来。放行判据始终是「approve 在这个 head sha 上为 success」，所以直接查它，
+          # 而不是依赖「watch 到的一堆里恰好有它」。
+          APPROVE=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs" \
+            --jq '.check_runs[] | select(.name=="approve") | .conclusion' | tail -1)
+          if [ "${APPROVE:-}" != "success" ]; then
+            echo "::error::approve 在 ${HEAD_SHA:0:8} 上的结论是「${APPROVE:-未上报}」，不合并。"
+            exit 1
+          fi
           gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --squash
 
       - name: 把结果贴回 PR
