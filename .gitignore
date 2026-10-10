@@ -2,3 +2,6 @@ node_modules/
 *.zip
 *.log
 .DS_Store
+
+# build-index.mjs 每次跑都会写/删的冲突清单（REPO_ROOT 下），属于运行产物，不入库
+conflicts.json
