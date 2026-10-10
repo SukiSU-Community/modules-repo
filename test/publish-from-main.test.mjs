@@ -448,7 +448,7 @@ test('merge-index 必须按「此刻的 main」重推导一遍，且排在合并
 });
 
 // 判定投稿的这套代码自己没过检，就没有资格批准任何投稿。
-test('approve 必须依赖 selftest：单测没在 CI 跑过 = 本轮所有「绿灯但线上是死的」的根因', () => {
+test('approve 必须依赖 selftest，且上游不 success 时自己判红（不能靠 skip）', () => {
   for (const f of AUDIT_COPIES) {
     const code = fs.readFileSync(f, 'utf8')
       .split(/\r?\n/)
@@ -463,6 +463,16 @@ test('approve 必须依赖 selftest：单测没在 CI 跑过 = 本轮所有「�
     assert.match(st, /node --test/, '真的把仓库单测跑起来，而不是留个占位作业');
     // selftest 自己不许写任何东西：它只是判据生产者
     assert.match(st, /permissions: \{\}/, 'selftest 不需要任何 GitHub 写权限');
+
+    // 关键的一条：**不能让 approve 被 skip**。canary PR #24 实测「上游红 → approve skip」
+    // 并不会挡住合并 —— skipped 的 required check 在 GitHub 眼里按满足处理，那条打坏了测试的
+    // PR 直接被 gh pr merge 合进了 main。所以 approve 必须 always 跑，并且自己判红。
+    assert.match(job, /^ {4}if: always\(\)$/m, 'approve 必须 always 跑：skip 等于放行');
+    assert.match(job, /needs: \[audit, selftest\]/);
+    const gate = code.slice(code.indexOf('上游没过检就没有批准资格'), code.indexOf('只批准「低风险'));
+    assert.match(gate, /AUDIT_RESULT: \$\{\{ needs\.audit\.result \}\}/, '要读 needs.*.result，不是 outputs');
+    assert.match(gate, /SELFTEST_RESULT: \$\{\{ needs\.selftest\.result \}\}/);
+    assert.match(gate, /!= "success"/, '非 success（红/跳过/取消）都要 exit 1');
   }
 });
 
@@ -494,6 +504,58 @@ test('等索引 PR 过检那一段：先有界地等 checks 出现，再按 appr
     assert.ok(judges > watches, 'approve 的结论要在 watch 之后查，抢跑等于没等');
     assert.match(block, /approve 在 .* 上的结论是/, 'approve 不是 success 时要说清结论是什么，而不是静默报好');
     assert.doesNotMatch(block, /gh pr merge/, '这一步不该试图合并：这个上下文里的 token 合不动（403）');
+  }
+});
+
+/**
+ * 同一个 job 里出现两次同名 key（我自己犯过一次：新步骤插到了 `steps:` 前面，于是有两个
+ * `steps:`）。这类错不会让 CI 变红，而是让**整条 workflow 解析失败、一条 check 都不产生** ——
+ * 而「required check 从没上报过」正是本仓库已经撞过两次的死法（所有 PR 永久 BLOCKED，
+ * 或者更糟：没人知道它没在跑）。
+ *
+ * 本仓库不许装 npm 依赖，所以这里不引 YAML 解析器，只做够拦住该类的结构检查：
+ * 只扫 `jobs:` 之下、缩进恰好 4 的 key（block scalar 的内容至少 8 空格，不会被误当 key）。
+ */
+function duplicateJobKeys(yml) {
+  const lines = yml.split(/\r?\n/).filter((l) => !/^\s*#/.test(l));
+  const dup = [];
+  let inJobs = false;
+  let job = null;
+  let seen = new Set();
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    const indent = line.length - line.trimStart().length;
+    if (indent === 0) {
+      inJobs = /^jobs:\s*$/.test(line);
+      job = null;
+      continue;
+    }
+    if (!inJobs) continue;
+    if (indent === 2) {
+      job = /^ {2}([A-Za-z_][\w-]*):/.exec(line)?.[1] ?? null;
+      seen = new Set();
+      continue;
+    }
+    if (indent === 4 && job) {
+      const key = /^ {4}([A-Za-z_][\w-]*):/.exec(line)?.[1];
+      if (!key) continue;
+      if (seen.has(key)) dup.push(`${job}.${key}`);
+      seen.add(key);
+    }
+  }
+  return dup;
+}
+
+test('两份 workflow 都不许有同一 job 内的重复 key（那会让整条 workflow 不跑）', () => {
+  // 夹具先证明它抓得到：两个 steps: 就是这次犯下的真错。
+  assert.deepEqual(duplicateJobKeys('jobs:\n  a:\n    steps:\n          x\n    steps:\n          y\n'), ['a.steps']);
+  assert.deepEqual(duplicateJobKeys('jobs:\n  a:\n    steps:\n    name: a\n'), []);
+  // run: 块里的内容缩进更深，不该被当成 key
+  assert.deepEqual(duplicateJobKeys('jobs:\n  a:\n    run: |\n          name: 里层\n    steps:\n'), []);
+
+  for (const f of [...AUDIT_COPIES, ...INDEX_COPIES]) {
+    assert.deepEqual(duplicateJobKeys(fs.readFileSync(f, 'utf8')), [],
+      `${path.basename(f)} 里有重复的 job key`);
   }
 });
 
