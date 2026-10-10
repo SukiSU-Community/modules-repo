@@ -324,6 +324,26 @@ test('index.yml 调的是这个脚本，提交带 [skip ci]，且不自己重写
   assert.doesNotMatch(yml, /labels?\.|auto-approved.*===|===.*auto-approved/);
 });
 
+// 自动合并的那次 push 不触发任何 workflow（GitHub 刻意切断 GITHUB_TOKEN 造成的链），
+// 实测证据：投稿 PR #4 被 publish 作业 squash 合并后，只有 pages 构建在跑，
+// Rebuild Index From Main 一次都没启动 —— 模块合进了 main 却永远进不了索引。
+// 所以这条链必须显式挂在 workflow_run 上，而不是指望 push。
+test('index.yml 必须由 workflow_run 接住「审核自动合并」这一段', () => {
+  const yml = fs.readFileSync(WF_INDEX, 'utf8');
+  assert.match(yml, /workflow_run:/, '缺了它，自动放行的投稿会停在 main 上没人重建索引');
+  // 接的对象必须是审核那条 workflow，而且名字要跟 audit.yml 的 name: 完全一致 ——
+  // workflow_run 按名字匹配，改了 audit.yml 的 name 却忘了这里，链就静默断了。
+  const auditName = fs.readFileSync(WF_MAIN, 'utf8').match(/^name:\s*(.+)$/m);
+  assert.ok(auditName, 'audit.yml 得有 name');
+  const name = auditName[1].trim();
+  assert.ok(
+    new RegExp(`workflows:\\s*\\[?\\s*'?${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}'?`).test(yml),
+    `index.yml 的 workflow_run 必须接「${name}」`
+  );
+  // 红了的审核运行不该顺带开一个空转的索引 PR
+  assert.match(yml, /workflow_run\.conclusion\s*==\s*'success'/);
+});
+
 test('index.yml 不直接推 main：ruleset 不给 Actions 开 bypass，所以索引也走 PR', () => {
   const yml = fs.readFileSync(WF_INDEX, 'utf8');
   assert.match(yml, /gh pr create/, '必须开 PR，而不是 git push 到 main');

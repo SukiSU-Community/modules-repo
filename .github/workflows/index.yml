@@ -36,6 +36,15 @@ on:
       - 'json/modules.json'
       - 'scripts/build-index.mjs'
       - 'scripts/publish-from-main.mjs'
+  # Actions 自己合出来的那次 push **不会**触发后续 workflow：GitHub 刻意不让
+  # 用 GITHUB_TOKEN 干的事再引发一条链。实测证据 —— 投稿 PR #4 由 publish 作业
+  # squash 合并进 main 之后，只有 pages 构建跑了，Rebuild Index From Main 一次都没启动。
+  # 所以「自动合并 → 重建索引」这一段必须靠 workflow_run 接上，它是官方留给这条链的口子。
+  # 附带的好处：workflow_run 跑的是**默认分支上的这份 YAML**，投稿者的 PR 改不动
+  # 「决定能不能进索引」的那段逻辑。
+  workflow_run:
+    workflows: ['Module Submission Audit']
+    types: [completed]
   workflow_dispatch:
     inputs:
       sha:
@@ -63,6 +72,11 @@ jobs:
   index:
     name: Stamp And Rebuild
     runs-on: ubuntu-latest
+    # 由 workflow_run 触发时只跟「审核跑成功」的那次：审核红了的运行里没有获批准的投稿，
+    # 让它在 main 上扫一遍只会白白开一个空转的索引 PR。
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
     steps:
       # 要 diff-tree 出这一次提交改了哪些 pending，所以必须拿到那个提交本身。
       - uses: actions/checkout@v4
