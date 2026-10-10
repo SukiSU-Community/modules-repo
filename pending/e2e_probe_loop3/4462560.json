@@ -1,0 +1,23 @@
+{
+  "id": "e2e_probe_loop3",
+  "name": "E2E Probe min",
+  "author": "zcode-e2e",
+  "description": "end-to-end probe for the submission pipeline",
+  "versions": [
+    {
+      "version": "v0.0.560",
+      "versionCode": 4462560,
+      "zipUrl": "https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/4562d5b0abaaa9727dbc631143dfcef0541e097a823de4864a0662eb9e9054c5.zip",
+      "size": 285,
+      "time": 1791654478773,
+      "sha256": "4562d5b0abaaa9727dbc631143dfcef0541e097a823de4864a0662eb9e9054c5"
+    }
+  ],
+  "source": "https://www.coolapk.com/u/2781460",
+  "uploader": "zcode-e2e",
+  "coolapkUid": "2781460",
+  "storage": "github-release-asset",
+  "releaseTag": "assets-v1",
+  "assetName": "4562d5b0abaaa9727dbc631143dfcef0541e097a823de4864a0662eb9e9054c5.zip",
+  "submittedAt": "2026-10-10T17:47:58.773Z"
+}
