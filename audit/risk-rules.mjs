@@ -21,6 +21,7 @@ export const CATEGORY_LABEL = {
   network: '外联',
   privacy: '投稿者隐私（不计入风险等级）',
   metadata: '元数据一致性',
+  structure: '包结构与审核覆盖度',
 };
 
 const MAX_SNIPPET = 160;
@@ -405,6 +406,242 @@ export function checkMetadata(prop, declared = {}) {
 
 export const METADATA_RULES = ['META_PROP_MISSING', 'META_FIELD_MISSING_ID', 'META_FIELD_MISSING_VERSION',
   'META_ID_FORMAT', 'META_ID_MISMATCH', 'META_VERSION_MISMATCH'];
+
+// ---------------------------------------------------------------------------
+// ⑥ 包结构与审核覆盖度
+// ---------------------------------------------------------------------------
+//
+// 这一节不看脚本内容，只看 zip 自己声明的元数据，因为它防的是另一类问题：
+// 「规则读到的条目」和「安装器解压出来的条目」不是同一个东西。内容规则写得再强，
+// 也挡不住下面这些手法：
+//   * 同名重复条目 —— 有的实现取第一个，有的取最后一个，审核看到的是前者；
+//   * ../ 上跳与绝对路径 —— 解压即写出模块目录之外；
+//   * 符号链接 —— 把模块里的常规路径指向 /data/data/... ，脚本按 $MODDIR 写法
+//     操作就落到别人家，而脚本本身一行危险模式都没有；
+//   * 超高压缩比 —— 解压即打爆 runner；
+//   * 加密条目 / 不支持的压缩方式 / 解压失败 —— 审核压根没读到那段字节。
+// 最后一类尤其容易漏：读不到 ≠ 干净。所以这些必须是参与定级的 finding，
+// 而不是塞进 warnings 里好看一眼就算完。
+
+/** 单文件纳入报告与人工复核的上限，超出即视为覆盖度缺口 */
+export const MAX_TEXT = 512 * 1024;
+/** 条目数上限：模块包正常在几百个以内，再多只可能是打包脚本失误或故意堆量 */
+export const MAX_ENTRIES = 3000;
+/** 声明的解压后总字节上限 */
+export const MAX_TOTAL_UNCOMPRESSED = 512 * 1024 * 1024;
+/** 单条声明解压上限，也是内置解压器的硬上限（真正的防爆护栏在这里，而不是比值） */
+export const MAX_ENTRY_UNCOMPRESSED = 64 * 1024 * 1024;
+/** 声明压缩比超过该值即视为异常（比值只是意图信号，实际限制由上面那条兜住） */
+export const MAX_RATIO = 200;
+
+/**
+ * 条目名是否会让解压写到模块目录之外。
+ * 反斜杠单独处理：它多半是 Windows 打包工具的产物，而非恶意，但同样会让
+ * `split('/')` 看不见 `..` 段，所以判断前必须先归一化。
+ * @returns {string|null} 命中的原因，null 表示安全
+ */
+export function unsafePathReason(name) {
+  const norm = String(name == null ? '' : name).replace(/\\/g, '/');
+  if (!norm) return '空条目名';
+  if (norm.startsWith('/')) return '绝对路径';
+  if (/^[A-Za-z]:\//.test(norm)) return 'Windows 盘符绝对路径';
+  if (norm.split('/').includes('..')) return '含 .. 的上跳路径';
+  if (/\0/.test(norm)) return '条目名含 NUL';
+  return null;
+}
+
+/**
+ * 只靠前 16 字节判断是不是二进制负载。
+ * 这里刻意不猜“像不像源码”，只认确定的可执行格式 + “开头就出现 NUL” 这一条：
+ * 前者说明模块在往设备上塞机器码（静态行级规则对它无效），后者能抓住
+ * 把 ELF 改名成 .txt / .json 规避扩展名分类的低级伪装。
+ * @param {Uint8Array} head
+ * @returns {{ id: string, why: string }|null}
+ */
+export function detectBinary(head) {
+  const b = head && head.length ? head : null;
+  if (!b) return null;
+  const u = (i) => (i < b.length ? b[i] : -1);
+  if (u(0) === 0x7f && u(1) === 0x45 && u(2) === 0x4c && u(3) === 0x46) return { id: 'ELF', why: 'ELF 可执行文件/共享库' };
+  if (u(0) === 0x4d && u(1) === 0x5a) return { id: 'PE', why: 'Windows PE（MZ 头）' };
+  // thin 32/64、fat 32/64 及其字节序反转。注意 0xCAFEBABE 同时也是 Java class 的头
+  // 四字节 —— 两者在这里的结论一致（不是文本、不能逐行审），所以不再单列 CLASS。
+  const MACHO = [
+    [0xfe, 0xed, 0xfa, 0xce], [0xce, 0xfa, 0xed, 0xfe],
+    [0xfe, 0xed, 0xfa, 0xcf], [0xcf, 0xfa, 0xed, 0xfe],
+    [0xca, 0xfe, 0xba, 0xbe], [0xbe, 0xba, 0xfe, 0xca],
+    [0xca, 0xfe, 0xba, 0xbf], [0xbf, 0xba, 0xfe, 0xca],
+  ];
+  if (MACHO.some((m) => m.every((v, i) => u(i) === v))) return { id: 'MACHO', why: 'Mach-O / fat 二进制（含 Java class 头）' };
+  if (u(0) === 0x64 && u(1) === 0x65 && u(2) === 0x78 && u(3) === 0x0a) return { id: 'DEX', why: 'Android DEX' };
+  for (let i = 0; i < Math.min(b.length, 512); i++) if (b[i] === 0x00) return { id: 'NUL', why: '开头即含 NUL，不是文本' };
+  return null;
+}
+
+/**
+ * zip 元数据层面的结构检查（纯函数）。
+ * @param {Array<{name:string, method?:number, compSize?:number, origSize?:number,
+ *               encrypted?:boolean, isSymlink?:boolean, isDir?:boolean}>} entries
+ * @returns {{ findings: Finding[], stats: object }}
+ */
+export function inspectStructure(entries = []) {
+  const out = [];
+  const push = (ruleId, severity, message, advice, file, snippet = '') =>
+    out.push({ ruleId, category: 'structure', severity, file, line: 0,
+      snippet: trimSnippet(snippet), message, advice });
+
+  const list = Array.isArray(entries) ? entries : [];
+  const files = list.filter((e) => e && !e.isDir);
+
+  let totalOrig = 0;
+  let totalComp = 0;
+  let maxRatio = 0;
+  let maxRatioName = '';
+  let maxRatioSizes = '';
+
+  const seen = new Map();
+  const unsafe = [];
+  const backslash = [];
+  const symlinks = [];
+  const encrypted = [];
+  const oddMethod = [];
+
+  for (const e of files) {
+    const name = String(e.name == null ? '' : e.name);
+    if (/\\/.test(name)) backslash.push(name);
+    const reason = unsafePathReason(name);
+    if (reason) unsafe.push({ name, reason });
+    if (!seen.has(name)) seen.set(name, 0);
+    seen.set(name, seen.get(name) + 1);
+    if (e.isSymlink) symlinks.push(name);
+    if (e.encrypted) encrypted.push(name);
+    if (e.method != null && e.method !== 0 && e.method !== 8) oddMethod.push({ name, method: e.method });
+
+    const orig = Number(e.origSize) || 0;
+    const comp = Number(e.compSize) || 0;
+    totalOrig += orig;
+    totalComp += comp;
+    if (comp > 0) {
+      const r = orig / comp;
+      if (r > maxRatio) { maxRatio = r; maxRatioName = name; maxRatioSizes = `orig=${orig} comp=${comp}`; }
+    }
+  }
+
+  for (const { name, reason } of unsafe) {
+    push('STRUCT_UNSAFE_PATH', 'high', `条目 ${name} 的路径不安全（${reason}）`,
+      '禁止。安装器按条目名写出文件时，这一条会直接落到模块目录之外。请重新打包，路径全部用相对路径。', name);
+  }
+  for (const name of seen.keys()) {
+    if (seen.get(name) > 1) {
+      push('STRUCT_DUPLICATE_NAME', 'high', `条目名重复：${name} 出现 ${seen.get(name)} 次`,
+        '禁止。审核只能确认其中一份的内容，而安装器到底解压哪一份取决于实现 —— 这正是「让扫描器看到干净的那份」的经典手法。请去掉重复条目。', name);
+    }
+  }
+  for (const name of symlinks) {
+    push('STRUCT_SYMLINK', 'high', `条目 ${name} 是符号链接`,
+      '需人工确认。符号链接能把模块里的任意路径指向 /data/data、/system 等位置，脚本按常规写法操作就会写到别人家。', name);
+  }
+  for (const name of encrypted) {
+    push('STRUCT_ENCRYPTED', 'medium', `条目 ${name} 被加密，审核读不到内容`,
+      '读不到不等于干净。请提交不加密的模块包。', name);
+  }
+  for (const { name, method } of oddMethod) {
+    push('STRUCT_UNSUPPORTED_METHOD', 'medium', `条目 ${name} 使用了审核不支持的压缩方式（method ${method}）`,
+      '该行级规则无法覆盖这段字节。请改用 deflate 或 stored 重新打包。', name, `method=${method}`);
+  }
+  if (backslash.length) {
+    push('STRUCT_BACKSLASH_PATH', 'medium', `${backslash.length} 个条目名使用反斜杠分隔（如 ${backslash[0]}）`,
+      '多半是 Windows 打包工具写出的非标准 zip。不同安装器对这些条目的处理不一致，请改用正斜杠重新打包。', backslash[0],
+      `共 ${backslash.length} 个`);
+  }
+  if (files.length > MAX_ENTRIES) {
+    push('STRUCT_ENTRY_COUNT', 'medium', `条目数 ${files.length} 超过 ${MAX_ENTRIES}`,
+      '正常模块不会这么多文件。请确认是否有必要，并去掉构建产物、缓存、无关资源。', '<zip>', `${files.length} 个条目`);
+  }
+  if (totalOrig > MAX_TOTAL_UNCOMPRESSED) {
+    push('STRUCT_ZIP_BOMB', 'high',
+      `声明的解压后总大小 ${(totalOrig / 1048576).toFixed(1)} MB 超过 ${(MAX_TOTAL_UNCOMPRESSED / 1048576).toFixed(0)} MB`,
+      '按 zip bomb 处理：解压器会当场打满磁盘/内存。审核侧已在解压时施加硬上限，此类包不予自动放行。', '<zip>',
+      `压缩后 ${(totalComp / 1024).toFixed(1)} KB`);
+  }
+  if (maxRatio > MAX_RATIO) {
+    push('STRUCT_RATIO', 'medium',
+      `条目 ${maxRatioName} 的声明压缩比 ${maxRatio.toFixed(0)}:1 异常（阈值 ${MAX_RATIO}:1）`,
+      '文本脚本很少压到这种程度。请解释为何需要；无法解释则按 zip bomb 处理。', maxRatioName,
+      maxRatioSizes);
+  }
+
+  return {
+    findings: out,
+    stats: {
+      entries: list.length,
+      fileEntries: files.length,
+      dirEntries: list.length - files.length,
+      totalUncompressed: totalOrig,
+      totalCompressed: totalComp,
+      maxRatio: Number(maxRatio.toFixed(1)),
+      maxRatioEntry: maxRatioName,
+      symlinks,
+      unsafePaths: unsafe.map((u) => u.name),
+      duplicateNames: [...seen.entries()].filter(([, n]) => n > 1).map(([n]) => n),
+      encrypted,
+      unsupportedMethods: oddMethod.map((o) => o.name),
+      backslashPaths: backslash,
+      limits: { MAX_ENTRIES, MAX_TOTAL_UNCOMPRESSED, MAX_ENTRY_UNCOMPRESSED, MAX_RATIO, MAX_TEXT },
+    },
+  };
+}
+
+/** 内容读到了一半就截断 —— 人工复核看不全，属于覆盖度缺口，必须参与定级 */
+export function checkCoverage(files = [], maxText = MAX_TEXT) {
+  const out = [];
+  for (const f of files) {
+    if (!f || !f.truncated) continue;
+    out.push({
+      ruleId: 'AUDIT_COVERAGE_TRUNCATED',
+      category: 'structure',
+      severity: 'medium',
+      file: String(f.name == null ? '' : f.name),
+      line: 0,
+      snippet: `${f.size} B`,
+      message: `${f.name} 有 ${(f.size / 1048576).toFixed(2)} MB，报告只内嵌前 ${(maxText / 1024).toFixed(0)} KB`,
+      advice: '行级规则跑的是全文，但人工复核与 PR 评论只能看到前缀。请不要把脚本塞到这么大；'
+        + '确实需要长文件时把它拆成多个被引用的文件，或由人工下载产物通读。',
+    });
+  }
+  return out;
+}
+
+/** 解压失败的条目：审核没读到字节，不能当作「无发现」 */
+export function checkUnread(unread = []) {
+  return (Array.isArray(unread) ? unread : []).map((u) => ({
+    ruleId: 'STRUCT_UNREADABLE',
+    category: 'structure',
+    severity: 'medium',
+    file: String(u && u.name ? u.name : ''),
+    line: 0,
+    snippet: trimSnippet(u && u.reason ? u.reason : ''),
+    message: `条目无法解压，审核未覆盖：${u && u.name}`,
+    advice: u && u.overLimit
+      ? '该条目解压后超过审核硬上限，按 zip bomb 风险处理，不予自动放行。'
+      : '请重新打包。审核读不到的条目一律不能视为干净。',
+  }));
+}
+
+/** 二进制条目：行级规则对它无效，只能靠人/专门通道看 */
+export function checkBinaries(binaries = []) {
+  return (Array.isArray(binaries) ? binaries : []).map((b) => ({
+    ruleId: 'STRUCT_BINARY',
+    category: 'structure',
+    severity: 'medium',
+    file: String(b && b.name ? b.name : ''),
+    line: 0,
+    snippet: `${b.id} / ${b.bytes} B`,
+    message: `${b.name} 是二进制负载（${b.why || b.id}），静态行级规则无法审查`,
+    advice: '模块可以带二进制（busybox、update-binary 等），但它必须在 module.prop/描述里说明来源，'
+      + '并给出可核对的上游或校验和；匿名可执行文件在 root 下运行等于把判断权交给机器码。',
+  }));
+}
 
 // ---------------------------------------------------------------------------
 // 风险定级
