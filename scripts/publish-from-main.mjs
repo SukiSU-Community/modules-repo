@@ -194,7 +194,13 @@ async function ghFetch(apiBase, token, segs, opts = {}) {
  */
 export async function findPrForCommit({ apiBase, token, owner, repo, sha, mainBranch = 'main', log = console }) {
   const data = await ghFetch(apiBase, token, [`repos/${owner}/${repo}/commits/${sha}/pulls`]);
-  const pulls = (data && Array.isArray(data.pull_requests) ? data.pull_requests : []);
+  // `/commits/{sha}/pulls` 返回的是**裸数组**，不是 `{ pull_requests: [...] }`。
+  // 这个错只在真实调用里暴露：dispatch 到 PR #4 的合并提交时，脚本读到 undefined →
+  // 认为「没有关联 PR」→ 拒绝盖章，而 gh api 手工查同一个提交明明有 PR #4。
+  // 两种形状都认，是为了不再依赖单一版本的响应封装；但测试的桩必须改成 GitHub
+  // 真实返回的那种（裸数组），否则桩和线上永远各说各话。
+  const pulls = (Array.isArray(data) ? data
+    : (data && Array.isArray(data.pull_requests) ? data.pull_requests : []));
   if (!pulls.length) {
     return { pr: null, checks: [], others: [], note: `提交 ${String(sha).slice(0, 8)} 没有关联的 PR（可能是人工直接推到 main）` };
   }
