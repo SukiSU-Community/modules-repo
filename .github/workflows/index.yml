@@ -161,6 +161,10 @@ jobs:
           node "$SCRIPTS_DIR/publish-from-main.mjs" "${ARGS[@]}"
 
       - name: 合并进索引（build-index.mjs）
+        # id 必须是 build：最后一步要用 steps.build.outputs.build_rc 决定回帖里写
+        # 「已入索引 ✅」还是「有冲突 ⚠️」。漏了这个 id，BUILD_RC 恒为空、兜成 '0'，
+        # 于是每次冲突都会被说成成功 —— 正是下面 PIPESTATUS 注释要避免的那种错。
+        id: build
         if: steps.stamp.outcome == 'success'
         shell: bash
         env:
