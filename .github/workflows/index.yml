@@ -126,6 +126,12 @@ jobs:
 
       - name: 盖章（回查 approve 的结论）
         id: stamp
+        # 本次认定的提交没带入任何 pending 时**不要**跑盖章：脚本把「没传 --changed」
+        # 理解成「不限范围 = 全部 pending」，而 workflow_run 触发之后 index.yml 会在每一次
+        # 审核成功后都跑一遍，于是某条只改了 workflow 的维护 PR 会拿自己那次 approve 的
+        # 结论，把 main 上所有还没消费的 pending 全部盖章 —— 借章。
+        # 老投稿要重试请用 workflow_dispatch 的 sha 输入，别靠这种巧合。
+        if: steps.layout.outputs.changed_count != '0'
         # 未获批准时后面几步全部跳过，但结果仍要贴回 PR，所以这里不直接让 job 红；
         # 判红留在最后一步。
         continue-on-error: true

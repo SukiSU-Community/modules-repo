@@ -344,6 +344,22 @@ test('index.yml 必须由 workflow_run 接住「审核自动合并」这一段',
   assert.match(yml, /workflow_run\.conclusion\s*==\s*'success'/);
 });
 
+// 脚本把「没传 --changed」当成「不限范围」（stampPendingFile 的 onlyPaths=null）。
+// 这条语义本身没错，错的是让 workflow 在 changed 列表为空时省略这个参数：
+// 挂上 workflow_run 之后 index.yml 每次审核成功都会跑，某条只改 workflow 的维护 PR
+// 就会拿自己那次 approve 的结论，给 main 上所有未消费的 pending 盖章 —— 借章。
+test('不传 --changed 就是全部 pending：所以 workflow 必须在空列表时跳过盖章', () => {
+  const o = parseArgs(['--pending', 'p', '--sha', 's']);
+  assert.deepEqual(o.changed, [], 'parseArgs 不给默认值，语义交给调用方');
+
+  const yml = fs.readFileSync(WF_INDEX, 'utf8');
+  const stampAt = yml.indexOf('name: 盖章');
+  assert.ok(stampAt > 0, '得有盖章那一步');
+  const head = yml.slice(stampAt, stampAt + 900);
+  assert.match(head, /if:\s*steps\.layout\.outputs\.changed_count\s*!=\s*'0'/,
+    'changed_count 为 0 时必须整步跳过，不能靠省略 --changed');
+});
+
 test('index.yml 不直接推 main：ruleset 不给 Actions 开 bypass，所以索引也走 PR', () => {
   const yml = fs.readFileSync(WF_INDEX, 'utf8');
   assert.match(yml, /gh pr create/, '必须开 PR，而不是 git push 到 main');
