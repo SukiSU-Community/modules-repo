@@ -310,10 +310,21 @@ test('main：--report 落下的判定结果能被 push 触发的 workflow 拿去
 const WF_MAIN = path.resolve(import.meta.dirname, '../.github/workflows/audit.yml');
 const WF_INDEX = path.resolve(import.meta.dirname, '../.github/workflows/index.yml');
 const WF_TEMPLATE = path.resolve(import.meta.dirname, '../../audit/workflows/audit.yml');
+const WF_INDEX_TEMPLATE = path.resolve(import.meta.dirname, '../../audit/workflows/index.yml');
+
+/**
+ * 同一份 workflow 的两个落地位置：仓库里实际生效的那份，和 monorepo 里的母本。
+ * 母本只存在于 monorepo 布局 —— 独立 clone 的 modules-repo 没有 ../audit/，这时必须
+ * 少比一份而不是 ENOENT：否则「把测试接进 CI」的第一步会为一个假理由红掉。
+ * 但母本一旦存在就必须一起比：它是下一次复制回去的源，让它带着旧逻辑等于是
+ * 埋一颗「改过的东西被冲掉」的雷（audit.yml 首行的警告说的就是这件事）。
+ */
+const AUDIT_COPIES = [WF_MAIN, WF_TEMPLATE].filter((f) => fs.existsSync(f));
+const INDEX_COPIES = [WF_INDEX, WF_INDEX_TEMPLATE].filter((f) => fs.existsSync(f));
 
 test('approve 这个 check 名必须真的就是 workflow 里那个 job 的 name', () => {
   // 两处靠字符串相等连接：job 改名 = 悄悄拆掉闸门。这条测试就是那根钉子。
-  for (const f of [WF_MAIN, WF_TEMPLATE]) {
+  for (const f of AUDIT_COPIES) {
     const yml = fs.readFileSync(f, 'utf8');
     assert.match(yml, new RegExp(`^\\s{2}${APPROVE_CHECK_NAME}:\\s*$`, 'm'), `${f} 里必须有个 name 为 ${APPROVE_CHECK_NAME} 的 job`);
     assert.match(yml, new RegExp(`name: ${APPROVE_CHECK_NAME}\\b`), `${f} 里 job 的 name: 必须是 ${APPROVE_CHECK_NAME}`);
@@ -365,14 +376,63 @@ test('不传 --changed 就是全部 pending：所以 workflow 必须在空列表
     'changed_count 为 0 时必须整步跳过，不能靠省略 --changed');
 });
 
-test('index.yml 不直接推 main：ruleset 不给 Actions 开 bypass，所以索引也走 PR', () => {
+test('index.yml 不开 PR 也不推 main：改动交给 App，自己只等绿并合并', () => {
   const yml = fs.readFileSync(WF_INDEX, 'utf8');
-  assert.match(yml, /gh pr create/, '必须开 PR，而不是 git push 到 main');
+  // 注释里必须能写「为什么不用 gh pr create / 不 git push」，所以「不许出现」那两条
+  // 只比可执行行 —— 上一轮就有人为了过测试把解释删掉，那是反方向的损失。
+  const code = yml.split(/\r?\n/).filter((l) => !/^\s*#/.test(l)).join('\n');
+  // 两条都是实测撞上的：org 禁止 Actions 创建/批准 PR（gh pr create 直接失败），
+  // 而 bot 写的提交不触发 pull_request 检查（索引 PR 会卡在"永远没有 approve"）。
+  assert.doesNotMatch(code, /gh pr create/, 'Actions 开不出 PR，写了只会得到一个红');
+  assert.doesNotMatch(code, /git push/, '出现任何 push 就等于宣布「机器人有后门」，而事实是它没有');
+  assert.match(yml, /open-index-pr\.mjs/, '开 PR 必须交给 Worker 的 App 身份');
+  assert.match(yml, /SUBMIT_WORKER_URL/, 'Worker 地址来自仓库变量，不写死在 YAML 里');
+  assert.match(yml, /REBUILD_TOKEN:\s*\$\{\{ secrets\.REBUILD_TOKEN \}\}/, '密钥走 env，不进命令行');
   assert.match(yml, /gh pr checks[^\n]*--watch/, '合并前必须等 required check 出结果');
-  assert.doesNotMatch(yml, /git push[^\n]*(:main|main\b)/,
-    '出现直接推 main 就等于宣布「机器人有后门」，而事实是它没有');
+  assert.match(yml, /gh pr merge[^\n]*--squash/);
+  // 不再 push，就不该再揣着 contents:write
+  assert.match(yml, /contents: read/);
   // 消费掉的 pending 是删除，不能交给盖章脚本去读
   assert.match(yml, /diff-tree[\s\S]{0,80}--diff-filter=ACMR/);
+});
+
+/**
+ * workflow 里 `steps.<id>` 是纯字符串连接：id 没声明时 GitHub 不报错，只是取到空串。
+ * 于是 `${{ steps.build.outputs.build_rc }}` 少写一个 `id: build`，回帖就永远显示
+ * 「退出码 0 ✅」—— 判据自己说自己绿，是这类错最难受的地方。runner 上的行为测不到，
+ * 就在文本层把这根线钉住。注释行要剥掉：那里出现 steps.xxx 只是解释，不会被求值。
+ */
+function danglingStepRefs(yml) {
+  const code = yml.split(/\r?\n/).filter((l) => !/^\s*#/.test(l)).join('\n');
+  // `id:` 有两种合法写法：单独一行（本仓库用的是这种），或直接跟在列表项的 `- ` 后面。
+  // 只认前一种的话，后一种写出来的 step 会被误判成"未声明"，于是这条测试会逼人改回
+  // 它自己喜欢的那一种 —— 那是风格检查，不是正确性检查。
+  const declared = new Set([...code.matchAll(/^\s*(?:-\s+)?id:\s*([A-Za-z0-9_-]+)\s*$/gm)].map((m) => m[1]));
+  const refs = [...new Set([...code.matchAll(/\bsteps\.([A-Za-z0-9_-]+)/g)].map((m) => m[1]))];
+  return refs.filter((r) => !declared.has(r));
+}
+
+test('workflow 里不许引用没声明 id 的 step（引用未声明=静默取空值）', () => {
+  // 先证明这个检查不是摆设：漏一个 id 必须被抓到。夹具按真实缩进写，
+  // 因为 `id:` 在 YAML 里永远是缩进行，正则也只认缩进行。
+  assert.deepEqual(danglingStepRefs('      - id: x\n        run: ${{ steps.x.outputs.k }}'), []);
+  assert.deepEqual(danglingStepRefs('      - name: n\n        id: x\n        run: ${{ steps.x.outputs.k }}'), []);
+  assert.deepEqual(danglingStepRefs('      - id: x\n        run: ${{ steps.y.outputs.k }}'), ['y']);
+  assert.deepEqual(danglingStepRefs('      # - run: ${{ steps.z.outputs.k }}\n      - id: x'), []);
+
+  for (const f of [...AUDIT_COPIES, ...INDEX_COPIES]) {
+    const dangling = danglingStepRefs(fs.readFileSync(f, 'utf8'));
+    assert.deepEqual(dangling, [],
+      `${path.basename(f)} 引用了未声明的 step id：${dangling.join(', ')} —— 那些取值恒为空串`);
+  }
+});
+
+test('build_rc 必须真的从有 id 的那一步写出，否则回帖把冲突说成成功', () => {
+  const yml = fs.readFileSync(WF_INDEX, 'utf8');
+  assert.match(yml, /id:\s*build\b/, '写 PIPESTATUS 的那一步得叫 build');
+  assert.match(yml, /BUILD_RC:\s*\$\{\{ steps\.build\.outputs\.build_rc \}\}/);
+  // 反过来也得对上号：产出方确实写了这个 output 名
+  assert.match(yml, /echo "build_rc=/);
 });
 
 test('approve 与 publish 的分工：没有待审内容时 approve 让路，但绝不合并', () => {
@@ -408,7 +468,7 @@ test('pull_request 触发不许带 paths 过滤：每个 PR 都必须拿到 appr
   // 不会触发审核 —— PR #5 就死在这上面（gh pr checks → no checks reported，
   // mergeStateStatus → BLOCKED），整条保护变成仓库的自我锁死。
   // 放行靠 locate 的 found=false 分支，不靠「干脆不触发」。
-  for (const f of [WF_MAIN, WF_TEMPLATE]) {
+  for (const f of AUDIT_COPIES) {
     const yml = fs.readFileSync(f, 'utf8');
     const block = yml.slice(yml.indexOf('pull_request:'), yml.indexOf('workflow_dispatch:'));
     assert.ok(block.length > 0 && block.includes('types:'), `${f} 里得能定位到 pull_request 触发块`);
@@ -422,7 +482,7 @@ test('pull_request 触发不许带 paths 过滤：每个 PR 都必须拿到 appr
 // 要防的「拿古老分支当基准用旧扫描器定罪自己」早就被钉定 + 复核挡住了，所以这里只允许
 // 「把当前 base 合进来，合不动（真冲突）才拒」这一种写法。
 test('审核不许要求 PR 已包含当前 main，只允许「合得动就审」', () => {
-  for (const f of [WF_MAIN, WF_TEMPLATE]) {
+  for (const f of AUDIT_COPIES) {
     // 只比可执行行：上面那段「这里原来写的是 …」的注释里就带着旧命令，整文件匹配会把
     // 解释历史的话当成违反约定，于是这条测试永远只能在删掉注释时变绿 —— 那正是它最该
     // 拦住的那种删除。
