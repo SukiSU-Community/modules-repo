@@ -7,8 +7,13 @@
 # 「删除 pending/** 触发 synchronize 再审核一遍」，两个坑互锁）。
 #
 # 于是不变式变成：
-#   main 的唯一入口 = 合并一个 approve 成功的 PR
-#   索引 = main 内容的函数（本 workflow 生成，提交带 [skip ci]，不再自我触发）
+#   main 的唯一入口 = 合并一个过检的 PR
+#   索引 = main 内容的函数（本 workflow 生成，自己开 PR、等 approve 变绿再合并）
+#
+# 索引改动也走 PR 而不是直接 push，是因为 repo ruleset 不给 GitHub Actions 开 bypass：
+# Integration 型 actor 必须是 ruleset source / org 里安装的 App，"App" 又不是合法 actor_type。
+# 与其把某个 App 的凭据塞进 Actions（扩大凭据面），不如让「main 上的一切都来自一个过检的 PR」
+# 字面为真。防自转靠 PR 标题里的 [skip ci]：squash 合并提交继承该标题，那次 push 不再触发 workflow。
 #
 # 关键安全点：合并进 main 的 pending JSON 上**没有**审核章。章由本 workflow 盖，
 # 而盖之前必须回查证据 —— 查的是那次合并对应 PR 的 head sha 上名为 `approve` 的
@@ -93,10 +98,13 @@ jobs:
           git cat-file -e "${SHA}^{commit}" || { echo "::error::${SHA} 不在这个仓库里"; exit 1; }
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
-          # 只认定「这一个提交带进 main 的 pending 文件」。不做全目录扫描是有意的：
-          # main 上可能留着历史里没批下来的条目，把它们按「最近一次合并的批准」盖章，
-          # 等于给无主的条目借一张章。
-          git diff-tree -r --no-commit-id --name-only "$SHA" -- "$PENDING_DIR" \
+          # 只认定「这一个提交带进 main 的、此刻仍然存在的 pending 文件」。
+          # 两个限制都是有意的：
+          #  * --diff-filter=ACMR 排除删除 —— 索引消费掉 pending 的那次提交全是删除，
+          #    把已删除的路径交给盖章脚本只会读不到文件而报错；
+          #  * 不做全目录扫描 —— main 上可能留着历史里没批下来的条目，按「最近一次合并
+          #    的批准」给它们盖章等于借章。
+          git diff-tree -r --no-commit-id --name-only --diff-filter=ACMR "$SHA" -- "$PENDING_DIR" \
             | sed "s#^#${GITHUB_WORKSPACE}/#" > changed.txt || true
           echo "changed_count=$(grep -c . changed.txt || true)" >> "$GITHUB_OUTPUT"
           echo "本次提交带入/改动的 pending 文件："
@@ -159,14 +167,78 @@ jobs:
           # 宁可不进索引，也不进坏索引：过不了校验就不提交。
           node "$SCRIPTS_DIR/validate-index.mjs" "$INDEX_FILE"
 
-      - name: 提交（带 [skip ci]，否则会自己触发自己成环）
+      - name: 建分支并提交（ruleset 禁止任何直接 push 到 main，包括机器人）
+        id: commit
         if: steps.stamp.outcome == 'success' && github.event.inputs.dry_run != 'true'
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "chore(index): rebuild after merge [skip ci]"
-          file_pattern: |
-            ${{ steps.layout.outputs.index_file }}
-            ${{ steps.layout.outputs.pending_dir }}
+        shell: bash
+        env:
+          RUN_ID: ${{ github.run_id }}
+          INDEX_FILE: ${{ steps.layout.outputs.index_file }}
+          PENDING_DIR: ${{ steps.layout.outputs.pending_dir }}
+        run: |
+          set -euo pipefail
+          # 没有变化就不开 PR —— 空 PR 会让「每个索引改动都来自 PR」这条叙事变脏。
+          if git diff --quiet HEAD -- "$INDEX_FILE" "$PENDING_DIR" \
+             && [ -z "$(git status --porcelain -- "$INDEX_FILE" "$PENDING_DIR")" ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "索引与 pending 都没有变化，不开 PR。"
+            exit 0
+          fi
+          BRANCH="index/rebuild-${RUN_ID}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          # -A 是必需的：被消费的 pending 文件是「删除」，不带 -A 的话删除不会被暂存，
+          # 索引进来了但条目没清掉，下次重跑会重复处理。
+          git add -A -- "$INDEX_FILE" "$PENDING_DIR"
+          git commit -F - <<MSG
+          chore(index): rebuild after merge [skip ci]
+
+          由 Rebuild Index From Main（run ${RUN_ID}）生成：
+          审核章来自该 PR 上 approve check 的 success 结论，索引由 build-index.mjs 合并。
+          MSG
+          git push -u origin "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+      # -------------------------------------------------------------------
+      # 索引改动自己开一个 PR 并等它变绿后合并，而不是直接推 main。
+      #
+      # 为什么只能这样：repo ruleset 的 bypass 列表不接受 GitHub Actions 这个
+      # Integration（"Actor GitHub Actions integration must be part of the ruleset
+      # source or owner organization"），也没有 "App" 这个 actor_type —— 想给机器人开
+      # 后门就得把某个 org 级 App 的凭据塞进 Actions。与其扩大凭据面，不如让索引改动
+      # 也走 PR：这样「main 上的一切都来自一个过检的 PR」是字面为真，而不是靠豁免。
+      #
+      # 环为什么不会自转：PR 标题带 [skip ci]，squash 后的合并提交继承这个标题，
+      # 那次 push 到 main 不触发任何 workflow。
+      # -------------------------------------------------------------------
+      - name: 开 PR、等 approve 变绿、合并
+        if: steps.commit.outputs.has_changes == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.commit.outputs.branch }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_TITLE: "chore(index): rebuild after merge [skip ci]"
+        run: |
+          set -euo pipefail
+          URL=$(gh pr create --base "$DEFAULT_BRANCH" --head "$BRANCH" --title "$PR_TITLE" --body "$(cat <<'BODY'
+          索引重建，由 `Rebuild Index From Main` 生成。
+
+          审核章的证据不在这里，而在被合并的那个投稿 PR 上：`approve` check 在其
+          head sha 上为 success。要复核就顺着 pending 条目里的 `audit.verify` 命令查。
+
+          合并前请先确认本 PR 的 `approve` 已通过。这个 PR 只应该是机器人开的索引改动；
+          人工想改索引，请改代码或走 revoke 流程，不要手改 `json/modules.json`。
+          BODY
+          )")
+          echo "索引 PR：$URL"
+          NUMBER=${URL##*/}
+          # --watch blocking：任何一个 required check 失败都会让这里非 0 退出，
+          # 于是这个 run 红、PR 留着给人看 —— 而不是「静默合了一个没过检的索引改动」。
+          gh pr checks "$NUMBER" --repo "$GITHUB_REPOSITORY" --watch --interval 15
+          gh pr merge "$NUMBER" --repo "$GITHUB_REPOSITORY" --squash
 
       - name: 把结果贴回 PR
         if: always()

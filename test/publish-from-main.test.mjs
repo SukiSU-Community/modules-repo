@@ -150,6 +150,17 @@ test('stampPendingFile：只改 --changed 里的文件，其它原样不动', ()
   assert.equal(isApproved(JSON.parse(fs.readFileSync(mine, 'utf8'))), true);
 });
 
+test('已删除的 pending 条目不能把整次盖章判失败', () => {
+  // 索引消费 pending 的那次提交里，文件是「删除」。这一步要是抛错，
+  // 表现是「索引 PR 建不出来」，而真实原因只是上一次已经消费过 —— 难查且没必要。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pfm-missing-'));
+  const gone = path.join(dir, 'mod_a-1.json');
+  const quiet = { log() {}, error() {} };
+  const r = stampPendingFile(gone, { owner: 'o', repo: 'r', evidence: { pr: 1, headSha: SHA }, log: quiet });
+  assert.equal(r.changed, false);
+  assert.equal(r.missing, true);
+});
+
 /* ---------------------------------------------------------------- main() */
 
 const fakeLog = () => { const out = []; return { out, log: (...a) => out.push(a.join(' ')), error: (...a) => out.push('! ' + a.join(' ')) }; };
@@ -311,6 +322,16 @@ test('index.yml 调的是这个脚本，提交带 [skip ci]，且不自己重写
   // 盖章节点必须交给脚本，不能在 YAML 里再写一份「看标签/看评论」的判定 ——
   // 两处判定迟早分叉，而分叉的方向一定是松的那一处赢。
   assert.doesNotMatch(yml, /labels?\.|auto-approved.*===|===.*auto-approved/);
+});
+
+test('index.yml 不直接推 main：ruleset 不给 Actions 开 bypass，所以索引也走 PR', () => {
+  const yml = fs.readFileSync(WF_INDEX, 'utf8');
+  assert.match(yml, /gh pr create/, '必须开 PR，而不是 git push 到 main');
+  assert.match(yml, /gh pr checks[^\n]*--watch/, '合并前必须等 required check 出结果');
+  assert.doesNotMatch(yml, /git push[^\n]*(:main|main\b)/,
+    '出现直接推 main 就等于宣布「机器人有后门」，而事实是它没有');
+  // 消费掉的 pending 是删除，不能交给盖章脚本去读
+  assert.match(yml, /diff-tree[\s\S]{0,80}--diff-filter=ACMR/);
 });
 
 test('approve 与 publish 的分工：没有待审内容时 approve 让路，但绝不合并', () => {

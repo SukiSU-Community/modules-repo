@@ -165,38 +165,61 @@ node --test test/publish-from-main.test.mjs
 
 顺序错了会直接把生产线打死：`approve` 这个 required check 由新 workflow 产出，
 在旧 workflow 还挂在 main 上时把它设为 required，所有投稿 PR 都会因「Expected 且永不发生」
-卡死。所以先推 workflow、再配保护，中间不要合 PR。
+卡死。所以下面这个顺序不能调换：**先推 workflow → 确认 workflow 存在 → 再建 ruleset**。
+
+下面这组参数是拿真仓库一步步试出来的（每条都对着 GitHub 的校验器验过，不是抄文档）：
 
 ```bash
-# 1) 确认 main 上的 workflow 已经有 approve job（推完再查）
+# 1) 确认 main 上的 workflow 已经有 approve job（推完再查，必须是 1）
 gh api repos/SukiSU-Community/modules-repo/contents/.github/workflows/audit.yml?ref=main \
-  --jq '.content' | base64 -d | grep -c 'name: approve'   # 必须是 1
+  --jq '.content' | base64 -d | grep -c 'name: approve'
 
-# 2) 上 ruleset：require PR + require approve + 限制 push，只给 Actions 留 bypass
-gh api -X POST repos/SukiSU-Community/modules-repo/rulesets \
-  -F name='protect-main' \
-  -F target='branch' \
-  -F enforcement='active' \
-  -f 'conditions.ref_name.include[]=@main' \
-  -F 'rules.require_pull_request.before_merge=true' \
-  -F 'rules.require_pull_request.approvals_before_merge=1' \
-  -F 'rules.require_status_check.strict=true' \
-  -F 'rules.require_status_check.checks[]=approve' \
-  -F 'rules.restrict_pushes.enabled=true' \
-  -F 'rules.force_pushes.enabled=false' \
-  -F 'rules.deletion.enabled=false' \
-  -F 'bypass_actors[].actor_type=Integration' \
-  -F 'bypass_actors[].actor_id=<GitHub Actions 的 App id>' \
+# 2) 建 ruleset
+gh api -X POST repos/SukiSU-Community/modules-repo/rulesets --input - <<'JSON'
+{"name":"protect-main","target":"branch","enforcement":"active",
+ "conditions":{"ref_name":{"include":["refs/heads/main"],"exclude":[]}},
+ "rules":[
+   {"type":"update"},
+   {"type":"deletion"},
+   {"type":"non_fast_forward"},
+   {"type":"pull_request","parameters":{"require_extra_approval_for_unattributed_changes":false}},
+   {"type":"required_status_checks","parameters":{
+      "required_status_checks":[{"context":"approve","integration_id":15368}],
+      "strict_required_status_checks_policy":false,
+      "do_not_enforce_on_create":false}}
+ ]}
+JSON
 ```
 
-`actor_id` 用 `gh api app/installations` 里 `app_id` 那一栏取（别凭记忆填）。
+踩过的四个坑，别再猜：
 
-最后两项（`force_pushes` / `deletion`）是**必须真开的**：只开 require PR、
-却留着「允许强推覆盖 main」，等于在承重墙上留一扇谁都能开的门 —— 索引和 pending
-历史都能被一次 `--force` 抹平，而这条 ruleset 看起来仍是绿的。
+| 想当然的写法 | 实际要求 |
+|---|---|
+| `include: ["main"]` | 必须写**全 ref** `refs/heads/main`；`main`、`main*`、`*` 一律报 `Invalid target patterns` |
+| `rules: { require_pull_request: ... }` | `rules` 是**数组**，每项 `{"type": ..., "parameters": ...}` |
+| 禁强推叫 `force_pushes` | 类型名是 `non_fast_forward`；`force_push`/`force_pushes`/`branch_protection` 都不是合法 type |
+| required check 写在 `parameters.checks[]` | 输入侧键名是 `parameters.required_status_checks[]`（回读时也是这个），`strict` 的真名是 `strict_required_status_checks_policy` |
 
-配完之后跑一次真实投稿验证闭环（提交 → approve 成功 → 合并 → index.yml 盖章入索引），
-只看测试通过不算数。
+**没有、也不该有 Actions 的 bypass。** repo ruleset 的 `bypass_actors` 只接受
+`Integration / OrganizationAdmin / RepositoryRole / Team / DeployKey / User`；填 Actions
+那个 Integration（本仓库 check run 里的 `app.id=15368`）会被拒：
+`Actor GitHub Actions integration must be part of the ruleset source or owner organization`，
+而 `"App"` 根本不是合法 actor_type。要开后门就得把某个 org 级 App 的凭据塞进 Actions secret。
+结论：**索引改动也走 PR**（`index.yml` 自己建分支、开 PR、`gh pr checks --watch` 等 approve
+变绿、再 squash 合并），于是「main 上的一切都来自一个过检的 PR」是字面为真，不靠豁免。
+
+`required_approving_review_count` 的默认值是 **0**（bare `pull_request` 就是「必须过 PR，
+不必须人类签字」）—— 这正是自动放行需要的；把它调到 1 会让机器人合不了任何 PR。
+`require_extra_approval_for_unattributed_changes` 默认为 `true`，这里显式关掉：投稿 PR 与
+索引 PR 的提交都由 bot 作者，留着它等于冻死整条流水线。这两个决定都是拿批准概率换审计强度，
+第二条贡献者加入后应当重新评估（见 P4 的角色阶梯）。
+
+`deletion` 与 `non_fast_forward` 必须真开：只上 require PR 却留着强推，等于在承重墙上
+留一扇谁都能开的门 —— 索引与 pending 历史能被一次 `--force` 抹平，而这条 ruleset 看起来
+仍是绿的。
+
+配完之后跑一次真实投稿验证闭环（提交 → approve success → 合并 → index.yml 建索引 PR →
+自动合并 → 模块出现在 `json/modules.json`），只看测试通过不算数。
 
 
 ## pending 目录是递归的

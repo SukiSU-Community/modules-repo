@@ -129,6 +129,12 @@ export function stampPendingFile(
   { owner, repo, evidence, onlyPaths = null, risk, log = console }
 ) {
   const abs = path.resolve(file);
+  if (!fs.existsSync(abs)) {
+    // 被索引消费掉的 pending 是「删除」。workflow 侧已经用 --diff-filter=ACMR 挡了一道，
+    // 这里再兜一次：读不到就当没这回事，别让一个已删除的条目把整次盖章判失败。
+    log.log(`[publish-from-main] 跳过 ${path.basename(abs)}：文件已不存在（多半是被上一次索引消费了）`);
+    return { changed: false, ids: [], skipped: [], missing: true };
+  }
   const raw = JSON.parse(fs.readFileSync(abs, 'utf8'));
   const list = Array.isArray(raw) ? raw : [raw];
   const ids = [];
