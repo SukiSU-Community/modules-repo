@@ -134,7 +134,11 @@ node scripts/fetch-pending-zip.mjs pending/ --out-dir /tmp/zips \
                                       │
                     index.yml ──> publish-from-main.mjs 回查那次 approve 的结论
                               ──> 盖章 ──> build-index --consume ──> validate-index
-                              ──> 建分支 + 开**索引 PR** ──> 等 approve 变绿 ──> 合并
+                              ──> 把改动集交给 Worker：App 建分支 + 开**索引 PR**
+                                      │
+                    索引 PR 自己的 audit run ──> kind/derive 判「索引 == base 的推导」
+                                      │
+                            merge-index（squash 合并；只能在这个上下文里合，见上文第 4 条）
 ```
 
 不变式：**main 的唯一入口是「合并一个 approve 成功的 PR」，索引是 main 内容的函数。**
@@ -299,27 +303,40 @@ JSON
 
 第 3 条今天就能跑（本次就是这么走完的），但它是「人工在场」，不是「自动放行」。
 
-### 方案 ② 落地后真跑抓到的三件事（2026-10-11，投稿 PR #15 / 索引 PR #16）
+### 方案 ② 落地后真跑抓到的四件事（2026-10-11，投稿 PR #15 / 索引 PR #16 #19）
 
-选定 ②：Actions 仍负责回查 approve → 盖章 → 算索引 → 校验 → 等绿 → 合并，只把「写分支 + 开 PR」
+选定 ②：Actions 仍负责回查 approve → 盖章 → 算索引 → 校验 → 等绿，只把「写分支 + 开 PR」
 这一脚交给 Worker 的 GitHub App（`POST /rebuild-index`，共享密钥 `REBUILD_TOKEN`）。跑之前上面
 那段第 2 条得先纠正：**不触发检查的是用 `GITHUB_TOKEN` 推上去的提交**（作者 github-actions[bot]），
 App 名下的提交会正常触发 —— 投稿 PR #15 就是 App 开的，`audit`/`approve`/`Merge Approved PR` 照常跑完。
 
-真跑第一次死在三处，全都是「测试全绿但线上是死的」那同一类：
+真跑第一次死在四处，全都是「测试全绿但线上是死的」那同一类：
 
 1. **tree 的删除项缺 `mode`** → GitHub 把整棵树 422 掉：
    `Must supply a valid tree.mode`。`sha: null` 只表达「删除」，`mode`/`type` 仍必填。
    单测当时全绿，是因为 `/git/trees` 的 stub 来者不拒 —— 它在回声实现自己发明的形状。
    现在 stub 按 GitHub 的规则校验 mode（含删除项），**stub 必须比实现更挑**，否则它只是面镜子。
 2. **`[skip ci]` 进了提交信息** → GitHub 干脆不为这条 PR 创建任何 workflow run，索引 PR #16
-   于是永远 `no checks reported`、永远等不到 approve。skip 标记只许留在 **PR 标题**上
-   （squash 后的合并提交继承标题，那次到 main 的 push 才不会被再触发一遍）；提交信息由
-   `commitMessageFor()` 剥干净。这条和「防自转」是两个相反的要求，很容易写反。
+   于是永远 `no checks reported`、永远等不到 approve。skip 标记只许留在 **PR 标题**上；提交信息由
+   `commitMessageFor()` 剥干净。这条和第 4 条那句「防自转」是两个相反的要求，很容易写反。
 3. **`gh pr checks --watch` 不等第一个 check 出现**：PR 刚建好的那几秒列表是空的，它直接
    `no checks reported` + 退出 1（实测 0.9 秒就把这一步判红，而 checks 后来是会建出来的）。
    现在先有界地等 check runs 出现（5 分钟上界，超时报错并指出「先看提交信息里有没有 skip 标记」），
-   再 `--watch`，watch 通过后**还要单独确认 `approve` 在那个 head sha 上为 success** 才 merge。
+   再 `--watch`，之后单独确认 `approve` 在那个 head sha 上为 success。
+4. **合并要放在 `pull_request` 上下文的 run 里**：index.yml（`workflow_run` / `dispatch` 触发）拿
+   `GITHUB_TOKEN` 去合索引 PR 得到
+   `GraphQL: Resource not accessible by integration (mergePullRequest)`（run 38069741398 → #19），
+   而同一个 token 在 audit.yml 的 publish 作业里合**自己那条**投稿 PR（#15）是成功的 —— org 那道
+   「不允许 Actions 创建/批准 PR」的开关管的是「在跟目标 PR 无关的 run 里对 PR 动手」。
+   因此索引 PR 的合并落在 audit.yml 新增的 `merge-index` 作业，判据两个缺一不可：
+   `index_pr`（少它 = 维护类 PR 也会被机器人合掉）+ `index_derived`（少它 = 手抄索引能进 main）。
+   `createComment` 在同一 job 里是成功的，所以这不是 `pull-requests: write` 权限不够。
+
+顺带纠正本文以前的一处说法：**`[skip ci]` 不是防自转的承重墙**。`gh pr merge --squash` 的合并提交
+信息取的是分支上那条提交的信息（#19 合出来是 `chore(index): rebuild after merge (#19)`，标题里
+的 `[skip ci]` 没跟过去），而那条提交恰恰必须干净才能让自己的检查跑起来。真正拦住自转的是两条
+结构条件：Actions 自己合出来的 push 不触发 workflow；人工合并时（实测 push run 38070248065 确实
+触发了）索引合并提交对 pending 只有删除，`--diff-filter=ACMR` 之后 `changed_count=0`，整段跳过。
 
 仍然开着的两个口（都不是这次要解决的）：
 
