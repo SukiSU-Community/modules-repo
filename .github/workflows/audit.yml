@@ -445,6 +445,12 @@ jobs:
           fi
 
           : > audit-out/summary.md
+          # 先把待扫清单打出来：这一步曾经出现过「zips.txt 非空、循环却一次都没跑、
+          # 步骤仍然 success」的形态（PR #4 run 38061078816），而下游 分流决策 只留下一句
+          # `ls: cannot access 'audit-out/*.audit.json'`。没有清单，那种失败无从判断。
+          echo "待扫清单 $(wc -l < zips.txt) 行："; cat zips.txt
+          WANT=$(wc -l < zips.txt)
+          GOT=0
           while IFS= read -r ZIP; do
             [ -z "$ZIP" ] && continue
             [ -f "$ZIP" ] || { echo "::warning::$ZIP 不存在，跳过"; continue; }
@@ -452,7 +458,18 @@ jobs:
             [ -n "$DECL_ID" ] && ARGS+=(--declared-id "$DECL_ID")
             [ -n "$DECL_VER" ] && ARGS+=(--declared-version "$DECL_VER")
             node "$SCANNER" "$ZIP" "${ARGS[@]}" --quiet | tee -a audit-out/summary.md
+            GOT=$((GOT+1))
           done < zips.txt
+
+          # 覆盖度闸：清单里每一条都必须产出一份扫描结论。少一条就是「绿勾 + 没扫过的内容」，
+          # 那是这道闸最危险的形态 —— 它把「让扫描不产出」变成一种绕过方式。
+          # 宁可红着让人来看，也不能让 approve 在没扫过的包上盖章。
+          PRODUCED=$(find audit-out -maxdepth 1 -name '*.audit.json' | wc -l)
+          if [ "$PRODUCED" -lt "$WANT" ]; then
+            echo "::error::待扫清单 $WANT 条，实际只产出 $PRODUCED 份扫描结论（循环跑了 $GOT 次），审核未覆盖全部投稿内容，终止。"
+            exit 1
+          fi
+          echo "覆盖度检查通过：$PRODUCED 份扫描结论覆盖 $WANT 条待扫包"
 
       # ---------------------------------------------------------------
       # 3. LLM 复核（可选）—— 仅在配置 AI_API_KEY 时执行
