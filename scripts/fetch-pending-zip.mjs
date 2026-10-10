@@ -48,10 +48,18 @@ export function pickVersion(raw) {
  * 于是两个问题：① 指到 `http://169.254.169.254/` 之类，让 CI runner 替攻击者发内部请求
  * （SSRF）；② 合法主机 302 到一个外部主机会被一路跟下去，白名单形同虚设。
  *
- * 只放行 GitHub 的 release 下载域：`github.com` 给入口，
- * `objects.githubusercontent.com` 是它 302 之后真正吐字节的那个。
+ * 只放行 GitHub 的 release 下载域：`github.com` 给入口，剩下两个是它 302 之后真正吐字节的那个。
+ *
+ * `release-assets.githubusercontent.com` 不是抄来的猜测：真实投稿（PR #4）在 github.com 直链
+ * 这一跳就死在这里，报「主机不在允许列表内」。GitHub 将 release asset 的签名直链从
+ * `objects.githubusercontent.com` 迁到了这个域，少认它一个域名，后果是**所有**真实投稿都取不到包、
+ * 审核直接空转——白名单把自己挡在门外，等于没有审核。两个域都保留：迁移期的旧链仍在吐字节。
  */
-export const ALLOWED_DOWNLOAD_HOSTS = new Set(['github.com', 'objects.githubusercontent.com']);
+export const ALLOWED_DOWNLOAD_HOSTS = new Set([
+  'github.com',
+  'objects.githubusercontent.com',
+  'release-assets.githubusercontent.com',
+]);
 const MAX_REDIRECTS = 5;
 
 /**
@@ -159,7 +167,7 @@ export function resolveDownloadUrl(raw, opts = {}) {
  * 下载一个 URL 到内存缓冲（zip 需整体读入才能交给 scan.mjs）。
  *
  * 重定向**自己跟**而不是 `redirect:'follow'`：GitHub 的 release 直链会 302 到
- * objects.githubusercontent.com，那是合法的；但「跟随」也意味着攻击者可以让
+ * ALLOWED_DOWNLOAD_HOSTS 里那两个 asset 域，那是合法的；但「跟随」也意味着攻击者可以让
  * github.com 的 URL 一路跳到任何主机 —— 白名单只在第一跳生效等于没有白名单。
  * 所以每一跳都重新过 assertDownloadUrl（按主机/协议/凭据判），跳数封顶 MAX_REDIRECTS。
  */

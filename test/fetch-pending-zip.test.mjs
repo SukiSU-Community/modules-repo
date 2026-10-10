@@ -190,6 +190,35 @@ test('重定向无限循环时靠跳数上限熔断', async () => {
   }
 });
 
-test('允许列表就是那两个主机，别悄悄加宽', () => {
-  assert.deepEqual([...ALLOWED_DOWNLOAD_HOSTS].sort(), ['github.com', 'objects.githubusercontent.com']);
+test('允许列表就是这三个主机，别悄悄加宽', () => {
+  assert.deepEqual(
+    [...ALLOWED_DOWNLOAD_HOSTS].sort(),
+    ['github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com'],
+  );
+});
+
+// 真实投稿 PR #4 就是死在这条上的：github.com 的 release 直链 302 到
+// release-assets.githubusercontent.com，而当时的白名单没有它，于是所有投稿都取不到包。
+// 签名直链的 path 是 /github-production-release-asset-2e/<id>/<token>?Expires=…&Signature=…，
+// 尾巴不再是 <sha>.zip —— 所以中间跳只过主机/协议/凭据这三关，
+// 「扫的包＝合的包」靠的是 main() 里对实下载字节做的 sha256 比对，而不是靠 URL 长相。
+test('302 到 release-assets.githubusercontent.com 的签名直链要能跟到底', async () => {
+  const real = globalThis.fetch;
+  const signed =
+    'https://release-assets.githubusercontent.com/github-production-release-asset-2e/999/deadbeef' +
+    '?Expires=1791642284&Key-Pair-Id=K1&Signature=ABC%3D';
+  const seen = [];
+  globalThis.fetch = async (u) => {
+    seen.push(String(u));
+    if (String(u) === GOOD) return new Response(null, { status: 302, headers: { location: signed } });
+    if (String(u).startsWith(signed)) return new Response(new Uint8Array([0x50, 0x4b, 0x05, 0x06]), { status: 200 });
+    return new Response(null, { status: 404 });
+  };
+  try {
+    const buf = await downloadToBuffer(GOOD);
+    assert.equal(buf.length, 4, '签名直链这一跳必须取到内容，而不是被白名单挡掉');
+    assert.equal(seen.length, 2);
+  } finally {
+    globalThis.fetch = real;
+  }
 });
