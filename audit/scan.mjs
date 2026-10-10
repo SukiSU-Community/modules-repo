@@ -20,6 +20,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from 'node:fs';
 import { basename, dirname, resolve, join, extname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { inflateRawSync } from 'node:zlib';
 import { spawnSync } from 'node:child_process';
 
@@ -720,18 +721,23 @@ export function main(argv = process.argv.slice(2)) {
   return 0;
 }
 
-// 仅当作为 CLI 直接运行时才跑 main（process.argv[1] 在 node -e 下不存在，必须判空）
-function runAsCli() {
-  const entry = process.argv[1];
-  if (!entry) return false;
-  const self = new URL(import.meta.url);
-  try {
-    return self.href === new URL(`file:///${entry.replace(/\\/g, '/')}`).href;
-  } catch {
-    return entry.endsWith('scan.mjs');
-  }
+// 仅当作为 CLI 直接运行时才跑 main。
+//
+// 判据必须是「解析成绝对路径后再比」，不能拿原始 argv[1] 拼 file URL：
+// Linux 上 process.argv[1] 保持调用方给的样子（CI 传的是相对的 `audit/scan.mjs`），
+// 旧写法得到 file:///audit/scan.mjs，与 import.meta.url 的
+// file:///home/runner/work/.../audit/scan.mjs 永远不相等 → main() 一次都没跑，
+// 进程 exit 0、不打印、不落盘。Windows 上 Node 会把 argv[1] 规范化成绝对路径，
+// 所以本地怎么跑都是对的 —— 静默失效只有 runner 上看得见（真实表现：扫描步骤 success
+// 却零产出，见 run 38061078816 / 38061728123）。
+//
+// 逻辑抽成纯函数并由调用方传 selfPath，是为了让这条「换平台才坏」的判断能在开发机上
+// 被测出来（spawn 出来的子进程在 Windows 上 argv[1] 永远是绝对路径，测不到相对形态）。
+export function isCliEntry(entry, selfPath) {
+  if (!entry || !selfPath) return false;
+  return resolve(entry) === selfPath;
 }
 
-if (runAsCli()) {
+if (isCliEntry(process.argv[1], fileURLToPath(import.meta.url))) {
   process.exitCode = main();
 }
