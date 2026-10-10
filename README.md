@@ -276,6 +276,9 @@ JSON
 
 ### 还开着的两个口子（不是代码能解决的）
 
+> **状态更新（2026-10-11）**：这两条已经定案走**方案 ②**（App 开索引 PR），下面两段留作
+> 「为什么现在长这样」的原因记录；第 2 条的判据后来被证明写宽了，纠正见下一节。
+
 1. **本 org 禁止 GitHub Actions 创建/批准 PR**。索引那半步需要开 PR，于是 `gh pr create` 直接报
    `GitHub Actions is not permitted to create or approve pull requests`；仓库级同名开关也改不动，
    `PATCH /repos/{owner}/{repo}/actions/permissions/workflow` 返回
@@ -295,6 +298,40 @@ JSON
 3. 保持现在的设计，每次由人点一下开 PR + 合并（半自动，流程与今天一致，只是多两次人工）。
 
 第 3 条今天就能跑（本次就是这么走完的），但它是「人工在场」，不是「自动放行」。
+
+### 方案 ② 落地后真跑抓到的三件事（2026-10-11，投稿 PR #15 / 索引 PR #16）
+
+选定 ②：Actions 仍负责回查 approve → 盖章 → 算索引 → 校验 → 等绿 → 合并，只把「写分支 + 开 PR」
+这一脚交给 Worker 的 GitHub App（`POST /rebuild-index`，共享密钥 `REBUILD_TOKEN`）。跑之前上面
+那段第 2 条得先纠正：**不触发检查的是用 `GITHUB_TOKEN` 推上去的提交**（作者 github-actions[bot]），
+App 名下的提交会正常触发 —— 投稿 PR #15 就是 App 开的，`audit`/`approve`/`Merge Approved PR` 照常跑完。
+
+真跑第一次死在三处，全都是「测试全绿但线上是死的」那同一类：
+
+1. **tree 的删除项缺 `mode`** → GitHub 把整棵树 422 掉：
+   `Must supply a valid tree.mode`。`sha: null` 只表达「删除」，`mode`/`type` 仍必填。
+   单测当时全绿，是因为 `/git/trees` 的 stub 来者不拒 —— 它在回声实现自己发明的形状。
+   现在 stub 按 GitHub 的规则校验 mode（含删除项），**stub 必须比实现更挑**，否则它只是面镜子。
+2. **`[skip ci]` 进了提交信息** → GitHub 干脆不为这条 PR 创建任何 workflow run，索引 PR #16
+   于是永远 `no checks reported`、永远等不到 approve。skip 标记只许留在 **PR 标题**上
+   （squash 后的合并提交继承标题，那次到 main 的 push 才不会被再触发一遍）；提交信息由
+   `commitMessageFor()` 剥干净。这条和「防自转」是两个相反的要求，很容易写反。
+3. **`gh pr checks --watch` 不等第一个 check 出现**：PR 刚建好的那几秒列表是空的，它直接
+   `no checks reported` + 退出 1（实测 0.9 秒就把这一步判红，而 checks 后来是会建出来的）。
+   现在先有界地等 check runs 出现（5 分钟上界，超时报错并指出「先看提交信息里有没有 skip 标记」），
+   再 `--watch`，watch 通过后**还要单独确认 `approve` 在那个 head sha 上为 success** 才 merge。
+
+仍然开着的两个口（都不是这次要解决的）：
+
+* **失败重试要人推一下**：一次重建失败会留下孤儿分支 `index/rebuild-<runId>`，同一个 run 重跑
+  会被判 `conflict`（这是有意的：不在半截状态上二次写入）。换新 run（`workflow_dispatch` 填
+  那次的 sha）就绕开了 —— 但「下一条无关的合并 PR」**不会**自动把这条被落下的 pending 捡起来，
+  因为那次提交没带入 pending，`changed_count=0` 整步跳过。要自动化这一步，得让重建按
+  「main 上是否存在未消费 pending」来判断范围，而不是按「这次提交带了什么」。
+* **单测没接进 CI**：`node --test` 只在本地跑（见下面「跑单测」）。上面这些洞之所以能带着
+  全绿上线，根因就在这儿。把它接进 `approve` 会让任意一个测试失败都挡住投稿，属于闸门语义的
+  变化，要单独定；接之前还得注意母本相关的测试在独立 clone 里必须跳过（已处理，见
+  `AUDIT_COPIES` / `INDEX_COPIES`）。
 
 
 ## pending 目录是递归的
@@ -386,6 +423,11 @@ node --test test/build-index.test.mjs   # 只跑这一个文件
 > 用不带参数的 `node --test` 或上面的显式文件路径。
 
 覆盖 `build-index` 的三种核心情况：新增模块、追加版本、id 冲突不覆盖。
+
+> ⚠️ **这些单测目前没有任何 CI 在跑** —— `audit.yml` 里没有 `node --test` 那一步，它们是纯本地的。
+> 本轮好几个「测试全绿但线上从没工作」的洞（scan.mjs 的 CLI 入口、`steps.build` 指向一个没声明的
+> id、tree 删除项缺 mode）就是这么带着绿灯上线的。接进 CI 之前先想清楚：挂在 `approve` 上就等于
+> 「任意一个测试失败都挡住投稿」，那是闸门语义的变化，不是加一步那么简单。
 
 ## 发布
 

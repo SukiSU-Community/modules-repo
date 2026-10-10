@@ -396,6 +396,37 @@ test('index.yml 不开 PR 也不推 main：改动交给 App，自己只等绿并
   assert.match(yml, /diff-tree[\s\S]{0,80}--diff-filter=ACMR/);
 });
 
+// 索引 PR 由 App 建出来。PR 刚建的那几秒 check runs 还是空的，而 `gh pr checks --watch`
+// 碰到空列表是**立刻退出 1**（run 38068977342 实测：PR #16 建好 0.9 秒就报 no checks
+// reported 红掉，checks 后来其实会建出来）。而更要命的一种情况是提交信息里带了 [skip ci]
+// —— GitHub 会干脆不为这条 PR 创建任何 run，于是这一段永远等不到东西。
+// 所以这一步得是：有界地等 checks 出现 → watch → 认 approve 在该 sha 上的结论 → 才 merge。
+test('等索引 PR 变绿那一段：先等 checks 出现，再按 approve 的结论决定合不合', () => {
+  for (const f of INDEX_COPIES) {
+    const yml = fs.readFileSync(f, 'utf8');
+    const at = yml.indexOf('name: 等 approve 变绿并合并');
+    assert.ok(at > 0, `${path.basename(f)} 里得有这样一步`);
+    // 只比可执行行：注释里就会出现 `gh pr checks --watch` 这类字样（那正是它在解释的坑），
+    // 整段按原文取下标会把「注释先出现」当成「代码先执行」，于是这条测试只在删注释时变绿。
+    const block = yml
+      .slice(at, at + 4000)
+      .split(/\r?\n/)
+      .filter((l) => !/^\s*#/.test(l))
+      .join('\n');
+
+    assert.match(block, /DEADLINE/, '等待必须有上界，否则这一步会挂死整个 workflow');
+    const waits = block.indexOf('check-runs');
+    const watches = block.indexOf('gh pr checks');
+    const merges = block.indexOf('gh pr merge');
+    const judges = block.indexOf('select(.name=="approve")');
+    assert.ok(waits >= 0 && watches >= 0 && merges >= 0 && judges >= 0,
+      `${path.basename(f)} 的这一步缺了四段之一：等 checks / watch / approve 判定 / merge`);
+    assert.ok(waits < watches, '先确认 checks 存在，再 --watch —— 顺序反了就还是那个 0.9 秒的假红');
+    assert.ok(judges < merges, 'approve 的结论必须排在 merge 之前判定');
+    assert.match(block, /approve 在 .* 上的结论是/, 'approve 不是 success 时要说清结论是什么，而不是静默不合并');
+  }
+});
+
 /**
  * workflow 里 `steps.<id>` 是纯字符串连接：id 没声明时 GitHub 不报错，只是取到空串。
  * 于是 `${{ steps.build.outputs.build_rc }}` 少写一个 `id: build`，回帖就永远显示
