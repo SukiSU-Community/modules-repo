@@ -246,6 +246,56 @@ JSON
 配完之后跑一次真实投稿验证闭环（提交 → approve success → 合并 → index.yml 建索引 PR →
 自动合并 → 模块出现在 `json/modules.json`），只看测试通过不算数。
 
+## 闭环实测记录（2026-10-10，投稿 PR #4 / 危险样本 PR #11）
+
+上面那句话照做了，于是一连串「测试全绿但生产是死的」全部现形。每条都记在这里，
+因为它们的共同形状是：**本地测不出来**，只有真跑一次才看得见。
+
+| # | 现象（证据形态） | 根因 | 修法 | PR |
+|---|---|---|---|---|
+| 1 | 审核第一步就失败：`下载地址主机不在允许列表内：release-assets.githubusercontent.com` | GitHub 把 release asset 的 302 目标换了域，白名单把自己挡在门外 | 白名单加该域；中间跳只过协议/凭据/主机，「扫的包=合的包」仍由实下载字节的 sha256 比对兜住 | #5 |
+| 2 | 维护 PR `gh pr checks` → no checks reported，`mergeStateStatus` → BLOCKED | 配了 required check 之后「从没上报」和「失败」对 GitHub 是同一件事，而触发带 `paths` 过滤 → 改 scripts/ 的 PR 永远不会有不存在的 approve | 去掉 `paths`，每个 PR 都跑；非投稿 PR 由 `found=false` 放行，而不是靠不触发 | #5 |
+| 3 | `git push origin main` 与 `gh pr merge` 全被拒：`Cannot update this protected ref.` | ruleset 里的 `update`（Restrict updates）＋ `bypass_actors: []` ＝ 谁都不能更新 main，包括 Actions | 删掉 `update`；`deletion`/`non_fast_forward`/`pull_request`/`required_status_checks` 这四条已经足够，实测直接推 main 仍然被拒 | — |
+| 4 | 重跑投稿审核时报 `PR 分支不是 origin/main 的后代` | main 会被机器人自己推进，投稿方是不会 rebase 的机器人 → 投稿永久冻死 | 闸门二改为 `git merge --no-commit --no-ff $BASE_SHA`：合得动就审，真冲突才拒（并 abort，不猜哪一边） | #6 |
+| 5 | 扫描步骤 **success 却零产出**，失败要到下一步才以 `ls: cannot access '*.audit.json'` 冒出来 | `scan.mjs` 的 CLI 入口判据拿 `argv[1]` 拼 file URL；Linux 上 `argv[1]` 保持相对路径，拼出来永远不等于 `import.meta.url` → `main()` 整个不跑。Windows 把 argv[1] 规范化成绝对路径，所以本地 143 条测试全绿 | 判据换成 `resolve(argv[1]) === fileURLToPath(import.meta.url)`，并抽成纯函数好在开发机上测两种形态；同一形状的两个脚本一起改。**结论：这道审核闸上线以来没扫过任何一个模块** | #8 |
+| 6 | 同上，但作为闸本身 | 「绿勾 + 一个字节都没扫」如果靠下游 `ls` 偶然兜住，只要哪天目录里有残留凑巧凑齐数量，就会放行未审内容 | 扫描步骤加覆盖度闸：`*.audit.json` 份数 < 待扫清单行数就 exit 1，并打出 WANT/GOT/PRODUCED | #7 |
+| 7 | dispatch 盖章时报「提交 c8f6a036 没有关联的 PR（可能是人工直接推到 main）」 | `/commits/{sha}/pulls` 返回**裸数组**，代码读的是 `data.pull_requests`；而测试桩照同一个误解返回 `{pull_requests:[…]}` —— 桩与实现一起错 | 两种形状都认，桩改成 GitHub 的真实形状；验过牙齿（改回只认对象后 4 条用例立刻红） | #10 |
+| 8 | 投稿被 approve 并合并之后，`Rebuild Index From Main` 一次都没启动 | GitHub 刻意切断 `GITHUB_TOKEN` 造成的 push 链 —— 机器人自己合的提交不触发任何 workflow | 索引重建挂 `workflow_run: Module Submission Audit`，并加 job 级 `if` 只跟成功的运行；实测 `workflow_run` 那条 run 起来了 | #9 |
+| 9 | 挂上 workflow_run 之后，每次审核成功都会跑重建 | 脚本语义是「不传 `--changed` = 不限范围」，于是只改 workflow 的维护 PR 会拿自己那次 approve 给 main 上**所有**未消费的 pending 盖章（借章） | `changed_count == 0` 时整一步跳过盖章；重试旧投稿走 dispatch 的 sha 输入 | #9 |
+
+同时验通的两条结论：
+
+- 放行路径：`approve` 绿 → Actions 自己 `gh pr merge` 成功（说明 ruleset 没把机器人挡在外面）→
+  盖章成立（`批准证据成立：PR #4 的 approve check 在 0426921a 上为 success`）→
+  `build-index` → `validate-index` → 索引 PR 的 `derive` 判**索引与推导一致（消费 1 个已批准条目）** →
+  合并后 `json/modules.json` 里出现该模块（`zipUrl` 指向内容寻址资产、`sha256` 一致、`verified:false`），
+  `pending/` 只剩 `.example.json`，Worker 的 `/check?id=e2e_probe_module&versionCode=1` 返回 `recorded`。
+- 拒绝路径：`customize.sh` 里放 `curl … | sh` + `setenforce 0` 的样本 → 扫描判高风险 →
+  `approve` **fail** → 标签 `needs-human-review` + `blocked-auto-merge` → `mergeStateStatus: BLOCKED`，
+  并且那次 `workflow_run` 触发的重建被 job 级 `if` **skipped**（红审核不会顺带开索引 PR）。
+
+### 还开着的两个口子（不是代码能解决的）
+
+1. **本 org 禁止 GitHub Actions 创建/批准 PR**。索引那半步需要开 PR，于是 `gh pr create` 直接报
+   `GitHub Actions is not permitted to create or approve pull requests`；仓库级同名开关也改不动，
+   `PATCH /repos/{owner}/{repo}/actions/permissions/workflow` 返回
+   `409 The organization does not allow GitHub Actions to create or approve pull requests`。
+   要开只能由 org 管理员在组织设置里放行（当前维护者在该 org 是 admin，但 token 没有 `admin:org` 作用域）。
+2. **机器人写的提交不触发 `pull_request` 检查**。实测：Actions 推上来的索引分支开成 PR 后
+   `no checks reported`；我用 API 补一个**自己名下**的空提交，检查立刻跑起来并给出 approve。
+   也就是说即使第 1 条放行，「机器人开的索引 PR」仍然拿不到 approve —— 两道闸是叠在一起的。
+
+所以「索引 = main 内容的函数」这条不变式在**语义**上已经验通，但第二段还做不到全自动。
+三条候选路（需要定一条，见任务 P2 之前）：
+
+1. 索引发布到不受保护的分支（`gh-pages` / `index-data`），Actions 直接 push，不需要 PR、
+   也不依赖 org 策略；代价是消费端索引 URL 要改（前端 `config.js` 本来就把索引地址做成可配置项）。
+2. 由 Worker 已装的 GitHub App 来开索引 PR —— 它是被允许的 actor，代价是要把「什么时候该重建」
+   显式告诉它（合并回执或定时兜底）。
+3. 保持现在的设计，每次由人点一下开 PR + 合并（半自动，流程与今天一致，只是多两次人工）。
+
+第 3 条今天就能跑（本次就是这么走完的），但它是「人工在场」，不是「自动放行」。
+
 
 ## pending 目录是递归的
 
