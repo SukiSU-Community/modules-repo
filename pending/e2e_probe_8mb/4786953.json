@@ -1,0 +1,23 @@
+{
+  "id": "e2e_probe_8mb",
+  "name": "E2E Probe 8MB",
+  "author": "zcode-e2e",
+  "description": "e2e size probe",
+  "versions": [
+    {
+      "version": "v0.0.953",
+      "versionCode": 4786953,
+      "zipUrl": "https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/fe00dfcfbbc83427686bfa7530fbcba5c74a62d81a443deb4a6dd0b3b7162c03.zip",
+      "size": 8323407,
+      "time": 1791624792171,
+      "sha256": "fe00dfcfbbc83427686bfa7530fbcba5c74a62d81a443deb4a6dd0b3b7162c03"
+    }
+  ],
+  "source": "https://www.coolapk.com/u/2781460",
+  "uploader": "zcode-e2e",
+  "coolapkUid": "2781460",
+  "storage": "github-release-asset",
+  "releaseTag": "assets-v1",
+  "assetName": "fe00dfcfbbc83427686bfa7530fbcba5c74a62d81a443deb4a6dd0b3b7162c03.zip",
+  "submittedAt": "2026-10-10T09:33:12.171Z"
+}
