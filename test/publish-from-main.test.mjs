@@ -365,12 +365,22 @@ test('不传 --changed 就是全部 pending：所以 workflow 必须在空列表
     'changed_count 为 0 时必须整步跳过，不能靠省略 --changed');
 });
 
-test('index.yml 不直接推 main：ruleset 不给 Actions 开 bypass，所以索引也走 PR', () => {
+test('index.yml 不开 PR 也不推 main：改动交给 App，自己只等绿并合并', () => {
   const yml = fs.readFileSync(WF_INDEX, 'utf8');
-  assert.match(yml, /gh pr create/, '必须开 PR，而不是 git push 到 main');
+  // 注释里必须能写「为什么不用 gh pr create / 不 git push」，所以「不许出现」那两条
+  // 只比可执行行 —— 上一轮就有人为了过测试把解释删掉，那是反方向的损失。
+  const code = yml.split(/\r?\n/).filter((l) => !/^\s*#/.test(l)).join('\n');
+  // 两条都是实测撞上的：org 禁止 Actions 创建/批准 PR（gh pr create 直接失败），
+  // 而 bot 写的提交不触发 pull_request 检查（索引 PR 会卡在"永远没有 approve"）。
+  assert.doesNotMatch(code, /gh pr create/, 'Actions 开不出 PR，写了只会得到一个红');
+  assert.doesNotMatch(code, /git push/, '出现任何 push 就等于宣布「机器人有后门」，而事实是它没有');
+  assert.match(yml, /open-index-pr\.mjs/, '开 PR 必须交给 Worker 的 App 身份');
+  assert.match(yml, /SUBMIT_WORKER_URL/, 'Worker 地址来自仓库变量，不写死在 YAML 里');
+  assert.match(yml, /REBUILD_TOKEN:\s*\$\{\{ secrets\.REBUILD_TOKEN \}\}/, '密钥走 env，不进命令行');
   assert.match(yml, /gh pr checks[^\n]*--watch/, '合并前必须等 required check 出结果');
-  assert.doesNotMatch(yml, /git push[^\n]*(:main|main\b)/,
-    '出现直接推 main 就等于宣布「机器人有后门」，而事实是它没有');
+  assert.match(yml, /gh pr merge[^\n]*--squash/);
+  // 不再 push，就不该再揣着 contents:write
+  assert.match(yml, /contents: read/);
   // 消费掉的 pending 是删除，不能交给盖章脚本去读
   assert.match(yml, /diff-tree[\s\S]{0,80}--diff-filter=ACMR/);
 });

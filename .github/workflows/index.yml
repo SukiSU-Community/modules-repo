@@ -64,9 +64,11 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  # contents 只要 read：这个 workflow 不再 git push（改动交给 App 写），
+  # 留着 write 等于揣着一把用不上的钥匙。
+  contents: read
   checks: read         # 取 approve 的结论
-  pull-requests: write # 由提交反查 PR + 把结果贴回 PR
+  pull-requests: write # 合并索引 PR + 把结果贴回 PR
 
 jobs:
   index:
@@ -187,14 +189,37 @@ jobs:
           # 宁可不进索引，也不进坏索引：过不了校验就不提交。
           node "$SCRIPTS_DIR/validate-index.mjs" "$INDEX_FILE"
 
-      - name: 建分支并提交（ruleset 禁止任何直接 push 到 main，包括机器人）
-        id: commit
+      # -------------------------------------------------------------------
+      # 把改动集交给 Worker，由 GitHub App 开索引 PR —— 这一步不是可选的复杂度。
+      #
+      # 为什么不能在这里 `git push` + `gh pr create`（两条都是实测撞上的）：
+      #   1. org `SukiSU-Community` 禁止 GitHub Actions 创建/批准 PR：
+      #      `pull request create failed: GraphQL: GitHub Actions is not permitted to
+      #      create or approve pull requests`，仓库级同名开关 PATCH 返回 409
+      #      「The organization does not allow ...」；
+      #   2. 机器人写的提交**不触发** pull_request 检查：Actions 推上来的索引分支开成 PR 后
+      #      `no checks reported`（`gh pr checks` 空），而人工补一个自己名下的提交后检查立刻跑。
+      #      没有 `approve`，ruleset 就永远不放行合并 —— 索引 PR 会卡成死局。
+      #
+      # App 名下的提交两个问题都没有：投稿 PR #4 就是它开的，audit/derive/approve 照常跑。
+      # 所以分工是：Actions 盖章 + 算索引 + 校验（凭据仍在它自己手里，够不着 GitHub 写入），
+      # Worker 用 App 身份写分支开 PR，Actions 再等绿并合并。
+      #
+      # 环不会自转：标题带 [skip ci]（Worker 端还会兜底补一次），squash 后的合并提交继承它。
+      # -------------------------------------------------------------------
+      - name: 把改动集交给 Worker，由 App 开索引 PR
+        id: openpr
         if: steps.stamp.outcome == 'success' && github.event.inputs.dry_run != 'true'
         shell: bash
         env:
           RUN_ID: ${{ github.run_id }}
           INDEX_FILE: ${{ steps.layout.outputs.index_file }}
           PENDING_DIR: ${{ steps.layout.outputs.pending_dir }}
+          SCRIPTS_DIR: ${{ steps.layout.outputs.scripts_dir }}
+          SHA: ${{ steps.layout.outputs.sha }}
+          WORKER_URL: ${{ vars.SUBMIT_WORKER_URL }}
+          # 走 env 不走命令行：命令行参数会出现在 runner 的进程列表与日志回显里
+          REBUILD_TOKEN: ${{ secrets.REBUILD_TOKEN }}
         run: |
           set -euo pipefail
           # 没有变化就不开 PR —— 空 PR 会让「每个索引改动都来自 PR」这条叙事变脏。
@@ -204,61 +229,47 @@ jobs:
             echo "索引与 pending 都没有变化，不开 PR。"
             exit 0
           fi
+          if [ -z "${WORKER_URL:-}" ]; then
+            echo "::error::没配仓库变量 SUBMIT_WORKER_URL（投稿 Worker 的 https 地址），开不出索引 PR。"
+            echo "::error::索引没更新，但改动已算好：配上变量后重跑本 workflow（或 dispatch 填 sha）即可。"
+            exit 1
+          fi
           BRANCH="index/rebuild-${RUN_ID}"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -c "$BRANCH"
-          # -A 是必需的：被消费的 pending 文件是「删除」，不带 -A 的话删除不会被暂存，
-          # 索引进来了但条目没清掉，下次重跑会重复处理。
-          git add -A -- "$INDEX_FILE" "$PENDING_DIR"
-          git commit -F - <<MSG
-          chore(index): rebuild after merge [skip ci]
-
-          由 Rebuild Index From Main（run ${RUN_ID}）生成：
-          审核章来自该 PR 上 approve check 的 success 结论，索引由 build-index.mjs 合并。
-          MSG
-          git push -u origin "$BRANCH"
-          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-          echo "has_changes=true" >> "$GITHUB_OUTPUT"
-
-      # -------------------------------------------------------------------
-      # 索引改动自己开一个 PR 并等它变绿后合并，而不是直接推 main。
-      #
-      # 为什么只能这样：repo ruleset 的 bypass 列表不接受 GitHub Actions 这个
-      # Integration（"Actor GitHub Actions integration must be part of the ruleset
-      # source or owner organization"），也没有 "App" 这个 actor_type —— 想给机器人开
-      # 后门就得把某个 org 级 App 的凭据塞进 Actions。与其扩大凭据面，不如让索引改动
-      # 也走 PR：这样「main 上的一切都来自一个过检的 PR」是字面为真，而不是靠豁免。
-      #
-      # 环为什么不会自转：PR 标题带 [skip ci]，squash 后的合并提交继承这个标题，
-      # 那次 push 到 main 不触发任何 workflow。
-      # -------------------------------------------------------------------
-      - name: 开 PR、等 approve 变绿、合并
-        if: steps.commit.outputs.has_changes == 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          BRANCH: ${{ steps.commit.outputs.branch }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          PR_TITLE: "chore(index): rebuild after merge [skip ci]"
-        run: |
-          set -euo pipefail
-          URL=$(gh pr create --base "$DEFAULT_BRANCH" --head "$BRANCH" --title "$PR_TITLE" --body "$(cat <<'BODY'
-          索引重建，由 `Rebuild Index From Main` 生成。
+          node "$SCRIPTS_DIR/open-index-pr.mjs" \
+            --root "$GITHUB_WORKSPACE" \
+            --worker "$WORKER_URL" \
+            --branch "$BRANCH" \
+            --base-sha "$SHA" \
+            --out-file pr-url.txt \
+            --body "$(cat <<'BODY'
+          索引重建，由 `Rebuild Index From Main` 生成，提交由投稿 Worker 的 GitHub App 写出。
 
           审核章的证据不在这里，而在被合并的那个投稿 PR 上：`approve` check 在其
           head sha 上为 success。要复核就顺着 pending 条目里的 `audit.verify` 命令查。
 
-          合并前请先确认本 PR 的 `approve` 已通过。这个 PR 只应该是机器人开的索引改动；
-          人工想改索引，请改代码或走 revoke 流程，不要手改 `json/modules.json`。
+          本 PR 的内容必须是 `build-index.mjs` 对 base 的推导结果 —— `derive` 步骤会自己
+          重算一遍并逐字段比对；对不上就判红。人工想改索引请改代码或走 revoke 流程，
+          不要手改 `json/modules.json`。
           BODY
-          )")
-          echo "索引 PR：$URL"
-          NUMBER=${URL##*/}
+          )"
+          URL=$(cat pr-url.txt)
+          echo "pr_url=$URL" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${URL##*/}" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+      - name: 等 approve 变绿并合并
+        if: steps.openpr.outputs.has_changes == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.openpr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
           # --watch blocking：任何一个 required check 失败都会让这里非 0 退出，
           # 于是这个 run 红、PR 留着给人看 —— 而不是「静默合了一个没过检的索引改动」。
-          gh pr checks "$NUMBER" --repo "$GITHUB_REPOSITORY" --watch --interval 15
-          gh pr merge "$NUMBER" --repo "$GITHUB_REPOSITORY" --squash
+          gh pr checks "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --watch --interval 15
+          gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --squash
 
       - name: 把结果贴回 PR
         if: always()

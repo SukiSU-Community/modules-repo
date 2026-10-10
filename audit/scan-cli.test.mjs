@@ -99,7 +99,7 @@ const SCRIPTS_DIR = SCRIPTS_DIRS.find((d) => existsSync(d)) || SCRIPTS_DIRS[0];
 test('所有 CLI 入口判据都不许用拼 file:// URL 的写法', () => {
   const files = [
     join(REPO_ROOT, 'audit', 'scan.mjs'),
-    ...['publish-from-main.mjs', 'verify-index-pr.mjs', 'build-index.mjs', 'fetch-pending-zip.mjs', 'validate-index.mjs']
+    ...['publish-from-main.mjs', 'verify-index-pr.mjs', 'build-index.mjs', 'fetch-pending-zip.mjs', 'validate-index.mjs', 'open-index-pr.mjs']
       .map((f) => join(SCRIPTS_DIR, f))
       .filter((f) => existsSync(f)),
   ];
