@@ -389,22 +389,46 @@ test('index.yml 不开 PR 也不推 main：改动交给 App，自己只等绿并
   assert.match(yml, /SUBMIT_WORKER_URL/, 'Worker 地址来自仓库变量，不写死在 YAML 里');
   assert.match(yml, /REBUILD_TOKEN:\s*\$\{\{ secrets\.REBUILD_TOKEN \}\}/, '密钥走 env，不进命令行');
   assert.match(yml, /gh pr checks[^\n]*--watch/, '合并前必须等 required check 出结果');
-  assert.match(yml, /gh pr merge[^\n]*--squash/);
+  // 合并本身不在这条 workflow 里：它的 run 不是那条 PR 的 pull_request 上下文，
+  // org 那道开关会让 mergePullRequest 直接 403（实测 run 38069741398）。见 audit.yml 的 merge-index。
+  assert.doesNotMatch(code, /gh pr merge/, 'index.yml 不该试图合并 —— 它在这个上下文里合不动');
   // 不再 push，就不该再揣着 contents:write
   assert.match(yml, /contents: read/);
   // 消费掉的 pending 是删除，不能交给盖章脚本去读
   assert.match(yml, /diff-tree[\s\S]{0,80}--diff-filter=ACMR/);
 });
 
+// 索引 PR 的合并只能发生在「那条 PR 自己的 pull_request run」里 —— 这是本轮真跑撞出来的：
+// index.yml 用同一个 GITHUB_TOKEN 合索引 PR 会得到
+// `GraphQL: Resource not accessible by integration (mergePullRequest)`，
+// 而 audit.yml 的 publish 作业在 pull_request 上下文里合自己的 PR（投稿 PR #15）是成功的。
+test('索引 PR 的合并挂在 audit 的 pull_request 上下文里，且两个判据都缺一不可', () => {
+  for (const f of AUDIT_COPIES) {
+    const code = fs.readFileSync(f, 'utf8')
+      .split(/\r?\n/)
+      .filter((l) => !/^\s*#/.test(l))
+      .join('\n');
+    assert.match(code, /^ {2}merge-index:$/m, `${path.basename(f)} 里得有 merge-index 作业`);
+    const at = code.indexOf('  merge-index:');
+    const job = code.slice(at, at + 1200);
+    // 少 index_pr 这一半 = 任何改脚本/文档的维护 PR 都会被机器人合进 main；
+    // 少 index_derived 这一半 = 手抄一份 json/modules.json 就能进 main。
+    assert.match(job, /if: needs\.audit\.outputs\.index_pr == 'true' && needs\.audit\.outputs\.index_derived == 'true'/,
+      '两个条件必须同时钉住，且是 && 而不是 ||');
+    assert.match(job, /needs: \[audit, approve\]/, 'approve 红了就不能合并（job 默认要求 needs 成功）');
+    assert.match(job, /gh pr merge .*--squash/, '合并方式必须是 squash：main 上每个索引状态对应一个过检 PR');
+  }
+});
+
 // 索引 PR 由 App 建出来。PR 刚建的那几秒 check runs 还是空的，而 `gh pr checks --watch`
 // 碰到空列表是**立刻退出 1**（run 38068977342 实测：PR #16 建好 0.9 秒就报 no checks
 // reported 红掉，checks 后来其实会建出来）。而更要命的一种情况是提交信息里带了 [skip ci]
 // —— GitHub 会干脆不为这条 PR 创建任何 run，于是这一段永远等不到东西。
-// 所以这一步得是：有界地等 checks 出现 → watch → 认 approve 在该 sha 上的结论 → 才 merge。
-test('等索引 PR 变绿那一段：先等 checks 出现，再按 approve 的结论决定合不合', () => {
+// 这一步只观察并报到本 run 的日志里：合并本身在 audit.yml 的 merge-index（见上面那条测试）。
+test('等索引 PR 过检那一段：先有界地等 checks 出现，再按 approve 的结论报状态', () => {
   for (const f of INDEX_COPIES) {
     const yml = fs.readFileSync(f, 'utf8');
-    const at = yml.indexOf('name: 等 approve 变绿并合并');
+    const at = yml.indexOf('name: 等索引 PR 过检');
     assert.ok(at > 0, `${path.basename(f)} 里得有这样一步`);
     // 只比可执行行：注释里就会出现 `gh pr checks --watch` 这类字样（那正是它在解释的坑），
     // 整段按原文取下标会把「注释先出现」当成「代码先执行」，于是这条测试只在删注释时变绿。
@@ -417,13 +441,13 @@ test('等索引 PR 变绿那一段：先等 checks 出现，再按 approve 的�
     assert.match(block, /DEADLINE/, '等待必须有上界，否则这一步会挂死整个 workflow');
     const waits = block.indexOf('check-runs');
     const watches = block.indexOf('gh pr checks');
-    const merges = block.indexOf('gh pr merge');
     const judges = block.indexOf('select(.name=="approve")');
-    assert.ok(waits >= 0 && watches >= 0 && merges >= 0 && judges >= 0,
-      `${path.basename(f)} 的这一步缺了四段之一：等 checks / watch / approve 判定 / merge`);
+    assert.ok(waits >= 0 && watches >= 0 && judges >= 0,
+      `${path.basename(f)} 的这一步缺了三段之一：等 checks / watch / approve 判定`);
     assert.ok(waits < watches, '先确认 checks 存在，再 --watch —— 顺序反了就还是那个 0.9 秒的假红');
-    assert.ok(judges < merges, 'approve 的结论必须排在 merge 之前判定');
-    assert.match(block, /approve 在 .* 上的结论是/, 'approve 不是 success 时要说清结论是什么，而不是静默不合并');
+    assert.ok(judges > watches, 'approve 的结论要在 watch 之后查，抢跑等于没等');
+    assert.match(block, /approve 在 .* 上的结论是/, 'approve 不是 success 时要说清结论是什么，而不是静默报好');
+    assert.doesNotMatch(block, /gh pr merge/, '这一步不该试图合并：这个上下文里的 token 合不动（403）');
   }
 });
 

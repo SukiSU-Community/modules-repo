@@ -8,12 +8,27 @@
 #
 # 于是不变式变成：
 #   main 的唯一入口 = 合并一个过检的 PR
-#   索引 = main 内容的函数（本 workflow 生成，自己开 PR、等 approve 变绿再合并）
+#   索引 = main 内容的函数（本 workflow 生成改动，交给 App 开成 PR）
 #
 # 索引改动也走 PR 而不是直接 push，是因为 repo ruleset 不给 GitHub Actions 开 bypass：
 # Integration 型 actor 必须是 ruleset source / org 里安装的 App，"App" 又不是合法 actor_type。
 # 与其把某个 App 的凭据塞进 Actions（扩大凭据面），不如让「main 上的一切都来自一个过检的 PR」
-# 字面为真。防自转靠 PR 标题里的 [skip ci]：squash 合并提交继承该标题，那次 push 不再触发 workflow。
+# 字面为真。
+#
+# ⚠️ 这个 workflow **不合并**索引 PR，也合不动：它的 run 不是那条 PR 的 pull_request 上下文，
+#    而 org 那道「不允许 Actions 创建/批准 PR」的开关同时管住了「在无关的 run 里合并 PR」，
+#    实测报 `GraphQL: Resource not accessible by integration (mergePullRequest)`。
+#    合并放在 audit.yml 的 merge-index 作业里 —— 同一个 token，但在正确的上下文里。
+#
+# 环为什么不会自转（纠正过一次说法，别再写回旧的）：
+#    以前这里写的是「PR 标题带 [skip ci]，squash 后的合并提交继承该标题」。实测不成立：
+#    `gh pr merge --squash` 的合并提交信息取的是**分支上那条提交**的信息（#19 合出来是
+#    `chore(index): rebuild after merge (#19)`，标题里的 [skip ci] 没跟过去），而那条提交恰恰
+#    必须干净 —— 提交信息带 skip 标记会让 GitHub 干脆不为这条 PR 创建任何 run（#16 的死法）。
+#    真正拦住自转的是两条结构条件：
+#      1. Actions 自己合出来的 push 不触发 workflow（GitHub 刻意切断 GITHUB_TOKEN 的链）；
+#      2. 就算触发了（人工合并那次就会，实测 push run 38070248065），索引合并提交对 pending
+#         只有删除，`--diff-filter=ACMR` 过滤后 changed_count=0，盖章/算索引/开 PR 整段跳过。
 #
 # 关键安全点：合并进 main 的 pending JSON 上**没有**审核章。章由本 workflow 盖，
 # 而盖之前必须回查证据 —— 查的是那次合并对应 PR 的 head sha 上名为 `approve` 的
@@ -262,7 +277,7 @@ jobs:
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
           echo "has_changes=true" >> "$GITHUB_OUTPUT"
 
-      - name: 等 approve 变绿并合并
+      - name: 等索引 PR 过检（只观察，合并由它自己的 run 做）
         if: steps.openpr.outputs.has_changes == 'true'
         shell: bash
         env:
@@ -281,27 +296,26 @@ jobs:
             HAVE=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs" --jq .total_count 2>/dev/null || echo 0)
             if [ "${HAVE:-0}" -gt 0 ]; then break; fi
             if [ "$SECONDS" -ge "$DEADLINE" ]; then
-              echo "::error::索引 PR #${PR_NUMBER}（${HEAD_SHA:0:8}）上 5 分钟没有任何 check：approve 不会出现，因此不合并。"
+              echo "::error::索引 PR #${PR_NUMBER}（${HEAD_SHA:0:8}）上 5 分钟没有任何 check：approve 不会出现，因此也不会被合并。"
               echo "::error::先看那次提交的信息里有没有 [skip ci] 之类的标记 —— 它会让 GitHub 干脆不为这条 PR 创建任何 workflow run。"
               exit 1
             fi
             sleep 10
           done
 
-          # 任何一个 required check 失败都会让这里非 0 退出：这个 run 红、PR 留着给人看，
-          # 而不是「静默合了一个没过检的索引改动」。
+          # 任何一个 required check 失败都会让这里非 0 退出：本 run 红、PR 留着给人看，
+          # 而不是「静默合了一个没过检的索引改动」。合并本身在 audit.yml 的 merge-index 作业里。
           gh pr checks "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --watch --interval 15
 
-          # --watch 只覆盖它当时看到的那些 check；approve 是链尾的 job，理论上可能晚于其它
-          # job 才建出来。放行判据始终是「approve 在这个 head sha 上为 success」，所以直接查它，
-          # 而不是依赖「watch 到的一堆里恰好有它」。
+          # watch 只覆盖它当时看到的那些 check，而 approve 是链尾的 job；放行判据始终是
+          # 「approve 在这个 head sha 上为 success」，所以直接查它的结论再报状态。
           APPROVE=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs" \
             --jq '.check_runs[] | select(.name=="approve") | .conclusion' | tail -1)
           if [ "${APPROVE:-}" != "success" ]; then
-            echo "::error::approve 在 ${HEAD_SHA:0:8} 上的结论是「${APPROVE:-未上报}」，不合并。"
+            echo "::error::approve 在 ${HEAD_SHA:0:8} 上的结论是「${APPROVE:-未上报}」，索引 PR 不会被合并。"
             exit 1
           fi
-          gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --squash
+          echo "索引 PR #${PR_NUMBER} 已过检；合并由它自己那条 run 的 merge-index 作业完成。"
 
       - name: 把结果贴回 PR
         if: always()

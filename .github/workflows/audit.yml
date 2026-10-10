@@ -850,3 +850,45 @@ jobs:
               body,
             });
 
+  # -------------------------------------------------------------------
+  # 索引重建 PR 的合并只能发生在这里 —— 位置不是随便挑的。
+  #
+  # org 那个「不允许 GitHub Actions 创建/批准 PR」的开关，同时管住了「在一个与目标 PR
+  # 无关的 run 里合并 PR」。index.yml 由 workflow_run / workflow_dispatch 触发，它拿到的
+  # GITHUB_TOKEN 去合索引 PR 会拿到：
+  #   GraphQL: Resource not accessible by integration (mergePullRequest)
+  # 实测（run 38069741398 → 索引 PR #19）。而同一个 token 在 publish 作业里合**自己这条**
+  # 投稿 PR（#15）是成功的 —— 唯一区别就是 run 的触发上下文。
+  #
+  # 所以把合并放回 pull_request 上下文就通了，而且没多开任何口子：判据仍由同一条链上的
+  # kind/derive/approve 产出，凭据仍是 GITHUB_TOKEN，App 只负责写分支开 PR。
+  #
+  # 两个条件都要：
+  #   * index_pr —— 这条 PR 只动索引；少了它，任何改 scripts/docs 的维护 PR 也会被机器人合掉；
+  #   * index_derived —— 索引内容 = base 的推导结果（verify-index-pr.mjs 逐字段比过）；
+  #     少了它，手抄一份 json/modules.json 就能进 main —— 那正是整条链唯一在防的事。
+  # needs: approve 还额外保证「approve 红了就绝不合并」：job 默认要求 needs 的 job 成功。
+  # -------------------------------------------------------------------
+  merge-index:
+    name: Merge Index PR
+    needs: [audit, approve]
+    if: needs.audit.outputs.index_pr == 'true' && needs.audit.outputs.index_derived == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: 合并（squash：main 上每个索引状态都对应一个过检的 PR）
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PR_NUMBER:-}" ]; then
+            echo "::error::这次运行不是来自 PR（dispatch 只重跑判定），索引合并要人工确认。"
+            exit 1
+          fi
+          gh pr merge "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --squash
+          echo "索引 PR #${PR_NUMBER} 已 squash 合并：main 上的 json/modules.json 就是这次推导的结果。"
+
