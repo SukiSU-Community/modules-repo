@@ -102,17 +102,32 @@ jobs:
             PENDING_DIR="$PREFIX/pending"
             INDEX_FILE="$PREFIX/json/modules.json"
             SCRIPTS_DIR="$PREFIX/scripts"
-            SCANNER="contrib/audit/scan.mjs"
           else
             PENDING_DIR="pending"
             INDEX_FILE="json/modules.json"
             SCRIPTS_DIR="scripts"
-            SCANNER="audit/scan.mjs"
           fi
-          [ -f "$SCANNER" ] || SCANNER="contrib/audit/scan.mjs"
+          # 扫描器路径同样由 PREFIX 推导，绝不能写死 contrib/audit/scan.mjs：
+          #   PREFIX=contrib/repo（monorepo 形态） -> contrib/audit/scan.mjs
+          #   PREFIX 为空（索引仓库在根）          -> audit/scan.mjs
+          # 两种候选取第一个真实存在的，兼容两种落地形态。
+          if [ -n "$PREFIX" ]; then
+            SCANNER_CANDIDATES=("contrib/audit/scan.mjs" "audit/scan.mjs")
+          else
+            SCANNER_CANDIDATES=("audit/scan.mjs" "contrib/audit/scan.mjs")
+          fi
+          SCANNER=""
+          for c in "${SCANNER_CANDIDATES[@]}"; do
+            if [ -f "$c" ]; then SCANNER="$c"; break; fi
+          done
+          if [ -z "$SCANNER" ]; then
+            SCANNER="${SCANNER_CANDIDATES[0]}"
+            echo "::warning::未找到 scan.mjs（已尝试：${SCANNER_CANDIDATES[*]}），扫描步骤会明确报错。"
+          fi
           echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
           echo "index_file=$INDEX_FILE" >> "$GITHUB_OUTPUT"
-          echo "索引仓库前缀：'${PREFIX:-<根>}'（pending=$PENDING_DIR, index=$INDEX_FILE）"
+          echo "scanner=$SCANNER" >> "$GITHUB_OUTPUT"
+          echo "索引仓库前缀：'${PREFIX:-<根>}'（pending=$PENDING_DIR, index=$INDEX_FILE, scanner=$SCANNER）"
 
           if [ -n "$MANUAL_ZIP" ]; then
             # 手动触发：直接给 zip 路径，走老路径
@@ -182,6 +197,8 @@ jobs:
           # 全部经 env 传入，不做 ${{ }} 文本拼接，避免 PR 内容注入 shell/node
           FORCE_INDEX: ${{ vars.MODULE_INDEX_PATH || '' }}
           LOCATE_INDEX: ${{ steps.locate.outputs.index_file }}
+          LOCATE_SCANNER: ${{ steps.locate.outputs.scanner }}
+          LOCATE_PREFIX: ${{ steps.locate.outputs.prefix }}
         run: |
           set -euo pipefail
           mkdir -p audit-out
@@ -190,18 +207,63 @@ jobs:
           [ -f "$INDEX" ] || INDEX=""
           echo "用于判定首次收录/版本更新的索引：${INDEX:-（无，changeType 会退化为 unknown）}"
 
+          # 扫描器路径由 locate 步骤按 PREFIX 推导后传过来（不再写死 contrib/audit/scan.mjs）。
+          # 索引仓库形态 PREFIX 为空 -> audit/scan.mjs；monorepo 形态 -> contrib/audit/scan.mjs。
+          SCANNER="${LOCATE_SCANNER}"
+          if [ -z "$SCANNER" ]; then
+            if [ -n "$LOCATE_PREFIX" ]; then
+              SCANNER="contrib/audit/scan.mjs"
+            else
+              SCANNER="audit/scan.mjs"
+            fi
+            [ -f "$SCANNER" ] || SCANNER="contrib/audit/scan.mjs"
+          fi
+          if [ ! -f "$SCANNER" ]; then
+            echo "::error::找不到扫描器 $SCANNER（PREFIX='${LOCATE_PREFIX:-<根>}'），无法完成安全审核。"
+            exit 1
+          fi
+          echo "扫描器：$SCANNER（PREFIX='${LOCATE_PREFIX:-<根>}'）"
+
           # 声明的 id / version 取自本次变更的 pending 元数据（递归，Worker 写的是
           # pending/<id>/<versionCode>.json，version 在 versions[].version 里）。
           DECL_ID=""; DECL_VER=""
           PFORM=$(find pending-changed -name '*.json' ! -name '.*' 2>/dev/null | head -n1 || true)
           if [ -n "$PFORM" ] && [ -f "$PFORM" ]; then
-            DECL_ID=$(node -e 'const j=require(process.argv[1]);process.stdout.write(String(j.id||j.moduleId||""))' "$PFORM" 2>/dev/null || true)
+            # ⚠️ 原写法 `require(process.argv[1])` 读出空值的真根因（已实测，见回报）：
+            #   require() 拿到不带 "./" 前缀的相对路径时，会把它当成**裸模块名**去
+            #   node_modules 里解析，而不是当文件路径 —— 于是 MODULE_NOT_FOUND，
+            #   错误被 `2>/dev/null || true` 静默吞掉，DECL_ID/DECL_VER 就成了空字符串。
+            #   实测：加 "./" 前缀后可 require 成功；换 fs.readFileSync 则相对/绝对路径都稳。
+            #
+            #   附：node -e 的 process.argv 实测为 [node.exe, arg1, arg2...]，
+            #   即 argv[1] 就是第一个实参（不是 node 路径）。但为了不依赖具体约定，
+            #   这里统一取**最后一个实参** process.argv[process.argv.length-1]，
+            #   无论 argv[1] 还是 argv[2] 是第一个实参都能正确取到文件路径。
+            #
+            # 结构见 contrib/worker/src/index.ts buildPendingJson（与 PR #1 真实文件一致）：
+            #   顶层 id；版本在 versions[versions.length-1].version。
+            DECL_ID=$(node -e '
+              const fs=require("fs");
+              const j=JSON.parse(fs.readFileSync(process.argv[process.argv.length-1],"utf8"));
+              process.stdout.write(String(j.id||j.moduleId||""));
+            ' "$PFORM" 2>/dev/null || true)
             DECL_VER=$(node -e '
-              const j=require(process.argv[1]);
+              const fs=require("fs");
+              const j=JSON.parse(fs.readFileSync(process.argv[process.argv.length-1],"utf8"));
               const v=Array.isArray(j.versions)&&j.versions.length?j.versions[j.versions.length-1]:null;
               process.stdout.write(String((v&&v.version)||j.version||j.versionName||""));
             ' "$PFORM" 2>/dev/null || true)
             echo "投稿声明：id=$DECL_ID version=$DECL_VER（来自 $PFORM）"
+            # 供应链红线：id 读不出来就判不了「首次收录 vs 版本更新」，
+            # 而规则是版本更新一律人工审 —— 读错会把更新误判成首次收录而自动放行。
+            # 所以宁可 fail closed：拿不到 id 就让流水线报错终止，不做无依据的自动放行。
+            if [ -z "$DECL_ID" ]; then
+              echo "::error::无法从 $PFORM 读出投稿 id，无法判定首次收录/版本更新，终止审核（不做自动放行）。"
+              exit 1
+            fi
+            if [ -z "$DECL_VER" ]; then
+              echo "::warning::无法从 $PFORM 读出投稿 version，变更类型判定可能退化为 unknown。"
+            fi
           fi
 
           : > audit-out/summary.md
@@ -211,7 +273,7 @@ jobs:
             ARGS=(--out-dir audit-out --index "$INDEX")
             [ -n "$DECL_ID" ] && ARGS+=(--declared-id "$DECL_ID")
             [ -n "$DECL_VER" ] && ARGS+=(--declared-version "$DECL_VER")
-            node contrib/audit/scan.mjs "$ZIP" "${ARGS[@]}" --quiet | tee -a audit-out/summary.md
+            node "$SCANNER" "$ZIP" "${ARGS[@]}" --quiet | tee -a audit-out/summary.md
           done < zips.txt
 
       # ---------------------------------------------------------------
