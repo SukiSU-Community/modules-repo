@@ -361,10 +361,39 @@ test('索引 PR 的判定必须排在「没有投稿内容」之前', () => {
   assert.match(yml, /index_derived: \$\{\{ steps\.derive\.outputs\.derived \}\}/);
 });
 
-test('audit 的触发路径必须含 json/**，否则索引 PR 拿不到任何 check', () => {
-  // required check 从没上报过 = Expected = 永远合不了。索引 PR 只改 json + 删 pending。
-  const yml = fs.readFileSync(WF_MAIN, 'utf8');
-  assert.match(yml, /-\s*'json\/\*\*'/);
+test('pull_request 触发不许带 paths 过滤：每个 PR 都必须拿到 approve', () => {
+  // required check 从没上报过 = Expected = 永远合不了，这点和「它红了」在 GitHub 眼里是
+  // 同一件事。带 paths 的版本只认 pending/**、json/**，改 scripts/ 或文档的维护 PR 根本
+  // 不会触发审核 —— PR #5 就死在这上面（gh pr checks → no checks reported，
+  // mergeStateStatus → BLOCKED），整条保护变成仓库的自我锁死。
+  // 放行靠 locate 的 found=false 分支，不靠「干脆不触发」。
+  for (const f of [WF_MAIN, WF_TEMPLATE]) {
+    const yml = fs.readFileSync(f, 'utf8');
+    const block = yml.slice(yml.indexOf('pull_request:'), yml.indexOf('workflow_dispatch:'));
+    assert.ok(block.length > 0 && block.includes('types:'), `${f} 里得能定位到 pull_request 触发块`);
+    assert.doesNotMatch(block, /^\s*paths:/m, `${f} 的 pull_request 触发里出现 paths 就会锁死维护类 PR`);
+  }
+});
+
+// 闸门二曾经是 `git merge-base --is-ancestor origin/main HEAD`（PR 必须已包含当前 main）。
+// PR #4 重跑时死在这句话上：main 会被机器人自己推进（索引重建 PR 也合进 main），于是任何
+// 一条提交后稍等几分钟的投稿都会「不是后代」，而投稿方是不会 rebase 的机器人 —— 模块永远进不了索引。
+// 要防的「拿古老分支当基准用旧扫描器定罪自己」早就被钉定 + 复核挡住了，所以这里只允许
+// 「把当前 base 合进来，合不动（真冲突）才拒」这一种写法。
+test('审核不许要求 PR 已包含当前 main，只允许「合得动就审」', () => {
+  for (const f of [WF_MAIN, WF_TEMPLATE]) {
+    // 只比可执行行：上面那段「这里原来写的是 …」的注释里就带着旧命令，整文件匹配会把
+    // 解释历史的话当成违反约定，于是这条测试永远只能在删掉注释时变绿 —— 那正是它最该
+    // 拦住的那种删除。
+    const code = fs
+      .readFileSync(f, 'utf8')
+      .split(/\r?\n/)
+      .filter((l) => !/^\s*#/.test(l))
+      .join('\n');
+    assert.doesNotMatch(code, /merge-base\s+--is-ancestor/, `${f} 里不许再有祖先检查，它会冻死机器人投稿`);
+    assert.match(code, /git merge --no-commit --no-ff/, `${f} 的闸门二必须是「合并当前 base」`);
+    assert.match(code, /git merge --abort/, `${f} 冲突时必须撤回合并并明确失败，不能猜哪一边`);
+  }
 });
 
 test('verify-index-pr 在 audit 里被调用，且用同一套 check 名取证', () => {

@@ -1,10 +1,9 @@
 # 模块投稿安全审核流水线
 #
-# ⚠️ 这是模板文件，位于 contrib/audit/workflows/ 下，**故意不放在仓库真实的 .github/ 里**，
-#    以免未经审核的自动化流程直接在正式仓库生效。启用办法：评审通过后把它复制到
-#    .github/workflows/audit.yml 并按需调整路径。
+# ⚠️ 这里是仓库里**实际生效**的那一份。母本在 monorepo 的 contrib/audit/workflows/audit.yml，
+#    两份只差首行标题。改了这份必须同步母本，否则下一次复制回去会把修过的东西冲掉。
 #
-# 触发：PR 上新增/修改了 pending/** 投稿元数据时。
+# 触发：**每一个** PR 都要跑（不能加 paths 过滤，原因见下面 on: 里的说明）。
 #
 # ⚠️ 关键前提：Worker 开的 PR 里**只有元数据 JSON**（pending/<id>/<versionCode>.json），
 #    zip 本体在 GitHub Release asset 上（见 contrib/worker/src/index.ts openPendingPr）。
@@ -33,12 +32,16 @@ name: Module Submission Audit
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    paths:
-      - 'pending/**'
-      # json/** 也在触发路径里，是为了让「只改索引」的 PR 也必须拿到一个结论。
-      # 但绝不能让它落到「没有投稿内容 → 直接绿」那条分支上 —— 那样任何人都能
-      # 开一个手抄索引的 PR 绕过整条审核链。它走的是 kind/derive 两步的推导判定。
-      - 'json/**'
+    # 这里**不能有 paths 过滤**，它是被一次真实的卡死换来的：配了 required_status_checks
+    # （context=approve）之后，「这个 check 从来没跑过」和「它失败了」对 GitHub 是同一件事
+    # —— PR 永远 BLOCKED。而带 paths 的版本只认 pending/**、json/**，于是改 scripts/ 或
+    # 文档的维护 PR 根本不会触发审核：PR #5 就是这样卡住的
+    # （gh pr checks 5 → no checks reported；gh pr view → mergeStateStatus BLOCKED）。
+    # 结论：approve 必须在**每一个** PR 上都存在。非投稿的 PR 由 locate 输出 found=false、
+    # approve 走「没有待审投稿内容 → 无批准事项」那条分支放行，而不是靠不触发来放行。
+    #
+    # 反过来，json/** 的改动绝不能因为「没有投稿内容」就直接放行 —— 手抄 json/modules.json
+    # 正是要挡的路径，它走 kind/derive 两步的推导判定（见 approve 里的先后顺序）。
   workflow_dispatch:
     inputs:
       zip:
@@ -127,9 +130,24 @@ jobs:
           BASE_SHA="$(git rev-parse "origin/$BASE_REF")"
           echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
 
-          # 闸门二：PR 必须真的长在这条 base 上（防止拿一条古老分支当 base 绕开新规则）
-          if ! git merge-base --is-ancestor "$BASE_SHA" HEAD; then
-            echo "::error::PR 分支不是 origin/$BASE_REF 的后代（base 落后或未合并）。先 rebase 再投稿。"
+          # 闸门二：把「当前 base」合进工作树，合不动才算问题。
+          #
+          # 这里原来写的是 `git merge-base --is-ancestor origin/main HEAD`（PR 必须已经
+          # 包含当前 main）。它在真实流量上是死结：main 会被机器人自己推进（索引重建 PR
+          # 也是合进 main），于是任何一条「提交后才过了几分钟」的投稿 PR 都会变成
+          # 「不是 origin/main 的后代」——PR #4 重跑时就死在这句话上，而投稿者是个只能
+          # 开单文件 PR 的机器人，它不会 rebase，模块就永远进不了索引。
+          #
+          # 这道闸真正要防的是「拿一条古老分支当基准，用旧扫描器/旧索引给自己定罪」，
+          # 而那个东西已经被上面的钉定 + 下面的复核挡住了：audit/、scripts/、json/ 一律
+          # 取自 BASE_SHA。所以这里改成：把当前 base 合进工作树（不提交），
+          # 只有真的**合不动**（内容冲突）才拒绝 —— 那才是必须让投稿者处理的情况。
+          if ! git merge --no-commit --no-ff "$BASE_SHA" >/dev/null 2>&1; then
+            {
+              echo "::error::PR 分支与当前 origin/$BASE_REF 冲突，合并后无法审。请先解决冲突再投稿。"
+              echo "::error::（冲突处不自动取舍：猜哪一边都可能把恶意内容合进索引。）"
+            } >&2
+            git merge --abort 2>/dev/null || true
             exit 1
           fi
 
