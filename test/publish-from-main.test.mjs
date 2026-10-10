@@ -410,13 +410,59 @@ test('索引 PR 的合并挂在 audit 的 pull_request 上下文里，且两个�
       .join('\n');
     assert.match(code, /^ {2}merge-index:$/m, `${path.basename(f)} 里得有 merge-index 作业`);
     const at = code.indexOf('  merge-index:');
-    const job = code.slice(at, at + 1200);
+    const next = code.slice(at + 2).search(/^ {2}[A-Za-z_-]+:$/m);
+    const job = next < 0 ? code.slice(at) : code.slice(at, at + 2 + next);
     // 少 index_pr 这一半 = 任何改脚本/文档的维护 PR 都会被机器人合进 main；
     // 少 index_derived 这一半 = 手抄一份 json/modules.json 就能进 main。
     assert.match(job, /if: needs\.audit\.outputs\.index_pr == 'true' && needs\.audit\.outputs\.index_derived == 'true'/,
       '两个条件必须同时钉住，且是 && 而不是 ||');
     assert.match(job, /needs: \[audit, approve\]/, 'approve 红了就不能合并（job 默认要求 needs 成功）');
     assert.match(job, /gh pr merge .*--squash/, '合并方式必须是 squash：main 上每个索引状态对应一个过检 PR');
+  }
+});
+
+// approve 绑 head sha：head 不动，derive 那次判定的绿就一直挂着。而 derive 比的是 PR 创建时的
+// base —— main 要是在这期间又进了新投稿，这条 PR 已经不是「当前 main 的函数」，合下去会反过来
+// 把更新的索引退回去。#18 就是这次真跑留下的过期样本。
+//
+// 不用 ruleset 的 strict_required_status_checks_policy 来封：那是对所有 PR 生效的，会同时要求
+// 投稿 PR 分支最新，而投稿方是不会 rebase 的机器人 —— 两条投稿挨着进来就把前一条永久卡死。
+test('merge-index 必须按「此刻的 main」重推导一遍，且排在合并之前', () => {
+  for (const f of AUDIT_COPIES) {
+    const code = fs.readFileSync(f, 'utf8')
+      .split(/\r?\n/)
+      .filter((l) => !/^\s*#/.test(l))
+      .join('\n');
+    const at = code.indexOf('  merge-index:');
+    const next = code.slice(at + 2).search(/^ {2}[A-Za-z_-]+:$/m);
+    const job = next < 0 ? code.slice(at) : code.slice(at, at + 2 + next);
+
+    assert.match(job, /verify-index-pr\.mjs/, '重推导用的必须是同一个判定器，不是在 YAML 里再写一遍判据');
+    assert.match(job, /git rev-parse "refs\/remotes\/origin\/\$\{BASE_REF}"/,
+      'base 要现取此刻的 base 分支，不能用 GitHub 报的 base.sha');
+    assert.match(job, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/,
+      '得检 PR head 本身：默认的 merge ref 里 HEAD^ 不是分叉点');
+    assert.ok(job.indexOf('verify-index-pr.mjs') < job.indexOf('gh pr merge'),
+      '重推导必须排在合并之前 —— 反着写就等于先合再查');
+  }
+});
+
+// 判定投稿的这套代码自己没过检，就没有资格批准任何投稿。
+test('approve 必须依赖 selftest：单测没在 CI 跑过 = 本轮所有「绿灯但线上是死的」的根因', () => {
+  for (const f of AUDIT_COPIES) {
+    const code = fs.readFileSync(f, 'utf8')
+      .split(/\r?\n/)
+      .filter((l) => !/^\s*#/.test(l))
+      .join('\n');
+    assert.match(code, /^ {2}selftest:$/m, `${path.basename(f)} 里得有 selftest 作业`);
+    const at = code.indexOf('  approve:');
+    const job = code.slice(at, at + 600);
+    assert.match(job, /needs: \[audit, selftest\]/,
+      'approve 要 needs selftest：单测红 → approve 被 skip → required check 不成功 → 不放行');
+    const st = code.slice(code.indexOf('  selftest:'), code.indexOf('  approve:'));
+    assert.match(st, /node --test/, '真的把仓库单测跑起来，而不是留个占位作业');
+    // selftest 自己不许写任何东西：它只是判据生产者
+    assert.match(st, /permissions: \{\}/, 'selftest 不需要任何 GitHub 写权限');
   }
 });
 
