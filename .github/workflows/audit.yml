@@ -68,6 +68,67 @@ jobs:
           node-version: '20'
 
       # ---------------------------------------------------------------
+      # 0. 把「决定结论的东西」钉回 base 版本
+      #
+      #    为什么必须有这一步：上面那次 checkout 拿的是 PR 分支，而 scan.mjs /
+      #    risk-rules.mjs / build-index.mjs / json/modules.json 全都从这棵工作树里读。
+      #    于是「谁能往 PR 里塞一份改过的扫描器」= 「谁能决定自己的风险等级」。
+      #    外部投稿人今天塞不进来（Worker 的 PR 只写一个 pending JSON，
+      #    sanitizeSegment 也挡住了路径穿越），但这个闸要开放给公开招募的贡献者 ——
+      #    只要给某人 write，他就有了在同一 PR 里替换扫描器的能力。
+      #
+      #    同样致命的还有 json/modules.json：changeType 靠它判「首次收录 / 版本更新」，
+      #    而「版本更新一律人工审核」正是防「fork 热门模块加几行恶意代码伪装成更新」
+      #    的唯一一道防线。索引取自 PR 分支，就等于让投稿人自己声明这是首次收录。
+      #
+      #    做法是删掉这三棵树再从 base 的 commit 恢复 —— 连 PR 新塞进 audit/ 的
+      #    额外文件也一起清掉，而不是只覆盖几个已知路径。
+      #    pending/ 保持来自 PR（那才是要审的投稿内容）。
+      # ---------------------------------------------------------------
+      - name: 把扫描器、合并逻辑与索引钉回 base 版本
+        id: pin
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          EXPECTED_BASE: ${{ vars.BASE_BRANCH || 'main' }}
+        run: |
+          set -euo pipefail
+
+          # 闸门一：base 必须是约定的那条分支。允许 PR 指向任意分支，就等于
+          # 允许「以一份没人看的分支为基准」来跑审核。
+          if [ "$BASE_REF" != "$EXPECTED_BASE" ]; then
+            echo "::error::PR 的 base 是 '$BASE_REF'，而审核只认 '$EXPECTED_BASE'。请改 base 后重开。"
+            exit 1
+          fi
+
+          git fetch --no-tags --depth=200 origin "$BASE_REF"
+          BASE_SHA="$(git rev-parse "origin/$BASE_REF")"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+
+          # 闸门二：PR 必须真的长在这条 base 上（防止拿一条古老分支当 base 绕开新规则）
+          if ! git merge-base --is-ancestor "$BASE_SHA" HEAD; then
+            echo "::error::PR 分支不是 origin/$BASE_REF 的后代（base 落后或未合并）。先 rebase 再投稿。"
+            exit 1
+          fi
+
+          for d in audit scripts json; do
+            if git ls-tree -r --name-only "$BASE_SHA" -- "$d" | grep -q .; then
+              rm -rf "$d"
+              git checkout "$BASE_SHA" -- "$d"
+            else
+              echo "::warning::base 版本里没有 $d/ 这棵树，跳过钉定。"
+            fi
+          done
+
+          # 复核：这三棵树此刻必须与 base 完全一致（有出入就是钉定没生效）
+          if ! git diff --quiet "$BASE_SHA" -- audit scripts json; then
+            echo "::error::钉定后 audit/scripts/json 仍与 base 不一致，审核结论不可信。"
+            git diff --stat "$BASE_SHA" -- audit scripts json || true
+            exit 1
+          fi
+          echo "已钉回 base：$BASE_SHA（audit/ scripts/ json/ 与之一致）"
+
+      # ---------------------------------------------------------------
       # 1. 定位投稿：从 PR 新增/修改的 pending/**/*.json 入手
       #
       #    断点 ① 的修复点。Worker 的 PR 只有 pending/<id>/<versionCode>.json，
@@ -480,6 +541,11 @@ jobs:
   #   { audit: { status: "auto-approved", ... } }
   # 写进 pending 条目，然后交给 build-index.mjs 去合并 —— 索引结构只有一个地方定义。
   # -------------------------------------------------------------------
+  #   ⚠️ 这一 job 目前仍然是「直接往 main 推索引改动」，所以 main 上不能开
+  #   「require a pull request / restrict pushes」，否则自动放行会当场失败。
+  #   想上分支保护，必须先把这里拆成两步（合并 PR → 由 push 到 main 的后续流程重建索引），
+  #   原因见文末注释：往 PR 分支回写索引，会同时踩上「required check 对新 sha 还没跑完
+  #   就无法合并」和「删除 pending/** 触发 synchronize 再审核一遍」两个坑。
   publish:
     name: Merge Into Index
     needs: audit
@@ -498,6 +564,30 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+
+      # 与 audit job 同理：合并逻辑与索引基准必须来自 base，不能来自 PR 分支。
+      # 否则「PR 里改 build-index.mjs」就能决定什么东西可以进索引、进成什么样。
+      - name: 把合并逻辑与索引钉回 base 版本
+        shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          EXPECTED_BASE: ${{ vars.BASE_BRANCH || 'main' }}
+        run: |
+          set -euo pipefail
+          if [ "$BASE_REF" != "$EXPECTED_BASE" ]; then
+            echo "::error::PR 的 base 是 '$BASE_REF'，合并只认 '$EXPECTED_BASE'。"
+            exit 1
+          fi
+          git fetch --no-tags --depth=200 origin "$BASE_REF"
+          BASE_SHA="$(git rev-parse "origin/$BASE_REF")"
+          for d in audit scripts json; do
+            if git ls-tree -r --name-only "$BASE_SHA" -- "$d" | grep -q .; then
+              rm -rf "$d"; git checkout "$BASE_SHA" -- "$d"
+            fi
+          done
+          git diff --quiet "$BASE_SHA" -- audit scripts json || {
+            echo "::error::钉定后仍与 base 不一致，拒绝合并。"; exit 1; }
+          echo "合并工具来自 base：$BASE_SHA"
 
       - name: 取回待合并 pending
         uses: actions/download-artifact@v4
