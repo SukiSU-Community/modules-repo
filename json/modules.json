@@ -1,6 +1,6 @@
 {
   "name": "SukiSU-Ultra Modules",
-  "lastUpdate": 1791652611517,
+  "lastUpdate": 1791654538972,
   "modules": [
     {
       "id": "e2e_probe_loop2",
@@ -15,6 +15,23 @@
           "size": 285,
           "time": 1791652556067,
           "sha256": "a1b6b17f269b07dcd1ee457c57da215c5fc30c47e799999774b98fd47e3760ad"
+        }
+      ],
+      "verified": false
+    },
+    {
+      "id": "e2e_probe_loop3",
+      "name": "E2E Probe min",
+      "author": "zcode-e2e",
+      "description": "end-to-end probe for the submission pipeline",
+      "versions": [
+        {
+          "version": "v0.0.560",
+          "versionCode": 4462560,
+          "zipUrl": "https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/4562d5b0abaaa9727dbc631143dfcef0541e097a823de4864a0662eb9e9054c5.zip",
+          "size": 285,
+          "time": 1791654478773,
+          "sha256": "4562d5b0abaaa9727dbc631143dfcef0541e097a823de4864a0662eb9e9054c5"
         }
       ],
       "verified": false
