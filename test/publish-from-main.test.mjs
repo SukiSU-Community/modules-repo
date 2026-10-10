@@ -178,11 +178,16 @@ function stubFetch(handler) {
 // 三个端点的 URL 长得互相包含（.../commits/<sha>/pulls 也含 "/pulls"），
 // 所以匹配顺序必须是 check-runs -> /pulls/<n> -> /commits/<sha>/pulls。
 // 上一版测试把泛匹配放前面，结果详情接口返回了列表体，merged 字段凭空消失。
+//
+// 返回形状按 GitHub 的真实响应来：`/commits/{sha}/pulls` 是**裸数组**。
+// 之前这里返回 `{ pull_requests: [...] }`，和被测代码的同一个误解正好对上，
+// 于是 31 条测试全绿、线上第一次真调用就判成「提交没有关联 PR」而拒绝盖章。
 function stubApi({ pullList, pr, checkRuns }) {
   return stubFetch((url) => {
     if (url.includes('/check-runs')) return { check_runs: checkRuns || [] };
     if (/\/pulls\/\d+$/.test(url)) return pr || null;
-    if (/\/pulls$/.test(url)) return { pull_requests: pullList || [] };
+    if (/\/commits\/[0-9a-f]+\/pulls$/.test(url)) return pullList || [];
+    if (/\/pulls$/.test(url)) return pullList || [];
     return null;
   });
 }
