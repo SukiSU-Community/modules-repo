@@ -1,0 +1,599 @@
+# 模块投稿安全审核流水线
+#
+# ⚠️ 这是模板文件，位于 contrib/audit/workflows/ 下，**故意不放在仓库真实的 .github/ 里**，
+#    以免未经审核的自动化流程直接在正式仓库生效。启用办法：评审通过后把它复制到
+#    .github/workflows/audit.yml 并按需调整路径。
+#
+# 触发：PR 上新增/修改了 pending/** 投稿元数据时。
+#
+# ⚠️ 关键前提：Worker 开的 PR 里**只有元数据 JSON**（pending/<id>/<versionCode>.json），
+#    zip 本体在 GitHub Release asset 上（见 contrib/worker/src/index.ts openPendingPr）。
+#    所以本流水线不能靠 `git diff --name-only -- '*.zip'` 找待审 zip —— 那样永远找不到。
+#    正确顺序是：定位新增的 pending/**/*.json -> 读里面的 zipUrl（或 releaseTag+assetName）
+#    -> 下载 zip -> 再交给 scan.mjs 扫描。
+#
+# 路径约定：本模板在两种不同的落地形态下都要能跑，所有路径统一由 REPO_PREFIX 推导：
+#   1. 索引仓库（pending/ 在仓库根）              -> REPO_PREFIX 为空
+#   2. 当前 monorepo（索引仓库在 contrib/repo/）  -> REPO_PREFIX=contrib/repo
+# 用 vars.MODULE_REPO_PREFIX 覆盖，或让下面的探测逻辑自己认。
+#
+# 决策矩阵（已定案）：
+#   低风险 + 首次收录        -> auto-approved，自动合入索引
+#   低风险 + 版本更新        -> needs-human-review，请求人工（不自动合入）
+#   中/高风险（任何变更类型）-> needs-human-review，阻止自动合入
+#   审核不通过的内容绝不出现在正式索引里。
+#
+# 若配置了 AI_API_KEY，会额外做一次 LLM 复核；未配置则跳过并注明「仅静态扫描」。
+
+name: Module Submission Audit
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'pending/**'
+  workflow_dispatch:
+    inputs:
+      zip:
+        description: '要扫描的模块 zip 路径（留空则按 PR 的 pending/*.json 自动定位）'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  audit:
+    name: Scan & Triage
+    runs-on: ubuntu-latest
+    outputs:
+      risk: ${{ steps.triage.outputs.risk }}
+      action: ${{ steps.triage.outputs.action }}
+      label: ${{ steps.triage.outputs.label }}
+      change_type: ${{ steps.triage.outputs.change_type }}
+      needs_human_review: ${{ steps.triage.outputs.needs_human_review }}
+      module_id: ${{ steps.triage.outputs.module_id }}
+      module_version: ${{ steps.triage.outputs.module_version }}
+    steps:
+      - name: Checkout PR 分支
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ---------------------------------------------------------------
+      # 1. 定位投稿：从 PR 新增/修改的 pending/**/*.json 入手
+      #
+      #    断点 ① 的修复点。Worker 的 PR 只有 pending/<id>/<versionCode>.json，
+      #    zip 在 release asset 上，因此：
+      #      a. git diff 找新增/修改的 pending JSON（不再找 *.zip）
+      #      b. fetch-pending-zip.mjs 读 JSON 里的 zipUrl（或 releaseTag+assetName）
+      #         把 zip 下载到 audit-out/zips/
+      #      c. 后面 scan.mjs 扫下载下来的 zip
+      # ---------------------------------------------------------------
+      - name: 定位投稿元数据
+        id: locate
+        shell: bash
+        env:
+          MANUAL_ZIP: ${{ inputs.zip }}
+          GITHUB_OWNER: ${{ github.repository_owner }}
+          GITHUB_REPO: ${{ github.event.repository.name }}
+          FORCE_PREFIX: ${{ vars.MODULE_REPO_PREFIX || '' }}
+          FORCE_INDEX: ${{ vars.MODULE_INDEX_PATH || '' }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "${{ github.base_ref }}" || true
+          BASE="origin/${{ github.base_ref }}"
+
+          mkdir -p audit-out pending-changed
+
+          # 索引仓库前缀：优先 vars 覆盖，否则按目录是否存在自动探测
+          PREFIX="$FORCE_PREFIX"
+          if [ -z "$PREFIX" ]; then
+            if [ -d contrib/repo/pending ]; then PREFIX="contrib/repo"; fi
+          fi
+          if [ -n "$PREFIX" ]; then
+            PENDING_DIR="$PREFIX/pending"
+            INDEX_FILE="$PREFIX/json/modules.json"
+            SCRIPTS_DIR="$PREFIX/scripts"
+            SCANNER="contrib/audit/scan.mjs"
+          else
+            PENDING_DIR="pending"
+            INDEX_FILE="json/modules.json"
+            SCRIPTS_DIR="scripts"
+            SCANNER="audit/scan.mjs"
+          fi
+          [ -f "$SCANNER" ] || SCANNER="contrib/audit/scan.mjs"
+          echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
+          echo "index_file=$INDEX_FILE" >> "$GITHUB_OUTPUT"
+          echo "索引仓库前缀：'${PREFIX:-<根>}'（pending=$PENDING_DIR, index=$INDEX_FILE）"
+
+          if [ -n "$MANUAL_ZIP" ]; then
+            # 手动触发：直接给 zip 路径，走老路径
+            printf '%s\n' "$MANUAL_ZIP" > zips.txt
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "pending_count=0" >> "$GITHUB_OUTPUT"
+            echo "手动指定 zip：$MANUAL_ZIP"
+          else
+            # a. 找本次 PR 新增/修改的 pending/**/*.json（递归，含 pending/<id>/<vc>.json）
+            #    注意：不再用 -- '*.zip'，PR 里没有 zip，只有元数据。
+            PENDING=$(git diff --name-only --diff-filter=AM "$BASE" HEAD -- "${PENDING_DIR}/**/*.json" || true)
+            if [ -z "$PENDING" ]; then
+              echo "found=false" >> "$GITHUB_OUTPUT"
+              echo "pending_count=0" >> "$GITHUB_OUTPUT"
+              echo "本次 PR 没有新增/修改的 pending 投稿元数据，跳过审核。"
+              exit 0
+            fi
+
+            # 把变更的 pending 文件原样拷到 pending-changed/pending/ 下（剥离前缀），
+            # 这样后续步骤拿到的始终是一个标准的 pending 目录树。
+            COUNT=0
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              [ -f "$f" ] || continue
+              REL="${f#"$PENDING_DIR"/}"
+              mkdir -p "pending-changed/pending/$(dirname "$REL")"
+              cp "$f" "pending-changed/pending/$REL"
+              COUNT=$((COUNT+1))
+            done <<< "$PENDING"
+
+            echo "本次 PR 涉及 $COUNT 个 pending 元数据："
+            printf '%s\n' "$PENDING"
+            if [ "$COUNT" -eq 0 ]; then
+              echo "found=false" >> "$GITHUB_OUTPUT"
+              echo "pending_count=0" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # b. 读元数据里的下载地址 -> 下载 zip 到 audit-out/zips/
+            node "$SCRIPTS_DIR/fetch-pending-zip.mjs" \
+              pending-changed/pending \
+              --out-dir audit-out/zips \
+              --owner "$GITHUB_OWNER" --repo "$GITHUB_REPO"
+
+            echo "pending_count=$COUNT" >> "$GITHUB_OUTPUT"
+
+            # c. 用下载产物拼出待扫 zip 列表
+            ls -1 audit-out/zips/*.zip > zips.txt 2>/dev/null || true
+            if [ ! -s zips.txt ]; then
+              echo "found=false" >> "$GITHUB_OUTPUT"
+              echo "::warning::pending 元数据已定位，但没有下载到任何 zip，跳过扫描。"
+              exit 0
+            fi
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "待审核 zip："
+            cat zips.txt
+          fi
+
+      # ---------------------------------------------------------------
+      # 2. 跑静态扫描（纯 Node，无 npm 依赖）
+      # ---------------------------------------------------------------
+      - name: 运行 scan.mjs
+        id: scan
+        if: steps.locate.outputs.found == 'true'
+        shell: bash
+        env:
+          # 全部经 env 传入，不做 ${{ }} 文本拼接，避免 PR 内容注入 shell/node
+          FORCE_INDEX: ${{ vars.MODULE_INDEX_PATH || '' }}
+          LOCATE_INDEX: ${{ steps.locate.outputs.index_file }}
+        run: |
+          set -euo pipefail
+          mkdir -p audit-out
+          # 索引用于判定“首次收录 / 版本更新”
+          INDEX="${FORCE_INDEX:-$LOCATE_INDEX}"
+          [ -f "$INDEX" ] || INDEX=""
+          echo "用于判定首次收录/版本更新的索引：${INDEX:-（无，changeType 会退化为 unknown）}"
+
+          # 声明的 id / version 取自本次变更的 pending 元数据（递归，Worker 写的是
+          # pending/<id>/<versionCode>.json，version 在 versions[].version 里）。
+          DECL_ID=""; DECL_VER=""
+          PFORM=$(find pending-changed -name '*.json' ! -name '.*' 2>/dev/null | head -n1 || true)
+          if [ -n "$PFORM" ] && [ -f "$PFORM" ]; then
+            DECL_ID=$(node -e 'const j=require(process.argv[1]);process.stdout.write(String(j.id||j.moduleId||""))' "$PFORM" 2>/dev/null || true)
+            DECL_VER=$(node -e '
+              const j=require(process.argv[1]);
+              const v=Array.isArray(j.versions)&&j.versions.length?j.versions[j.versions.length-1]:null;
+              process.stdout.write(String((v&&v.version)||j.version||j.versionName||""));
+            ' "$PFORM" 2>/dev/null || true)
+            echo "投稿声明：id=$DECL_ID version=$DECL_VER（来自 $PFORM）"
+          fi
+
+          : > audit-out/summary.md
+          while IFS= read -r ZIP; do
+            [ -z "$ZIP" ] && continue
+            [ -f "$ZIP" ] || { echo "::warning::$ZIP 不存在，跳过"; continue; }
+            ARGS=(--out-dir audit-out --index "$INDEX")
+            [ -n "$DECL_ID" ] && ARGS+=(--declared-id "$DECL_ID")
+            [ -n "$DECL_VER" ] && ARGS+=(--declared-version "$DECL_VER")
+            node contrib/audit/scan.mjs "$ZIP" "${ARGS[@]}" --quiet | tee -a audit-out/summary.md
+          done < zips.txt
+
+      # ---------------------------------------------------------------
+      # 3. LLM 复核（可选）—— 仅在配置 AI_API_KEY 时执行
+      # ---------------------------------------------------------------
+      - name: 复核模式
+        id: mode
+        shell: bash
+        env:
+          # 经 env 传入，避免把密钥直接拼进脚本文本
+          HAS_KEY: ${{ secrets.AI_API_KEY }}
+        run: |
+          if [ -n "${HAS_KEY:-}" ]; then
+            echo "ai=true" >> "$GITHUB_OUTPUT"
+            echo "已配置 AI_API_KEY：将额外做一次 LLM 复核。"
+          else
+            echo "ai=false" >> "$GITHUB_OUTPUT"
+            echo "未配置 AI_API_KEY：跳过 LLM 复核，本次为「仅静态扫描」。"
+          fi
+
+      - name: LLM 复核
+        id: llm
+        if: steps.locate.outputs.found == 'true' && steps.mode.outputs.ai == 'true'
+        shell: bash
+        env:
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_API_BASE: ${{ vars.AI_API_BASE || 'https://api.openai.com/v1' }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'gpt-4o-mini' }}
+        run: |
+          set -euo pipefail
+          # 取最近的 markdown 报告送入模型；只做“是否同意静态结论”的判断。
+          # 模型只能加严不能放宽（见“分流决策”里的 order 比较）。
+          REPORT=$(ls -t audit-out/*.audit.md | head -n1)
+          node -e '
+            const fs=require("fs");
+            const md=fs.readFileSync(process.argv[1],"utf8").slice(0,60000);
+            const body={model:process.env.AI_MODEL,messages:[
+              {role:"system",content:"你是 Android root 模块（Magisk/KernelSU）安全审核员。只输出 JSON。"},
+              {role:"user",content:"以下是静态扫描报告。若存在静态扫描未识别的 root 级危险行为，输出 {\"agree\":false,\"risk\":\"high|medium\",\"reasons\":[...]}；否则输出 {\"agree\":true,\"risk\":null,\"reasons\":[]}。报告：\n"+md}
+            ],temperature:0};
+            fetch(process.env.AI_API_BASE+"/chat/completions",{method:"POST",
+              headers:{"content-type":"application/json","authorization":"Bearer "+process.env.AI_API_KEY},
+              body:JSON.stringify(body)})
+              .then(r=>r.json()).then(j=>{
+                const t=j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content||"{}";
+                fs.writeFileSync("audit-out/llm.json",t);
+                console.log(t);
+              }).catch(e=>{console.error("LLM 调用失败：",e.message);process.exit(0);});
+          ' "$REPORT"
+          [ -f audit-out/llm.json ] || echo '{"agree":true,"risk":null,"reasons":[]}' > audit-out/llm.json
+
+      # ---------------------------------------------------------------
+      # 4. 定级与分流
+      # ---------------------------------------------------------------
+      - name: 分流决策
+        id: triage
+        if: steps.locate.outputs.found == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          JSON=$(ls -t audit-out/*.audit.json | head -n1)
+          node -e '
+            const fs=require("fs");
+            const r=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+            let risk=r.riskLevel, changeType=r.changeType, reasons=r.riskReasons.slice();
+            // LLM 复核只能加严，不能放宽静态结论
+            let llmNote="仅静态扫描（未配置 AI_API_KEY，已跳过 LLM 复核）";
+            if (fs.existsSync("audit-out/llm.json")) {
+              let l; try { l=JSON.parse(fs.readFileSync("audit-out/llm.json","utf8")); } catch { l={agree:true}; }
+              if (l && l.agree === false) {
+                const order={low:1,medium:2,high:3};
+                if ((order[l.risk]||3) > (order[risk]||1)) { risk=l.risk; }
+                reasons=reasons.concat((l.reasons||[]).map(x=>"LLM 复核："+x));
+                llmNote="已做 LLM 复核，模型不同意静态结论并已按更严等级处理";
+              } else {
+                llmNote="已做 LLM 复核，模型同意静态结论";
+              }
+            }
+            const out=process.env.GITHUB_OUTPUT;
+            const w=(k,v)=>fs.appendFileSync(out,`${k}=${String(v).replace(/\r?\n/g," ")}\n`);
+            w("risk",risk); w("change_type",changeType);
+            w("module_id", r.meta && r.meta.id ? r.meta.id : "(缺失)");
+            w("module_version", r.meta && r.meta.version ? r.meta.version : "");
+            w("llm_note", llmNote);
+            w("reasons", reasons.join("；"));
+
+            // 决策矩阵：唯一可自动放行的是「低风险 + 首次收录」
+            if (risk === "low" && changeType === "first") {
+              w("action","auto-approve"); w("label","auto-approved"); w("needs_human_review","false");
+            } else {
+              w("action", risk === "low" ? "request-review" : "block");
+              w("label","needs-human-review"); w("needs_human_review","true");
+            }
+          ' "$JSON"
+
+      # ---------------------------------------------------------------
+      # 5. 把报告贴到 PR
+      # ---------------------------------------------------------------
+      - name: 上传报告
+        if: steps.locate.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-audit-report
+          path: audit-out/
+
+      # publish job 需要拿到本次变更的 pending 元数据才能调 build-index.mjs 合并，
+      # 因此把它一并存成 artifact（两个 job 之间只有 artifact 是可靠的传递通道）。
+      - name: 上传待合并 pending
+        if: steps.locate.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pending-to-publish
+          path: pending-changed/pending/
+          if-no-files-found: warn
+
+      - name: 发布 PR 评论
+        if: steps.locate.outputs.found == 'true'
+        uses: actions/github-script@v7
+        env:
+          RISK: ${{ steps.triage.outputs.risk }}
+          ACTION: ${{ steps.triage.outputs.action }}
+          LABEL: ${{ steps.triage.outputs.label }}
+          CHANGE_TYPE: ${{ steps.triage.outputs.change_type }}
+          LLM_NOTE: ${{ steps.triage.outputs.llm_note }}
+          MODULE_ID: ${{ steps.triage.outputs.module_id }}
+          REASONS: ${{ steps.triage.outputs.reasons }}
+        with:
+          script: |
+            const fs = require('fs');
+            const files = fs.existsSync('audit-out')
+              ? fs.readdirSync('audit-out').filter(f => f.endsWith('.audit.md'))
+              : [];
+            let body = `## 模块投稿安全审核\n\n`
+              + `- 模块 id：\`${process.env.MODULE_ID}\`\n`
+              + `- 风险等级：**${String(process.env.RISK).toUpperCase()}**\n`
+              + `- 变更类型：**${process.env.CHANGE_TYPE === 'first' ? '首次收录'
+                  : process.env.CHANGE_TYPE === 'update' ? '版本更新' : '未知'}**\n`
+              + `- 处置：**\`${process.env.ACTION}\`** / 标签 \`${process.env.LABEL}\`\n`
+              + `- 依据：${process.env.REASONS}\n`
+              + `- 复核方式：${process.env.LLM_NOTE}\n`;
+
+            if (process.env.ACTION === 'auto-approve') {
+              body += `\n✅ 静态扫描未发现风险且为首次收录，已自动合入索引。\n`;
+            } else if (process.env.CHANGE_TYPE === 'update' && process.env.RISK === 'low') {
+              body += `\n⚠️ 风险虽低，但这是对**已收录模块的版本更新**，按规则一律转人工审核，未自动合入。\n`;
+            } else {
+              body += `\n⛔ 中/高风险，需人工审核后才可进入正式索引；本 PR 不会自动合入。\n`;
+            }
+
+            if (files.length) {
+              const md = fs.readFileSync(`audit-out/${files[0]}`, 'utf8');
+              const MAX = 60000;
+              body += `\n<details><summary>完整报告（${files[0]}）</summary>\n\n`
+                + (md.length > MAX ? md.slice(0, MAX) + '\n\n…（报告过长已截断，完整版见 workflow artifact）' : md)
+                + `\n</details>\n`;
+            }
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+      # ---------------------------------------------------------------
+      # 6. 打标签
+      # ---------------------------------------------------------------
+      - name: 打标签
+        if: steps.locate.outputs.found == 'true'
+        uses: actions/github-script@v7
+        env:
+          LABEL: ${{ steps.triage.outputs.label }}
+        with:
+          script: |
+            const label = process.env.LABEL;
+            const add = [label];
+            if (label === 'needs-human-review') add.push('blocked-auto-merge');
+            // 标签可能尚未在仓库中创建，缺失时先建后打
+            for (const l of add) {
+              try {
+                await github.rest.issues.getLabel({ owner: context.repo.owner, repo: context.repo.repo, name: l });
+              } catch {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  name: l, color: l === 'auto-approved' ? '0e8a16' : 'd93f0b',
+                  description: l === 'auto-approved' ? '静态扫描低风险且为首次收录，自动放行' : '需人工审核',
+                });
+              }
+            }
+            await github.rest.issues.addLabels({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: add,
+            });
+
+  # -------------------------------------------------------------------
+  # 仅有「低风险 + 首次收录」才会走到这一 job；其余情况该 job 被跳过，
+  # 因此审核不通过的内容不会出现在正式索引里。
+  #
+  # 断点 ③ 的修复点：这里**不再自己拼 JSON**。原先只写
+  #   { id, version, addedAt, approvedBy }
+  # 缺 versions / name / author / description / verified，下次 build-index 会崩，
+  # validate-index 也必然失败。正确做法是：把 CI 的审核结论以约定字段
+  #   { audit: { status: "auto-approved", ... } }
+  # 写进 pending 条目，然后交给 build-index.mjs 去合并 —— 索引结构只有一个地方定义。
+  # -------------------------------------------------------------------
+  publish:
+    name: Merge Into Index
+    needs: audit
+    if: needs.audit.outputs.action == 'auto-approve'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # 新增「把合并结果贴回 PR」步骤要写评论；job 级 permissions 会整体覆盖
+      # 顶层 permissions，缺这一行 createComment 会 403。
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 取回待合并 pending
+        uses: actions/download-artifact@v4
+        with:
+          name: pending-to-publish
+          path: pending-to-publish
+
+      - name: 落位到索引仓库的 pending 目录
+        id: place
+        shell: bash
+        env:
+          FORCE_PREFIX: ${{ vars.MODULE_REPO_PREFIX || '' }}
+          MODULE_ID: ${{ needs.audit.outputs.module_id }}
+          MODULE_VERSION: ${{ needs.audit.outputs.module_version || '' }}
+          RISK: ${{ needs.audit.outputs.risk }}
+        run: |
+          set -euo pipefail
+          PREFIX="$FORCE_PREFIX"
+          if [ -z "$PREFIX" ] && [ -d contrib/repo/pending ]; then PREFIX="contrib/repo"; fi
+          PENDING_DIR="${PREFIX:+$PREFIX/}pending"
+          INDEX_FILE="${PREFIX:+$PREFIX/}json/modules.json"
+          SCRIPTS_DIR="${PREFIX:+$PREFIX/}scripts"
+          echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
+          echo "pending_dir=$PENDING_DIR" >> "$GITHUB_OUTPUT"
+          echo "index_file=$INDEX_FILE" >> "$GITHUB_OUTPUT"
+
+          # 把审核结论写进每一条待合并的 pending 条目。
+          # 字段名/status 与 build-index.mjs 的 APPROVAL_FIELD / APPROVED_STATUS 常量一致，
+          # 改任一侧都必须同步改另一侧（契约见 contrib/repo/README.md「审核标记契约」）。
+          node -e '
+            const fs=require("fs"), path=require("path");
+            const SRC="pending-to-publish", DST=process.argv[1], ID=process.argv[2], RISK=process.argv[3];
+            const walk=(d,out=[])=>{ for(const n of fs.readdirSync(d)){ const f=path.join(d,n);
+              if(fs.statSync(f).isDirectory()) walk(f,out); else if(n.toLowerCase().endsWith(".json")) out.push(f);} return out; };
+            if(!fs.existsSync(SRC)) { console.error("没有取回任何 pending 元数据，终止"); process.exit(1); }
+            const files=walk(SRC);
+            if(files.length===0){ console.error("pending-to-publish 是空的，终止"); process.exit(1); }
+            fs.mkdirSync(DST,{recursive:true});
+            let n=0;
+            for(const f of files){
+              const rel=path.relative(SRC,f);
+              const raw=JSON.parse(fs.readFileSync(f,"utf8"));
+              const list=Array.isArray(raw)?raw:[raw];
+              const stamped=list.map(e=>{
+                if(ID && e && e.id && e.id!==ID) return e;      // 只给本次审核通过的那个 id 盖章
+                return { ...e, audit:{ ...(e.audit||{}), status:"auto-approved",
+                         by:"ci:auto-approved", at:new Date().toISOString(), risk:RISK } };
+              });
+              const target=path.join(DST,rel);
+              fs.mkdirSync(path.dirname(target),{recursive:true});
+              fs.writeFileSync(target, JSON.stringify(Array.isArray(raw)?stamped:stamped[0],null,2)+"\n");
+              console.log("已盖章 -> "+target);
+              n++;
+            }
+            console.log("共盖章 "+n+" 个 pending 文件");
+          ' "$PENDING_DIR" "$MODULE_ID" "$RISK"
+
+      - name: 合并进索引（build-index.mjs）
+        id: build
+        shell: bash
+        env:
+          MODULE_ID: ${{ needs.audit.outputs.module_id }}
+        run: |
+          set -euo pipefail
+          PREFIX="${{ steps.place.outputs.prefix }}"
+          PENDING_DIR="${{ steps.place.outputs.pending_dir }}"
+          INDEX_FILE="${{ steps.place.outputs.index_file }}"
+          SCRIPTS_DIR="${PREFIX:+$PREFIX/}scripts"
+
+          echo "—— 合并前 ——"
+          node "$SCRIPTS_DIR/validate-index.mjs" "$INDEX_FILE" || echo "（合并前校验未通过，继续合并后再校验）"
+
+          # 断点 ③：build-index 遇到非法条目时会 exit 2。以前这一行直接让整个 job 失败，
+          # 后果是索引里什么都没有、PR 上也没有任何解释 —— 投稿者根本不知道自己为什么
+          # 失败，只能看到 CI 红了。
+          # 改法：退出码不再中断 job（真正的守门员是后面的「校验索引」步骤 —— 合并结果
+          # 过不了 validate-index 就不提交，宁可不进索引也不进坏索引），
+          # 但把 stdout 完整存到 build-index.log，下一步贴回 PR 让投稿者看得见。
+          set +e
+          # 注意：管道里 $? 拿到的是最后一个命令（tee）的退出码，不是 node 的。
+          # 必须用 PIPESTATUS[0] 取 node 自己的退出码，否则 BUILD_RC 恒为 0，
+          # 下一步会把「有冲突/非法条目」误报成「✅ 已合入索引」。
+          # 加 --consume 清掉已合并的 pending，否则它们会永久留在仓库、每次重跑都重复处理。
+          # 安全前提：build-index.mjs 在有冲突或非法条目时会自己跳过删除（见其 main() 删除块），
+          # 所以这里不必先判断退出码再决定是否传参 —— 传了也不会在冲突未解决时丢数据。
+          node "$SCRIPTS_DIR/build-index.mjs" --pending "$PENDING_DIR" --index "$INDEX_FILE" --consume 2>&1 | tee build-index.log
+          BUILD_RC=${PIPESTATUS[0]}
+          set -e
+          echo "build_rc=$BUILD_RC" >> "$GITHUB_OUTPUT"
+          echo "build-index.mjs 退出码=$BUILD_RC（2=有冲突/非法条目，见下面的 PR 评论）"
+
+      - name: 把合并结果贴回 PR
+        uses: actions/github-script@v7
+        env:
+          MODULE_ID: ${{ needs.audit.outputs.module_id }}
+          BUILD_RC: ${{ steps.build.outputs.build_rc }}
+        with:
+          script: |
+            const fs = require('fs');
+            const log = fs.existsSync('build-index.log') ? fs.readFileSync('build-index.log', 'utf8') : '(无 build-index 输出)';
+            const rc = process.env.BUILD_RC;
+            const MAX = 20000;
+
+            let body = `## 索引合并结果\n\n`
+              + `- 模块 id：\`${process.env.MODULE_ID}\`\n`
+              + `- build-index.mjs 退出码：\`${rc}\`\n\n`;
+
+            if (rc === '0') {
+              body += `✅ 已合入索引。\n`;
+            } else {
+              // 关键：把「为什么没进索引」讲清楚，而不是只留一个红灯。
+              body += `⚠️ 合并过程中有冲突或非法条目（退出码 \`${rc}\`）。\n`
+                + `下面这段是 \`build-index.mjs\` 的完整输出，里面有具体是哪一条、缺了什么字段；\n`
+                + `若模块没能进索引，原因都写在里面。\n`;
+            }
+
+            body += `\n<details><summary>build-index.mjs 输出</summary>\n\n\`\`\`\n`
+              + (log.length > MAX ? log.slice(0, MAX) + '\n…（已截断）' : log)
+              + `\n\`\`\`\n</details>\n`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+      - name: 校验索引（validate-index.mjs）
+        shell: bash
+        env:
+          MODULE_ID: ${{ needs.audit.outputs.module_id }}
+        run: |
+          set -euo pipefail
+          PREFIX="${{ steps.place.outputs.prefix }}"
+          INDEX_FILE="${{ steps.place.outputs.index_file }}"
+          SCRIPTS_DIR="${PREFIX:+$PREFIX/}scripts"
+
+          # 合并结果必须通过校验器，否则不提交 —— 宁可不进索引，也不进坏索引。
+          node "$SCRIPTS_DIR/validate-index.mjs" "$INDEX_FILE"
+
+          # 双重保险：确认这次审核的模块真的进了索引（versions/name/author/description/verified 齐全）
+          node -e '
+            const fs=require("fs");
+            const idx=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+            const m=(idx.modules||[]).find(x=>x.id===process.argv[2]);
+            if(!m){ console.error("模块 "+process.argv[2]+" 未出现在索引里"); process.exit(1); }
+            for(const f of ["name","author","description","versions","verified"]){
+              if(!(f in m)){ console.error("索引条目缺字段 "+f); process.exit(1); }
+            }
+            if(!Array.isArray(m.versions)||m.versions.length===0){ console.error("索引条目 versions 为空"); process.exit(1); }
+            console.log("已确认入索引："+m.id+" "+m.versions.map(v=>v.version).join(",")+
+                        "（verified="+m.verified+"）");
+          ' "$INDEX_FILE" "$MODULE_ID"
+
+      - name: 提交
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'chore(index): auto-approve module ${{ needs.audit.outputs.module_id }}'
+          file_pattern: |
+            ${{ steps.place.outputs.index_file }}
+            ${{ steps.place.outputs.pending_dir }}
