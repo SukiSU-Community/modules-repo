@@ -142,6 +142,7 @@ node scripts/fetch-pending-zip.mjs pending/ --out-dir /tmp/zips \
 ```
 
 不变式：**main 的唯一入口是「合并一个 approve 成功的 PR」，索引是 main 内容的函数。**
+而 `approve` 自己挂在 `selftest` 上 —— 判定器没通过仓库单测时，它没有资格批准任何东西。
 
 索引改动自己也走 PR（而不是直接 push main），因为 repo ruleset 不给 GitHub Actions 开
 bypass。于是多了一个必须回答的问题：*一个只改 `json/modules.json` 的 PR，凭什么算批准？*
@@ -338,17 +339,21 @@ App 名下的提交会正常触发 —— 投稿 PR #15 就是 App 开的，`aud
 结构条件：Actions 自己合出来的 push 不触发 workflow；人工合并时（实测 push run 38070248065 确实
 触发了）索引合并提交对 pending 只有删除，`--diff-filter=ACMR` 之后 `changed_count=0`，整段跳过。
 
-仍然开着的两个口（都不是这次要解决的）：
+还剩一个口（不是这次要解决的）：
 
 * **失败重试要人推一下**：一次重建失败会留下孤儿分支 `index/rebuild-<runId>`，同一个 run 重跑
   会被判 `conflict`（这是有意的：不在半截状态上二次写入）。换新 run（`workflow_dispatch` 填
   那次的 sha）就绕开了 —— 但「下一条无关的合并 PR」**不会**自动把这条被落下的 pending 捡起来，
   因为那次提交没带入 pending，`changed_count=0` 整步跳过。要自动化这一步，得让重建按
   「main 上是否存在未消费 pending」来判断范围，而不是按「这次提交带了什么」。
-* **单测没接进 CI**：`node --test` 只在本地跑（见下面「跑单测」）。上面这些洞之所以能带着
-  全绿上线，根因就在这儿。把它接进 `approve` 会让任意一个测试失败都挡住投稿，属于闸门语义的
-  变化，要单独定；接之前还得注意母本相关的测试在独立 clone 里必须跳过（已处理，见
-  `AUDIT_COPIES` / `INDEX_COPIES`）。
+
+另外记一笔**已经封掉的那个**，因为它有一个看起来很诱人的错修法：
+
+* **过期索引 PR**（`approve` 绑 head sha，head 不动那次推导判定的绿就一直挂着，而 main 可能已经
+  前进）。封法是 `merge-index` 在合并前用**同一个判定器**按此刻的 main 再推导一遍，对得上才合。
+  **不要**改成打开 ruleset 的 `strict_required_status_checks_policy`：那一条对所有 PR 生效，会同时
+  要求投稿 PR 分支最新才许合，而投稿方是不会 rebase 的机器人 —— 两条投稿挨着进来就把前一条永久
+  卡死，和本文上面修掉的「祖先检查冻死机器人投稿」是同一个形状。
 
 
 ## pending 目录是递归的
@@ -441,10 +446,18 @@ node --test test/build-index.test.mjs   # 只跑这一个文件
 
 覆盖 `build-index` 的三种核心情况：新增模块、追加版本、id 冲突不覆盖。
 
-> ⚠️ **这些单测目前没有任何 CI 在跑** —— `audit.yml` 里没有 `node --test` 那一步，它们是纯本地的。
+> **这些单测由 CI 的 `selftest` 作业跑，而 `approve` 依赖它**（2026-10-11 接上的）：selftest 红
+> → approve 被 skip → required check 不成功 → 投稿与索引都停在门口。之前它们只在本地跑，那正是
 > 本轮好几个「测试全绿但线上从没工作」的洞（scan.mjs 的 CLI 入口、`steps.build` 指向一个没声明的
-> id、tree 删除项缺 mode）就是这么带着绿灯上线的。接进 CI 之前先想清楚：挂在 `approve` 上就等于
-> 「任意一个测试失败都挡住投稿」，那是闸门语义的变化，不是加一步那么简单。
+> id、tree 删除项缺 mode）能带着绿灯上线的根因 —— 判定投稿能不能进 main 的那套代码自己没过检，
+> 就没有资格批准任何投稿。
+>
+> 刻意接受的语义：**任意一条单测失败都会挡住合并**，包括与本次改动无关的失败。理由是本仓库的
+> 测试只用 node 内置模块、不联网、自建临时 git 仓库。真出现 flaky 应该修测试，而不是把这道闸拆掉
+> —— 拆的诱惑很大，因为每次红的都是别人的投稿。
+>
+> 另一处坑：母本相关的测试（`AUDIT_COPIES` / `INDEX_COPIES`）在独立 clone 里必须跳过而不是 ENOENT，
+> 因为 `../../audit/workflows/` 只存在于 monorepo 布局。
 
 ## 发布
 

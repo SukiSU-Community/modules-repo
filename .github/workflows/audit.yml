@@ -714,6 +714,35 @@ jobs:
             });
 
   # -------------------------------------------------------------------
+  # 判定器自己先过检：跑仓库单测。
+  #
+  # 为什么挂在这儿而不是只当个信息位：本轮抓到的每一个洞（scan.mjs 的 CLI 入口在 Linux 上
+  # 静默不执行、`steps.build` 指向一个没声明的 id、tree 删除项缺 mode、`[skip ci]` 放错位置）
+  # 全都是「测试全绿但线上是死的」，而反过来 —— 测试从来没在 CI 里跑过 —— 意味着这些洞连
+  # 绿灯都没有过，是纯本地的安慰。判定投稿能不能进 main 的那套代码自己没过检，就不该由它
+  # 来批准任何投稿。
+  #
+  # 于是 approve `needs: selftest`：selftest 红 → approve 被 skip → required check 没成功
+  # → ruleset 不放行，投稿与索引都停在门口。这是刻意接受的语义：**任意一条单测失败都会挡住
+  # 合并**，包括与本次改动无关的偶发失败。取舍理由是本仓库的测试只用 node 内置模块、不联网、
+  # 自建临时 git 仓库，稳定性由这份 workflow 自己保证；真要出现 flaky，应该修测试而不是把
+  # 这道闸拆掉。
+  # -------------------------------------------------------------------
+  selftest:
+    name: selftest
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # 与 audit 作业同一个大版本：这里跑的就是 audit 作业将要执行的那些脚本。
+          node-version: '20'
+      - name: 跑仓库单测（test/ 与 audit/ 下的 *.test.mjs）
+        shell: bash
+        run: node --test
+
+  # -------------------------------------------------------------------
   # 批准闸：把「扫完了」和「可以合并」拆成两个 check。
   #
   # 为什么必须拆：audit job 绿只说明扫描跑通了，不代表结论是放行。required status
@@ -727,7 +756,9 @@ jobs:
   # -------------------------------------------------------------------
   approve:
     name: approve
-    needs: audit
+    # selftest 红的时候 approve 不跑（被 skip）：required check 没成功 = 不放行。
+    # 判定投稿的这套代码自己没过检，就没有资格批准任何投稿。
+    needs: [audit, selftest]
     runs-on: ubuntu-latest
     permissions: {}
     steps:
@@ -878,6 +909,63 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      # 检的是 PR head 本身，不是 GitHub 默认的 merge ref：要比的「这条索引提交从哪个 main
+      # 分出来」只有 head 的历史里有答案。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # -------------------------------------------------------------------
+      # 过期索引 PR 的防护。
+      #
+      # 为什么需要它：`approve` 绑的是 head sha —— head 不动，那次推导判定的结论就一直挂着绿。
+      # 而 derive 比的是「PR 创建时」的 base。如果这期间 main 又前进了（比如又合了一条投稿），
+      # 这条 PR 的内容就已经不是当前 main 的函数了，合下去会把更新的索引退回去。
+      #
+      # 为什么不开 ruleset 的 strict_required_status_checks_policy：那是全局的，会同时要求
+      # **投稿 PR** 也必须分支最新才许合 —— 投稿方是不会 rebase 的机器人，两条投稿挨着进来
+      # 就会把前一条永久卡死（本轮实测：祖先检查冻死机器人投稿是同一个形状）。所以只在这条
+      # 链上补，不动全局保护配置。
+      #
+      # 判据沿用 derive 那一条，只是把 base 换成**此刻的 main**：索引内容仍然 ==
+      # buildIndex(当前 main, 本 PR 消费掉的 pending) 才合。
+      #   * main 这期间只进了维护类改动 → 推导结果不变 → 照样合（不会误伤）；
+      #   * main 这期间进了新投稿 → 新 pending 会出现在 base..head 的删除里，而这条 PR 的索引
+      #     没有它 → 判不一致、不合。那条新投稿自己会触发一次重建，开出覆盖两者的新索引 PR。
+      # -------------------------------------------------------------------
+      - name: 按当前 main 重推导一遍，只对得上才合
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ github.base_ref }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          FORCE_PREFIX: ${{ vars.MODULE_REPO_PREFIX || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BASE_REF:-}" ]; then
+            echo "::error::这次运行不是来自 PR（dispatch 只重跑判定），索引合并要人工确认。"
+            exit 1
+          fi
+          git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" >/dev/null 2>&1
+          BASE_SHA="$(git rev-parse "refs/remotes/origin/${BASE_REF}")"
+
+          PREFIX="$FORCE_PREFIX"
+          if [ -z "$PREFIX" ] && [ -d contrib/repo/pending ]; then PREFIX="contrib/repo"; fi
+          PENDING_DIR="${PREFIX:+$PREFIX/}pending"
+          INDEX_FILE="${PREFIX:+$PREFIX/}json/modules.json"
+          SCRIPTS_DIR="${PREFIX:+$PREFIX/}scripts"
+
+          echo "重推导：base=${BASE_SHA:0:8}（此刻的 ${BASE_REF}），head=$(git rev-parse --short HEAD)"
+          node "$SCRIPTS_DIR/verify-index-pr.mjs" --base "$BASE_SHA" --head HEAD \
+            --owner "$OWNER" --repo "$REPO" --pending-dir "$PENDING_DIR" \
+            --index-file "$INDEX_FILE" --report verify-at-merge.report.json
+
       - name: 合并（squash：main 上每个索引状态都对应一个过检的 PR）
         shell: bash
         env:
