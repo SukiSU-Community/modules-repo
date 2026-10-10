@@ -134,10 +134,35 @@ node scripts/fetch-pending-zip.mjs pending/ --out-dir /tmp/zips \
                                       │
                     index.yml ──> publish-from-main.mjs 回查那次 approve 的结论
                               ──> 盖章 ──> build-index --consume ──> validate-index
-                              ──> 提交（带 [skip ci]）
+                              ──> 建分支 + 开**索引 PR** ──> 等 approve 变绿 ──> 合并
 ```
 
 不变式：**main 的唯一入口是「合并一个 approve 成功的 PR」，索引是 main 内容的函数。**
+
+索引改动自己也走 PR（而不是直接 push main），因为 repo ruleset 不给 GitHub Actions 开
+bypass。于是多了一个必须回答的问题：*一个只改 `json/modules.json` 的 PR，凭什么算批准？*
+答案是 `scripts/verify-index-pr.mjs`，判据只有一条，而且是按内容判：
+
+```
+PR 里的索引 == buildIndex(base 索引, base 上被本 PR 消费掉的那些 pending 条目)
+```
+
+「那些条目算已批准」**不由 PR 自己声明** —— 否则删掉一个从没批准的 `pending/xxx.json`
+再把它手抄进索引就能过。批准依据必须去外部取：把该文件带上 main 的那个提交所属 PR，
+其 head sha 上 `approve` 的结论为 success（复用 `publish-from-main.mjs` 的
+`findPrForCommit` / `assertMergeApproved`，和盖审核章同一套判据）。
+
+四种伪造各有对应断言，其中五种在 `test/verify-index-pr.test.mjs` 里用**真 git 仓库 +
+真 build-index.mjs** 跑（`ls-tree` / `log -1 -- path` / `diff-filter` 这些行为靠读代码猜，
+最容易落成「单测全绿但 CI 永远判不过」—— 事实上当初就撞出一个 `Set.prototype.filter`）：
+
+| 伪造 | 结果 |
+|---|---|
+| 改了索引但一个 pending 都没消费 | 拒：索引不是推导出来的，是手改的 |
+| 删掉没批过的 pending 再抄进索引 | 拒：拿不到批准证据 |
+| 索引 PR 里夹带新投稿 | 拒：交回投稿扫描判定 |
+| 内容对但字段被动过（如 `verified`） | 拒：逐字段差异报出来 |
+| 只换 `lastUpdate` / 模块顺序 | 放行：时间戳与顺序不是内容 |
 
 以前 publish 在 PR 上下文里直接往 main 推索引提交，于是 main 永远不能开
 `require a pull request / restrict pushes`。改成「先往 PR 分支写索引、再合并 PR」也不行：

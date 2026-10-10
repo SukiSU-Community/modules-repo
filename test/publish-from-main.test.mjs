@@ -343,6 +343,36 @@ test('approve 与 publish 的分工：没有待审内容时 approve 让路，但
   assert.match(yml, /if: needs\.audit\.outputs\.found == 'true' && needs\.audit\.outputs\.action == 'auto-approve'/);
 });
 
+test('索引 PR 的判定必须排在「没有投稿内容」之前', () => {
+  // 顺序就是安全性：索引 PR 的 found 天然不是 true，先走 found 分支等于
+  // 「任何只改 json/modules.json 的 PR 一律放行」，手抄索引即可绕过整条审核链。
+  const yml = fs.readFileSync(WF_MAIN, 'utf8');
+  // 只在 approve 那一步的正文里比顺序：全文找 FOUND 会命中 kind 步骤里的日志文案，
+  // 那是「比较位置」这类断言最容易假通过与假失败的地方。
+  const anchor = yml.indexOf('INDEX_PR: ${{ needs.audit.outputs.index_pr }}');
+  assert.ok(anchor > 0, 'approve 必须把 index_pr 读进来');
+  const body = yml.slice(anchor);
+  const i = body.indexOf('${INDEX_PR:-}');
+  const j = body.indexOf('${FOUND:-}');
+  assert.ok(i >= 0, 'approve 里必须显式处理索引 PR');
+  assert.ok(j >= 0, 'approve 里必须处理 found!=true');
+  assert.ok(i < j, '索引 PR 分支必须在 found 分支之前');
+  assert.match(yml, /index_pr: \$\{\{ steps\.kind\.outputs\.index_pr \}\}/);
+  assert.match(yml, /index_derived: \$\{\{ steps\.derive\.outputs\.derived \}\}/);
+});
+
+test('audit 的触发路径必须含 json/**，否则索引 PR 拿不到任何 check', () => {
+  // required check 从没上报过 = Expected = 永远合不了。索引 PR 只改 json + 删 pending。
+  const yml = fs.readFileSync(WF_MAIN, 'utf8');
+  assert.match(yml, /-\s*'json\/\*\*'/);
+});
+
+test('verify-index-pr 在 audit 里被调用，且用同一套 check 名取证', () => {
+  const yml = fs.readFileSync(WF_MAIN, 'utf8');
+  assert.match(yml, /verify-index-pr\.mjs/);
+  assert.match(yml, /checks: read/, '取证要读 check runs，权限缺了就只会得到一个红');
+});
+
 test('parseArgs：--changed 吃多个路径，且不把下一个 --flag 吞掉', () => {
   const o = parseArgs(['--pending', 'p', '--changed', 'a.json', 'b.json', '--dry-run']);
   assert.deepEqual(o.changed.map((p) => path.basename(p)), ['a.json', 'b.json']);

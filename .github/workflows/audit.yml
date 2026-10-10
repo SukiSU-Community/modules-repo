@@ -35,6 +35,10 @@ on:
     types: [opened, synchronize, reopened]
     paths:
       - 'pending/**'
+      # json/** 也在触发路径里，是为了让「只改索引」的 PR 也必须拿到一个结论。
+      # 但绝不能让它落到「没有投稿内容 → 直接绿」那条分支上 —— 那样任何人都能
+      # 开一个手抄索引的 PR 绕过整条审核链。它走的是 kind/derive 两步的推导判定。
+      - 'json/**'
   workflow_dispatch:
     inputs:
       zip:
@@ -49,6 +53,9 @@ concurrency:
 permissions:
   contents: read
   pull-requests: write
+  # 索引 PR 的批准证据要从 check runs 里取（verify-index-pr.mjs 复用
+  # publish-from-main 的 findPrForCommit），所以这里也要读得到 checks。
+  checks: read
   issues: write
 
 jobs:
@@ -68,6 +75,9 @@ jobs:
       # 或改的是 scripts/docs）。它必须和「审过但不通过」区分开：前者没有批准事项，
       # 后者才有 —— 混在一起会让维护类 PR 永远卡在一个不会变绿的 required check 上。
       found: ${{ steps.locate.outputs.found }}
+      # 索引重建 PR 走的是另一条判据：内容必须由 base 推导得出（见 kind/derive 两步）。
+      index_pr: ${{ steps.kind.outputs.index_pr }}
+      index_derived: ${{ steps.derive.outputs.derived }}
     steps:
       - name: Checkout PR 分支
         uses: actions/checkout@v4
@@ -272,6 +282,68 @@ jobs:
             echo "found=true" >> "$GITHUB_OUTPUT"
             echo "待审核 zip："
             cat zips.txt
+          fi
+
+      # ---------------------------------------------------------------
+      # 1b. 判定这个 PR 是哪一类：投稿 / 索引重建 / 都不是
+      #
+      # 为什么要单独立一步而不是塞进 approve：两类 PR 的判据完全不同，混在一个
+      # shell 里迟早写成「看起来都过了」。索引 PR 必须由内容判定，不能由
+      # 「它没有投稿内容」判定 —— 后者等于给手改索引开门。
+      # ---------------------------------------------------------------
+      - name: 判定 PR 类型
+        id: kind
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          FOUND: ${{ steps.locate.outputs.found }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=200 origin "$BASE_REF" >/dev/null 2>&1 || true
+          BASE_SHA="$(git rev-parse "origin/$BASE_REF")"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          # ACMR：新增/复制/修改/重命名才算改了索引；删除索引不是重建
+          CHANGED_JSON=$(git diff --name-only --diff-filter=ACMR "$BASE_SHA" HEAD -- 'json/' || true)
+          if [ -n "$CHANGED_JSON" ] && [ "${FOUND:-}" != "true" ]; then
+            echo "index_pr=true" >> "$GITHUB_OUTPUT"
+            echo "这是索引重建 PR（改了 json/，且不含新投稿）：$CHANGED_JSON"
+          else
+            echo "index_pr=false" >> "$GITHUB_OUTPUT"
+            if [ -n "$CHANGED_JSON" ]; then
+              echo "::warning::这个 PR 同时带投稿和索引改动 —— 索引改动不会被推导判定放行，投稿按扫描结论走。"
+            fi
+            echo "不是索引重建 PR（found=${FOUND:-<空>}，json 改动=${CHANGED_JSON:-无}）"
+          fi
+
+      - name: 验索引确由 base 推导（只给索引 PR）
+        id: derive
+        if: steps.kind.outputs.index_pr == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ steps.kind.outputs.base_sha }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          FORCE_PREFIX: ${{ vars.MODULE_REPO_PREFIX || '' }}
+        run: |
+          set -euo pipefail
+          PREFIX="$FORCE_PREFIX"
+          if [ -z "$PREFIX" ] && [ -d contrib/repo/pending ]; then PREFIX="contrib/repo"; fi
+          PENDING_DIR="${PREFIX:+$PREFIX/}pending"
+          INDEX_FILE="${PREFIX:+$PREFIX/}json/modules.json"
+          SCRIPTS_DIR="${PREFIX:+$PREFIX/}scripts"
+          set +e
+          node "$SCRIPTS_DIR/verify-index-pr.mjs" --base "$BASE_SHA" --head HEAD \
+            --owner "$OWNER" --repo "$REPO" --pending-dir "$PENDING_DIR" \
+            --index-file "$INDEX_FILE" --report verify-index-pr.report.json
+          RC=$?
+          set -e
+          if [ "$RC" = "0" ]; then
+            echo "derived=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "derived=false" >> "$GITHUB_OUTPUT"
+            echo "::error::索引 PR 未通过推导校验，见上面输出。"
           fi
 
       # ---------------------------------------------------------------
@@ -624,10 +696,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions: {}
     steps:
-      - name: 只批准「低风险 + 首次收录」
+      - name: 只批准「低风险 + 首次收录」或「可复算的索引重建」
         shell: bash
         env:
           FOUND: ${{ needs.audit.outputs.found }}
+          INDEX_PR: ${{ needs.audit.outputs.index_pr }}
+          DERIVED: ${{ needs.audit.outputs.index_derived }}
           ACTION: ${{ needs.audit.outputs.action }}
           LABEL: ${{ needs.audit.outputs.label }}
           RISK: ${{ needs.audit.outputs.risk }}
@@ -636,6 +710,20 @@ jobs:
           REASONS: ${{ needs.audit.outputs.reasons }}
         run: |
           set -euo pipefail
+          # 索引重建 PR 单独判，且必须排在「没有投稿内容」之前：
+          # 它的 found 天然不是 true，若先走那条分支就等于「只改索引的 PR 一律放行」，
+          # 整条审核链被一次手抄 json/modules.json 绕过。
+          if [ "${INDEX_PR:-}" = "true" ]; then
+            if [ "${DERIVED:-}" = "true" ]; then
+              echo "批准：索引重建 PR，内容与「base 索引 + 被消费的已批准条目」的推导逐字段一致。"
+              exit 0
+            fi
+            {
+              echo "::error::未获批准：这是索引重建 PR，但索引与 base 的推导结果不一致，或被消费的条目拿不到批准证据。"
+              echo "::error::索引只能由 build-index.mjs 从 pending 推导，不接受手改；要下架请走 revoke 流程。"
+            } >&2
+            exit 1
+          fi
           # 没有待审投稿内容 = 没有批准事项。删除 pending、改脚本/文档这类 PR 必须能正常走，
           # 否则 required check 会把所有维护类 PR 一起卡死（而它们的 check 永远不会发生）。
           if [ "${FOUND:-}" != "true" ]; then
