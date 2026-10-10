@@ -1,0 +1,27 @@
+# 谁能改「决定结论的东西」，而不是「谁改什么都要有个人类签字」。
+#
+# 只圈这三类路径是刻意的：它们定义了风险等级与索引结构，谁有写权限，谁就能
+# 在同一 PR 里换掉扫描器或合并逻辑，从而决定自己的投稿怎么被判。
+# 审核流水线运行时的对应防线是 audit.yml / index.yml 里的「钉回 base」步骤，
+# CODEOWNERS 是它的人事面补充，不是替代品。
+#
+# ⚠️ 现在这份文件只有建议效力：仓库上还没有启用「require CODEOWNER review」，
+# 而且只有一个 owner —— 单人 owner 意味着 owner 自己不需要任何人批准，
+# 恰好是「公开招募贡献者」之后最该关掉的口子。加进第二个 owner 之前，
+# 别把这里当成控制点在引用。
+#
+# 语法：模式  owner  [owner...]
+
+# 扫描器与规则表：命中什么算危险、怎么定级，全在这里
+/audit/              @yufeng-liang
+
+# 索引合并与取包守卫：索引结构只由 build-index.mjs 定义；
+# fetch-pending-zip.mjs / publish-from-main.mjs 决定「凭什么算批准」
+/scripts/            @yufeng-liang
+
+# 流水线本身。改 workflow 就是改闸门，必须走 review。
+/.github/workflows/  @yufeng-liang
+
+# 正式索引产物。手改 json/modules.json 等于绕过整条审核链，
+# 只有 revoke（下架）流程可以碰它，而那个流程本身也在 /scripts/ 里。
+/json/               @yufeng-liang
