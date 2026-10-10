@@ -1,0 +1,23 @@
+{
+  "id": "e2e_probe_min",
+  "name": "E2E Probe",
+  "author": "zcode-e2e",
+  "description": "e2e probe",
+  "versions": [
+    {
+      "version": "v0.0.1",
+      "versionCode": 4586599,
+      "zipUrl": "https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/26e43418c212b1646b199e1153f2cf043125c7e674ce9980e006bb7da7697406.zip",
+      "size": 226,
+      "time": 1791624589243,
+      "sha256": "26e43418c212b1646b199e1153f2cf043125c7e674ce9980e006bb7da7697406"
+    }
+  ],
+  "source": "https://www.coolapk.com/u/2781460",
+  "uploader": "zcode-e2e",
+  "coolapkUid": "2781460",
+  "storage": "github-release-asset",
+  "releaseTag": "assets-v1",
+  "assetName": "26e43418c212b1646b199e1153f2cf043125c7e674ce9980e006bb7da7697406.zip",
+  "submittedAt": "2026-10-10T09:29:49.243Z"
+}
