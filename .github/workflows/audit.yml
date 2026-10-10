@@ -130,9 +130,24 @@ jobs:
           BASE_SHA="$(git rev-parse "origin/$BASE_REF")"
           echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
 
-          # 闸门二：PR 必须真的长在这条 base 上（防止拿一条古老分支当 base 绕开新规则）
-          if ! git merge-base --is-ancestor "$BASE_SHA" HEAD; then
-            echo "::error::PR 分支不是 origin/$BASE_REF 的后代（base 落后或未合并）。先 rebase 再投稿。"
+          # 闸门二：把「当前 base」合进工作树，合不动才算问题。
+          #
+          # 这里原来写的是 `git merge-base --is-ancestor origin/main HEAD`（PR 必须已经
+          # 包含当前 main）。它在真实流量上是死结：main 会被机器人自己推进（索引重建 PR
+          # 也是合进 main），于是任何一条「提交后才过了几分钟」的投稿 PR 都会变成
+          # 「不是 origin/main 的后代」——PR #4 重跑时就死在这句话上，而投稿者是个只能
+          # 开单文件 PR 的机器人，它不会 rebase，模块就永远进不了索引。
+          #
+          # 这道闸真正要防的是「拿一条古老分支当基准，用旧扫描器/旧索引给自己定罪」，
+          # 而那个东西已经被上面的钉定 + 下面的复核挡住了：audit/、scripts/、json/ 一律
+          # 取自 BASE_SHA。所以这里改成：把当前 base 合进工作树（不提交），
+          # 只有真的**合不动**（内容冲突）才拒绝 —— 那才是必须让投稿者处理的情况。
+          if ! git merge --no-commit --no-ff "$BASE_SHA" >/dev/null 2>&1; then
+            {
+              echo "::error::PR 分支与当前 origin/$BASE_REF 冲突，合并后无法审。请先解决冲突再投稿。"
+              echo "::error::（冲突处不自动取舍：猜哪一边都可能把恶意内容合进索引。）"
+            } >&2
+            git merge --abort 2>/dev/null || true
             exit 1
           fi
 
