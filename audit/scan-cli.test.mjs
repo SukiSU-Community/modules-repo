@@ -86,15 +86,24 @@ test('CLI：绝对路径调用同样要跑（不能只修好一边）', () => {
 // 整类问题的钉子：仓库里每个能当 CLI 跑的 .mjs 都必须用「解析成绝对路径再比」的判据。
 // 靠拼 file:// URL 比字符串的写法，在一边平台上会静默不执行 —— 扫描器踩过这个坑
 // （Linux runner 上 success 但零产出），盖章与验索引那两个脚本是同一形状。
+//
+// audit/ 与 scripts/ 的相对位置在两种落地形态里不一样（索引仓库在根 / monorepo 在
+// contrib/repo/），所以目录自己探，别写死：写死的版本在母本那份里会因为找不到文件而炸，
+// 而"炸在错误的布局上"只会让人把测试删掉。
+const SCRIPTS_DIRS = [
+  resolve(REPO_ROOT, 'scripts'),
+  resolve(REPO_ROOT, 'repo', 'scripts'),
+];
+const SCRIPTS_DIR = SCRIPTS_DIRS.find((d) => existsSync(d)) || SCRIPTS_DIRS[0];
+
 test('所有 CLI 入口判据都不许用拼 file:// URL 的写法', () => {
   const files = [
     join(REPO_ROOT, 'audit', 'scan.mjs'),
-    join(REPO_ROOT, 'scripts', 'publish-from-main.mjs'),
-    join(REPO_ROOT, 'scripts', 'verify-index-pr.mjs'),
-    join(REPO_ROOT, 'scripts', 'build-index.mjs'),
-    join(REPO_ROOT, 'scripts', 'fetch-pending-zip.mjs'),
-    join(REPO_ROOT, 'scripts', 'validate-index.mjs'),
+    ...['publish-from-main.mjs', 'verify-index-pr.mjs', 'build-index.mjs', 'fetch-pending-zip.mjs', 'validate-index.mjs']
+      .map((f) => join(SCRIPTS_DIR, f))
+      .filter((f) => existsSync(f)),
   ];
+  assert.ok(files.length >= 3, `待查文件太少（${files.length}），八成是目录没探对：${SCRIPTS_DIR}`);
   for (const f of files) {
     const src = readFileSync(f, 'utf8');
     assert.doesNotMatch(
@@ -103,7 +112,7 @@ test('所有 CLI 入口判据都不许用拼 file:// URL 的写法', () => {
       `${f} 用拼 URL 比字符串当入口判据，会在某个平台上静默不跑`
     );
     if (/process\.argv\[1\]/.test(src)) {
-      assert.match(src, /resolve\((?:cwd,\s*)?process\.argv\[1\]\)|isCliEntry\(/, `${f} 的入口判据要比绝对路径`);
+      assert.match(src, /resolve\((?:\s*'[^']*',\s*)?process\.argv\[1\s*\]\s*\)|isCliEntry\(/, `${f} 的入口判据要比绝对路径`);
     }
   }
 });
@@ -119,7 +128,9 @@ test('isCliEntry：相对与绝对两种 argv[1] 形态必须给出同一个答�
   assert.equal(isCliEntry(rel, selfPath), true, `相对形态「${rel}」就是 Linux runner 上的真实输入`);
   assert.equal(isCliEntry(`./${rel.replace(/\\/g, '/')}`, selfPath), true, './ 前缀同样要认');
 
-  assert.equal(isCliEntry('scan.mjs', selfPath), false, '同名但不在同一目录，不能算入口');
+  // 这一条不能写成裸 'scan.mjs'：cwd 正好是 audit/ 时它解析出来就是 selfPath，
+  // 测试会因为运行目录不同而给出不同答案 —— 那就不是在测判据，而是在测 cwd。
+  assert.equal(isCliEntry(join('nowhere', 'scan.mjs'), selfPath), false, '指向别的文件就不能算入口');
   assert.equal(isCliEntry(undefined, selfPath), false, 'node -e / 被 import 时没有 argv[1]');
   assert.equal(isCliEntry(selfPath, ''), false, '拿不到自身路径时宁可不当入口');
 });
