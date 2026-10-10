@@ -351,6 +351,13 @@ App 名下的提交会正常触发 —— 投稿 PR #15 就是 App 开的，`aud
 
 * **过期索引 PR**（`approve` 绑 head sha，head 不动那次推导判定的绿就一直挂着，而 main 可能已经
   前进）。封法是 `merge-index` 在合并前用**同一个判定器**按此刻的 main 再推导一遍，对得上才合。
+  这条闸在索引 PR #28 上真跑过（不是只挂着）：
+
+  ```
+  Merge Index PR  steps: 按当前 main 重推导 → 合并
+  重推导：base=02ff7eaa（此刻的 main），head=d700df5
+  [verify-index-pr] 索引与推导一致（消费 1 个已批准条目）
+  ```
   **不要**改成打开 ruleset 的 `strict_required_status_checks_policy`：那一条对所有 PR 生效，会同时
   要求投稿 PR 分支最新才许合，而投稿方是不会 rebase 的机器人 —— 两条投稿挨着进来就把前一条永久
   卡死，和本文上面修掉的「祖先检查冻死机器人投稿」是同一个形状。
@@ -386,6 +393,19 @@ gh pr merge 24 → 合进去了
 `needs.selftest.result` 都必须是 `success`」，否则 `exit 1` —— 让 required check 明确**变红**，
 而不是消失。这样 audit 自己崩了（扫描器挂掉、覆盖度闸开火）也不会出现「approve 缺席但被当成
 通过」。
+
+修完再开一次同样的 canary（#26，验完就关，没合），这次实测：
+
+```
+selftest          fail
+approve           fail           ← 修之前这里是 skipping
+Scan & Triage     pass
+mergeStateStatus  BLOCKED
+gh pr merge 26 → "the base branch policy prohibits the merge"
+```
+
+**这道闸现在是实测会咬人，不是看起来像装了。** 同一个 `if: always()` 也顺手堵掉了另一条同形状的
+路：以前 `audit` 作业自己崩掉时，approve 同样是 skip = 放行。
 
 `test/canary-selftest-proof.test.mjs` 已从 main 删掉（forward delete，见 #25），canary 只在
 「开一条会红的 PR、验证它红且合不动、然后关掉」这个用途下存在。
