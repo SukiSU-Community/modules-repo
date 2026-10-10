@@ -58,9 +58,10 @@ const MAX_REDIRECTS = 5;
  * 校验一个下载地址能不能取。返回 { ok, url, error }。
  *
  * 判据不止主机名：还要求 https、URL 里不带凭据（`https://github.com@evil.tld/`
- * 这种经典写法靠解析主机名就能挡掉），并且**当条目同时给了 releaseTag+assetName 时，
- * 直链落到的文件名必须就是那个 asset**。这条是关键 —— 否则元数据写一个干净的
- * sha256、zipUrl 指向另一个包，扫的是 A 合的是 B，整个内容寻址的信任就空了。
+ * 这种经典写法靠解析主机名就能挡掉），并且把 `zipUrl` 尾巴、`assetName`、
+ * `versions[].sha256` 三者钉死成同一个包 —— 直链落到的文件名必须就是声明的 asset，
+ * 而 asset 必须是内容寻址名 `<sha256>.zip`。少任何一环，「元数据写一个干净的摘要、
+ * zipUrl 指向另一个包」就能让扫的是 A、合的是 B，整个内容寻址的信任就空了。
  */
 export function assertDownloadUrl(url, raw = {}) {
   let u;
@@ -79,12 +80,22 @@ export function assertDownloadUrl(url, raw = {}) {
   if (!ALLOWED_DOWNLOAD_HOSTS.has(host)) {
     return { ok: false, error: `下载地址主机不在允许列表内：${host}（只允许 ${[...ALLOWED_DOWNLOAD_HOSTS].join(', ')}）` };
   }
+  const segs = decodeURIComponent(u.pathname).split('/').filter(Boolean);
+  const last = segs[segs.length - 1] || '';
   const asset = typeof raw.assetName === 'string' ? raw.assetName.trim() : '';
-  if (asset) {
-    const segs = decodeURIComponent(u.pathname).split('/').filter(Boolean);
-    const last = segs[segs.length - 1] || '';
-    if (last !== asset) {
-      return { ok: false, error: `下载地址落到的是「${last}」，与元数据声明的 assetName「${asset}」不一致 —— 扫的包和合的包可能不是同一个` };
+  if (asset && last !== asset) {
+    return { ok: false, error: `下载地址落到的是「${last}」，与元数据声明的 assetName「${asset}」不一致 —— 扫的包和合的包可能不是同一个` };
+  }
+  // 内容寻址名必须就是声明摘要那一个。只比 assetName 不够：手搓的 JSON 完全可以让
+  // assetName 与 zipUrl 互相印证、却和 versions[].sha256 毫无关系，那样「扫 A 合 B」
+  // 仍然成立。三个字段互为证据，缺一环就拒。
+  const sha = String((pickVersion(raw) || {}).sha256 || raw.sha256 || '').trim().toLowerCase();
+  if (sha) {
+    if (!SHA256_RE.test(sha)) {
+      return { ok: false, error: `声明的 sha256 不是 64 位十六进制：「${sha.slice(0, 80)}」` };
+    }
+    if (last !== `${sha}.zip`) {
+      return { ok: false, error: `直链文件名「${last}」不是内容寻址名「${sha}.zip」—— 摘要与包对不上，不予下载` };
     }
   }
   const tag = typeof raw.releaseTag === 'string' ? raw.releaseTag.trim() : '';
@@ -309,6 +320,12 @@ export async function main(argv = process.argv.slice(2)) {
             if (actual !== rec.declaredSha256.toLowerCase()) {
               throw new Error(`sha256 不匹配：元数据声明 ${rec.declaredSha256}，实际 ${actual}`);
             }
+          } else if (/^https?:\/\//i.test(r.url)) {
+            // 远端来源必须有可校验的摘要。没有声明值，就没有任何办法证明「扫过的那个包」
+            // 与「合进索引的那个包」是同一个；离线自测的本地文件不受此约束（字节就在手上）。
+            throw new Error(
+              `远端来源缺少合法的 sha256 声明（收到「${String(rec.declaredSha256 || '').slice(0, 72) || '(空)'}」），无摘要不送审`
+            );
           }
           fs.writeFileSync(target, buf);
           rec.sha256 = sha256Hex(buf);

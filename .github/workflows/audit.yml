@@ -240,10 +240,25 @@ jobs:
 
             # c. 用下载产物拼出待扫 zip 列表
             ls -1 audit-out/zips/*.zip > zips.txt 2>/dev/null || true
+
+            # 只要有 pending 却没拿到它对应的包，这次审核就没有结论。必须失败，
+            # 不能 ::warning:: 之后 exit 0 —— 「绿勾 + 一个字节都没扫」是这道闸最
+            # 危险的形态：它把「让下载失败」变成一种绕过方式。
+            # 取包失败在脚本里是按条目记 error、且只要还有一条成功就返回 0，
+            # 所以判据必须看 manifest，而不是数文件个数。
+            if [ -f audit-out/zips/manifest.json ]; then
+              node -e '
+                const fs=require("fs");
+                const recs=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+                const bad=(Array.isArray(recs)?recs:[]).filter(r=>r && (r.error || !r.zip));
+                if(!bad.length){ console.log("manifest：全部 "+recs.length+" 条都取到了待审包"); process.exit(0); }
+                for(const b of bad) console.log("::error::"+(b.id||"?")+" 未取得待审包："+(b.error||"manifest 里没有 zip 字段"));
+                process.exit(1);
+              ' audit-out/zips/manifest.json
+            fi
             if [ ! -s zips.txt ]; then
-              echo "found=false" >> "$GITHUB_OUTPUT"
-              echo "::warning::pending 元数据已定位，但没有下载到任何 zip，跳过扫描。"
-              exit 0
+              echo "::error::已定位 $COUNT 个 pending 元数据，但一个 zip 都没拿到，审核无结论。"
+              exit 1
             fi
             echo "found=true" >> "$GITHUB_OUTPUT"
             echo "待审核 zip："

@@ -69,6 +69,50 @@ test('直链落到的文件名与声明的 assetName 不一致 → 拒', () => {
   assert.match(r.error, /与元数据声明的 assetName/);
 });
 
+test('assetName 与 zipUrl 互相印证，却和 versions[].sha256 无关 → 一样拒', () => {
+  // 手搓 pending JSON 的下一步就是这条：把 assetName 和 zipUrl 写成同一个名字，
+  // 让「名字对得上」的旧判据通过，而摘要指向另一个包。三处必须钉成同一个。
+  const sha = 'c'.repeat(64);
+  const url = `https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/${ASSET}`;
+  const r = resolveDownloadUrl({
+    releaseTag: 'assets-v1',
+    assetName: ASSET,
+    versions: [{ versionCode: 1, zipUrl: url, sha256: sha }],
+  });
+  assert.equal(r.url, '', JSON.stringify(r));
+  assert.match(r.error, /内容寻址名/);
+  assert.ok(r.error.includes(`${sha}.zip`), '报错里必须给出期望的那个名字');
+});
+
+test('三处一致的条目（assetName == <sha256>.zip == 直链尾巴）放行', () => {
+  const sha = 'd'.repeat(64);
+  const name = `${sha}.zip`;
+  const url = `https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/${name}`;
+  const r = resolveDownloadUrl({ releaseTag: 'assets-v1', assetName: name, versions: [{ versionCode: 1, zipUrl: url, sha256: sha }] });
+  assert.equal(r.url, url);
+});
+
+test('摘要写成别的形状（短串 / 含非十六进制字符）直接拒，不当成「没声明」放过', () => {
+  for (const bad of ['d'.repeat(63), 'z'.repeat(64), 'sha256:deadbeef', '0123456789abcdef'.repeat(3)]) {
+    const r = assertDownloadUrl(
+      `https://github.com/o/r/releases/download/assets-v1/${'d'.repeat(64)}.zip`,
+      { versions: [{ versionCode: 1, sha256: bad }] },
+    );
+    assert.equal(r.ok, false, `${bad} 不该被放行`);
+    assert.match(r.error, /64 位十六进制/);
+  }
+});
+
+test('大小写混合的摘要声明：归一化后与内容寻址名一致就放行', () => {
+  const sha = 'E'.repeat(64);
+  const r = assertDownloadUrl(
+    `https://github.com/o/r/releases/download/assets-v1/${sha.toLowerCase()}.zip`,
+    { versions: [{ versionCode: 1, sha256: sha }] },
+  );
+  assert.equal(r.ok, true, JSON.stringify(r));
+});
+
+
 test('直链不在声明的 release tag 路径下 → 拒', () => {
   const url = `https://github.com/SukiSU-Community/modules-repo/releases/download/other-tag/${ASSET}`;
   const c = assertDownloadUrl(url, { releaseTag: 'assets-v1', assetName: ASSET });
