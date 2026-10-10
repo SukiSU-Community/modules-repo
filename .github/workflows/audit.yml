@@ -1,10 +1,9 @@
 # 模块投稿安全审核流水线
 #
-# ⚠️ 这是模板文件，位于 contrib/audit/workflows/ 下，**故意不放在仓库真实的 .github/ 里**，
-#    以免未经审核的自动化流程直接在正式仓库生效。启用办法：评审通过后把它复制到
-#    .github/workflows/audit.yml 并按需调整路径。
+# ⚠️ 这里是仓库里**实际生效**的那一份。母本在 monorepo 的 contrib/audit/workflows/audit.yml，
+#    两份只差首行标题。改了这份必须同步母本，否则下一次复制回去会把修过的东西冲掉。
 #
-# 触发：PR 上新增/修改了 pending/** 投稿元数据时。
+# 触发：**每一个** PR 都要跑（不能加 paths 过滤，原因见下面 on: 里的说明）。
 #
 # ⚠️ 关键前提：Worker 开的 PR 里**只有元数据 JSON**（pending/<id>/<versionCode>.json），
 #    zip 本体在 GitHub Release asset 上（见 contrib/worker/src/index.ts openPendingPr）。
@@ -33,12 +32,16 @@ name: Module Submission Audit
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    paths:
-      - 'pending/**'
-      # json/** 也在触发路径里，是为了让「只改索引」的 PR 也必须拿到一个结论。
-      # 但绝不能让它落到「没有投稿内容 → 直接绿」那条分支上 —— 那样任何人都能
-      # 开一个手抄索引的 PR 绕过整条审核链。它走的是 kind/derive 两步的推导判定。
-      - 'json/**'
+    # 这里**不能有 paths 过滤**，它是被一次真实的卡死换来的：配了 required_status_checks
+    # （context=approve）之后，「这个 check 从来没跑过」和「它失败了」对 GitHub 是同一件事
+    # —— PR 永远 BLOCKED。而带 paths 的版本只认 pending/**、json/**，于是改 scripts/ 或
+    # 文档的维护 PR 根本不会触发审核：PR #5 就是这样卡住的
+    # （gh pr checks 5 → no checks reported；gh pr view → mergeStateStatus BLOCKED）。
+    # 结论：approve 必须在**每一个** PR 上都存在。非投稿的 PR 由 locate 输出 found=false、
+    # approve 走「没有待审投稿内容 → 无批准事项」那条分支放行，而不是靠不触发来放行。
+    #
+    # 反过来，json/** 的改动绝不能因为「没有投稿内容」就直接放行 —— 手抄 json/modules.json
+    # 正是要挡的路径，它走 kind/derive 两步的推导判定（见 approve 里的先后顺序）。
   workflow_dispatch:
     inputs:
       zip:

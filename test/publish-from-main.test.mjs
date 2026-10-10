@@ -361,10 +361,18 @@ test('索引 PR 的判定必须排在「没有投稿内容」之前', () => {
   assert.match(yml, /index_derived: \$\{\{ steps\.derive\.outputs\.derived \}\}/);
 });
 
-test('audit 的触发路径必须含 json/**，否则索引 PR 拿不到任何 check', () => {
-  // required check 从没上报过 = Expected = 永远合不了。索引 PR 只改 json + 删 pending。
-  const yml = fs.readFileSync(WF_MAIN, 'utf8');
-  assert.match(yml, /-\s*'json\/\*\*'/);
+test('pull_request 触发不许带 paths 过滤：每个 PR 都必须拿到 approve', () => {
+  // required check 从没上报过 = Expected = 永远合不了，这点和「它红了」在 GitHub 眼里是
+  // 同一件事。带 paths 的版本只认 pending/**、json/**，改 scripts/ 或文档的维护 PR 根本
+  // 不会触发审核 —— PR #5 就死在这上面（gh pr checks → no checks reported，
+  // mergeStateStatus → BLOCKED），整条保护变成仓库的自我锁死。
+  // 放行靠 locate 的 found=false 分支，不靠「干脆不触发」。
+  for (const f of [WF_MAIN, WF_TEMPLATE]) {
+    const yml = fs.readFileSync(f, 'utf8');
+    const block = yml.slice(yml.indexOf('pull_request:'), yml.indexOf('workflow_dispatch:'));
+    assert.ok(block.length > 0 && block.includes('types:'), `${f} 里得能定位到 pull_request 触发块`);
+    assert.doesNotMatch(block, /^\s*paths:/m, `${f} 的 pull_request 触发里出现 paths 就会锁死维护类 PR`);
+  }
 });
 
 test('verify-index-pr 在 audit 里被调用，且用同一套 check 名取证', () => {
