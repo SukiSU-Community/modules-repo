@@ -722,11 +722,14 @@ jobs:
   # 绿灯都没有过，是纯本地的安慰。判定投稿能不能进 main 的那套代码自己没过检，就不该由它
   # 来批准任何投稿。
   #
-  # 于是 approve `needs: selftest`：selftest 红 → approve 被 skip → required check 没成功
-  # → ruleset 不放行，投稿与索引都停在门口。这是刻意接受的语义：**任意一条单测失败都会挡住
-  # 合并**，包括与本次改动无关的偶发失败。取舍理由是本仓库的测试只用 node 内置模块、不联网、
-  # 自建临时 git 仓库，稳定性由这份 workflow 自己保证；真要出现 flaky，应该修测试而不是把
-  # 这道闸拆掉。
+  # 于是 approve `needs: selftest` 且 `if: always()`：selftest 不 success 时 approve **自己判红**。
+  # 不能靠 needs 把它 skip —— canary PR #24 实测：selftest 红、approve 被 skip，而 GitHub 报
+  # `mergeable: MERGEABLE` + `mergeStateStatus: UNSTABLE`，`gh pr merge` 就把那条打坏了测试的 PR
+  # 合进了 main。**「required check 从没上报过」（Expected，会 BLOCKED）与「上报了但 skipped」
+  # （按满足处理）不是一回事**，后者能让整条保护形同虚设。
+  # 接受的语义：**任意一条单测失败都会挡住合并**，包括与本次改动无关的失败。取舍理由是本仓库的
+  # 测试只用 node 内置模块、不联网、自建临时 git 仓库；真出现 flaky 应该修测试，而不是把这道闸
+  # 拆掉 —— 拆的诱惑很大，因为每次红的都是别人的投稿。
   # -------------------------------------------------------------------
   selftest:
     name: selftest
@@ -756,12 +759,35 @@ jobs:
   # -------------------------------------------------------------------
   approve:
     name: approve
-    # selftest 红的时候 approve 不跑（被 skip）：required check 没成功 = 不放行。
-    # 判定投稿的这套代码自己没过检，就没有资格批准任何投稿。
+    # `if: always()` 不是保险丝式写法，是被一条实测打脸后加的：canary PR #24 里 selftest 红，
+    # approve 因为 needs 没满足而被 **skip**，结果 GitHub 报 `mergeStateStatus: UNSTABLE` +
+    # `mergeable: MERGEABLE`，`gh pr merge` 直接把它合进了 main ——
+    # **「required check 没跑过」和「required check 被 skip」不是一回事**：前者是 Expected 会
+    # BLOCKED（本文上面修 paths 过滤那次就是撞在这上面），后者按满足处理。所以「上游红了就
+    # 让 approve 不跑」等于把闸门拆了还自以为关着。
+    #
+    # 现在 approve 永远跑，并且第一步先把「上游有没有全部成功」当成自己的判据：任何一环不是
+    # success（红、跳过、取消）都直接 exit 1，让 required check 明确变红。
     needs: [audit, selftest]
+    if: always()
     runs-on: ubuntu-latest
     permissions: {}
     steps:
+      - name: 上游没过检就没有批准资格（fail closed）
+        shell: bash
+        env:
+          AUDIT_RESULT: ${{ needs.audit.result }}
+          SELFTEST_RESULT: ${{ needs.selftest.result }}
+        run: |
+          set -euo pipefail
+          if [ "${AUDIT_RESULT:-}" != "success" ] || [ "${SELFTEST_RESULT:-}" != "success" ]; then
+            echo "::error::拒绝批准：audit=${AUDIT_RESULT:-<空>} selftest=${SELFTEST_RESULT:-<空>}，两者都必须是 success。"
+            echo "::error::判定器自己没过检（或扫描本身没跑成）时，这条链没有任何批准结论 —— 这里必须是红，"
+            echo "  不能是「跳过」。跳过在 GitHub 眼里等于满足 required check。"
+            exit 1
+          fi
+          echo "上游都过了：audit=success selftest=success，继续按内容与推导判定。"
+
       - name: 只批准「低风险 + 首次收录」或「可复算的索引重建」
         shell: bash
         env:

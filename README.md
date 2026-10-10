@@ -356,6 +356,45 @@ App 名下的提交会正常触发 —— 投稿 PR #15 就是 App 开的，`aud
   卡死，和本文上面修掉的「祖先检查冻死机器人投稿」是同一个形状。
 
 
+### 一件被 canary 实测推翻的事：`skipped` 的 required check 等于**满足**
+
+接完 `selftest` 之后我写的设计是「selftest 红 → `approve` 因 needs 不满足而被 skip →
+required check 没成功 → 不放行」。听起来很顺，而且和本仓库以前那条经验（「check 从来没跑过」
+和「check 失败」对 GitHub 是同一件事，PR 会永远 BLOCKED）长得几乎一样。
+
+**它是错的。** 为了验证我开了一条故意打坏一个断言的 canary PR #24，实际结果是：
+
+```
+selftest        fail
+approve         skipping        ← 不是 fail，是 skip
+Scan & Triage   pass
+gh pr view →  mergeable: MERGEABLE, mergeStateStatus: UNSTABLE
+gh pr merge 24 → 合进去了
+```
+
+所以要分清两种「没有绿」：
+
+| 状态 | ruleset 眼里的意思 |
+| --- | --- |
+| required check **从没上报过**（Expected） | 不满足 → BLOCKED（本文 paths 过滤那次撞的就是这个） |
+| 上报了但结论是 **skipped** | **按满足处理** → 放行 |
+
+也就是说「上游红了就让 approve 不跑」等于把闸门拆了还自以为关着 —— 而且它比没装闸更危险，
+因为看的人会以为那个红色 job 挡住了什么。
+
+改法：`approve` 加 `if: always()`，并把自己**第一步**的判据设成「`needs.audit.result` 与
+`needs.selftest.result` 都必须是 `success`」，否则 `exit 1` —— 让 required check 明确**变红**，
+而不是消失。这样 audit 自己崩了（扫描器挂掉、覆盖度闸开火）也不会出现「approve 缺席但被当成
+通过」。
+
+`test/canary-selftest-proof.test.mjs` 已从 main 删掉（forward delete，见 #25），canary 只在
+「开一条会红的 PR、验证它红且合不动、然后关掉」这个用途下存在。
+
+顺带记一次我自己造的第二类错：把新 step 插在既有的 `steps:` **前面**，于是同一个 job 里出现
+两个 `steps:` —— 这不是「CI 变红」，而是**整条 workflow 解析失败、一条 check 都不产生**，
+正好落进上面表格的第一行，所有 PR 一起卡死。仓库不许装 YAML 依赖，所以补了
+`duplicateJobKeys()` 这条结构检查（缩进恰好 4 的 key 不许重复）来拦这一类。
+
 ## pending 目录是递归的
 
 Worker 开 PR 时写的是 **嵌套路径** `pending/<id>/<versionCode>.json`
