@@ -28,6 +28,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { buildIndex, markApproved, collectPendingFiles } from './build-index.mjs';
@@ -273,6 +274,9 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   return verdict.ok ? 0 : 1;
 }
 
-if (process.argv[1] && import.meta.url === `file://${path.resolve(process.argv[1]).replace(/\\/g, '/')}`) {
+// 入口判据用 resolve 比对绝对路径，不要拿 argv[1] 拼 file:// URL —— 与 audit/scan.mjs
+// 同一条坑：拼出来的串在 Windows 上永远不等于 import.meta.url，这个「验索引是否真由
+// base 推导」的 CLI 就会静默 exit 0，看起来跑了、其实什么都没判。
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().then((rc) => { process.exitCode = rc; });
 }

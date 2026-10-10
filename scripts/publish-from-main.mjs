@@ -26,6 +26,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 
 import { collectPendingFiles, markApproved, isApproved } from './build-index.mjs';
 
@@ -290,6 +291,10 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   return 0;
 }
 
-if (process.argv[1] && import.meta.url === `file://${path.resolve(process.argv[1]).replace(/\\/g, '/')}`) {
+// 入口判据用 resolve 比对绝对路径，不要拿 argv[1] 拼 file:// URL：
+// 拼出来的那串在 Windows 上永远不等于 import.meta.url（缺第三个斜杠），于是这个
+// 负责「盖章」的 CLI 在开发机上静默 exit 0、什么也不做 —— 与 audit/scan.mjs 刚在
+// Linux runner 上踩到的同一个坑（那边 argv[1] 还是相对的，坏得更彻底）。
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().then((rc) => { process.exitCode = rc; });
 }
