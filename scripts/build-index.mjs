@@ -36,11 +36,35 @@ const SHA256_RE = /^[0-9a-fA-F]{64}$/;
  *
  * audit.yml 的 publish 步骤在 pending JSON 里写入：
  *   { "audit": { "status": "auto-approved", "by": "ci:auto-approved", "at": "…", "risk": "low" } }
- * build-index.mjs 只在 status === "auto-approved" 时放行，与 ``approved: true``
- * （人工/本地直接标记）等价。改这里必须同步改 contrib/audit/workflows/audit.yml。
+ * 人工放行写的是同一个字段、不同的 status：
+ *   { "audit": { "status": "human-approved", "by": "gh:<login>@<reviewId>", … } }
+ *
+ * 改这里必须同步改 contrib/audit/workflows/audit.yml 与本仓库 .github/workflows/audit.yml。
  */
 export const APPROVAL_FIELD = 'audit';
 export const APPROVED_STATUS = 'auto-approved';
+export const HUMAN_APPROVED_STATUS = 'human-approved';
+export const APPROVED_STATUSES = [APPROVED_STATUS, HUMAN_APPROVED_STATUS];
+
+/**
+ * pending 条目是否为「审核通过」。**只认契约字段 `audit`**，且章上必须有人。
+ *
+ * 以前这里还认两种快捷写法：`{ approved: true }` 与 `{ review: { approved: true } }`。
+ * 它们等于一条绕过审核的后门 —— 任何人（包括将来招募来的贡献者）只要在
+ * pending JSON 里手加一个字段，不需要改索引结构、不需要 CI 盖章，就能把包送进索引。
+ * 「已收录模块的版本更新一律人工审核」这条核心防线会被它整个作废。
+ *
+ * 同理，`{ audit: { status: "auto-approved" } }` 这种**没有 by 的无主章**也不算通过：
+ * 追责链要回答的是「谁批的」，一个不带署名的章和没有章等价。
+ * （`by` 可外部复验 —— 那是 P4 双签要加严的地方，这里先把「有没有署名字段」钉住。）
+ */
+export function isApproved(raw) {
+  if (!raw || typeof raw !== 'object') return false;
+  const a = raw[APPROVAL_FIELD];
+  if (!a || typeof a !== 'object') return false;
+  if (!APPROVED_STATUSES.includes(a.status)) return false;
+  return typeof a.by === 'string' && a.by.trim() !== '';
+}
 
 /** 把 CI 的审核结论写进一个 pending 条目（幂等：重复调用结果相同）。 */
 export function markApproved(entry, meta = {}) {
@@ -51,20 +75,6 @@ export function markApproved(entry, meta = {}) {
     ...meta,
   };
   return out;
-}
-
-/**
- * pending 条目是否为“审核通过”。三种写法都认：
- *   CI 写的 { audit: { status: "auto-approved" } }（契约字段）
- *   人工写的 { approved: true }
- *   人工写的 { review: { approved: true } }
- */
-export function isApproved(raw) {
-  if (!raw || typeof raw !== 'object') return false;
-  if (raw[APPROVAL_FIELD] && raw[APPROVAL_FIELD].status === APPROVED_STATUS) return true;
-  if (raw.approved === true) return true;
-  if (raw.review && raw.review.approved === true) return true;
-  return false;
 }
 
 function isNonEmptyString(v) {

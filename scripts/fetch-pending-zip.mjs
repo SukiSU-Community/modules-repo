@@ -41,16 +41,89 @@ export function pickVersion(raw) {
 }
 
 /**
+ * 允许 runner 去取 zip 的主机。
+ *
+ * pending JSON 里的 `zipUrl` 是**投稿方可控的文本**（Worker 写的是 GitHub Release 直链，
+ * 但这个 JSON 任何有仓库写权限的人都能手搓）。原来照单全收并 `redirect:'follow'`，
+ * 于是两个问题：① 指到 `http://169.254.169.254/` 之类，让 CI runner 替攻击者发内部请求
+ * （SSRF）；② 合法主机 302 到一个外部主机会被一路跟下去，白名单形同虚设。
+ *
+ * 只放行 GitHub 的 release 下载域：`github.com` 给入口，
+ * `objects.githubusercontent.com` 是它 302 之后真正吐字节的那个。
+ */
+export const ALLOWED_DOWNLOAD_HOSTS = new Set(['github.com', 'objects.githubusercontent.com']);
+const MAX_REDIRECTS = 5;
+
+/**
+ * 校验一个下载地址能不能取。返回 { ok, url, error }。
+ *
+ * 判据不止主机名：还要求 https、URL 里不带凭据（`https://github.com@evil.tld/`
+ * 这种经典写法靠解析主机名就能挡掉），并且**当条目同时给了 releaseTag+assetName 时，
+ * 直链落到的文件名必须就是那个 asset**。这条是关键 —— 否则元数据写一个干净的
+ * sha256、zipUrl 指向另一个包，扫的是 A 合的是 B，整个内容寻址的信任就空了。
+ */
+export function assertDownloadUrl(url, raw = {}) {
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    return { ok: false, error: `下载地址不是合法 URL：${String(url).slice(0, 120)}` };
+  }
+  if (u.protocol !== 'https:') {
+    return { ok: false, error: `下载地址必须是 https，收到 ${u.protocol}` };
+  }
+  if (u.username || u.password) {
+    return { ok: false, error: '下载地址里不能带凭据（user:pass@host 形式的 URL 一律拒）' };
+  }
+  const host = u.hostname.toLowerCase();
+  if (!ALLOWED_DOWNLOAD_HOSTS.has(host)) {
+    return { ok: false, error: `下载地址主机不在允许列表内：${host}（只允许 ${[...ALLOWED_DOWNLOAD_HOSTS].join(', ')}）` };
+  }
+  const asset = typeof raw.assetName === 'string' ? raw.assetName.trim() : '';
+  if (asset) {
+    const segs = decodeURIComponent(u.pathname).split('/').filter(Boolean);
+    const last = segs[segs.length - 1] || '';
+    if (last !== asset) {
+      return { ok: false, error: `下载地址落到的是「${last}」，与元数据声明的 assetName「${asset}」不一致 —— 扫的包和合的包可能不是同一个` };
+    }
+  }
+  const tag = typeof raw.releaseTag === 'string' ? raw.releaseTag.trim() : '';
+  if (tag && !decodeURIComponent(u.pathname).includes(`/releases/download/${tag}/`)) {
+    return { ok: false, error: `下载地址不在 release tag「${tag}」的下载路径下` };
+  }
+  return { ok: true, url: u.toString() };
+}
+
+/**
  * 从 pending 条目解析 zip 下载地址。三种写法都支持：
  *   1. versions[].zipUrl                      —— Worker 实际写出的字段
  *   2. 顶层 zipUrl                            —— 简化条目
  *   3. releaseTag + assetName                 —— 拼 GitHub Release 直链
+ *
+ * 解析完必须过 assertDownloadUrl；不通过就报错而不是照取。
  */
 export function resolveDownloadUrl(raw, opts = {}) {
   const v = pickVersion(raw);
   const direct = (v && typeof v.zipUrl === 'string' ? v.zipUrl.trim() : '')
     || (typeof raw.zipUrl === 'string' ? raw.zipUrl.trim() : '');
-  if (direct) return { url: direct, source: 'zipUrl' };
+  if (direct) {
+    // 本地来源（file:// 或磁盘上的路径，含根本不成 URL 的串）是离线自测用的，CI 里默认不认：
+    // pending JSON 的 zipUrl 是投稿方可控的文本，允许它指本地路径就等于允许读 runner
+    // 文件系统上的任意文件。要开只能显式传 --allow-local-zipurl。
+    if (!/^https?:\/\//i.test(direct)) {
+      if (opts.allowLocal !== true) {
+        return {
+          url: '',
+          source: 'zipUrl',
+          error: `zipUrl 不是 http(s) 地址（「${direct.slice(0, 120)}」），按本地来源默认拒绝；离线自测请显式加 --allow-local-zipurl`,
+        };
+      }
+      return { url: direct, source: 'zipUrl-local' };
+    }
+    const checked = assertDownloadUrl(direct, raw);
+    if (!checked.ok) return { url: '', source: 'zipUrl', error: checked.error };
+    return { url: checked.url, source: 'zipUrl' };
+  }
 
   const tag = typeof raw.releaseTag === 'string' ? raw.releaseTag.trim() : '';
   const asset = typeof raw.assetName === 'string' ? raw.assetName.trim() : '';
@@ -71,17 +144,42 @@ export function resolveDownloadUrl(raw, opts = {}) {
   return { url: '', source: 'none', error: 'pending 条目里没有 zipUrl，也没有 releaseTag+assetName' };
 }
 
-/** 下载一个 URL 到内存缓冲（zip 需整体读入才能交给 scan.mjs）。 */
+/**
+ * 下载一个 URL 到内存缓冲（zip 需整体读入才能交给 scan.mjs）。
+ *
+ * 重定向**自己跟**而不是 `redirect:'follow'`：GitHub 的 release 直链会 302 到
+ * objects.githubusercontent.com，那是合法的；但「跟随」也意味着攻击者可以让
+ * github.com 的 URL 一路跳到任何主机 —— 白名单只在第一跳生效等于没有白名单。
+ * 所以每一跳都重新过 assertDownloadUrl（按主机/协议/凭据判），跳数封顶 MAX_REDIRECTS。
+ */
 export async function downloadToBuffer(url, opts = {}) {
   const timeout = opts.timeoutMs ?? FETCH_TIMEOUT_MS;
-  const ac = typeof AbortController === 'function' ? new AbortController() : null;
-  const timer = ac ? setTimeout(() => ac.abort(), timeout) : null;
-  try {
-    const res = await fetch(url, {
-      redirect: 'follow',
-      ...(ac ? { signal: ac.signal } : {}),
-      headers: { 'user-agent': 'sukisu-module-audit', accept: 'application/zip,*/*' },
-    });
+  let next = String(url);
+
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const checked = assertDownloadUrl(next, {});
+    if (!checked.ok) throw new Error(`下载地址不合法：${checked.error}`);
+
+    const ac = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = ac ? setTimeout(() => ac.abort(), timeout) : null;
+    let res;
+    try {
+      res = await fetch(checked.url, {
+        redirect: 'manual',
+        ...(ac ? { signal: ac.signal } : {}),
+        headers: { 'user-agent': 'sukisu-module-audit', accept: 'application/zip,*/*' },
+      });
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+
+    if ([301, 302, 303, 307, 308].includes(res.status)) {
+      const loc = res.headers.get('location');
+      if (!loc) throw new Error(`HTTP ${res.status} 却没有 Location 头`);
+      next = new URL(loc, checked.url).toString();
+      continue;
+    }
+
     if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
     const len = Number(res.headers.get('content-length') ?? '');
     if (Number.isFinite(len) && len > MAX_DOWNLOAD_BYTES) {
@@ -92,9 +190,8 @@ export async function downloadToBuffer(url, opts = {}) {
       throw new Error(`zip 过大：${buf.byteLength} 字节 > 上限 ${MAX_DOWNLOAD_BYTES}`);
     }
     return buf;
-  } finally {
-    if (timer) clearTimeout(timer);
   }
+  throw new Error(`重定向次数超过上限 ${MAX_REDIRECTS}，停止跟随`);
 }
 
 export function sha256Hex(bytes) {
@@ -107,11 +204,12 @@ export function readLocalFile(p) {
 }
 
 export function parseArgs(argv) {
-  const opts = { _: [], outDir: null, force: false };
+  const opts = { _: [], outDir: null, force: false, allowLocal: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--out-dir' && i + 1 < argv.length) { opts.outDir = path.resolve(argv[++i]); continue; }
     if (a === '--force') { opts.force = true; continue; }
+    if (a === '--allow-local-zipurl') { opts.allowLocal = true; continue; }
     if (a === '--owner' && i + 1 < argv.length) { opts.owner = argv[++i]; continue; }
     if (a === '--repo' && i + 1 < argv.length) { opts.repo = argv[++i]; continue; }
     opts._.push(a);
@@ -185,7 +283,7 @@ export async function main(argv = process.argv.slice(2)) {
 
       try {
         if (!fs.existsSync(target) || force) {
-          const r = resolveDownloadUrl(raw, { owner: opts.owner, repo: opts.repo });
+          const r = resolveDownloadUrl(raw, { owner: opts.owner, repo: opts.repo, allowLocal: opts.allowLocal });
           rec.zipUrl = r.url;
           if (!r.url) throw new Error(r.error || '无法解析下载地址');
 

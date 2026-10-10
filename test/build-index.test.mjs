@@ -6,20 +6,33 @@ import path from 'node:path';
 import {
   buildIndex, normalizeEntry, isApproved,
   collectPendingFiles, markApproved, parseArgs, main,
-  APPROVAL_FIELD, APPROVED_STATUS,
+  APPROVAL_FIELD, APPROVED_STATUS, HUMAN_APPROVED_STATUS,
 } from '../scripts/build-index.mjs';
 import { validateIndex } from '../scripts/validate-index.mjs';
 
 const sha = (n) => n.toString(16).padStart(64, '0');
 
-/** 造一个最小合法 pending 条目。 */
+/**
+ * 造一个最小合法 pending 条目。
+ *
+ * `approved: true|false` 只是这里方便写字面量：**出桩时一律翻译成契约字段 `audit`**。
+ * 夹具以前是直接发 `{ approved: true }` 的，而那种快捷写法本身就是被 isApproved
+ * 关掉的那条后门 —— 夹具继续用它，等于所有测试都在测一条早晚会堵上的路。
+ * 需要显式测后门行为的用例，自己手写那个字段，别走这里。
+ */
 function entry(over = {}) {
+  const { approved = true, ...rest } = over;
   return {
     id: 'demo_mod',
     name: 'Demo',
     author: 'tester',
     description: 'demo module',
-    approved: true,
+    audit: {
+      status: approved ? APPROVED_STATUS : 'needs-human-review',
+      by: 'test:ci',
+      at: '2026-01-01T00:00:00.000Z',
+      risk: 'low',
+    },
     versions: [
       {
         version: 'v1.0.0',
@@ -30,7 +43,7 @@ function entry(over = {}) {
         sha256: sha(1),
       },
     ],
-    ...over,
+    ...rest,
   };
 }
 
@@ -108,15 +121,24 @@ test('情况三：id 冲突且 sha256 不同时不覆盖', () => {
   assert.equal(conflicts[0].incomingSha256, sha(0xdead));
 });
 
-test('补充：未通过审核的条目被忽略', () => {
+test('补充：未通过审核的条目被忽略，且手写的快捷写法不再算通过', () => {
   const { index, stats } = buildIndex({
     index: emptyIndex,
-    entries: [entry({ approved: false }), { ...entry({ id: 'x' }), review: { approved: true } }],
+    entries: [entry({ approved: false }), entry({ id: 'x' })],
   });
   assert.equal(index.modules.length, 1);
   assert.equal(index.modules[0].id, 'x');
   assert.equal(stats.skipped, 1);
-  assert.equal(isApproved({ review: { approved: true } }), true);
+
+  // 这两条以前都会被 isApproved 认下来 —— 等于任何人手加一个字段就能绕过 CI 盖章
+  // 把包送进索引，「版本更新一律人工审核」这条防线会被整个作废。
+  assert.equal(isApproved({ approved: true }), false, '手写 approved:true 不该算通过');
+  assert.equal(isApproved({ review: { approved: true } }), false, '手写 review.approved 不该算通过');
+  // 有章但没署名：追责链回答不了「谁批的」，与没有章等价
+  assert.equal(isApproved({ [APPROVAL_FIELD]: { status: APPROVED_STATUS } }), false, '无主章不该算通过');
+  assert.equal(isApproved({ [APPROVAL_FIELD]: { status: APPROVED_STATUS, by: '   ' } }), false);
+  // 人工放行走同一个字段，但 status 不同、且必须署名
+  assert.equal(isApproved({ [APPROVAL_FIELD]: { status: HUMAN_APPROVED_STATUS, by: 'gh:yufeng-liang@1234' } }), true);
 });
 
 test('补充：zipUrl 为空的条目被判非法，不写进索引', () => {
