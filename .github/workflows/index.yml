@@ -1,0 +1,221 @@
+# ---------------------------------------------------------------------------
+# 合并后重建索引（main 上的自动放行闭环）
+#
+# 这个 workflow 存在的理由：分支保护要求「进 main 必须过 PR、必须过 approve check」，
+# 而审核流水线不能再直接往 main 推索引提交（原因见 audit.yml 里 publish job 的长注释：
+# 往 PR 分支回写索引会同时踩上「新 sha 的 required check 还没跑完就无法合并」和
+# 「删除 pending/** 触发 synchronize 再审核一遍」，两个坑互锁）。
+#
+# 于是不变式变成：
+#   main 的唯一入口 = 合并一个 approve 成功的 PR
+#   索引 = main 内容的函数（本 workflow 生成，提交带 [skip ci]，不再自我触发）
+#
+# 关键安全点：合并进 main 的 pending JSON 上**没有**审核章。章由本 workflow 盖，
+# 而盖之前必须回查证据 —— 查的是那次合并对应 PR 的 head sha 上名为 `approve` 的
+# check 的结论（由 scripts/publish-from-main.mjs 执行）。刻意不依赖以下任何一种：
+#   * PR 标签：有 triage 权限的人随手就能加一个 auto-approved；
+#   * PR 评论：正文里混着投稿者可控文本与模型产出；
+#   * 「分支保护肯定配好了」：配置是别人可以改的，而 check 结论改不了。
+#
+# name 连接点：approve（audit.yml 的 job 名 / publish-from-main.mjs 的 APPROVE_CHECK_NAME）。
+# ---------------------------------------------------------------------------
+
+name: Rebuild Index From Main
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'pending/**'
+      - 'json/modules.json'
+      - 'scripts/build-index.mjs'
+      - 'scripts/publish-from-main.mjs'
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: '按哪一次 main 上的提交来认定 PR（留空=本次推送；重试旧投稿时填那次的 sha）'
+        required: false
+      dry_run:
+        description: '只判定与盖章，不提交索引'
+        type: boolean
+        required: false
+        default: false
+
+# 串行：这个 job 写 main，两个并发 run 会互相踩索引文件与 pending 删除。
+# cancel-in-progress 必须是 false —— 中途取消会留下「runner 里已盖章、main 上未提交」的
+# 半截判断，而下一次 run 看到的还是旧的。
+concurrency:
+  group: index-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  checks: read         # 取 approve 的结论
+  pull-requests: write # 由提交反查 PR + 把结果贴回 PR
+
+jobs:
+  index:
+    name: Stamp And Rebuild
+    runs-on: ubuntu-latest
+    steps:
+      # 要 diff-tree 出这一次提交改了哪些 pending，所以必须拿到那个提交本身。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 定位仓库结构与本次认定的提交
+        id: layout
+        shell: bash
+        env:
+          FORCE_PREFIX: ${{ vars.MODULE_REPO_PREFIX || '' }}
+          INPUT_SHA: ${{ github.event.inputs.sha }}
+          PUSHED_SHA: ${{ github.event.after }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          PREFIX="$FORCE_PREFIX"
+          if [ -z "$PREFIX" ] && [ -d contrib/repo/pending ]; then PREFIX="contrib/repo"; fi
+          PENDING_DIR="${PREFIX:+$PREFIX/}pending"
+          echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
+          echo "pending_dir=$PENDING_DIR" >> "$GITHUB_OUTPUT"
+          echo "index_file=${PENDING_DIR%pending}json/modules.json" >> "$GITHUB_OUTPUT"
+          echo "scripts_dir=${PENDING_DIR%pending}scripts" >> "$GITHUB_OUTPUT"
+
+          # dispatch 填的 sha 优先；push 用 after；其余兜到当前 head。
+          SHA="${INPUT_SHA:-${PUSHED_SHA:-$HEAD_SHA}}"
+          SHA="${SHA//[^0-9a-fA-F]/}"   # 只当十六进制串处理，外部文本不能进后面的命令
+          if [ "${#SHA}" -lt 40 ]; then echo "::error::拿不到合法的提交号"; exit 1; fi
+          git cat-file -e "${SHA}^{commit}" || { echo "::error::${SHA} 不在这个仓库里"; exit 1; }
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+          # 只认定「这一个提交带进 main 的 pending 文件」。不做全目录扫描是有意的：
+          # main 上可能留着历史里没批下来的条目，把它们按「最近一次合并的批准」盖章，
+          # 等于给无主的条目借一张章。
+          git diff-tree -r --no-commit-id --name-only "$SHA" -- "$PENDING_DIR" \
+            | sed "s#^#${GITHUB_WORKSPACE}/#" > changed.txt || true
+          echo "changed_count=$(grep -c . changed.txt || true)" >> "$GITHUB_OUTPUT"
+          echo "本次提交带入/改动的 pending 文件："
+          cat changed.txt
+
+      - name: 盖章（回查 approve 的结论）
+        id: stamp
+        # 未获批准时后面几步全部跳过，但结果仍要贴回 PR，所以这里不直接让 job 红；
+        # 判红留在最后一步。
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.layout.outputs.sha }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          PENDING_DIR: ${{ steps.layout.outputs.pending_dir }}
+          SCRIPTS_DIR: ${{ steps.layout.outputs.scripts_dir }}
+          DRY: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          ARGS=(--pending "$PENDING_DIR" --sha "$SHA" --owner "$OWNER" --repo "$REPO"
+                --report publish-from-main.report.json)
+          # --changed 只在真有改动时传：不传 = 脚本按「全部 pending」处理，
+          # 而空列表会被它当成范围限制，一个都不盖。
+          if [ -s changed.txt ]; then
+            while IFS= read -r p; do
+              [ -n "$p" ] && ARGS+=(--changed "$p")
+            done < changed.txt
+          fi
+          if [ "${DRY:-}" = "true" ]; then ARGS+=(--dry-run); fi
+          node "$SCRIPTS_DIR/publish-from-main.mjs" "${ARGS[@]}"
+
+      - name: 合并进索引（build-index.mjs）
+        if: steps.stamp.outcome == 'success'
+        shell: bash
+        env:
+          PENDING_DIR: ${{ steps.layout.outputs.pending_dir }}
+          INDEX_FILE: ${{ steps.layout.outputs.index_file }}
+          SCRIPTS_DIR: ${{ steps.layout.outputs.scripts_dir }}
+        run: |
+          set -euo pipefail
+          set +e
+          # --consume 清掉已合并的 pending：不清它们就永久留在仓库里、每次重跑重复处理。
+          # 安全前提：build-index.mjs 在有冲突/非法条目时自己跳过删除，不会在冲突未解决时丢数据。
+          node "$SCRIPTS_DIR/build-index.mjs" --pending "$PENDING_DIR" --index "$INDEX_FILE" --consume 2>&1 | tee build-index.log
+          # 管道里 $? 拿到的是 tee 的退出码，必须用 PIPESTATUS[0] 取 node 自己的，
+          # 否则 BUILD_RC 恒为 0，回帖会把「有冲突」说成「已入索引」。
+          echo "build_rc=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          set -e
+
+      - name: 校验索引（validate-index.mjs）
+        if: steps.stamp.outcome == 'success'
+        shell: bash
+        env:
+          INDEX_FILE: ${{ steps.layout.outputs.index_file }}
+          SCRIPTS_DIR: ${{ steps.layout.outputs.scripts_dir }}
+        run: |
+          set -euo pipefail
+          # 宁可不进索引，也不进坏索引：过不了校验就不提交。
+          node "$SCRIPTS_DIR/validate-index.mjs" "$INDEX_FILE"
+
+      - name: 提交（带 [skip ci]，否则会自己触发自己成环）
+        if: steps.stamp.outcome == 'success' && github.event.inputs.dry_run != 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(index): rebuild after merge [skip ci]"
+          file_pattern: |
+            ${{ steps.layout.outputs.index_file }}
+            ${{ steps.layout.outputs.pending_dir }}
+
+      - name: 把结果贴回 PR
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          STAMP_OUTCOME: ${{ steps.stamp.outcome }}
+          BUILD_RC: ${{ steps.build.outputs.build_rc }}
+          SHA: ${{ steps.layout.outputs.sha }}
+        with:
+          script: |
+            const fs = require('fs');
+            let rep = {};
+            try { rep = JSON.parse(fs.readFileSync('publish-from-main.report.json', 'utf8')); } catch {}
+            if (!rep.pr) {
+              // 反查不到 PR 时只在本 run 里说明，不去猜该通知谁。
+              core.notice('report 里没有 PR 号，跳过回帖；原因见上一步日志。');
+              return;
+            }
+            if (process.env.STAMP_OUTCOME === 'success' && rep.reason === 'no-pending') return;
+
+            const log = fs.existsSync('build-index.log') ? fs.readFileSync('build-index.log', 'utf8') : '';
+            const MAX = 20000;
+            let body;
+            if (process.env.STAMP_OUTCOME !== 'success') {
+              body = `## 索引未更新\n\n`
+                + `这次合并带进 \`main\` 的 pending 条目**没有**被盖审核章，因此不会进正式索引。\n\n`
+                + `- 原因：${rep.reason || '(publish-from-main 没给原因，见该 run 日志)'}\n`
+                + `- 认定的提交：\`${process.env.SHA}\`\n\n`
+                + `要么让该 PR 上名字为 \`approve\` 的 check 变成 success 后重跑本 workflow，`
+                + `要么走人工双签盖章（见 GOVERNANCE.md）。这里不做「看起来像通过了就盖」。`;
+            } else {
+              const rc = process.env.BUILD_RC || '0';
+              body = `## 索引已重建\n\n`
+                + `- 盖章依据：\`approve\` check 在 \`${rep.headSha || process.env.SHA}\` 上为 success（PR #${rep.pr}）\n`
+                + `- 盖章的 id：${(rep.ids || []).map((x) => '`' + x + '`').join('、') || '（无新条目）'}\n`
+                + `- build-index.mjs 退出码：\`${rc}\`${rc === '0' ? ' ✅' : ' ⚠️ 有冲突/非法条目，见下面输出'}\n\n`;
+              if (log) {
+                body += `<details><summary>build-index.mjs 输出</summary>\n\n\`\`\`\n`
+                  + (log.length > MAX ? log.slice(0, MAX) + '\n…（已截断）' : log) + '\n```\n</details>';
+              }
+            }
+            await github.rest.issues.createComment({
+              issue_number: rep.pr, owner: context.repo.owner, repo: context.repo.repo, body,
+            });
+
+      - name: 未获批准时让本 run 红
+        if: steps.stamp.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::error::publish-from-main 拒绝盖章：原因见上一步与 PR 上的说明。"
+          echo "模块不会进正式索引 —— 这不是可以忽略的告警。"
+          exit 1

@@ -42,6 +42,10 @@ on:
         required: false
         type: string
 
+concurrency:
+  group: audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: write
@@ -59,6 +63,11 @@ jobs:
       needs_human_review: ${{ steps.triage.outputs.needs_human_review }}
       module_id: ${{ steps.triage.outputs.module_id }}
       module_version: ${{ steps.triage.outputs.module_version }}
+      reasons: ${{ steps.triage.outputs.reasons }}
+      # found=false 表示「这个 PR 里没有待审投稿内容」（比如只是删除 pending，
+      # 或改的是 scripts/docs）。它必须和「审过但不通过」区分开：前者没有批准事项，
+      # 后者才有 —— 混在一起会让维护类 PR 永远卡在一个不会变绿的 required check 上。
+      found: ${{ steps.locate.outputs.found }}
     steps:
       - name: Checkout PR 分支
         uses: actions/checkout@v4
@@ -598,183 +607,119 @@ jobs:
             });
 
   # -------------------------------------------------------------------
-  # 仅有「低风险 + 首次收录」才会走到这一 job；其余情况该 job 被跳过，
-  # 因此审核不通过的内容不会出现在正式索引里。
+  # 批准闸：把「扫完了」和「可以合并」拆成两个 check。
   #
-  # 断点 ③ 的修复点：这里**不再自己拼 JSON**。原先只写
-  #   { id, version, addedAt, approvedBy }
-  # 缺 versions / name / author / description / verified，下次 build-index 会崩，
-  # validate-index 也必然失败。正确做法是：把 CI 的审核结论以约定字段
-  #   { audit: { status: "auto-approved", ... } }
-  # 写进 pending 条目，然后交给 build-index.mjs 去合并 —— 索引结构只有一个地方定义。
+  # 为什么必须拆：audit job 绿只说明扫描跑通了，不代表结论是放行。required status
+  # check 若直接钉在 audit 上，那么「中风险、需人工审核」的 PR 同样能满足 required
+  # check —— 分支保护就形同虚设。所以保护要要求的是 approve 这一条，而它只在
+  # action == auto-approve 时成功。
+  #
+  # 这个 job 的 name 是三处约定唯一的连接点：本文件、contrib/audit 模板、
+  # scripts/publish-from-main.mjs 里的 APPROVE_CHECK_NAME。改 job 名等于把闸门拆掉，
+  # 而 test/publish-from-main.test.mjs 钉住了这条字符串。
   # -------------------------------------------------------------------
-  #   ⚠️ 这一 job 目前仍然是「直接往 main 推索引改动」，所以 main 上不能开
-  #   「require a pull request / restrict pushes」，否则自动放行会当场失败。
-  #   想上分支保护，必须先把这里拆成两步（合并 PR → 由 push 到 main 的后续流程重建索引），
-  #   原因见文末注释：往 PR 分支回写索引，会同时踩上「required check 对新 sha 还没跑完
-  #   就无法合并」和「删除 pending/** 触发 synchronize 再审核一遍」两个坑。
-  publish:
-    name: Merge Into Index
+  approve:
+    name: approve
     needs: audit
-    if: needs.audit.outputs.action == 'auto-approve'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: 只批准「低风险 + 首次收录」
+        shell: bash
+        env:
+          FOUND: ${{ needs.audit.outputs.found }}
+          ACTION: ${{ needs.audit.outputs.action }}
+          LABEL: ${{ needs.audit.outputs.label }}
+          RISK: ${{ needs.audit.outputs.risk }}
+          CHANGE_TYPE: ${{ needs.audit.outputs.change_type }}
+          MODULE_ID: ${{ needs.audit.outputs.module_id }}
+          REASONS: ${{ needs.audit.outputs.reasons }}
+        run: |
+          set -euo pipefail
+          # 没有待审投稿内容 = 没有批准事项。删除 pending、改脚本/文档这类 PR 必须能正常走，
+          # 否则 required check 会把所有维护类 PR 一起卡死（而它们的 check 永远不会发生）。
+          if [ "${FOUND:-}" != "true" ]; then
+            echo "本 PR 里没有待审投稿内容（found=${FOUND:-<空>}），无批准事项 —— 不代表其中任何投稿获准。"
+            exit 0
+          fi
+          if [ "${ACTION:-}" = "auto-approve" ] && [ "${LABEL:-}" = "auto-approved" ]; then
+            echo "批准：${MODULE_ID:-?} risk=${RISK:-?} changeType=${CHANGE_TYPE:-?}"
+            echo "依据：${REASONS:-（无）}"
+            exit 0
+          fi
+          {
+            echo "::error::未获批准：action=${ACTION:-<空>} label=${LABEL:-<空>} risk=${RISK:-<空>} changeType=${CHANGE_TYPE:-<空>}"
+            echo "::error::依据：${REASONS:-（无）}"
+            echo "::error::本 PR 不满足自动放行条件，需人工审核后走双签盖章流程（见 README/GOVERNANCE.md）。"
+          } >&2
+          exit 1
+
+  # -------------------------------------------------------------------
+  # 只做一件事：把已获批准的 PR 合进 main。索引不在这里生成。
+  #
+  # 为什么不在这里往 main 推索引提交，也不改成「先往 PR 分支写索引、再合并 PR」：
+  #   * 后者那次索引提交落在 pending/** 上，会触发 synchronize 把审核再跑一遍，
+  #     而新 head sha 的 required check 还没出结果时 `gh pr merge` 本身就过不去 ——
+  #     两个坑互锁，我在实现上一版方案时撞死在这里；
+  #   * 前者意味着 main 上永远不能开「require a pull request / restrict pushes」，
+  #     于是任何人都能用一次 push 绕过整条审核链。
+  #
+  # 拆成两段之后的不变式很干净：**main 的唯一入口是「合并一个 approve 成功的 PR」，
+  # 索引是 main 内容的函数**（重建见 .github/workflows/index.yml）。
+  #
+  # 代价是章不能再由 publish 现场盖：合并进 main 的 pending JSON 上没有审核结论，
+  # 所以下游必须回头取证据。index.yml 走的是「查那次 approve check 的结论」，
+  # 不读标签（有 triage 权限就能加）、不读评论（投稿者和模型都能影响它）、
+  # 也不假设分支保护肯定已经配好（配置能被别人关掉，而结论改不了）。
+  # -------------------------------------------------------------------
+  publish:
+    name: Merge Approved PR
+    needs: [audit, approve]
+    # 两个条件都要：approve 在「没有待审投稿内容」时也成功（那是给维护类 PR 让路的），
+    # 而合并只应该在「确有投稿且获自动放行」时发生。少写 found 这一半，
+    # 就等于任何改了 pending/** 的 PR 都能被机器人自动合进 main。
+    if: needs.audit.outputs.found == 'true' && needs.audit.outputs.action == 'auto-approve'
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      # 新增「把合并结果贴回 PR」步骤要写评论；job 级 permissions 会整体覆盖
-      # 顶层 permissions，缺这一行 createComment 会 403。
+      # 合并与「把结果贴回 PR」都要写 PR；job 级 permissions 会整体覆盖顶层，
+      # 少这一行 gh pr merge 与 createComment 都会 403。
       pull-requests: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.base_ref }}
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      # 与 audit job 同理：合并逻辑与索引基准必须来自 base，不能来自 PR 分支。
-      # 否则「PR 里改 build-index.mjs」就能决定什么东西可以进索引、进成什么样。
-      - name: 把合并逻辑与索引钉回 base 版本
+      - name: 合并
         shell: bash
         env:
-          BASE_REF: ${{ github.base_ref }}
-          EXPECTED_BASE: ${{ vars.BASE_BRANCH || 'main' }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MODULE_ID: ${{ needs.audit.outputs.module_id }}
         run: |
           set -euo pipefail
-          if [ "$BASE_REF" != "$EXPECTED_BASE" ]; then
-            echo "::error::PR 的 base 是 '$BASE_REF'，合并只认 '$EXPECTED_BASE'。"
+          if [ -z "${PR_NUMBER:-}" ]; then
+            echo "::error::这次运行不是来自 PR（workflow_dispatch 只能重跑扫描，合并要人工确认）。"
             exit 1
           fi
-          git fetch --no-tags --depth=200 origin "$BASE_REF"
-          BASE_SHA="$(git rev-parse "origin/$BASE_REF")"
-          for d in audit scripts json; do
-            if git ls-tree -r --name-only "$BASE_SHA" -- "$d" | grep -q .; then
-              rm -rf "$d"; git checkout "$BASE_SHA" -- "$d"
-            fi
-          done
-          git diff --quiet "$BASE_SHA" -- audit scripts json || {
-            echo "::error::钉定后仍与 base 不一致，拒绝合并。"; exit 1; }
-          echo "合并工具来自 base：$BASE_SHA"
+          # squash：投稿的 pending 条目与它的审核记录合成 main 上的一个提交，
+          # 之后 index 从这一个提交回溯到同一个 PR —— 追溯链不留「分支上还有谁的改动」这种悬念。
+          # 合并失败最常见的原因是保护/规则不允许 Actions 这个 actor 合并，报错直接抛出来，
+          # 不要静默：模块没进索引时必须看得见。
+          gh pr merge "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --squash
+          echo "已 squash 合并 #${PR_NUMBER}（${MODULE_ID:-?}），索引由 push 触发的 Rebuild Index From Main 生成"
 
-      - name: 取回待合并 pending
-        uses: actions/download-artifact@v4
-        with:
-          name: pending-to-publish
-          path: pending-to-publish
-
-      - name: 落位到索引仓库的 pending 目录
-        id: place
-        shell: bash
-        env:
-          FORCE_PREFIX: ${{ vars.MODULE_REPO_PREFIX || '' }}
-          MODULE_ID: ${{ needs.audit.outputs.module_id }}
-          MODULE_VERSION: ${{ needs.audit.outputs.module_version || '' }}
-          RISK: ${{ needs.audit.outputs.risk }}
-        run: |
-          set -euo pipefail
-          PREFIX="$FORCE_PREFIX"
-          if [ -z "$PREFIX" ] && [ -d contrib/repo/pending ]; then PREFIX="contrib/repo"; fi
-          PENDING_DIR="${PREFIX:+$PREFIX/}pending"
-          INDEX_FILE="${PREFIX:+$PREFIX/}json/modules.json"
-          SCRIPTS_DIR="${PREFIX:+$PREFIX/}scripts"
-          echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
-          echo "pending_dir=$PENDING_DIR" >> "$GITHUB_OUTPUT"
-          echo "index_file=$INDEX_FILE" >> "$GITHUB_OUTPUT"
-
-          # 把审核结论写进每一条待合并的 pending 条目。
-          # 字段名/status 与 build-index.mjs 的 APPROVAL_FIELD / APPROVED_STATUS 常量一致，
-          # 改任一侧都必须同步改另一侧（契约见 contrib/repo/README.md「审核标记契约」）。
-          node -e '
-            const fs=require("fs"), path=require("path");
-            const SRC="pending-to-publish", DST=process.argv[1], ID=process.argv[2], RISK=process.argv[3];
-            const walk=(d,out=[])=>{ for(const n of fs.readdirSync(d)){ const f=path.join(d,n);
-              if(fs.statSync(f).isDirectory()) walk(f,out); else if(n.toLowerCase().endsWith(".json")) out.push(f);} return out; };
-            if(!fs.existsSync(SRC)) { console.error("没有取回任何 pending 元数据，终止"); process.exit(1); }
-            const files=walk(SRC);
-            if(files.length===0){ console.error("pending-to-publish 是空的，终止"); process.exit(1); }
-            fs.mkdirSync(DST,{recursive:true});
-            let n=0;
-            for(const f of files){
-              const rel=path.relative(SRC,f);
-              const raw=JSON.parse(fs.readFileSync(f,"utf8"));
-              const list=Array.isArray(raw)?raw:[raw];
-              const stamped=list.map(e=>{
-                if(ID && e && e.id && e.id!==ID) return e;      // 只给本次审核通过的那个 id 盖章
-                return { ...e, audit:{ ...(e.audit||{}), status:"auto-approved",
-                         by:"ci:auto-approved", at:new Date().toISOString(), risk:RISK } };
-              });
-              const target=path.join(DST,rel);
-              fs.mkdirSync(path.dirname(target),{recursive:true});
-              fs.writeFileSync(target, JSON.stringify(Array.isArray(raw)?stamped:stamped[0],null,2)+"\n");
-              console.log("已盖章 -> "+target);
-              n++;
-            }
-            console.log("共盖章 "+n+" 个 pending 文件");
-          ' "$PENDING_DIR" "$MODULE_ID" "$RISK"
-
-      - name: 合并进索引（build-index.mjs）
-        id: build
-        shell: bash
-        env:
-          MODULE_ID: ${{ needs.audit.outputs.module_id }}
-        run: |
-          set -euo pipefail
-          PREFIX="${{ steps.place.outputs.prefix }}"
-          PENDING_DIR="${{ steps.place.outputs.pending_dir }}"
-          INDEX_FILE="${{ steps.place.outputs.index_file }}"
-          SCRIPTS_DIR="${PREFIX:+$PREFIX/}scripts"
-
-          echo "—— 合并前 ——"
-          node "$SCRIPTS_DIR/validate-index.mjs" "$INDEX_FILE" || echo "（合并前校验未通过，继续合并后再校验）"
-
-          # 断点 ③：build-index 遇到非法条目时会 exit 2。以前这一行直接让整个 job 失败，
-          # 后果是索引里什么都没有、PR 上也没有任何解释 —— 投稿者根本不知道自己为什么
-          # 失败，只能看到 CI 红了。
-          # 改法：退出码不再中断 job（真正的守门员是后面的「校验索引」步骤 —— 合并结果
-          # 过不了 validate-index 就不提交，宁可不进索引也不进坏索引），
-          # 但把 stdout 完整存到 build-index.log，下一步贴回 PR 让投稿者看得见。
-          set +e
-          # 注意：管道里 $? 拿到的是最后一个命令（tee）的退出码，不是 node 的。
-          # 必须用 PIPESTATUS[0] 取 node 自己的退出码，否则 BUILD_RC 恒为 0，
-          # 下一步会把「有冲突/非法条目」误报成「✅ 已合入索引」。
-          # 加 --consume 清掉已合并的 pending，否则它们会永久留在仓库、每次重跑都重复处理。
-          # 安全前提：build-index.mjs 在有冲突或非法条目时会自己跳过删除（见其 main() 删除块），
-          # 所以这里不必先判断退出码再决定是否传参 —— 传了也不会在冲突未解决时丢数据。
-          node "$SCRIPTS_DIR/build-index.mjs" --pending "$PENDING_DIR" --index "$INDEX_FILE" --consume 2>&1 | tee build-index.log
-          BUILD_RC=${PIPESTATUS[0]}
-          set -e
-          echo "build_rc=$BUILD_RC" >> "$GITHUB_OUTPUT"
-          echo "build-index.mjs 退出码=$BUILD_RC（2=有冲突/非法条目，见下面的 PR 评论）"
-
-      - name: 把合并结果贴回 PR
+      - name: 告知合并结果
         uses: actions/github-script@v7
         env:
           MODULE_ID: ${{ needs.audit.outputs.module_id }}
-          BUILD_RC: ${{ steps.build.outputs.build_rc }}
         with:
           script: |
-            const fs = require('fs');
-            const log = fs.existsSync('build-index.log') ? fs.readFileSync('build-index.log', 'utf8') : '(无 build-index 输出)';
-            const rc = process.env.BUILD_RC;
-            const MAX = 20000;
-
-            let body = `## 索引合并结果\n\n`
-              + `- 模块 id：\`${process.env.MODULE_ID}\`\n`
-              + `- build-index.mjs 退出码：\`${rc}\`\n\n`;
-
-            if (rc === '0') {
-              body += `✅ 已合入索引。\n`;
-            } else {
-              // 关键：把「为什么没进索引」讲清楚，而不是只留一个红灯。
-              body += `⚠️ 合并过程中有冲突或非法条目（退出码 \`${rc}\`）。\n`
-                + `下面这段是 \`build-index.mjs\` 的完整输出，里面有具体是哪一条、缺了什么字段；\n`
-                + `若模块没能进索引，原因都写在里面。\n`;
-            }
-
-            body += `\n<details><summary>build-index.mjs 输出</summary>\n\n\`\`\`\n`
-              + (log.length > MAX ? log.slice(0, MAX) + '\n…（已截断）' : log)
-              + `\n\`\`\`\n</details>\n`;
-
+            // 合并 != 已入索引。这一步把两件事的先后讲明白，否则投稿者会在
+            // 「PR 已合并」之后看不到索引变化而以为流水线坏了。
+            const branch = context.payload.repository.default_branch;
+            const body = `## 已合并，索引稍后重建\n\n`
+              + `本 PR 已由审核流水线 squash 合并进 \`${branch}\`（批准依据：\`approve\` check 在该 head sha 上为 success）。\n\n`
+              + `- 模块 id：\`${process.env.MODULE_ID || '(未知)'}\`\n`
+              + `- 索引条目由 **Rebuild Index From Main** 这个 run 生成，它由本次合并触发的 push 启动；\n`
+              + `- 那一步会在 main 上回查 \`approve\` 的结论才盖审核章，所以它失败时模块**不会**进索引，`
+              + `原因写在那个 run 的日志里，也会贴回本 PR。\n`;
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
@@ -782,37 +727,3 @@ jobs:
               body,
             });
 
-      - name: 校验索引（validate-index.mjs）
-        shell: bash
-        env:
-          MODULE_ID: ${{ needs.audit.outputs.module_id }}
-        run: |
-          set -euo pipefail
-          PREFIX="${{ steps.place.outputs.prefix }}"
-          INDEX_FILE="${{ steps.place.outputs.index_file }}"
-          SCRIPTS_DIR="${PREFIX:+$PREFIX/}scripts"
-
-          # 合并结果必须通过校验器，否则不提交 —— 宁可不进索引，也不进坏索引。
-          node "$SCRIPTS_DIR/validate-index.mjs" "$INDEX_FILE"
-
-          # 双重保险：确认这次审核的模块真的进了索引（versions/name/author/description/verified 齐全）
-          node -e '
-            const fs=require("fs");
-            const idx=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
-            const m=(idx.modules||[]).find(x=>x.id===process.argv[2]);
-            if(!m){ console.error("模块 "+process.argv[2]+" 未出现在索引里"); process.exit(1); }
-            for(const f of ["name","author","description","versions","verified"]){
-              if(!(f in m)){ console.error("索引条目缺字段 "+f); process.exit(1); }
-            }
-            if(!Array.isArray(m.versions)||m.versions.length===0){ console.error("索引条目 versions 为空"); process.exit(1); }
-            console.log("已确认入索引："+m.id+" "+m.versions.map(v=>v.version).join(",")+
-                        "（verified="+m.verified+"）");
-          ' "$INDEX_FILE" "$MODULE_ID"
-
-      - name: 提交
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: 'chore(index): auto-approve module ${{ needs.audit.outputs.module_id }}'
-          file_pattern: |
-            ${{ steps.place.outputs.index_file }}
-            ${{ steps.place.outputs.pending_dir }}

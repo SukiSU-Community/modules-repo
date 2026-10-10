@@ -85,30 +85,119 @@ node scripts/fetch-pending-zip.mjs pending/ --out-dir /tmp/zips \
 
 未带审核标记的条目会被 `build-index` 直接跳过，不进索引。
 
-## 审核标记契约（audit.yml ↔ build-index.mjs）
+## 审核标记契约（audit.yml / index.yml ↔ build-index.mjs）
 
 **Workflow 写的、脚本认的，是同一个字段。** 这是两边的唯一约定面，改动必须同步：
 
 | 常量 | 值 | 定义处 | 写入方 |
 |---|---|---|---|
-| `APPROVAL_FIELD` | `audit` | `scripts/build-index.mjs:32` | `contrib/audit/workflows/audit.yml` publish 步骤 |
-| `APPROVED_STATUS` | `auto-approved` | `scripts/build-index.mjs:33` | 同上 |
+| `APPROVAL_FIELD` | `audit` | `scripts/build-index.mjs` | `scripts/publish-from-main.mjs`（经 `markApproved`） |
+| `APPROVED_STATUS` | `auto-approved` | 同上 | 同上 |
+| `HUMAN_APPROVED_STATUS` | `human-approved` | 同上 | 人工双签脚本（P4，尚未实现） |
+| `APPROVE_CHECK_NAME` | `approve` | `scripts/publish-from-main.mjs` | `audit.yml` 的 job `name:` |
 
-Auto-approve 时 `audit.yml` 会在 pending 条目里写入：
+自动放行时 pending 条目里的章长这样：
 
 ```json
-{ "audit": { "status": "auto-approved", "by": "ci:auto-approved", "at": "…", "risk": "low" } }
+{
+  "audit": {
+    "status": "auto-approved",
+    "by": "ci:approve#SukiSU-Community/modules-repoPR7@aabbccddee12",
+    "at": "2026-10-10T09:00:00.000Z",
+    "risk": "low",
+    "verify": "gh api repos/SukiSU-Community/modules-repo/commits/<headSha>/pulls"
+  }
+}
 ```
 
-`build-index.mjs` 的 `isApproved()` 认三种写法，任一成立即放行：
+`by` 必须是**别人也能复验的指针**，不是「ci 说过」这种自证：拿 PR 号 + head sha，
+任何人 `gh api .../check-runs?name=approve` 都能重跑这个判断。
 
-1. `{ "audit": { "status": "auto-approved" } }` —— **CI 走的这条**（契约字段）
-2. `{ "approved": true }` —— 人工/本地直接标记
-3. `{ "review": { "approved": true } }` —— 人工/本地直接标记
+`isApproved()` **只认 `audit` 这一个字段**，且章上必须有人（`by` 非空）。
+以下写法一律不算通过：
 
-> 为什么必须有这一段：Worker 写出的 pending JSON 没有 `approved` 字段，
-> 而旧版 `isApproved` 只认 `approved === true`，于是 CI 盖了章也进不了索引。
-> 现在 CI 统一写 `audit.status`，脚本统一认 `audit.status`，两边对齐。
+- `{ "approved": true }`、`{ "review": { "approved": true" } }` —— 旧接口，已删。
+  保留它们等于给「直接改 pending JSON」留一条比 CI 通道更高的权限捷径：索引文件由
+  `build-index` 从 pending 派生，任何能写 pending 的人就能入索引；如果连布尔后门都在，
+  这条捷径就完全不需要审核环节。
+- `{ "audit": { "status": "auto-approved" } }` —— 无主章。`by` 为空说明盖章的人没留名，
+  这种章在追责链上是零价值。
+
+## 两段式自动放行（为什么 publish 不再直接写索引）
+
+```
+投稿 PR ──audit（扫描+报告）──> approve（只在「低风险+首次收录」时成功）
+                                      │
+                            publish（只 squash 合并）
+                                      │
+                              push 到 main
+                                      │
+                    index.yml ──> publish-from-main.mjs 回查那次 approve 的结论
+                              ──> 盖章 ──> build-index --consume ──> validate-index
+                              ──> 提交（带 [skip ci]）
+```
+
+不变式：**main 的唯一入口是「合并一个 approve 成功的 PR」，索引是 main 内容的函数。**
+
+以前 publish 在 PR 上下文里直接往 main 推索引提交，于是 main 永远不能开
+`require a pull request / restrict pushes`。改成「先往 PR 分支写索引、再合并 PR」也不行：
+那次索引提交落在 `pending/**` 上会触发 `synchronize` 把审核再跑一遍，而新 head sha 的
+required check 还没出结果时 `gh pr merge` 本身就过不去 —— 两个坑互锁。
+
+拆成两段带来的真问题：合并进 main 的 pending JSON 上**没有章**。章由 `index.yml` 盖，
+而它盖之前回查证据，刻意不依赖这三样东西：
+
+| 不依赖 | 为什么 |
+|---|---|
+| PR 标签 | 有 triage 权限的人随手就能加一个 `auto-approved` |
+| PR 评论 | 正文里混着投稿者可控文本与模型产出 |
+| 「分支保护肯定配好了」 | 配置是别人可以改的，而 check 结论改不了 |
+
+本地跑这段判定（离线自测，不需要真 token 也能验失败路径）：
+
+```bash
+node scripts/publish-from-main.mjs --pending pending --sha <main上的提交> \
+     --owner SukiSU-Community --repo modules-repo --report r.json
+node --test test/publish-from-main.test.mjs
+```
+
+## main 分支保护 runbook（**必须在新 workflow 上了 main 之后再执行**）
+
+顺序错了会直接把生产线打死：`approve` 这个 required check 由新 workflow 产出，
+在旧 workflow 还挂在 main 上时把它设为 required，所有投稿 PR 都会因「Expected 且永不发生」
+卡死。所以先推 workflow、再配保护，中间不要合 PR。
+
+```bash
+# 1) 确认 main 上的 workflow 已经有 approve job（推完再查）
+gh api repos/SukiSU-Community/modules-repo/contents/.github/workflows/audit.yml?ref=main \
+  --jq '.content' | base64 -d | grep -c 'name: approve'   # 必须是 1
+
+# 2) 上 ruleset：require PR + require approve + 限制 push，只给 Actions 留 bypass
+gh api -X POST repos/SukiSU-Community/modules-repo/rulesets \
+  -F name='protect-main' \
+  -F target='branch' \
+  -F enforcement='active' \
+  -f 'conditions.ref_name.include[]=@main' \
+  -F 'rules.require_pull_request.before_merge=true' \
+  -F 'rules.require_pull_request.approvals_before_merge=1' \
+  -F 'rules.require_status_check.strict=true' \
+  -F 'rules.require_status_check.checks[]=approve' \
+  -F 'rules.restrict_pushes.enabled=true' \
+  -F 'rules.force_pushes.enabled=false' \
+  -F 'rules.deletion.enabled=false' \
+  -F 'bypass_actors[].actor_type=Integration' \
+  -F 'bypass_actors[].actor_id=<GitHub Actions 的 App id>' \
+```
+
+`actor_id` 用 `gh api app/installations` 里 `app_id` 那一栏取（别凭记忆填）。
+
+最后两项（`force_pushes` / `deletion`）是**必须真开的**：只开 require PR、
+却留着「允许强推覆盖 main」，等于在承重墙上留一扇谁都能开的门 —— 索引和 pending
+历史都能被一次 `--force` 抹平，而这条 ruleset 看起来仍是绿的。
+
+配完之后跑一次真实投稿验证闭环（提交 → approve 成功 → 合并 → index.yml 盖章入索引），
+只看测试通过不算数。
+
 
 ## pending 目录是递归的
 

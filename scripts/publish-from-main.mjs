@@ -1,0 +1,289 @@
+#!/usr/bin/env node
+/**
+ * 合并后重建索引 —— 决定「main 上这些 pending 条目凭什么算审核通过」。
+ *
+ * 为什么要有这个文件。分支保护的语义是「进 main 必须过 PR、必须过审核 check」，
+ * 而原来的 publish job 是在 PR 上下文里直接往 main 推索引提交的。想让 publish 改成
+ * 「先往 PR 分支写索引、再合并 PR」并不通：那次索引提交落在 `pending/**` 上，会触发
+ * `synchronize` 把审核再跑一遍，而新 head sha 的 required check 还没出结果时
+ * `gh pr merge` 本身就过不去 —— 两个坑互锁。所以只能拆成两段：publish 只合并，
+ * 索引由「已经落到 main 的内容」重建（见 .github/workflows/index.yml）。
+ *
+ * 拆开的代价是章没了：章是审核结论，原先由 publish 现场盖。这个文件补回这一环，
+ * 而且补得比原来更硬 —— 它不读 PR 标签（有 triage 权限就能随手加一个
+ * `auto-approved`）、不读评论正文（那是投稿者和模型都能影响的文本）、也不假设
+ * 「分支保护肯定已经配好了」（配置是可以被另一个人关掉的，而这里要的是可复核的证据），
+ * 而是回到 GitHub 去取那次审核 check 的**结论本身**：
+ *
+ *   checks.listForRef(pr.head.sha) 里名为 `approve` 的那一条必须 conclusion === success。
+ *
+ * 那条结论由 Actions 产出，仓库写权限改不了它。之所以还要专门查一次，是因为
+ * 「条目出现在 main 上」并不等于「它被批准过」：pending JSON 的正文是投稿方可控文本，
+ * 而合并动作在没上保护之前人类也能直接点。
+ *
+ * 只用 node: 内置模块（本仓库硬性约束）。
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import process from 'node:process';
+
+import { collectPendingFiles, markApproved, isApproved } from './build-index.mjs';
+
+/**
+ * 必须通过的 check 名。这个名字就是 audit.yml 里那个 job 的 `name:` ——
+ * 两边靠字符串相等连接，所以 job 改名等于把闸门拆了：改名时必须同时改这里，
+ * 而 test/publish-from-main.test.mjs 里钉着这条。
+ */
+export const APPROVE_CHECK_NAME = 'approve';
+
+/** 人工批准的章（P4 的双签脚本会用），这里只认这个前缀，别的前缀一律不当证据 */
+export const HUMAN_APPROVE_STATUS = 'human-approved';
+
+/**
+ * 从一组 check run 里取某个名字的**最终**结论。
+ *
+ * 同名多条是常态（re-run、多个 workflow 共用 job 名），所以按 completed_at 取最新，
+ * 并且只认已经跑完的：status 还是 in_progress / queued 时 conclusion 是 null，
+ * 那种情况必须当成「没通过」而不是「通过」。
+ */
+export function checkConclusion(runs, name = APPROVE_CHECK_NAME) {
+  const list = (Array.isArray(runs) ? runs : []).filter(
+    (r) => r && typeof r.name === 'string' && r.name === name
+  );
+  if (!list.length) return { found: false, conclusion: null };
+  list.sort((a, b) => String(b.completed_at || '').localeCompare(String(a.completed_at || '')));
+  const top = list[0];
+  return { found: true, conclusion: top.conclusion ?? null, status: top.status ?? null };
+}
+
+/**
+ * 判定「这次合并算不算被批准」。纯函数，好测。
+ * @param {{ pr: object, checks: object[], mainBranch: string }} input
+ * @returns {{ ok: boolean, reason: string, evidence: object }}
+ */
+export function assertMergeApproved({ pr, checks = [], mainBranch = 'main' } = {}) {
+  const fail = (reason, extra = {}) => ({ ok: false, reason, evidence: { ...extra } });
+
+  if (!pr || typeof pr !== 'object') return fail('拿不到这次推送对应的 PR，无法确认批准来源');
+  if (pr.merged !== true) return fail(`PR #${pr.number} 不是已合并状态`, { pr: pr.number });
+  const base = pr.base && pr.base.ref;
+  if (base !== mainBranch) {
+    return fail(`PR #${pr.number} 的 base 是 ${base}，不是 ${mainBranch}`, { pr: pr.number, base });
+  }
+  const headSha = pr.head && pr.head.sha;
+  if (!/^[0-9a-f]{40}$/i.test(String(headSha || ''))) {
+    return fail(`PR #${pr.number} 没有可用的 head sha`, { pr: pr.number });
+  }
+
+  const { found, conclusion } = checkConclusion(checks, APPROVE_CHECK_NAME);
+  if (!found) {
+    return fail(
+      `PR #${pr.number} 的 head ${headSha.slice(0, 8)} 上没有名为 ${APPROVE_CHECK_NAME} 的 check —— `
+      + '没有批准证据就不盖房。',
+      { pr: pr.number, headSha }
+    );
+  }
+  if (conclusion !== 'success') {
+    return fail(
+      `PR #${pr.number} 上 ${APPROVE_CHECK_NAME} 的结论是 ${conclusion}（不是 success），未获批准`,
+      { pr: pr.number, headSha, conclusion }
+    );
+  }
+  return {
+    ok: true,
+    reason: `PR #${pr.number} 的 ${APPROVE_CHECK_NAME} check 在 ${headSha.slice(0, 8)} 上为 success`,
+    evidence: { pr: pr.number, headSha, checkName: APPROVE_CHECK_NAME, conclusion },
+  };
+}
+
+/**
+ * 章上写什么。`by` 必须是**别人也能复验**的指针，而不是「ci 说过」这种自证：
+ * 拿到 pr + headSha，任何人用 `gh api repos/<o>/<r>/check-runs/<headSha>?name=approve`
+ * 都能重跑这个判断。
+ */
+export function approvalBy({ owner, repo, evidence }) {
+  const sha = String(evidence.headSha || '').slice(0, 12);
+  return `ci:${APPROVE_CHECK_NAME}#${owner}/${repo}PR${evidence.pr}@${sha}`;
+}
+
+/**
+ * 给一个 pending 条目盖章（走 build-index 的 markApproved，契约只有一处定义）。
+ * 已经 approved 的条目原样返回，避免每次重跑都改 `at` 造成无意义 diff。
+ */
+export function stampEntry(entry, { owner, repo, evidence, now = () => new Date().toISOString(), risk }) {
+  if (isApproved(entry)) return { entry, stamped: false };
+  const by = approvalBy({ owner, repo, evidence });
+  const meta = { by, at: now() };
+  if (risk) meta.risk = risk;
+  // 把复验路径留在章里：以后有人问「凭什么」，不用回去翻 workflow 日志。
+  meta.verify = `gh api repos/${owner}/${repo}/commits/${evidence.headSha}/pulls`;
+  return { entry: markApproved(entry, meta), stamped: true };
+}
+
+/**
+ * 读一个 pending 文件 -> 盖章 -> 写回。数组条目逐条处理。
+ * @returns {{ changed: boolean, ids: string[], skipped: string[] }}
+ */
+export function stampPendingFile(
+  file,
+  { owner, repo, evidence, onlyPaths = null, risk, log = console }
+) {
+  const abs = path.resolve(file);
+  const raw = JSON.parse(fs.readFileSync(abs, 'utf8'));
+  const list = Array.isArray(raw) ? raw : [raw];
+  const ids = [];
+  const skipped = [];
+  let changed = false;
+
+  const targets = onlyPaths && !onlyPaths.includes(abs) ? [] : list;
+  const stamped = targets.map((e) => {
+    const r = stampEntry(e, { owner, repo, evidence, risk });
+    if (r.stamped) {
+      changed = true;
+      if (e && e.id) ids.push(String(e.id));
+    } else if (e && e.id) {
+      skipped.push(String(e.id));
+    }
+    return r.entry;
+  });
+  const out = Array.isArray(raw) ? stamped : stamped[0];
+
+  if (changed) {
+    fs.writeFileSync(abs, `${JSON.stringify(out, null, 2)}\n`, 'utf8');
+    log.log(`[publish-from-main] 盖章节 -> ${path.basename(abs)}（${ids.join(', ')}）`);
+  } else if (onlyPaths && !onlyPaths.includes(abs)) {
+    log.log(`[publish-from-main] 跳过 ${path.basename(abs)}：本次推送没有改动它`);
+  }
+  return { changed, ids, skipped };
+}
+
+/* ------------------------------------------------------------------ 取证据 */
+
+async function ghFetch(apiBase, token, segs, opts = {}) {
+  const url = `${apiBase.replace(/\/$/, '')}/${segs.join('/')}`;
+  const res = await fetch(url, {
+    headers: {
+      authorization: `Bearer ${token}`,
+      accept: 'application/vnd.github+json',
+      'x-github-api-version': '2022-11-28',
+      ...(opts.headers || {}),
+    },
+    ...(opts.body ? { method: 'POST', body: JSON.stringify(opts.body) } : {}),
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(`GET ${url} -> HTTP ${res.status}`);
+  return res.json();
+}
+
+/**
+ * 找到「把 sha 带进 main 的那个 PR」。squash 合并时一次推送只有一个 PR；
+ * 真出现多个（merge commit 形式）时，取 base 是目标分支的那一个，并在日志里说明还有其它 ——
+ * 这里刻意不做「多个 PR 分别验证」的复杂度：Worker 的投稿 PR 永远是一个 id 一个 PR，
+ * 多 PR 混进同一次推送本来就该人工看。
+ *
+ * 注意不靠列表接口判断「是否已合并」：`/commits/{sha}/pulls` 返回的是精简对象，
+ * 有没有 merged/merged_at 不在承诺范围内。合并状态一律由后面那次单 PR 详情来判断，
+ * 所以这里只挑候选，判定交给 assertMergeApproved。
+ */
+export async function findPrForCommit({ apiBase, token, owner, repo, sha, mainBranch = 'main', log = console }) {
+  const data = await ghFetch(apiBase, token, [`repos/${owner}/${repo}/commits/${sha}/pulls`]);
+  const pulls = (data && Array.isArray(data.pull_requests) ? data.pull_requests : []);
+  if (!pulls.length) {
+    return { pr: null, checks: [], others: [], note: `提交 ${String(sha).slice(0, 8)} 没有关联的 PR（可能是人工直接推到 main）` };
+  }
+  const chosen = pulls.find((p) => p && p.base && p.base.ref === mainBranch) || pulls[0];
+  const detail = await ghFetch(apiBase, token, [`repos/${owner}/${repo}/pulls/${chosen.number}`]);
+  const pr = detail ? { ...chosen, ...detail } : chosen;
+  const checksData = pr.head && pr.head.sha
+    ? await ghFetch(apiBase, token, [`repos/${owner}/${repo}/commits/${pr.head.sha}/check-runs`])
+    : null;
+  const checks = (checksData && Array.isArray(checksData.check_runs) ? checksData.check_runs : []);
+  if (pulls.length > 1) log.log(`[publish-from-main] 注意：该提交关联 ${pulls.length} 个 PR，按 #${pr.number} 判定`);
+  return { pr, checks, others: pulls.filter((p) => p.number !== pr.number) };
+}
+
+/* ---------------------------------------------------------------------- CLI */
+
+export function parseArgs(argv) {
+  const opts = { _: [], changed: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith('--')) { opts._.push(a); continue; }
+    const key = a.slice(2);
+    const eq = key.indexOf('=');
+    if (eq >= 0) { opts[key.slice(0, eq)] = key.slice(eq + 1); continue; }
+    const next = argv[i + 1];
+    if (key === 'changed') {
+      // --changed 接多个路径，吃到下一个 -- 为止
+      while (i + 1 < argv.length && !argv[i + 1].startsWith('--')) opts.changed.push(path.resolve(argv[++i]));
+      continue;
+    }
+    if (next && !next.startsWith('--')) { opts[key] = next; i++; } else opts[key] = true;
+  }
+  return opts;
+}
+
+export async function main(argv = process.argv.slice(2), deps = {}) {
+  const opts = parseArgs(argv);
+  const log = deps.log || console;
+  if (opts.help || !opts.pending || !opts.sha || !opts.owner || !opts.repo) {
+    log.log(`用法: node publish-from-main.mjs --pending <dir> --sha <mainSha> --owner <o> --repo <r>
+       [--index <json>] [--changed <path> ...] [--main-branch main] [--report <file.json>] [--dry-run]
+   给「本次推送改动到的 pending 条目」盖审核章；章的证据是那 PR 上名为 approve 的 check 结论。`);
+    return opts.help ? 0 : 2;
+  }
+
+  const token = deps.token || process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '';
+  if (!token) { log.error('[publish-from-main] 没有 GITHUB_TOKEN，取不到批准证据，拒绝盖章节。'); return 1; }
+  const apiBase = deps.apiBase || process.env.GITHUB_API_URL || 'https://api.github.com';
+  const mainBranch = opts['main-branch'] || 'main';
+
+  const files = collectPendingFiles(path.resolve(opts.pending));
+  // 判定结果落一份机器可读的报告：push 触发的 workflow 里没有 context.issue.number，
+  // 要「把为什么没进索引贴回 PR」就只能靠这里留下的指针。不传 --report 则不写文件。
+  const report = { ok: false, reason: '', pr: null, headSha: '', ids: [], pendingCount: files.length };
+  const writeReport = () => {
+    if (!opts.report) return;
+    fs.writeFileSync(path.resolve(opts.report), `${JSON.stringify(report, null, 2)}\n`, 'utf8');
+  };
+
+  if (!files.length) { log.log('[publish-from-main] pending 目录是空的，无需重建索引。'); report.ok = true; report.reason = 'no-pending'; writeReport(); return 0; }
+
+  const { pr, checks = [], note } = await findPrForCommit({
+    apiBase, token, owner: opts.owner, repo: opts.repo, sha: opts.sha, mainBranch, log,
+  });
+  const verdict = assertMergeApproved({ pr, checks, mainBranch });
+  report.pr = verdict.evidence?.pr ?? null;
+  report.headSha = verdict.evidence?.headSha ?? '';
+  if (!verdict.ok) {
+    report.reason = verdict.reason;
+    log.error(`[publish-from-main] 未获批准，不盖章节：${verdict.reason}${note ? `（${note}）` : ''}`);
+    log.error('[publish-from-main] 条目留在 main 上但不会进索引；要么让审核结论转为批准，要么走人工双签盖章。');
+    writeReport();
+    return 1;
+  }
+  report.ok = true;
+  report.reason = verdict.reason;
+  log.log(`[publish-from-main] 批准证据成立：${verdict.reason}`);
+
+  let touched = 0;
+  // collectPendingFiles 返回的是 { file, rel, entries }，不是路径字符串
+  for (const rec of files) {
+    const r = stampPendingFile(rec.file, {
+      owner: opts.owner, repo: opts.repo, evidence: verdict.evidence,
+      onlyPaths: opts.changed.length ? opts.changed : null, risk: opts.risk, log,
+    });
+    if (r.changed) touched++;
+    report.ids.push(...r.ids);
+  }
+  if (!touched) {
+    log.log('[publish-from-main] 本次推送没有需要盖章的新条目（都已经是 approved，或不在改动范围内）。');
+  }
+  if (opts['dry-run']) log.log('[publish-from-main] --dry-run：不写索引，仅止于盖章判定。');
+  writeReport();
+  return 0;
+}
+
+if (process.argv[1] && import.meta.url === `file://${path.resolve(process.argv[1]).replace(/\\/g, '/')}`) {
+  main().then((rc) => { process.exitCode = rc; });
+}
