@@ -1,0 +1,23 @@
+{
+  "id": "e2e_probe_dangerous",
+  "name": "E2E Probe Dangerous",
+  "author": "zcode-e2e",
+  "description": "reject-path probe: curl | sh in customize.sh",
+  "versions": [
+    {
+      "version": "v0.0.2",
+      "versionCode": 2,
+      "zipUrl": "https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/66fbf6b4d268ec2c4bd03d243c408296e9f2dda45b672dd1cda09bf587ba48c2.zip",
+      "size": 607,
+      "time": 1791646822532,
+      "sha256": "66fbf6b4d268ec2c4bd03d243c408296e9f2dda45b672dd1cda09bf587ba48c2"
+    }
+  ],
+  "source": "https://www.coolapk.com/u/2781460",
+  "uploader": "zcode-e2e",
+  "coolapkUid": "2781460",
+  "storage": "github-release-asset",
+  "releaseTag": "assets-v1",
+  "assetName": "66fbf6b4d268ec2c4bd03d243c408296e9f2dda45b672dd1cda09bf587ba48c2.zip",
+  "submittedAt": "2026-10-10T15:40:22.532Z"
+}
