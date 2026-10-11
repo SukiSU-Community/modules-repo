@@ -1,0 +1,46 @@
+{
+  "schema": "sukisu-dispositions-v1",
+  "lastUpdate": 1791687753247,
+  "dispositions": [
+    {
+      "kind": "revoke",
+      "reason": "test-probe",
+      "by": "gh:yufeng-liang@issuecomment-6104846280",
+      "at": "2026-10-11T03:02:31.612Z",
+      "note": "流水线验证留下的探针包，理由见 by 指向的评论",
+      "id": "e2e_probe_loop2"
+    },
+    {
+      "kind": "revoke",
+      "reason": "test-probe",
+      "by": "gh:yufeng-liang@issuecomment-6104846280",
+      "at": "2026-10-11T03:02:32.024Z",
+      "note": "流水线验证留下的探针包，理由见 by 指向的评论",
+      "id": "e2e_probe_loop3"
+    },
+    {
+      "kind": "revoke",
+      "reason": "test-probe",
+      "by": "gh:yufeng-liang@issuecomment-6104846280",
+      "at": "2026-10-11T03:02:32.443Z",
+      "note": "流水线验证留下的探针包，理由见 by 指向的评论",
+      "id": "e2e_probe_min"
+    },
+    {
+      "kind": "revoke",
+      "reason": "test-probe",
+      "by": "gh:yufeng-liang@issuecomment-6104846280",
+      "at": "2026-10-11T03:02:32.842Z",
+      "note": "流水线验证留下的探针包，理由见 by 指向的评论",
+      "id": "e2e_probe_module"
+    },
+    {
+      "kind": "revoke",
+      "reason": "test-probe",
+      "by": "gh:yufeng-liang@issuecomment-6104846280",
+      "at": "2026-10-11T03:02:33.247Z",
+      "note": "流水线验证留下的探针包，理由见 by 指向的评论",
+      "id": "e2e_probe_p04"
+    }
+  ]
+}
