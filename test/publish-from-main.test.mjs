@@ -447,6 +447,42 @@ test('merge-index 必须按「此刻的 main」重推导一遍，且排在合并
   }
 });
 
+// 「索引 PR」的认定只看 json/modules.json，不看整个 json/。
+// 为什么这算一条安全判据而不是分类细节：台账单独改动**既不消费 pending 也不改变当前索引**，
+// 于是推导必然「一致」—— 如果它被认成索引 PR，删掉一条处置（把某人从黑名单放出来）
+// 就会被 merge-index 自动合掉。削弱处置必须是人工判断。
+test('kind 只把「索引内容真的变了」的 PR 认成索引 PR，台账单独改动不算', () => {
+  for (const f of AUDIT_COPIES) {
+    const yml = fs.readFileSync(f, 'utf8');
+    assert.match(yml, /--diff-filter=ACMR "\$BASE_SHA" HEAD -- 'json\/modules\.json'/,
+      `${path.basename(f)}：路径过滤必须钉到 json/modules.json`);
+    assert.doesNotMatch(yml, /--diff-filter=ACMR "\$BASE_SHA" HEAD -- 'json\/'/,
+      `${path.basename(f)}：'json/' 会把只改台账的 PR 也认成索引 PR，从而可被自动合并`);
+  }
+});
+
+// 下架的生效速度实际由 CDN 的 TTL 决定，不是由 main 决定：实测索引 PR #34 把索引推空之后
+// 近 50 分钟，jsDelivr 上仍然返回下架前的 4 个模块（订阅那个地址的 App 照样能装到已下架的包）。
+// 所以合并之后必须紧跟一次 purge；而它排在合并**之后**同样是判据的一部分 ——
+// 先 purge 再合，清掉的是旧内容，新内容照样被缓存回去。
+test('merge-index 合并之后必须 purge CDN，且顺序在合并之后', () => {
+  for (const f of AUDIT_COPIES) {
+    const code = fs.readFileSync(f, 'utf8')
+      .split(/\r?\n/)
+      .filter((l) => !/^\s*#/.test(l))
+      .join('\n');
+    const at = code.indexOf('  merge-index:');
+    const next = code.slice(at + 2).search(/^ {2}[A-Za-z_-]+:$/m);
+    const job = next < 0 ? code.slice(at) : code.slice(at, at + 2 + next);
+    assert.match(job, /node scripts\/purge-cdn\.mjs/, '清缓存要交给脚本，判据不在 YAML 里再写一遍');
+    // repo variable 不会自动变成环境变量 —— 不显式传，README 里那句
+    // 「其它镜像放进 CDN_PURGE_URLS」就是一条配了也不生效的死配置。
+    assert.match(job, /CDN_PURGE_URLS: \$\{\{ vars\.CDN_PURGE_URLS \}\}/, 'CDN_PURGE_URLS 必须显式传给脚本');
+    assert.ok(job.indexOf('gh pr merge') < job.indexOf('purge-cdn.mjs'),
+      'purge 必须排在合并之后 —— 先清再合等于什么都没清');
+  }
+});
+
 // 判定投稿的这套代码自己没过检，就没有资格批准任何投稿。
 test('approve 必须依赖 selftest，且上游不 success 时自己判红（不能靠 skip）', () => {
   for (const f of AUDIT_COPIES) {

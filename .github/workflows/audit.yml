@@ -325,16 +325,24 @@ jobs:
           BASE_SHA="$(git rev-parse "origin/$BASE_REF")"
           echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
           # ACMR：新增/复制/修改/重命名才算改了索引；删除索引不是重建
-          CHANGED_JSON=$(git diff --name-only --diff-filter=ACMR "$BASE_SHA" HEAD -- 'json/' || true)
+          #
+          # 只看 json/modules.json，不看整个 json/ —— 这一条是「机器人只合索引内容真的变了、
+          # 且变得能对得上推导」的 PR。把台账单独也算成索引改动会开一个洞：
+          # 删掉一条处置记录（把某人从黑名单里放出来）既不消费 pending，也不改变当前索引，
+          # 于是 expected == actual，模式 B 判「推导一致」→ merge-index 自动合。
+          # 削弱处置的决定不该由推导说了算，它是人工判断：留在这儿落到「无投稿内容」分支，
+          # 绿了也要人合；而它真正的后果（被放行的模块重新出现在下一次重建里）本来就
+          # 需要有人先把那条 pending 留着 —— 这正是 --consume 不删被台账挡下的 pending 的理由。
+          CHANGED_JSON=$(git diff --name-only --diff-filter=ACMR "$BASE_SHA" HEAD -- 'json/modules.json' || true)
           if [ -n "$CHANGED_JSON" ] && [ "${FOUND:-}" != "true" ]; then
             echo "index_pr=true" >> "$GITHUB_OUTPUT"
-            echo "这是索引重建 PR（改了 json/，且不含新投稿）：$CHANGED_JSON"
+            echo "这是索引重建 PR（改了 json/modules.json，且不含新投稿）：$CHANGED_JSON"
           else
             echo "index_pr=false" >> "$GITHUB_OUTPUT"
             if [ -n "$CHANGED_JSON" ]; then
               echo "::warning::这个 PR 同时带投稿和索引改动 —— 索引改动不会被推导判定放行，投稿按扫描结论走。"
             fi
-            echo "不是索引重建 PR（found=${FOUND:-<空>}，json 改动=${CHANGED_JSON:-无}）"
+            echo "不是索引重建 PR（found=${FOUND:-<空>}，索引改动=${CHANGED_JSON:-无}）"
           fi
 
       - name: 验索引确由 base 推导（只给索引 PR）
@@ -1046,4 +1054,26 @@ jobs:
           fi
           gh pr merge "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --squash
           echo "索引 PR #${PR_NUMBER} 已 squash 合并：main 上的 json/modules.json 就是这次推导的结果。"
+
+      # -------------------------------------------------------------------
+      # 合并之后立刻让 CDN 上那份旧索引失效。
+      #
+      # 为什么这一步在这条链上，而不是「谁用 CDN 谁自己管」：下架的生效速度实际由 CDN 的
+      # TTL 决定，而不是由 main 决定。实测 2026-10-11 —— 索引 PR #34 把索引推空之后近
+      # 50 分钟，jsDelivr 上仍然返回下架前的 4 个模块，也就是订阅那个地址的 App 照样能装到
+      # 已被下架的包。「索引 = f(main)」在源站上成立，在用户手里不成立。
+      #
+      # 失效方向：合并已经发生，这一步红不撤销任何事，只是把「缓存还在发旧内容」变成看得见
+      # 的失败（要红，不要静默 0 —— 静默 0 等于那条下架在用户手里没发生过）。
+      # 脚本只内置 jsDelivr 的公开 purge GET；其它镜像一律报「无能为力」而不冻住流水线。
+      # -------------------------------------------------------------------
+      - name: 让 CDN 上那份旧索引立刻失效
+        shell: bash
+        env:
+          # repo variable 不会自动变成环境变量，得显式传 —— 否则 README 里写的
+          # 「其它镜像放进 CDN_PURGE_URLS」是一条配了也不生效的死配置。
+          CDN_PURGE_URLS: ${{ vars.CDN_PURGE_URLS }}
+        run: |
+          set -euo pipefail
+          node scripts/purge-cdn.mjs
 
