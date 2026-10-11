@@ -578,6 +578,19 @@ node scripts/revoke.mjs --id <模块ID> [--version-code <n>] [--sha256 <64hex>] 
   `cdn.jsdelivr.net` 也打得通），所以这一步的绿只能在 CI 里看；失败路径与三态判定由
   `test/purge-cdn.test.mjs` 用注入的 fetch 覆盖。
 
+**但 purge 只清得掉边缘，清不掉客户端。** jsDelivr 对 `@分支` 形式的地址回
+`Cache-Control: public, max-age=604800, s-maxage=43200` —— **七天**。实测复现过：清完源站边缘之后，
+同一个页面里 `fetch(url)` 仍然拿到 4 个模块，而 `fetch(url, { cache: 'reload' })` 拿到 0 个 ——
+差的就是那层本地 HTTP 缓存。投稿站已经把索引与台账两处读取都改成 `cache: "no-cache"`
+（配合对方给的弱 ETag，通常只是一个 304），**可管理器 App 自己发的那个订阅请求不归这里管**。
+要把客户端那七天也压掉，只有三条路，都还没定：
+
+1. 订阅地址换成带 commit 的固定版本 —— 内容不可变、没有陈旧问题，但地址每次发版都变，
+   破坏「一个固定订阅地址」这个前提；
+2. 自己出一份带短 `Cache-Control` 的镜像（Worker 加一个 `GET /index.json` 代理，或 GitHub Pages
+   —— 后者大陆可达性差，前者要新端点 = 改契约）；
+3. 接受它，把话说明白：下架到订阅者生效是「边缘分钟级、客户端最长七天」。
+
 公示页在投稿站那边（`modules-web` 的 `#/incidents`），它显示的就是这份台账原文。
 
 ## 发布
