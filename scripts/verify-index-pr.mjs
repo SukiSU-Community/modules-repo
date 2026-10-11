@@ -37,7 +37,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { buildIndex, markApproved, collectPendingFiles } from './build-index.mjs';
-import { findPrForCommit, assertMergeApproved } from './publish-from-main.mjs';
+import { findPrForCommit, assertMergeApproved, approvalBy } from './publish-from-main.mjs';
 import { DEFAULT_DISPOSITIONS_FILE, parseDispositions } from './dispositions.mjs';
 
 /** 索引重建 PR 允许碰的文件。白名单外的任何改动都判「这不是重建，是夹带」。 */
@@ -242,16 +242,20 @@ export function commitThatAdded(cwd, ref, file) {
 export async function attestPath({ cwd, baseRef, file, apiBase, token, owner, repo, mainBranch }) {
   const sha = commitThatAdded(cwd, baseRef, file);
   if (!/^[0-9a-f]{40}$/i.test(sha)) return { ok: false, reason: `找不到把它带上 ${baseRef} 的提交` };
-  const { pr, checks = [] } = await findPrForCommit({ apiBase, token, owner, repo, sha, mainBranch, log: { log() {}, error() {} } });
-  const v = assertMergeApproved({ pr, checks, mainBranch });
+  const { pr, checks = [], comments = [] } = await findPrForCommit({ apiBase, token, owner, repo, sha, mainBranch, log: { log() {}, error() {} } });
+  const v = assertMergeApproved({ pr, checks, comments, mainBranch });
   if (!v.ok) return { ok: false, reason: `${v.reason}（引入提交 ${sha.slice(0, 12)}）`, commitSha: sha };
   return {
     ok: true,
-    by: `ci:approve#${owner}/${repo}PR${v.evidence.pr}@${String(v.evidence.headSha).slice(0, 12)}`,
+    // 章的文字复用 approvalBy，不在这里再拼一遍：这个文件的存在理由就是「和盖审核章
+    // 用的是同一个判据，不另起一套」。自己拼一份的结果是人工双签放行的条目在这里永远
+    // 对不上 —— 那条 pending 会既进不了索引、又没人说为什么。
+    by: approvalBy({ owner, repo, evidence: v.evidence }),
     at: new Date().toISOString(),
     commitSha: sha,
     pr: v.evidence.pr,
     headSha: v.evidence.headSha,
+    kind: v.kind,
   };
 }
 
