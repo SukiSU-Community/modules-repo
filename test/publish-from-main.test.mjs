@@ -672,3 +672,55 @@ test('parseArgs：--changed 吃多个路径，且不把下一个 --flag 吞掉',
   assert.equal(o['dry-run'], true);
   assert.equal(o.pending, 'p');
 });
+
+/* ------------------------------------------------ P3：处置台账在 workflow 里的接线 */
+
+/** 取 code（去掉注释行）里某个标记所在的 job 片段。 */
+function jobCode(yml, jobKey) {
+  const code = yml.split(/\r?\n/).filter((l) => !/^\s*#/.test(l)).join('\n');
+  const at = code.indexOf(`  ${jobKey}:`);
+  assert.ok(at >= 0, `workflow 里得有 ${jobKey} 作业`);
+  const next = code.slice(at + 1).search(/^ {2}\S.*:$/m);
+  return code.slice(at, next < 0 ? undefined : at + 1 + next);
+}
+
+test('dispose 步存在、只在有投稿内容时跑，并把结论导出成 job output', () => {
+  for (const f of AUDIT_COPIES) {
+    const code = fs.readFileSync(f, 'utf8').split(/\r?\n/).filter((l) => !/^\s*#/.test(l)).join('\n');
+    assert.match(code, /^ {8}id: dispose$/m, `${path.basename(f)} 里必须有 id 为 dispose 的步骤`);
+    assert.match(code, /node "\$\{P\}scripts\/disposition-check\.mjs" --github-output/, '判据由脚本产出，不内联');
+    assert.match(code, /disposition: \$\{\{ steps\.dispose\.outputs\.hit \}\}/, '结论必须导出，否则 approve 拿不到');
+    assert.match(code, /disposition_reason: \$\{\{ steps\.dispose\.outputs\.why \}\}/);
+    // 导出名与引用名靠字符串相等连接：改任何一边都等于悄悄断链
+    const hit = code.match(/^ {6}disposition: \$\{\{ steps\.dispose\.outputs\.(\w+) \}\}/m);
+    assert.ok(hit && hit[1] === 'hit', 'output 名必须就是 dispose 写的那个 key');
+  }
+});
+
+test('approve 先看台账命中，且这一条排在索引 PR 分支之前', () => {
+  for (const f of AUDIT_COPIES) {
+    const job = jobCode(fs.readFileSync(f, 'utf8'), 'approve');
+    const hitAt = job.indexOf('"${DISPOSITION:-}" = "hit"');
+    const idxAt = job.indexOf('"${INDEX_PR:-}" = "true"');
+    assert.ok(hitAt >= 0, 'approve 必须自己判台账命中 —— 命中就红，不能靠 needs 被 skip（skip 等于满足）');
+    assert.ok(idxAt >= 0);
+    assert.ok(hitAt < idxAt, '台账命中要先于一切放行分支：混合 PR 也不能从索引分支溜过去');
+    assert.match(job, /DISPOSITION: \$\{\{ needs\.audit\.outputs\.disposition \}\}/);
+    assert.match(job, /exit 1/, '被拒必须是明确的红，不是消失');
+  }
+});
+
+test('两处 verify-index-pr 调用都要显式给 --dispositions-file（monorepo 布局下默认值是错的）', () => {
+  const code = fs.readFileSync(WF_MAIN, 'utf8').split(/\r?\n/).filter((l) => !/^\s*#/.test(l)).join('\n');
+  // 计数而不是解析整段调用：workflow 里靠反斜杠续行，跨行正则会贪心把两次调用并成一次。
+  assert.equal((code.match(/verify-index-pr\.mjs/g) || []).length, 2, 'derive 与 merge-index 各一次重推导');
+  assert.equal((code.match(/--dispositions-file "\$DISPOSITIONS_FILE"/g) || []).length, 2,
+    '每次重推导都要显式给台账路径：默认值相对 cwd，contrib/repo 布局下会读错文件');
+  assert.equal((code.match(/DISPOSITIONS_FILE="\$\{PREFIX:\+\$PREFIX\/\}json\/dispositions\.json"/g) || []).length, 2);
+});test('workflow 不许内联台账匹配逻辑（判据只能有一份实现）', () => {
+  for (const f of AUDIT_COPIES) {
+    const code = fs.readFileSync(f, 'utf8').split(/\r?\n/).filter((l) => !/^\s*#/.test(l)).join('\n');
+    assert.doesNotMatch(code, /matchAny\(|isModuleLevel\(|filterVersions\(/,
+      '台账判据出现在 workflow 里就是第二份实现，早晚和 build-index 漂移');
+  }
+});

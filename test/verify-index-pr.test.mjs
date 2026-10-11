@@ -12,6 +12,7 @@ import {
   normalizeIndex, stableStringify, diffIndexes, judgeIndexPr, commitThatAdded, parseArgs,
 } from '../scripts/verify-index-pr.mjs';
 import { buildIndex, markApproved } from '../scripts/build-index.mjs';
+import { parseDispositions } from '../scripts/dispositions.mjs';
 
 const P = (id, vc = 1, over = {}) => ({
   id, name: id, author: 'a', description: 'd',
@@ -242,4 +243,144 @@ test('真仓库：--report 里留下可复核的证据指针', async () => {
   assert.equal(r.ok, true);
   assert.deepEqual(r.consumed, ['pending/mod_a/1.json']);
   assert.equal(r.evidences[0].pr, 7);
+});
+
+/* ------------------------------------------------------- P3：台账参与重推导 */
+
+const revokeOf = (id) => ({
+  schema: 'sukisu-dispositions-v1',
+  dispositions: [{ kind: 'revoke', id, reason: 'test-probe', by: 'gh:t@1', at: '2026-10-11T00:00:00Z' }],
+});
+
+test('P3 判定：台账驱动型重建（没消费 pending）→ 一致即放行', () => {
+  const base = { name: 'SukiSU-Ultra Modules', lastUpdate: 0, modules: [{ id: 'mod_a', versions: [] }] };
+  const v = judgeIndexPr({
+    baseIndex: base,
+    actualIndex: { name: 'SukiSU-Ultra Modules', lastUpdate: 0, modules: [] },
+    deletedPaths: [], touchedPaths: [],
+    dispositions: parseDispositions(revokeOf('mod_a')), ledgerChanged: true,
+    attest: () => ({ ok: true }),
+  });
+  assert.equal(v.ok, true, v.reason);
+  assert.match(v.reason, /台账驱动/);
+});
+
+test('P3 判定：改了台账但索引没按台账重算 → 判不一致（台账不是免检通行证）', () => {
+  const base = { name: 'x', lastUpdate: 0, modules: [{ id: 'mod_a', name: 'A', author: 'a', description: 'd', versions: [{ versionCode: 1, sha256: '1'.repeat(64) }] }] };
+  const v = judgeIndexPr({
+    baseIndex: base,
+    actualIndex: base,                     // 索引原封不动，只是塞了台账
+    deletedPaths: [], touchedPaths: [],
+    dispositions: parseDispositions(revokeOf('mod_a')), ledgerChanged: true,
+    attest: () => ({ ok: true }),
+  });
+  assert.equal(v.ok, false);
+  assert.match(v.reason, /与推导结果不一致/);
+});
+
+test('P3 判定：既没消费 pending 也没改台账 → 还是「手改索引」', () => {
+  const v = judgeIndexPr({
+    baseIndex: { name: 'x', modules: [] }, actualIndex: { name: 'x', modules: [] },
+    deletedPaths: [], touchedPaths: [], ledgerChanged: false, dispositions: [], attest: () => ({ ok: true }),
+  });
+  assert.equal(v.ok, false);
+  assert.match(v.reason, /既没消费 pending、也没改处置台账/);
+});
+
+test('P3 判定：消费投稿 + 同时改台账 → 拒，一个 PR 只做一个决定', () => {
+  const base = { name: 'x', lastUpdate: 0, modules: [] };
+  const v = judgeIndexPr({
+    baseIndex: base,
+    baseEntries: [{ path: 'pending/mod_a/1.json', entry: { id: 'mod_a' } }],
+    actualIndex: base,
+    deletedPaths: ['pending/mod_a/1.json'], touchedPaths: [],
+    dispositions: parseDispositions(revokeOf('other')), ledgerChanged: true,
+    attest: () => ({ ok: true, by: 'ci:approve#o/rPR7@aaaaaaaaaaaa', pr: 7, headSha: 'a'.repeat(40) }),
+  });
+  assert.equal(v.ok, false);
+  assert.match(v.reason, /请拆成两条/);
+});
+
+test('P3 判定：索引忠实推导但顺手改了扫描脚本 → 挡（这条封的是自动合并的夹带路径）', () => {
+  const base = { name: 'x', lastUpdate: 0, modules: [] };
+  const v = judgeIndexPr({
+    baseIndex: base,
+    baseEntries: [{ path: 'pending/mod_a/1.json', entry: { id: 'mod_a' } }],
+    actualIndex: base,
+    deletedPaths: ['pending/mod_a/1.json'], touchedPaths: [],
+    changedPaths: ['json/modules.json', 'pending/mod_a/1.json', 'audit/scan.mjs'],
+    dispositions: [], ledgerChanged: false,
+    attest: () => ({ ok: true, by: 'ci:approve#o/rPR7@aaaaaaaaaaaa', pr: 7, headSha: 'a'.repeat(40) }),
+  });
+  assert.equal(v.ok, false, '推导比得上也不许夹带代码改动');
+  assert.match(v.reason, /audit\/scan\.mjs/);
+});
+
+test('P3 判定：白名单内的路径照常通过（pending 删除 + 索引 + 台账）', () => {
+  const base = { name: 'x', lastUpdate: 0, modules: [] };
+  const v = judgeIndexPr({
+    baseIndex: base,
+    baseEntries: [{ path: 'pending/mod_a/1.json', entry: { id: 'mod_a' } }],
+    actualIndex: base,
+    deletedPaths: ['pending/mod_a/1.json'], touchedPaths: [],
+    changedPaths: ['json/modules.json', 'pending/mod_a/1.json'],
+    dispositions: [], ledgerChanged: false,
+    attest: () => ({ ok: true, by: 'ci:approve#o/rPR7@aaaaaaaaaaaa', pr: 7, headSha: 'a'.repeat(40) }),
+  });
+  assert.equal(v.ok, true, v.reason);
+});
+
+// 真 git：base 上索引里已经有 mod_a，PR 只加台账并重算索引
+function ledgerFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vip-ledger-'));
+  G(dir, 'init', '-q', '-b', 'main');
+  G(dir, 'config', 'user.name', 't');
+  G(dir, 'config', 'user.email', 't@example.invalid');
+  fs.mkdirSync(path.join(dir, 'json'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'pending'), { recursive: true });
+  const seeded = buildIndex({ index: { name: 'SukiSU-Ultra Modules', lastUpdate: 0, modules: [] }, entries: [P('mod_a')] }).index;
+  fs.writeFileSync(path.join(dir, 'json', 'modules.json'), JSON.stringify(seeded, null, 2) + '\n');
+  fs.writeFileSync(path.join(dir, 'pending', '.example.json'), '[]\n');
+  G(dir, 'add', '-A');
+  G(dir, 'commit', '-qm', 'base：索引里有 mod_a');
+  return dir;
+}
+
+/** 复刻 revoke.mjs 干的事：只写台账 -> build-index --dispositions 重算 -> 提交成 PR 分支 */
+function makeRevokePr(dir, ledger) {
+  fs.writeFileSync(path.join(dir, 'json', 'dispositions.json'), JSON.stringify(ledger, null, 2) + '\n');
+  const scripts = path.resolve(import.meta.dirname, '../scripts');
+  execFileSync(process.execPath, [path.join(scripts, 'build-index.mjs'),
+    '--pending', 'pending', '--index', 'json/modules.json',
+    '--dispositions', 'json/dispositions.json'], { cwd: dir, encoding: 'utf8' });
+  G(dir, 'checkout', '-qb', 'revoke/mod_a');
+  G(dir, 'add', '-A');
+  G(dir, 'commit', '-qm', 'chore(dispose): revoke mod_a');
+}
+
+test('P3 真仓库：只改台账 + 重算索引的 PR 判为一致 → 退出 0', async () => {
+  const dir = ledgerFixture();
+  makeRevokePr(dir, revokeOf('mod_a'));
+  const log = quiet();
+  const m = await V();
+  const rc = await m.main(['--base', 'main', '--head', 'HEAD', '--owner', 'o', '--repo', 'r', '--cwd', dir],
+    { log, token: 't', attest: () => ({ ok: true }) });
+  assert.equal(rc, 0, allLogs(log));
+  assert.match(allLogs(log), /台账驱动/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('P3 真仓库：台账坏了 → 停住，不当「没有台账」把下架全放回', async () => {
+  const dir = ledgerFixture();
+  fs.writeFileSync(path.join(dir, 'json', 'dispositions.json'), '{ 坏掉的台账');
+  G(dir, 'checkout', '-qb', 'revoke/bad');
+  G(dir, 'add', '-A');
+  G(dir, 'commit', '-qm', 'chore(dispose): 坏台账');
+  const log = quiet();
+  const m = await V();
+  const rc = await m.main(['--base', 'main', '--head', 'HEAD', '--owner', 'o', '--repo', 'r', '--cwd', dir],
+    { log, token: 't', attest: () => ({ ok: true }) });
+  assert.equal(rc, 1);
+  assert.match(allLogs(log), /读不懂|不合格/);
+  fs.rmSync(dir, { recursive: true, force: true });
 });

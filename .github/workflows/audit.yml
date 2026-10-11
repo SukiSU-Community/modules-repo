@@ -81,6 +81,9 @@ jobs:
       # 索引重建 PR 走的是另一条判据：内容必须由 base 推导得出（见 kind/derive 两步）。
       index_pr: ${{ steps.kind.outputs.index_pr }}
       index_derived: ${{ steps.derive.outputs.derived }}
+      # 处置台账（下架/黑名单）在 CI 侧的那一道：hit / clear（见 dispose 步）。
+      disposition: ${{ steps.dispose.outputs.hit }}
+      disposition_reason: ${{ steps.dispose.outputs.why }}
     steps:
       - name: Checkout PR 分支
         uses: actions/checkout@v4
@@ -350,11 +353,13 @@ jobs:
           if [ -z "$PREFIX" ] && [ -d contrib/repo/pending ]; then PREFIX="contrib/repo"; fi
           PENDING_DIR="${PREFIX:+$PREFIX/}pending"
           INDEX_FILE="${PREFIX:+$PREFIX/}json/modules.json"
+          DISPOSITIONS_FILE="${PREFIX:+$PREFIX/}json/dispositions.json"
           SCRIPTS_DIR="${PREFIX:+$PREFIX/}scripts"
           set +e
           node "$SCRIPTS_DIR/verify-index-pr.mjs" --base "$BASE_SHA" --head HEAD \
             --owner "$OWNER" --repo "$REPO" --pending-dir "$PENDING_DIR" \
-            --index-file "$INDEX_FILE" --report verify-index-pr.report.json
+            --index-file "$INDEX_FILE" --dispositions-file "$DISPOSITIONS_FILE" \
+            --report verify-index-pr.report.json
           RC=$?
           set -e
           if [ "$RC" = "0" ]; then
@@ -614,6 +619,29 @@ jobs:
           ' "$JSON"
 
       # ---------------------------------------------------------------
+      # 4-b. 处置台账核对（三处拦截里的 CI 侧那道；判据在 scripts/dispositions.mjs，
+      # 与 build-index 的推导、Worker 的提交入口共用同一份实现，不在此处另写一遍）。
+      #
+      # 命中时这一步**仍然成功**：它只产结论，红由 approve 判。
+      # 让扫描作业因为黑名单而崩掉，会把 report / 标签 / 贴回 PR 的报告一起带走，
+      # 投稿者只看到一个红叉而不知道为什么被拒。
+      # ---------------------------------------------------------------
+      - name: 处置台账核对（下架 / 黑名单）
+        id: dispose
+        if: steps.locate.outputs.found == 'true'
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.pin.outputs.base_sha }}
+          PREFIX: ${{ steps.locate.outputs.prefix }}
+        run: |
+          set -euo pipefail
+          P="${PREFIX:+$PREFIX/}"
+          node "${P}scripts/disposition-check.mjs" --github-output \
+            --base "$BASE_SHA" \
+            --ledger "${P}json/dispositions.json" \
+            --pending-dir "${P}pending"
+
+      # ---------------------------------------------------------------
       # 5. 把报告贴到 PR
       # ---------------------------------------------------------------
       - name: 上传报告
@@ -800,14 +828,25 @@ jobs:
           CHANGE_TYPE: ${{ needs.audit.outputs.change_type }}
           MODULE_ID: ${{ needs.audit.outputs.module_id }}
           REASONS: ${{ needs.audit.outputs.reasons }}
+          DISPOSITION: ${{ needs.audit.outputs.disposition }}
+          DISPOSITION_REASON: ${{ needs.audit.outputs.disposition_reason }}
         run: |
           set -euo pipefail
+          # 台账命中排在所有分支之前：它是「已经判过、结论是不要这条」，
+          # 不该因为后面某条分支更宽松就被放过去（索引 PR 也在此列 —— 一条混合了
+          # 新投稿的索引 PR 如果命中黑名单，同样必须红）。
+          if [ "${DISPOSITION:-}" = "hit" ]; then
+            echo "::error::拒绝批准：这条投稿命中处置台账（已下架的内容或已拉黑的主体）。"
+            echo "::error::依据：${DISPOSITION_REASON:-（无）}"
+            echo "::error::要复核或申诉，去仓库里查 json/dispositions.json 对应那一条的 by 与 at —— 结论上有署名，就能找到下处置的人。"
+            exit 1
+          fi
           # 索引重建 PR 单独判，且必须排在「没有投稿内容」之前：
           # 它的 found 天然不是 true，若先走那条分支就等于「只改索引的 PR 一律放行」，
           # 整条审核链被一次手抄 json/modules.json 绕过。
           if [ "${INDEX_PR:-}" = "true" ]; then
             if [ "${DERIVED:-}" = "true" ]; then
-              echo "批准：索引重建 PR，内容与「base 索引 + 被消费的已批准条目」的推导逐字段一致。"
+              echo "批准：索引重建 PR，内容与「base 索引 + 被消费的已批准条目 + head 上的处置台账」的推导逐字段一致。"
               exit 0
             fi
             {
@@ -985,12 +1024,14 @@ jobs:
           if [ -z "$PREFIX" ] && [ -d contrib/repo/pending ]; then PREFIX="contrib/repo"; fi
           PENDING_DIR="${PREFIX:+$PREFIX/}pending"
           INDEX_FILE="${PREFIX:+$PREFIX/}json/modules.json"
+          DISPOSITIONS_FILE="${PREFIX:+$PREFIX/}json/dispositions.json"
           SCRIPTS_DIR="${PREFIX:+$PREFIX/}scripts"
 
           echo "重推导：base=${BASE_SHA:0:8}（此刻的 ${BASE_REF}），head=$(git rev-parse --short HEAD)"
           node "$SCRIPTS_DIR/verify-index-pr.mjs" --base "$BASE_SHA" --head HEAD \
             --owner "$OWNER" --repo "$REPO" --pending-dir "$PENDING_DIR" \
-            --index-file "$INDEX_FILE" --report verify-at-merge.report.json
+            --index-file "$INDEX_FILE" --dispositions-file "$DISPOSITIONS_FILE" \
+            --report verify-at-merge.report.json
 
       - name: 合并（squash：main 上每个索引状态都对应一个过检的 PR）
         shell: bash

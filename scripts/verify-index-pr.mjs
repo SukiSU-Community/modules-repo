@@ -13,9 +13,14 @@
  * 变绿、被合进 main —— 整条审核链被一次手抄索引绕过。
  *
  * 所以索引 PR 需要一个**按内容判定**的结论，而不是按「谁开的 / 有没有投稿」判定。
- * 判据只有一条，但必须严格：
+ * 判据只有一条式子，两种合法形态：
  *
- *   PR 里的索引 == buildIndex(base 索引, base 上被这次 PR 删掉的那些 pending 条目)
+ *   A 消费型：PR 里的索引 == buildIndex(base 索引, base 上被这次 PR 删掉的已批准条目, head 台账)
+ *   B 台账型：PR 里的索引 == buildIndex(base 索引, [],                            head 台账)
+ *
+ * B 不是放宽 —— 它只是把「下架」表达成推导的第二个输入，而不是推导的例外。
+ * 因此台账必须参与推导（它由 build-index 从 head 上读），而**不能**塞进 json/modules.json
+ * 的某个顶层键：normalizeIndex 只比 name + modules，藏在索引里的东西等于免检。
  *
  * 而「被删掉的那些条目算已批准」这件事**不能由 PR 自己声明**：删掉一个从没批准的
  * pending 文件再把它手抄进索引，正好是绕过路径。批准依据必须是外部证据 ——
@@ -33,6 +38,10 @@ import { execFileSync } from 'node:child_process';
 
 import { buildIndex, markApproved, collectPendingFiles } from './build-index.mjs';
 import { findPrForCommit, assertMergeApproved } from './publish-from-main.mjs';
+import { DEFAULT_DISPOSITIONS_FILE, parseDispositions } from './dispositions.mjs';
+
+/** 索引重建 PR 允许碰的文件。白名单外的任何改动都判「这不是重建，是夹带」。 */
+export const ALLOWED_INDEX_PR_PATHS = ['json/modules.json', DEFAULT_DISPOSITIONS_FILE];
 
 /**
  * 归一化到能逐字段比的状态。
@@ -82,17 +91,29 @@ export function diffIndexes(expected, actual) {
 /**
  * 纯判定核心：把「哪些条目算批准」和「推导结果对不对」分开，前者必须是外部证据。
  *
+ * 两种合法的索引 PR：
+ *   A 投稿消费型 —— 删掉了若干**有外部批准证据**的 pending，索引 = f(base 索引, 这些条目, 台账)
+ *   B 台账驱动型 —— 没消费投稿，只改了处置台账（下架/拉黑），索引 = f(base 索引, [], 新台账)
+ * 其余一律不认。判据仍是同一份 buildIndex，所以 B 不是放宽，只是换了第二个输入。
+ *
  * @param {{
  *   baseIndex: object,
  *   baseEntries: Array<{path: string, entry: object}>,
  *   deletedPaths: string[],
  *   touchedPaths: string[],   // PR 里新增/修改的 pending 路径
  *   actualIndex: object,
- *   attest: (p: string) => {ok: boolean, reason: string}
+ *   attest: (p: string) => {ok: boolean, reason: string},
+ *   dispositions?: object[],  // head 上的台账（已校验）
+ *   ledgerChanged?: boolean,
+ *   changedPaths?: string[],  // 本 PR 改到的所有文件
+ *   allowedPaths?: string[]
  * }} input
  */
 export function judgeIndexPr(input) {
-  const { baseIndex, baseEntries = [], deletedPaths = [], touchedPaths = [], actualIndex, attest } = input;
+  const {
+    baseIndex, baseEntries = [], deletedPaths = [], touchedPaths = [], actualIndex, attest,
+    dispositions = [], ledgerChanged = false, changedPaths = null, allowedPaths = ALLOWED_INDEX_PR_PATHS,
+  } = input;
   const fail = (reason, extra = {}) => ({ ok: false, reason, ...extra });
 
   // 索引 PR 的定义就是「不带新投稿」。带了就交给投稿扫描那条路判，别在这里混着批。
@@ -100,8 +121,30 @@ export function judgeIndexPr(input) {
     return fail(`这个 PR 同时新增/修改了 pending 条目（${touchedPaths.slice(0, 3).join('、')}`
       + `${touchedPaths.length > 3 ? ' 等' : ''}），不是纯索引重建，不按推导放行`);
   }
-  if (!deletedPaths.length) {
-    return fail('这个 PR 改了 json/modules.json 但一个 pending 都没消费 —— 索引不是推导出来的，是手改的');
+
+  // 文件集白名单。没有这一条，「改了 scan.mjs 让所有包都判低风险 + 附一份忠实推导的索引」
+  // 也会被判成合法重建并被 merge-index 自动合掉 —— 推导只比索引内容，看不见代码被动过。
+  // 这是接台账时顺手补的：json/dispositions.json 一进允许列表，就必须把「除此之外不许碰」
+  // 同时写死，否则允许列表会变成又一条自由通道。
+  if (changedPaths) {
+    const outside = changedPaths.filter(
+      (p) => !allowedPaths.includes(p) && !(p === 'pending' || p.startsWith('pending/')),
+    );
+    if (outside.length) {
+      return fail(`这个 PR 除了索引还改了：${outside.slice(0, 5).join('、')}`
+        + `${outside.length > 5 ? ' 等' : ''}。索引重建只许动 json/modules.json、json/dispositions.json 和 pending/**`
+        + '（要改脚本请另开 PR 走人工审核）');
+    }
+  }
+
+  if (!deletedPaths.length && !ledgerChanged) {
+    return fail('这个 PR 改了 json/modules.json 但既没消费 pending、也没改处置台账'
+      + ' —— 索引不是推导出来的，是手改的');
+  }
+  // 一个 PR 只做一个决定：混着来会让「这批投稿被批准了」和「这些内容被下架了」
+  // 在同一个批准结论里，事后无从分别复核。
+  if (deletedPaths.length && ledgerChanged) {
+    return fail('这个 PR 同时消费投稿和修改处置台账，请拆成两条：一条只管收录，一条只管下架');
   }
 
   const byPath = new Map(baseEntries.map((e) => [e.path, e.entry]));
@@ -121,10 +164,18 @@ export function judgeIndexPr(input) {
     evidences.push({ path: p, ...a });
   }
 
-  const { index: expected } = buildIndex({ index: baseIndex, entries: approved });
+  const { index: expected } = buildIndex({ index: baseIndex, entries: approved, dispositions });
   const diffs = diffIndexes(expected, actualIndex);
   if (diffs.length) {
     return fail('PR 里的索引与推导结果不一致：\n  - ' + diffs.join('\n  - '), { diffs, evidences });
+  }
+  if (ledgerChanged && !deletedPaths.length) {
+    return {
+      ok: true,
+      reason: `索引与推导一致（台账驱动：按 ${dispositions.length} 条处置记录重算，未消费投稿）`,
+      evidences,
+      consumed: [],
+    };
   }
   return { ok: true, reason: `索引与推导一致（消费 ${deletedPaths.length} 个已批准条目）`, evidences, consumed: deletedPaths };
 }
@@ -141,6 +192,30 @@ function showJson(cwd, ref, file) {
     return JSON.parse(git(cwd, ['show', `${ref}:${file}`]));
   } catch {
     return null;
+  }
+}
+
+/**
+ * 和 showJson 的区别只在一件事：**「文件不存在」和「文件在但读不懂」必须是两种结果**。
+ * 台账走这条 —— 读不懂的台账若被当成「没有台账」，等于一次坏 JSON 把所有已下架的模块
+ * 原样放回索引，而这件事不会有任何地方变红。
+ */
+function readJsonAt(cwd, ref, file) {
+  let text;
+  try {
+    text = git(cwd, ['show', `${ref}:${file}`]);
+  } catch (e) {
+    const msg = String((e && e.stderr) || (e && e.message) || '');
+    // 措辞有两家：does not exist in / exists on disk but not in <ref>。都算「这个 ref 上没有」。
+    if (/does not exist in|exists on disk, but not in|does not exist on disk|pathspec/i.test(msg)) {
+      return { present: false };
+    }
+    return { present: true, error: msg.trim().split('\n')[0] };
+  }
+  try {
+    return { present: true, json: JSON.parse(text) };
+  } catch (e) {
+    return { present: true, error: `JSON 解析失败 - ${e.message}` };
   }
 }
 
@@ -198,13 +273,15 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   const log = deps.log || console;
   if (opts.help || !opts.base || !opts.owner || !opts.repo) {
     log.log(`用法: node verify-index-pr.mjs --base <baseRef> --owner <o> --repo <r>
-       [--pending-dir pending] [--index-file json/modules.json] [--cwd <dir>] [--report <file>]
-   判定当前工作树里的索引是否等于「base 内容 + 被本 PR 消费的已批准条目」的推导结果。`);
+       [--pending-dir pending] [--index-file json/modules.json] [--dispositions-file json/dispositions.json]
+       [--cwd <dir>] [--report <file>]
+   判定当前工作树里的索引是否等于「base 内容 + 被本 PR 消费的已批准条目 + head 上的处置台账」的推导结果。`);
     return opts.help ? 0 : 2;
   }
   const cwd = opts.cwd ? path.resolve(opts.cwd) : process.cwd();
   const pendingDir = opts['pending-dir'] || 'pending';
   const indexFile = opts['index-file'] || 'json/modules.json';
+  const dispFile = opts['dispositions-file'] || DEFAULT_DISPOSITIONS_FILE;
   const baseRef = String(opts.base);
   const mainBranch = opts['main-branch'] || 'main';
   const token = deps.token || process.env.GITHUB_TOKEN || process.env.GH_TOKEN || '';
@@ -248,6 +325,42 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     for (const e of (Array.isArray(obj) ? obj : [obj])) baseEntries.push({ path: p, entry: e });
   }
 
+  // ── 处置台账：第三个推导输入，只能从 ref 上读（工作树此刻是 PR head）──
+  // head 上的台账参与推导；base 的那份只用来看「这个 PR 有没有动台账」。
+  const baseLedger = readJsonAt(cwd, baseRef, dispFile);
+  const headLedger = readJsonAt(cwd, headRef, dispFile);
+  for (const [where, r] of [['base', baseLedger], ['head', headLedger]]) {
+    if (r.error) {
+      report.reason = `${where} 上的 ${dispFile} 读不懂：${r.error}（不当「没有台账」处理，停住）`;
+      log.error('[verify-index-pr] ' + report.reason);
+      writeReport();
+      return 1;
+    }
+  }
+  let dispositions = [];
+  try {
+    dispositions = headLedger.present ? parseDispositions(headLedger.json, `head:${dispFile}`) : [];
+  } catch (e) {
+    report.reason = `head 上的台账不合格：${e.message}`;
+    log.error('[verify-index-pr] ' + report.reason);
+    writeReport();
+    return 1;
+  }
+  const ledgerChanged = stableStringify(baseLedger.json ?? null) !== stableStringify(headLedger.json ?? null);
+
+  // 本 PR 到底动了哪些文件。拿不到就不判 —— 白名单检查缺席地「通过」比红更危险。
+  let changedPaths = null;
+  try {
+    const mergeBase = git(cwd, ['merge-base', baseRef, headRef]).trim();
+    changedPaths = git(cwd, ['diff', '--name-only', `${mergeBase}..${headRef}`])
+      .split('\n').map((s) => s.trim()).filter(Boolean);
+  } catch (e) {
+    report.reason = `取不到本 PR 的改动文件集（merge-base ${baseRef}..${headRef} 失败：${String((e && e.stderr) || e.message).trim().split('\n')[0]}）`;
+    log.error('[verify-index-pr] ' + report.reason);
+    writeReport();
+    return 1;
+  }
+
   const attesters = new Map();
   const attest = (p) => {
     if (!attesters.has(p)) {
@@ -264,10 +377,13 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   const verdict = judgeIndexPr({
     baseIndex, baseEntries, deletedPaths, touchedPaths, actualIndex,
     attest: (p) => settled.get(p) || { ok: false, reason: '未取证' },
+    dispositions, ledgerChanged, changedPaths,
   });
   report.ok = verdict.ok;
   report.reason = verdict.reason;
   report.consumed = deletedPaths;
+  report.ledger = { changed: ledgerChanged, entries: dispositions.length, file: dispFile };
+  report.changedPaths = changedPaths;
   report.evidences = (verdict.evidences || []).map((e) => ({ path: e.path, pr: e.pr, commitSha: e.commitSha, ok: e.ok, reason: e.reason }));
   for (const line of String(verdict.reason).split('\n')) (verdict.ok ? log.log : log.error).call(log, '[verify-index-pr] ' + line);
   writeReport();
