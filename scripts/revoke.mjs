@@ -29,18 +29,40 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(__dirname, '..');
 
 /**
+ * 处置指针的规范形态：**浏览器里点得开的永久链接**。
+ *
+ * 为什么不是 `gh:<login>@issuecomment-<id>`（这是第一版随手写的形状）：GitHub 的评论 id
+ * 单独拼不出 URL，必须知道它挂在哪个 issue 上 —— 只有 id 的指针在公示页上是一段死文本，
+ * 谁都得自己去搜。实测过：`api.github.com/repos/<repo>/issues/comments/<id>` 会回 html_url，
+ * 但那是要求访问者自己去查的东西，不该出现在「点一下就能看证据」这一步。
+ *
+ * 校验放在**写入端**而不是 dispositions.mjs 的通用校验里：台账里已经有 5 条旧形状的记录，
+ * 让校验器拒收旧记录 = 读不懂台账 = 推导停住 = 索引冻死（那条失效方向是设计好的），
+ * 而写入端收紧只影响以后下的处置。
+ */
+export const PROOF_URL_RE = /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/issues\/\d+#issuecomment-\d+$/;
+
+/**
  * 组一条处置记录。
  *
- * `by` 必须是**别人能回访的指针**（`gh:<login>@<reviewId|issuecomment-…>`），不是「admin 说的」。
+ * `by` 必须是**别人能回访、且在浏览器里点得开**的证据链接，不是「admin 说的」。
  * 无主章在追责链上是零价值 —— 与 pending 章 isApproved() 同一条理由，
  * 而处置比放行更需要留名：放行错了顶多多一个包，下架错了是把别人的作品抹掉。
  */
 export function buildDisposition(flags, now = new Date()) {
   const kind = flags.kind || 'revoke';
+  const by = String(flags.by || '').trim();
+  if (!PROOF_URL_RE.test(by)) {
+    throw new Error(
+      '--by 必须是点得开的 GitHub 证据链接（https://github.com/<owner>/<repo>/issues/<n>#issuecomment-<id>），'
+      + `收到 ${JSON.stringify(flags.by)}。评论 URL 的拿法：在 issue 里发完说明后点那条评论的时间戳，`
+      + '或 GET api.github.com/repos/<owner>/<repo>/issues/comments/<id> 取 html_url。'
+    );
+  }
   const d = {
     kind,
     reason: flags.reason,
-    by: flags.by,
+    by,
     at: now.toISOString(),
   };
   if (flags.id) d.id = String(flags.id).trim();
@@ -84,7 +106,9 @@ export function main(argv = process.argv.slice(2), io = console, deps = {}) {
   const indexFile = path.resolve(ROOT, flags.index || 'json/modules.json');
 
   const usage = `用法: node scripts/revoke.mjs --id <id> [--version-code <n>] [--sha256 <64hex>] [--uid <酷安UID>]
-          --kind revoke|deny --reason ${REASONS.join('|')} --by <可回访指针> [--note <公示说明>] [--verify <复核命令>] [--dry-run]`;
+          --kind revoke|deny --reason ${REASONS.join('|')}
+          --by https://github.com/<owner>/<repo>/issues/<n>#issuecomment-<id>
+          [--note <公示说明>] [--verify <复核命令>] [--dry-run]`;
   if (!flags.id && !flags.sha256 && !flags.uid) {
     io.error(`[revoke] 必须至少给一个选择器（--id / --sha256 / --uid）。\n${usage}`);
     return 2;
@@ -98,11 +122,17 @@ export function main(argv = process.argv.slice(2), io = console, deps = {}) {
     return 2;
   }
   if (!flags.by || flags.by === true) {
-    io.error('[revoke] --by 不能为空：下了处置必须留名，且是可回访的指针（gh:<login>@<reviewId|issuecomment-…>）');
+    io.error(`[revoke] --by 不能为空：下了处置必须留下点得开的证据链接。\n${usage}`);
     return 2;
   }
 
-  const entry = buildDisposition(flags, now);
+  let entry;
+  try {
+    entry = buildDisposition(flags, now);
+  } catch (e) {
+    io.error(`[revoke] ${e.message}`);
+    return 2;
+  }
   // 归一化+校验走同一条 parseDispositions：脚本不能有一套比 CI 松的校验，
   // 否则「本地能写进去、CI 判红」的台账会一直留在 main 的历史里。
   let normalized;

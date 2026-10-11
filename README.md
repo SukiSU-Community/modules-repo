@@ -518,6 +518,68 @@ node --test test/build-index.test.mjs   # 只跑这一个文件
 > 另一处坑：母本相关的测试（`AUDIT_COPIES` / `INDEX_COPIES`）在独立 clone 里必须跳过而不是 ENOENT，
 > 因为 `../../audit/workflows/` 只存在于 monorepo 布局。
 
+## 处置（下架 / 拉黑）
+
+`json/dispositions.json` 是索引推导的**第二个输入**：`索引 = buildIndex(pending, 台账)`。
+它不是索引的附属说明，也不是删完就忘的黑名单 —— 判据只有一份
+（`scripts/dispositions.mjs`），Worker 与公示页各自镜像/读取它，但不重算判据。
+
+**三处拦截，失效方向刻意不对称：**
+
+| 位置 | 读不到 / 读不懂台账时 | 为什么 |
+|---|---|---|
+| Worker `POST /submit`（intake） | **放行** | 这里拒掉的代价是「raw 抖一下所有人都投不了稿」；漏放只是这条投稿走到 CI 才被挡 |
+| CI `audit.yml` 的 `dispose` 步 + `approve` | **停住判红** | 那里的失效方向是「这次审核没结论」，而「跳过一条坏条目」等于让被下架的模块复活 |
+| `build-index.mjs` 推导 | **停住判红**（`--consume` 还不删被挡下的 pending，留作复核现场） | 同上，且起算点不能漂 |
+
+选择器 `id` / `sha256` / `coolapkUid` 之间是 **AND**（写成 OR 会连累同 id 的好版本）；
+`versionCode` 必须跟 `id` 同时出现。空选择器直接拒 —— 那条记录会匹配一切。
+
+### 下一条处置
+
+```bash
+node scripts/revoke.mjs --id <模块ID> [--version-code <n>] [--sha256 <64hex>] [--uid <酷安UID>] \
+     --kind revoke|deny --reason <公示分类> \
+     --by https://github.com/<owner>/<repo>/issues/<n>#issuecomment-<id> \
+     --note "<给人看的说明>" [--verify <任何人都能跑的复核命令>] [--dry-run]
+```
+
+`--by` 现在**必须**是浏览器里点得开的评论永久链接。旧形状 `gh:<login>@issuecomment-<id>`
+只有评论 id、没有 issue 号，而 GitHub 无法从评论 id 反查 URL（`api.github.com/repos/<o>/<r>/issues/comments/<id>`
+会回 `html_url`，但那是要求访问者自己去查的东西）。校验只加在**写入端**：让通用校验器拒收旧记录
+= 读不懂台账 = 推导停住 = 索引冻死，那条失效方向是设计好的。
+名字不再进台账 —— 谁下的处置看那条评论的作者，抄一份进台账就是引进一个会过期的字段。
+
+### 为什么「只改台账」的 PR 不算索引 PR（一个被这次改动顺手关掉的洞）
+
+`audit.yml` 的 `kind` 步只看 `json/modules.json` 有没有变。**以前看的是整个 `json/`**，
+于是删掉一条处置记录（把某人从黑名单里放出来）会被认成索引重建：它既不消费 pending，
+也不改变当前索引，推导必然「一致」→ `merge-index` 自动合。削弱处置不该由推导说了算，
+它是人工判断 —— 现在这类 PR 落到「无投稿内容」分支，绿了也要人合。
+
+它真正的后果（被放行的模块重新出现在下一次重建里）本来就依赖有人把那条 pending 留着，
+这也正是 `--consume` 不删被台账挡下的 pending 的理由。
+
+### 合并之后：CDN 必须失效
+
+`merge-index` 在 `gh pr merge` 之后紧跟一步 `node scripts/purge-cdn.mjs`。
+理由是一条实测：**下架的生效速度由 CDN 的 TTL 决定，而不是由 main 决定** ——
+索引 PR #34 把 `json/modules.json` 推空之后近 50 分钟，
+`https://cdn.jsdelivr.net/gh/SukiSU-Community/modules-repo@main/json/modules.json`
+仍然返回下架前的 4 个模块，也就是订阅那个地址的 App 照样能装到已被下架的包。
+
+- 只内置 jsDelivr 一家：它的 purge 是公开 GET、不需要凭据（往 CI 里塞一把能改 CDN 的钥匙，
+  比这一步省下的麻烦贵得多）。别的镜像把地址放进 repo variable `CDN_PURGE_URLS`（逗号分隔），
+  脚本对它只认「`cdn.` → `purge.` 换主机名」，认不出来就报「无能为力」并**继续绿** ——
+  清不动第三方镜像是运维的事，不该把已经完成的合并判成失败。
+- 清除失败（HTTP 非 2xx / `status=error` / 网络异常）→ **退出码 1**，输出里带重试命令。
+  合并已经发生，这一步红不撤销任何事，只是把「CDN 还在发旧索引」变成看得见的失败。
+- 本地开发机上 `node` 直连 `purge.jsdelivr.net` 会被 `ECONNRESET`（同一时刻 `curl` 打得通，
+  `cdn.jsdelivr.net` 也打得通），所以这一步的绿只能在 CI 里看；失败路径与三态判定由
+  `test/purge-cdn.test.mjs` 用注入的 fetch 覆盖。
+
+公示页在投稿站那边（`modules-web` 的 `#/incidents`），它显示的就是这份台账原文。
+
 ## 发布
 
 仓库推到 GitHub 后开启 **Settings → Pages → Deploy from branch（选默认分支的根目录）**，

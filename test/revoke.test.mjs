@@ -11,11 +11,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { main, parseArgs, sameSelectors } from '../scripts/revoke.mjs';
+import { main, parseArgs, sameSelectors, buildDisposition } from '../scripts/revoke.mjs';
 import { buildIndex } from '../scripts/build-index.mjs';
 
 const SHA = (c) => c.repeat(64);
-const BY = 'gh:yufengliang@issuecomment-123456';
+// 指针必须是浏览器里点得开的永久链接（带 issue 号），旧形状 gh:<login>@issuecomment-<id>
+// 单独拼不出 URL —— 见 revoke.mjs 里 PROOF_URL_RE 的注释。
+const BY = 'https://github.com/o/r/issues/33#issuecomment-123456';
 
 function sandbox({ ledger = null, modules = [] } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'revoke-'));
@@ -130,7 +132,7 @@ test('同样选择器重复下处置 → 退出 4，不写第二条', () => {
   const s = sandboxWithModule();
   run(s, ['--id', 'mod_x', '--kind', 'revoke', '--reason', 'test-probe', '--by', BY]);
   const before = fs.readFileSync(s.ledgerPath, 'utf8');
-  const { rc, io } = run(s, ['--id', 'mod_x', '--kind', 'revoke', '--reason', 'malware', '--by', 'gh:other@1'], capture());
+  const { rc, io } = run(s, ['--id', 'mod_x', '--kind', 'revoke', '--reason', 'malware', '--by', 'https://github.com/o/r/issues/9#issuecomment-777'], capture());
   assert.equal(rc, 4);
   assert.match(io.out.join('\n'), /已经有同样选择器的记录/);
   assert.equal(fs.readFileSync(s.ledgerPath, 'utf8'), before, '重复下处置不许往台账里堆矛盾记录');
@@ -171,4 +173,37 @@ test('parseArgs：--dry-run 是裸 flag，不吃下一个参数', () => {
   assert.equal(o.id, 'a');
   assert.equal(o['dry-run'], true);
   assert.equal(o.reason, 'malware');
+});
+
+/* ------------------------------------------------------------ by 指针形状 */
+
+test('buildDisposition：只接受点得开的证据链接', () => {
+  const d = buildDisposition({ reason: 'malware', by: BY, id: 'a' }, new Date('2026-10-11T00:00:00Z'));
+  assert.equal(d.by, BY);
+  assert.equal(d.at, '2026-10-11T00:00:00.000Z');
+});
+
+test('buildDisposition：旧形状 gh:<login>@issuecomment-<id> 被拒 —— 它在浏览器里点不开', () => {
+  for (const bad of [
+    'gh:yufengliang@issuecomment-123456',
+    'https://github.com/o/r/issues/33',                 // 缺评论锚点：跳到 issue 顶部，看不到那条说明
+    'https://github.com/o/r/issues/33#issuecomment-x',
+    'https://evil.example.com/o/r/issues/33#issuecomment-1',
+    'http://github.com/o/r/issues/33#issuecomment-1',   // 明文不算
+    'https://github.com/o/r/pull/33#issuecomment-1',    // 只认 issues 路径（PR 评论也挂在 issues/<n> 下，写成 /pull/ 就是手打错了）
+    '',
+  ]) {
+    assert.throws(() => buildDisposition({ reason: 'malware', by: bad, id: 'a' }), /issuecomment/, `${bad} 应该被拒`);
+  }
+});
+
+test('main：--by 形状不对时退出 2 并告诉人 URL 怎么拿，绝不落盘', () => {
+  const s = sandbox();
+  const lines = [];
+  const io = { log: (m) => lines.push(String(m)), error: (m) => lines.push(String(m)) };
+  const rc = main(['--id', 'mod_x', '--reason', 'malware', '--by', 'gh:me@issuecomment-9', '--ledger', s.ledgerPath, '--index', s.indexPath], io);
+  assert.equal(rc, 2);
+  assert.ok(lines.some((l) => l.includes('html_url')), '报错要顺手给出拿 URL 的办法');
+  assert.equal(fs.existsSync(s.ledgerPath), false, '一条都不该写下去');
+  fs.rmSync(s.dir, { recursive: true, force: true });
 });
