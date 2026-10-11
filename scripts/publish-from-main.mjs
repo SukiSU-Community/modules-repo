@@ -58,11 +58,72 @@ export function checkConclusion(runs, name = APPROVE_CHECK_NAME) {
 }
 
 /**
+ * 人工批准的章。评论正文的**第一行**必须以这个标记开头，其余部分是理由。
+ * 为什么用评论而不是标签：标签需要 triage 权限、而且改一次就看不出历史；评论带
+ * `author_association` 与 `id`，两者都能被任何人复验（`gh api repos/<o>/<r>/issues/comments/<id>`）。
+ */
+export const HUMAN_APPROVAL_MARKER = '#' + HUMAN_APPROVE_STATUS;
+
+/** 只有这两种身份算签核人（OWNER=仓库所有者，MEMBER=同 org 成员）。 */
+export const TRUSTED_ASSOCIATIONS = new Set(['OWNER', 'MEMBER']);
+
+/** 双签：默认要两个**不同的人**。同一个人发十条仍然是一签。 */
+export const REQUIRED_SIGNERS = 2;
+
+/**
+ * 从 PR 评论里挑出有效的人工签。
+ *
+ * 判据全部是可复验的字段，不碰任何「看起来像官方」的文本：
+ *   * 第一行以 `#human-approved` 开头（写在第一行是为了让人一眼看出这条评论的**用途**，
+ *     而不是在讨论中间夹一句就能冒充）；
+ *   * `author_association` ∈ {OWNER, MEMBER} —— 这是 GitHub 在读取时算出来的关系，
+ *     冒充不了；
+ *   * 有数字 `id`（拿它就能回访那条评论）。
+ * 按 login 去重，所以同一个人刷多少条都只算一签。
+ */
+export function findHumanApprovals(comments = [], require = REQUIRED_SIGNERS) {
+  const valid = [];
+  const rejected = [];
+  for (const c of (Array.isArray(comments) ? comments : [])) {
+    const body = String((c && c.body) || '');
+    const firstLine = body.trim().split('\n', 1)[0].trim();
+    if (!firstLine.startsWith(HUMAN_APPROVAL_MARKER)) continue; // 不是签核评论，不参与判定
+    const assoc = String((c && c.author_association) || '').toUpperCase();
+    const login = String((c && c.user && c.user.login) || '');
+    const id = Number(c && c.id);
+    if (!TRUSTED_ASSOCIATIONS.has(assoc)) {
+      rejected.push({ id, login, why: `身份是 ${assoc || '未知'}，不是 OWNER/MEMBER` });
+      continue;
+    }
+    if (!login || !Number.isFinite(id)) {
+      rejected.push({ id, login, why: '缺 login 或评论 id，无法复验' });
+      continue;
+    }
+    valid.push({ id, login, assoc, reason: firstLine.slice(HUMAN_APPROVAL_MARKER.length).trim() });
+  }
+  const byLogin = new Map();
+  for (const a of valid) {
+    const k = a.login.toLowerCase();
+    if (!byLogin.has(k)) byLogin.set(k, a); // 同一人取最早那条
+  }
+  const signers = [...byLogin.values()];
+  return { signers, enough: signers.length >= require, require, rejected };
+}
+
+/**
  * 判定「这次合并算不算被批准」。纯函数，好测。
- * @param {{ pr: object, checks: object[], mainBranch: string }} input
+ *
+ * 两条路，顺序不能反：
+ *   1. **机器路**：head sha 上 `approve` 的结论是 success —— 审核流水线自己判的，证据最强。
+ *   2. **人工路**：机器判了不通过（或没结论），但 PR 已被合并，且评论里有 ≥2 个
+ *      OWNER/MEMBER 的 `#human-approved` 签名。这条路的成立前提本身就是「有人越过了红」：
+ *      required check 红着的时候 Actions 合不动，所以合上的人一定是拿自己的权限点的。
+ *      因此还要求 `merged_by` 不是 bot —— 哪天 org/ruleset 被改到允许 Actions 强合红 PR，
+ *      这里必须拒绝盖章，而不是替那次合并背书。
+ * @param {{ pr: object, checks: object[], comments?: object[], mainBranch: string, requireSigners?: number }} input
  * @returns {{ ok: boolean, reason: string, evidence: object }}
  */
-export function assertMergeApproved({ pr, checks = [], mainBranch = 'main' } = {}) {
+export function assertMergeApproved({ pr, checks = [], comments = [], mainBranch = 'main', requireSigners = REQUIRED_SIGNERS } = {}) {
   const fail = (reason, extra = {}) => ({ ok: false, reason, evidence: { ...extra } });
 
   if (!pr || typeof pr !== 'object') return fail('拿不到这次推送对应的 PR，无法确认批准来源');
@@ -77,34 +138,78 @@ export function assertMergeApproved({ pr, checks = [], mainBranch = 'main' } = {
   }
 
   const { found, conclusion } = checkConclusion(checks, APPROVE_CHECK_NAME);
-  if (!found) {
+  if (found && conclusion === 'success') {
+    return {
+      ok: true,
+      kind: 'ci',
+      reason: `PR #${pr.number} 的 ${APPROVE_CHECK_NAME} check 在 ${headSha.slice(0, 8)} 上为 success`,
+      evidence: { pr: pr.number, headSha, checkName: APPROVE_CHECK_NAME, conclusion },
+    };
+  }
+
+  // 机器路不通 —— 试人工路。先说清机器为什么不算通过，拒绝时两个理由都要能看见。
+  const machine = !found
+    ? `head ${headSha.slice(0, 8)} 上没有名为 ${APPROVE_CHECK_NAME} 的 check`
+    : `${APPROVE_CHECK_NAME} 的结论是 ${conclusion}（不是 success）`;
+  const sig = findHumanApprovals(comments, requireSigners);
+  if (!sig.signers.length) {
     return fail(
-      `PR #${pr.number} 的 head ${headSha.slice(0, 8)} 上没有名为 ${APPROVE_CHECK_NAME} 的 check —— `
-      + '没有批准证据就不盖房。',
-      { pr: pr.number, headSha }
+      `PR #${pr.number} 未获批准：${machine}，而评论里一条 ${HUMAN_APPROVAL_MARKER} 人工签都没有`
+      + '（要放行请在 PR 里留签名，见 GOVERNANCE.md）',
+      { pr: pr.number, headSha, machine }
     );
   }
-  if (conclusion !== 'success') {
+  if (!sig.enough) {
     return fail(
-      `PR #${pr.number} 上 ${APPROVE_CHECK_NAME} 的结论是 ${conclusion}（不是 success），未获批准`,
-      { pr: pr.number, headSha, conclusion }
+      `PR #${pr.number} 未获批准：${machine}，人工签只有 ${sig.signers.length} 个（${sig.signers.map((s) => s.login).join('、')}），`
+      + `少于要求的 ${sig.require} 个不同的人`,
+      { pr: pr.number, headSha, machine, signers: sig.signers }
+    );
+  }
+  const mergedBy = String((pr.merged_by && pr.merged_by.login) || '');
+  if (!mergedBy) {
+    return fail(`PR #${pr.number} 查不到是谁合的，人工放行不留名等于没有放行`, { pr: pr.number, headSha, machine });
+  }
+  if (/\[bot\]$/i.test(mergedBy)) {
+    return fail(
+      `PR #${pr.number} 在 ${machine} 的情况下被 ${mergedBy}（bot）合并 —— 说明 org/ruleset 被改到允许`
+      + ' Actions 强合红 PR 了。这里拒绝替那次合并盖章，请先去查保护配置。',
+      { pr: pr.number, headSha, machine, mergedBy }
     );
   }
   return {
     ok: true,
-    reason: `PR #${pr.number} 的 ${APPROVE_CHECK_NAME} check 在 ${headSha.slice(0, 8)} 上为 success`,
-    evidence: { pr: pr.number, headSha, checkName: APPROVE_CHECK_NAME, conclusion },
+    kind: 'human',
+    reason: `PR #${pr.number} 由 ${mergedBy} 人工合并，并有 ${sig.signers.length} 个 OWNER/MEMBER 的 ${HUMAN_APPROVAL_MARKER} 签名`,
+    evidence: { pr: pr.number, headSha, mergedBy, signers: sig.signers, machine },
   };
 }
 
 /**
  * 章上写什么。`by` 必须是**别人也能复验**的指针，而不是「ci 说过」这种自证：
- * 拿到 pr + headSha，任何人用 `gh api repos/<o>/<r>/check-runs/<headSha>?name=approve`
- * 都能重跑这个判断。
+ *   * 机器路：拿 pr + headSha，任何人 `gh api repos/<o>/<r>/check-runs/<headSha>?name=approve`
+ *     都能重跑这个判断。
+ *   * 人工路：把每个签名的**评论 id** 写进去，任何人
+ *     `gh api repos/<o>/<r>/issues/comments/<id>` 就能看到是谁、以什么身份、写了什么理由。
  */
-export function approvalBy({ owner, repo, evidence }) {
+export function approvalBy({ owner, repo, evidence, kind } = {}) {
   const sha = String(evidence.headSha || '').slice(0, 12);
+  // kind 从证据本身推：有签名列表就是人工路。多一个要手工同步的参数，就多一个会写错的地方。
+  const k = kind || (evidence && evidence.signers ? 'human' : 'ci');
+  if (k === 'human') {
+    const ids = (evidence.signers || []).map((s) => `c${s.id}`).join('+');
+    return `${HUMAN_APPROVE_STATUS}#${owner}/${repo}PR${evidence.pr}@${sha}/${ids}`;
+  }
   return `ci:${APPROVE_CHECK_NAME}#${owner}/${repo}PR${evidence.pr}@${sha}`;
+}
+
+/** 复验路径：让人拿到章就知道该敲哪条命令，不用回去翻 workflow 日志。 */
+export function approvalVerifyHint({ owner, repo, evidence } = {}) {
+  if (evidence && evidence.signers) {
+    const cmds = evidence.signers.map((s) => `gh api repos/${owner}/${repo}/issues/comments/${s.id}`);
+    return cmds.join(' && ');
+  }
+  return `gh api repos/${owner}/${repo}/commits/${evidence.headSha}/pulls`;
 }
 
 /**
@@ -117,7 +222,7 @@ export function stampEntry(entry, { owner, repo, evidence, now = () => new Date(
   const meta = { by, at: now() };
   if (risk) meta.risk = risk;
   // 把复验路径留在章里：以后有人问「凭什么」，不用回去翻 workflow 日志。
-  meta.verify = `gh api repos/${owner}/${repo}/commits/${evidence.headSha}/pulls`;
+  meta.verify = approvalVerifyHint({ owner, repo, evidence });
   return { entry: markApproved(entry, meta), stamped: true };
 }
 
@@ -211,8 +316,15 @@ export async function findPrForCommit({ apiBase, token, owner, repo, sha, mainBr
     ? await ghFetch(apiBase, token, [`repos/${owner}/${repo}/commits/${pr.head.sha}/check-runs`])
     : null;
   const checks = (checksData && Array.isArray(checksData.check_runs) ? checksData.check_runs : []);
+  // 评论只在机器路不通时才需要，但**一律取**：人工签的证据形状和机器路一样要能复验，
+  // 少取一次就会变成「机器红着的时候没人能证明谁放行过」。分页取满 100 条足够 ——
+  // 一条投稿 PR 的讨论不会更长，而超了也只是签核评论落在窗口外，判定会明确拒绝而不是放行。
+  const commentsData = pr.number
+    ? await ghFetch(apiBase, token, [`repos/${owner}/${repo}/issues/${pr.number}/comments?per_page=100`])
+    : null;
+  const comments = Array.isArray(commentsData) ? commentsData : [];
   if (pulls.length > 1) log.log(`[publish-from-main] 注意：该提交关联 ${pulls.length} 个 PR，按 #${pr.number} 判定`);
-  return { pr, checks, others: pulls.filter((p) => p.number !== pr.number) };
+  return { pr, checks, comments, others: pulls.filter((p) => p.number !== pr.number) };
 }
 
 /* ---------------------------------------------------------------------- CLI */
@@ -262,22 +374,26 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
 
   if (!files.length) { log.log('[publish-from-main] pending 目录是空的，无需重建索引。'); report.ok = true; report.reason = 'no-pending'; writeReport(); return 0; }
 
-  const { pr, checks = [], note } = await findPrForCommit({
+  const { pr, checks = [], comments = [], note } = await findPrForCommit({
     apiBase, token, owner: opts.owner, repo: opts.repo, sha: opts.sha, mainBranch, log,
   });
-  const verdict = assertMergeApproved({ pr, checks, mainBranch });
+  const verdict = assertMergeApproved({ pr, checks, comments, mainBranch });
   report.pr = verdict.evidence?.pr ?? null;
   report.headSha = verdict.evidence?.headSha ?? '';
   if (!verdict.ok) {
     report.reason = verdict.reason;
     log.error(`[publish-from-main] 未获批准，不盖章节：${verdict.reason}${note ? `（${note}）` : ''}`);
-    log.error('[publish-from-main] 条目留在 main 上但不会进索引；要么让审核结论转为批准，要么走人工双签盖章。');
+    log.error(
+      '[publish-from-main] 条目留在 main 上但不会进索引；要么让审核结论转为批准，'
+      + `要么由两个 OWNER/MEMBER 在 PR 里各留一条以 ${HUMAN_APPROVAL_MARKER} 开头的评论再重跑（见 GOVERNANCE.md）。`
+    );
     writeReport();
     return 1;
   }
   report.ok = true;
+  report.kind = verdict.kind;
   report.reason = verdict.reason;
-  log.log(`[publish-from-main] 批准证据成立：${verdict.reason}`);
+  log.log(`[publish-from-main] 批准证据成立（${verdict.kind === 'human' ? '人工双签' : '审核流水线'}）：${verdict.reason}`);
 
   let touched = 0;
   // collectPendingFiles 返回的是 { file, rel, entries }，不是路径字符串

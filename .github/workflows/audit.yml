@@ -877,7 +877,7 @@ jobs:
           {
             echo "::error::未获批准：action=${ACTION:-<空>} label=${LABEL:-<空>} risk=${RISK:-<空>} changeType=${CHANGE_TYPE:-<空>}"
             echo "::error::依据：${REASONS:-（无）}"
-            echo "::error::本 PR 不满足自动放行条件，需人工审核后走双签盖章流程（见 README/GOVERNANCE.md）。"
+            echo "::error::本 PR 不满足自动放行条件，需人工审核后走双签盖章流程（见仓库根 GOVERNANCE.md：两名组织成员各在 PR 评论首行写 #human-approved）。"
           } >&2
           exit 1
 

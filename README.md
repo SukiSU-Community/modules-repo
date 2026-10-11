@@ -93,7 +93,7 @@ node scripts/fetch-pending-zip.mjs pending/ --out-dir /tmp/zips \
 |---|---|---|---|
 | `APPROVAL_FIELD` | `audit` | `scripts/build-index.mjs` | `scripts/publish-from-main.mjs`（经 `markApproved`） |
 | `APPROVED_STATUS` | `auto-approved` | 同上 | 同上 |
-| `HUMAN_APPROVED_STATUS` | `human-approved` | 同上 | 人工双签脚本（P4，尚未实现） |
+| `HUMAN_APPROVED_STATUS` | `human-approved` | 同上 | `scripts/publish-from-main.mjs`（人工双签路径，流程见 [GOVERNANCE.md](GOVERNANCE.md)） |
 | `APPROVE_CHECK_NAME` | `approve` | `scripts/publish-from-main.mjs` | `audit.yml` 的 job `name:` |
 
 自动放行时 pending 条目里的章长这样：
@@ -112,6 +112,17 @@ node scripts/fetch-pending-zip.mjs pending/ --out-dir /tmp/zips \
 
 `by` 必须是**别人也能复验的指针**，不是「ci 说过」这种自证：拿 PR 号 + head sha，
 任何人 `gh api .../check-runs?name=approve` 都能重跑这个判断。
+
+机器放行与人工双签是两种章，`by` 的形状不一样，`isApproved()` 都只认非空 `by`：
+
+```
+ci:approve#<owner>/<repo>PR<n>@<headSha12>
+human-approved#<owner>/<repo>PR<n>@<headSha12>/c<评论id>+c<评论id>
+```
+
+后者多出来的 `c<id>+c<id>` 是两名 OWNER/MEMBER 的签核评论 id，
+`gh api repos/<owner>/<repo>/issues/comments/<id>` 能逐条点开复验。
+谁有资格签、怎么签、签错了会怎样：见 [GOVERNANCE.md](GOVERNANCE.md)。
 
 `isApproved()` **只认 `audit` 这一个字段**，且章上必须有人（`by` 非空）。
 以下写法一律不算通过：
