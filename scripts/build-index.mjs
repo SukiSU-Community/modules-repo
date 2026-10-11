@@ -23,11 +23,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { DEFAULT_DISPOSITIONS_FILE, filterVersions, isModuleLevel, loadDispositions, matchAny } from './dispositions.mjs';
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, '..');
 export const PENDING_DIR = path.join(REPO_ROOT, 'pending');
 export const INDEX_FILE = path.join(REPO_ROOT, 'json', 'modules.json');
 export const CONFLICT_FILE = path.join(REPO_ROOT, 'conflicts.json');
+/** 处置台账（下架/拉黑）。它是推导的**输入**，不是索引的附属说明文字。 */
+export const DISPOSITIONS_FILE = path.join(REPO_ROOT, DEFAULT_DISPOSITIONS_FILE);
 
 const SHA256_RE = /^[0-9a-fA-F]{64}$/;
 
@@ -180,10 +184,15 @@ export function normalizeEntry(raw, source = '<memory>') {
 /**
  * 合并核心逻辑（纯函数，供单测直接调用）。
  *
- * @param {{index?: object, entries: Array<object>}} input
- * @returns {{index: object, conflicts: Array<object>, stats: object, fallbacks: Array<object>}}
+ * **处置台账在这里生效，而且是唯一生效的地方。** main() 和 verify-index-pr 的重推导
+ * 都只调这个函数，所以「索引 = f(pending, 台账)」这条式子只有一份实现；
+ * 判据写在 workflow、Worker 或 main() 里任何别处，都会出现两份结果 ——
+ * 要么索引 PR 永远判不一致，要么（更糟）判得过而线上留着已下架的模块。
+ *
+ * @param {{index?: object, entries: Array<object>, dispositions?: Array<object>}} input
+ * @returns {{index: object, conflicts: Array<object>, stats: object, fallbacks: Array<object>, blocked: Array<object>}}
  */
-export function buildIndex({ index, entries }) {
+export function buildIndex({ index, entries, dispositions = [] }) {
   const base = index && typeof index === 'object' && !Array.isArray(index) ? index : {};
   const out = {
     name: typeof base.name === 'string' ? base.name : 'SukiSU-Ultra Modules',
@@ -192,7 +201,14 @@ export function buildIndex({ index, entries }) {
   };
 
   const conflicts = [];
-  const stats = { approved: 0, skipped: 0, invalid: 0, addedModules: 0, addedVersions: 0, conflicts: 0, fallbacks: 0 };
+  const stats = {
+    approved: 0, skipped: 0, invalid: 0, addedModules: 0, addedVersions: 0, conflicts: 0, fallbacks: 0,
+    blocked: 0,          // 被台账挡下的投稿条目（不该进索引）
+    removedVersions: 0,  // 从既有索引里按台账抹掉的版本（下架生效的那一步）
+    removedModules: 0,   // 版本被抹空后连模块一起移除
+  };
+  // 被台账挡下的清单：CI 要把它贴回 PR / 写进日志，否则「为什么没进索引」无人可读。
+  const blocked = [];
   // 补过字段的条目清单：[{ id, fallbacks: [{field, from, to}] }]，供 CI 贴回 PR 解释。
   const allFallbacks = [];
   const byId = new Map(out.modules.map((m) => [m.id, m]));
@@ -212,8 +228,31 @@ export function buildIndex({ index, entries }) {
       conflicts.push({ type: 'invalid-entry', reason: n.error });
       continue;
     }
-    stats.approved += 1;
     const entry = n.entry;
+
+    // 台账命中 → 不合并，且**不进 conflicts**：冲突是「要人判断」，
+    // 台账命中是「已经判断过了」，把后者计成前者会让 exit 2 挡住 --consume，
+    // 于是下一次重建又被同一批已下架的 pending 卡住（自我堵死）。
+    //
+    // 匹配用的是**归一化后的条目 + 原始 coolapkUid**：coolapkUid 是追责字段、不进 MMRL 索引，
+    // normalizeEntry 不带它，所以直接用 entry 去匹配会让「按人拉黑」静默失效
+    // —— 判据看着在跑，其实永远匹配不上，这是最难发现的一种坏。
+    const hit = matchAny(dispositions, { ...entry, coolapkUid: raw && raw.coolapkUid });
+    if (hit) {
+      stats.blocked += 1;
+      blocked.push({
+        id: entry.id,
+        via: hit.via,
+        versionCode: hit.versionCode,
+        reason: hit.matched.reason,
+        by: hit.matched.by,
+        at: hit.matched.at,
+        raw, // main() 靠这个引用认出它属于哪个 pending 文件，从而**不删**那个文件
+      });
+      continue;
+    }
+
+    stats.approved += 1;
     if (n.fallbacks && n.fallbacks.length > 0) {
       allFallbacks.push({ id: entry.id, fallbacks: n.fallbacks });
       stats.fallbacks += n.fallbacks.length;
@@ -262,6 +301,50 @@ export function buildIndex({ index, entries }) {
     }
   }
 
+  // 台账对**已在索引里的内容**同样生效 —— 这一步才是「下架」本身。
+  // 只在合并时挡新条目是不够的：那样台账只能防未来，防不了过去，
+  // 下一次重建会把旧版本原样从 base 带回来，看起来「下架过却又活了」。
+  // 抹的是版本级：指到具体产物的处置不该连累同 id 的其它版本；版本抹空了才移除模块。
+  if (dispositions.length > 0) {
+    const moduleLevel = dispositions.filter(isModuleLevel);
+    const kept = [];
+    for (const m of out.modules) {
+      const versionCodes = (Array.isArray(m.versions) ? m.versions : []).map((v) => v.versionCode);
+      // 先判模块级：只写 id（或只写 coolapkUid）的处置就是整条下架，
+      // 与它有几个版本无关 —— 零版本的模块壳也必须能被清掉。
+      const whole = matchAny(moduleLevel, m);
+      if (whole) {
+        stats.removedModules += 1;
+        stats.removedVersions += versionCodes.length;
+        blocked.push({
+          id: m.id, via: whole.via, removedVersions: versionCodes,
+          reason: whole.matched.reason, by: whole.matched.by, at: whole.matched.at,
+        });
+        continue;
+      }
+      // 再判产物级：指到 sha256 / versionCode 的只抹那几条。
+      const { removed, keptVersions } = filterVersions(dispositions, m);
+      if (removed.length === 0) {
+        kept.push(m);
+        continue;
+      }
+      stats.removedVersions += removed.length;
+      m.versions = keptVersions;
+      blocked.push({
+        id: m.id, via: removed[0].via, removedVersions: removed.map((r) => r.version.versionCode),
+        reason: removed[0].disposition.reason, by: removed[0].disposition.by, at: removed[0].disposition.at,
+      });
+      if (keptVersions.length === 0) {
+        stats.removedModules += 1; // 版本被抹空了，模块壳一并移除
+        continue;
+      }
+      kept.push(m);
+    }
+    out.modules = kept;
+    byId.clear();
+    for (const m of out.modules) byId.set(m.id, m);
+  }
+
   // 版本按 versionCode 降序，MMRL 客户端期望最新版在前。
   for (const m of out.modules) {
     m.versions.sort((a, b) => b.versionCode - a.versionCode);
@@ -269,7 +352,7 @@ export function buildIndex({ index, entries }) {
   out.modules.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
   if (out.modules.length > 0) out.lastUpdate = Date.now();
-  return { index: out, conflicts, stats, fallbacks: allFallbacks };
+  return { index: out, conflicts, stats, fallbacks: allFallbacks, blocked };
 }
 
 function isPendingJson(name) {
@@ -332,15 +415,24 @@ export function collectPendingFiles(dir) {
  *                          绝不在现场还有人看得懂之前把 pending 清掉（见 main() 里的删除块注释）
  *   --pending <dir>        指定 pending 目录（默认 <repo>/pending）
  *   --index <file>         指定索引文件（默认 <repo>/json/modules.json）
+ *   --dispositions <file>  指定处置台账（默认 <repo>/json/dispositions.json；不存在=空台账）
  */
 export function parseArgs(argv) {
-  const opts = { dryRun: false, consume: false, pendingDir: PENDING_DIR, indexFile: INDEX_FILE, _: [] };
+  const opts = {
+    dryRun: false,
+    consume: false,
+    pendingDir: PENDING_DIR,
+    indexFile: INDEX_FILE,
+    dispositionsFile: DISPOSITIONS_FILE,
+    _: [],
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--dry-run') { opts.dryRun = true; continue; }
     if (a === '--consume') { opts.consume = true; continue; }
     if (a === '--pending' && i + 1 < argv.length) { opts.pendingDir = path.resolve(argv[++i]); continue; }
     if (a === '--index' && i + 1 < argv.length) { opts.indexFile = path.resolve(argv[++i]); continue; }
+    if (a === '--dispositions' && i + 1 < argv.length) { opts.dispositionsFile = path.resolve(argv[++i]); continue; }
     opts._.push(a);
   }
   return opts;
@@ -351,6 +443,16 @@ export function main(argv = process.argv.slice(2)) {
   const pendingDir = opts.pendingDir;
   const indexFile = opts.indexFile;
 
+  // 台账坏了必须**停下来**，不能当空台账继续：后者等于「一次坏 JSON 把所有下架抹掉」，
+  // 而被下架的模块重新出现在索引里是无声的、没人会去查的动作。
+  let dispositions;
+  try {
+    dispositions = loadDispositions(opts.dispositionsFile);
+  } catch (e) {
+    console.error(`[build-index] 处置台账读不懂，停止合并（不当空台账处理）：${e.message}`);
+    return 3;
+  }
+
   const current = fs.existsSync(indexFile)
     ? JSON.parse(fs.readFileSync(indexFile, 'utf8'))
     : { name: 'SukiSU-Ultra Modules', lastUpdate: 0, modules: [] };
@@ -358,7 +460,7 @@ export function main(argv = process.argv.slice(2)) {
   const files = collectPendingFiles(pendingDir);
   const entries = [];
   for (const item of files) for (const e of item.entries) entries.push(e);
-  const { index, conflicts, stats, fallbacks } = buildIndex({ index: current, entries });
+  const { index, conflicts, stats, fallbacks, blocked } = buildIndex({ index: current, entries, dispositions });
 
   if (!opts.dryRun) {
     fs.mkdirSync(path.dirname(indexFile), { recursive: true });
@@ -382,7 +484,25 @@ export function main(argv = process.argv.slice(2)) {
             `pending 文件全部保留，请人工处理后再重跑`,
         );
       } else {
-        for (const item of files) fs.rmSync(item.file);
+        // 被台账挡下的条目**不删**。两个理由：
+        //   1) 删了就等于把「为什么这条没进索引」的现场销毁 —— 台账可以事后被改，
+        //      而 pending 一旦没了就无从复核；
+        //   2) 重推导（verify-index-pr）比的是「base 索引 + 被消费的已批准条目」，
+        //      悄悄多删一批文件会让 base 的起算点漂移，判据随之失去意义。
+        // 留着它也不会自我堵死：过滤是 (pending, 台账) 的函数，同一批条目每次都被同样挡下，
+        // 索引不再变化，因此不会反复触发重建。
+        const blockedRaw = new Set(blocked.filter((b) => b.raw).map((b) => b.raw));
+        let kept = 0;
+        for (const item of files) {
+          if (item.entries.some((e) => blockedRaw.has(e))) {
+            kept += 1;
+            continue;
+          }
+          fs.rmSync(item.file);
+        }
+        if (kept > 0) {
+          console.log(`[build-index] --consume：保留 ${kept} 个被处置台账挡下的 pending 文件（不删，留作复核现场）`);
+        }
         for (const d of fs.existsSync(pendingDir) ? fs.readdirSync(pendingDir) : []) {
           const full = path.join(pendingDir, d);
           try {
@@ -395,11 +515,23 @@ export function main(argv = process.argv.slice(2)) {
 
   console.log(
     `[build-index] 扫描 ${files.length} 个 pending 文件（${pendingDir}，递归）；` +
-      `通过审核 ${stats.approved} / 未通过 ${stats.skipped} / 非法 ${stats.invalid}；` +
-      `新增模块 ${stats.addedModules}，追加版本 ${stats.addedVersions}，冲突 ${stats.conflicts}`,
+      `通过审核 ${stats.approved} / 未通过 ${stats.skipped} / 非法 ${stats.invalid} / 台账挡下 ${stats.blocked}；` +
+      `新增模块 ${stats.addedModules}，追加版本 ${stats.addedVersions}，` +
+      `台账抹掉版本 ${stats.removedVersions}（模块整条移除 ${stats.removedModules}），冲突 ${stats.conflicts}`,
   );
   if (files.length === 0) {
     console.log('[build-index] 没有待合并的 pending 条目，索引保持不变');
+  }
+
+  // 每一条挡下/抹掉都要说清「哪条台账、谁下的、什么时候」——
+  // 处置生效必须是可见的，否则投稿者只看到「合并了但索引里没有」，
+  // 而维护者也无法复核下架有没有越权（只指到一个产物却抹掉了整个模块）。
+  if (blocked.length > 0) {
+    console.log(`[build-index] 处置台账命中 ${blocked.length} 条：`);
+    for (const b of blocked) {
+      const vcs = b.removedVersions ? ` 抹掉版本 ${b.removedVersions.join(',')}` : b.versionCode ? ` 版本 ${b.versionCode}` : '';
+      console.log(`  - ${b.id}${vcs} via ${b.via}｜reason=${b.reason}｜by=${b.by}｜at=${b.at}`);
+    }
   }
 
   // 兜底必须说出来。以前缺 author/description/version 是「静默拒收」：

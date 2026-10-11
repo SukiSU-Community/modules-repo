@@ -439,3 +439,169 @@ test('回归 ②：--pending / --index 参数解析', () => {
   assert.equal(path.basename(o.pendingDir), 'P');
   assert.equal(path.basename(o.indexFile), 'I');
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P3：处置台账参与推导
+//
+// 这里锁的是「索引 = f(pending, 台账)」这条式子里的第二个输入。
+// 所有用例都**显式传 --dispositions**：默认值指向仓库里那份真台账，
+// 不传就等于单测去读生产数据 —— 台账一改，测试结论跟着变，那是最坏的假绿。
+// ─────────────────────────────────────────────────────────────────────────────
+
+const { parseDispositions } = await import('../scripts/dispositions.mjs');
+const ledger = (...list) => parseDispositions({ schema: 'sukisu-dispositions-v1', dispositions: list });
+
+test('P3：台账命中的新条目不进索引，也不算冲突（算冲突会挡住 --consume，自我堵死）', () => {
+  const { index, conflicts, stats, blocked } = buildIndex({
+    index: emptyIndex,
+    entries: [entry()],
+    dispositions: ledger({ kind: 'revoke', id: 'demo_mod', reason: 'malware', by: 'gh:x@1', at: '2026-10-11T00:00:00Z' }),
+  });
+  assert.equal(index.modules.length, 0);
+  assert.equal(stats.blocked, 1);
+  assert.equal(stats.approved, 0, '被挡下的不算「通过审核」');
+  assert.equal(conflicts.length, 0);
+  assert.equal(blocked.length, 1);
+  assert.equal(blocked[0].via, 'id');
+  assert.equal(blocked[0].reason, 'malware');
+  assert.ok(blocked[0].by, '挡下的清单必须带得上面的章，否则事后无从复核');
+});
+
+test('P3：台账会把**已在索引里**的版本抹掉 —— 这一步才是下架本身', () => {
+  const seeded = buildIndex({ index: emptyIndex, entries: [entry()] }).index;
+  const { index, stats } = buildIndex({
+    index: seeded,
+    entries: [],
+    dispositions: ledger({ kind: 'revoke', id: 'demo_mod', reason: 'policy', by: 'gh:x@1', at: '2026-10-11T00:00:00Z' }),
+  });
+  assert.equal(index.modules.length, 0);
+  assert.equal(stats.removedVersions, 1);
+  assert.equal(stats.removedModules, 1, '版本抹空了要连模块一起移除');
+});
+
+test('P3：指到产物的处置不越权 —— 同 id 的另一个版本必须留着', () => {
+  const two = buildIndex({
+    index: emptyIndex,
+    entries: [entry({
+      versions: [
+        { version: 'v1', versionCode: 100, zipUrl: 'https://e/1.zip', size: 1, time: 1, sha256: sha(1) },
+        { version: 'v2', versionCode: 200, zipUrl: 'https://e/2.zip', size: 1, time: 1, sha256: sha(2) },
+      ],
+    })],
+  }).index;
+  const { index, stats } = buildIndex({
+    index: two,
+    entries: [],
+    dispositions: ledger({ kind: 'revoke', id: 'demo_mod', sha256: sha(1), reason: 'malware', by: 'gh:x@1', at: '2026-10-11T00:00:00Z' }),
+  });
+  assert.equal(index.modules.length, 1, '模块还在，只是坏产物没了');
+  assert.deepEqual(index.modules[0].versions.map((v) => v.versionCode), [200]);
+  assert.equal(stats.removedVersions, 1);
+  assert.equal(stats.removedModules, 0);
+});
+
+test('P3：换皮重投被同一条 sha256 抓住（改了 id 也没用）', () => {
+  const resubmit = entry({ id: 'brand_new_name', versions: [{ version: 'v1', versionCode: 1, zipUrl: 'https://e/1.zip', size: 1, time: 1, sha256: sha(1) }] });
+  const { index, stats } = buildIndex({
+    index: emptyIndex,
+    entries: [resubmit],
+    dispositions: ledger({ kind: 'revoke', sha256: sha(1), reason: 'malware', by: 'gh:x@1', at: '2026-10-11T00:00:00Z' }),
+  });
+  assert.equal(index.modules.length, 0);
+  assert.equal(stats.blocked, 1);
+});
+
+test('P3：按 coolapkUid 拉黑能挡住投稿（normalizeEntry 不带 uid，漏接就会静默失效）', () => {
+  const d = { kind: 'deny', coolapkUid: '2781460', reason: 'impersonation', by: 'gh:x@1', at: '2026-10-11T00:00:00Z' };
+  const hit = buildIndex({ index: emptyIndex, entries: [entry({ coolapkUid: '2781460' })], dispositions: ledger(d) });
+  assert.equal(hit.index.modules.length, 0, '这个人的投稿不进索引');
+  assert.equal(hit.stats.blocked, 1);
+  const miss = buildIndex({ index: emptyIndex, entries: [entry({ coolapkUid: '1111111' })], dispositions: ledger(d) });
+  assert.equal(miss.index.modules.length, 1, '别人不受牵连');
+});
+
+test('P3：空台账 = 行为与接台账之前逐字段一致（回归护栏）', () => {
+  const a = buildIndex({ index: emptyIndex, entries: [entry()] });
+  const b = buildIndex({ index: emptyIndex, entries: [entry()], dispositions: ledger() });
+  assert.deepEqual(b.index, a.index);
+  assert.equal(b.stats.blocked, 0);
+});
+
+test('P3 main：被挡下的 pending 不被 --consume 删除，正常消费的照删', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'consume-blocked-'));
+  const pendingDir = path.join(dir, 'pending');
+  const indexFile = path.join(dir, 'json', 'modules.json');
+  const dispFile = path.join(dir, 'json', 'dispositions.json');
+  fs.mkdirSync(path.join(pendingDir, 'blocked_mod'), { recursive: true });
+  fs.mkdirSync(path.join(pendingDir, 'ok_mod'), { recursive: true });
+  fs.mkdirSync(path.dirname(indexFile), { recursive: true });
+  fs.writeFileSync(indexFile, `${JSON.stringify(emptyIndex, null, 2)}\n`, 'utf8');
+  fs.writeFileSync(
+    path.join(pendingDir, 'blocked_mod', '100.json'),
+    JSON.stringify(entry({ id: 'blocked_mod' })),
+    'utf8',
+  );
+  fs.writeFileSync(
+    path.join(pendingDir, 'ok_mod', '100.json'),
+    JSON.stringify(entry({ id: 'ok_mod', versions: [{ version: 'v1', versionCode: 100, zipUrl: 'https://e/ok.zip', size: 1, time: 1, sha256: sha(9) }] })),
+    'utf8',
+  );
+  fs.writeFileSync(
+    dispFile,
+    JSON.stringify({ schema: 'sukisu-dispositions-v1', dispositions: [{ kind: 'revoke', id: 'blocked_mod', reason: 'test-probe', by: 'gh:x@1', at: '2026-10-11T00:00:00Z' }] }),
+    'utf8',
+  );
+
+  const rc = main(['--pending', pendingDir, '--index', indexFile, '--dispositions', dispFile, '--consume']);
+  assert.equal(rc, 0, '台账命中不是冲突，不该 exit 2');
+  assert.ok(fs.existsSync(path.join(pendingDir, 'blocked_mod', '100.json')), '挡下的那条要留作复核现场');
+  assert.equal(fs.existsSync(path.join(pendingDir, 'ok_mod', '100.json')), false, '正常消费的照删');
+  const idx = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
+  assert.deepEqual(idx.modules.map((m) => m.id), ['ok_mod']);
+
+  // 幂等：再跑一次，结果不该变（留着坏条目不会反复触发重建）
+  const rc2 = main(['--pending', pendingDir, '--index', indexFile, '--dispositions', dispFile, '--consume']);
+  assert.equal(rc2, 0);
+  assert.deepEqual(JSON.parse(fs.readFileSync(indexFile, 'utf8')).modules.map((m) => m.id), ['ok_mod']);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('P3 main：台账读不懂 → 退出 3 且**不写索引**（不能当空台账把下架全抹掉）', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ledger-bad-'));
+  const indexFile = path.join(dir, 'json', 'modules.json');
+  const dispFile = path.join(dir, 'json', 'dispositions.json');
+  fs.mkdirSync(path.dirname(indexFile), { recursive: true });
+  const seeded = buildIndex({ index: emptyIndex, entries: [entry()] }).index;
+  fs.writeFileSync(indexFile, `${JSON.stringify(seeded, null, 2)}\n`, 'utf8');
+  const before = fs.readFileSync(indexFile, 'utf8');
+  fs.writeFileSync(dispFile, '{ 坏掉的台账', 'utf8');
+
+  const rc = main(['--pending', path.join(dir, 'pending'), '--index', indexFile, '--dispositions', dispFile, '--consume']);
+  assert.equal(rc, 3);
+  assert.equal(fs.readFileSync(indexFile, 'utf8'), before, '索引一个字节都不许动');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('P3 main：台账里那条选择器全空的记录会让整次推导停住（而不是被跳过）', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ledger-badentry-'));
+  const indexFile = path.join(dir, 'json', 'modules.json');
+  const dispFile = path.join(dir, 'json', 'dispositions.json');
+  fs.mkdirSync(path.dirname(indexFile), { recursive: true });
+  fs.writeFileSync(indexFile, `${JSON.stringify(emptyIndex, null, 2)}\n`, 'utf8');
+  // 选择器全空 == 匹配一切。跳过它继续跑，等于把整个索引抹空；停住才是对的方向。
+  fs.writeFileSync(
+    dispFile,
+    JSON.stringify({ schema: 'sukisu-dispositions-v1', dispositions: [{ kind: 'revoke', reason: 'malware', by: 'gh:x@1', at: '2026-10-11T00:00:00Z' }] }),
+    'utf8',
+  );
+  const before = fs.readFileSync(indexFile, 'utf8');
+  assert.equal(main(['--pending', path.join(dir, 'pending'), '--index', indexFile, '--dispositions', dispFile]), 3);
+  assert.equal(fs.readFileSync(indexFile, 'utf8'), before);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('P3：parseArgs 认 --dispositions，默认指向仓库那份', () => {
+  const o = parseArgs(['--dispositions', 'D']);
+  assert.equal(path.basename(o.dispositionsFile), 'D');
+  assert.equal(path.basename(parseArgs([]).dispositionsFile), 'dispositions.json');
+});
