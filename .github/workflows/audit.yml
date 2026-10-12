@@ -660,17 +660,41 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          JSON=$(ls -t audit-out/*.audit.json | head -n1)
+          # 多包 PR 取最严（2026-10-13 修；计划 §4 F16）。
+          # 这里原本是 `ls -t audit-out/*.audit.json | head -n1` —— 只拿「时间戳最新的那一份报告」定级，
+          # 而 publish 作业合的是**整条 PR**。于是一条含两份 pending 的 PR，只要最新那份判成 low+first，
+          # 另一份哪怕 high 也会被一起 squash 合并进去；locate 打的 pending_count 从没被任何判据读过。
+          # 现在的判据是：auto-approve 只在**每一份**报告都是 low + first 时才成立；
+          # 等级取所有报告里最严的那个，module_id / reasons 按包汇总，让人看得出这条 PR 里到底有几个人投稿。
+          # 没有报告就不许定级（audit-out 为空 → 直接红），不许把「什么都没扫到」当成放行理由。
           node -e '
             const fs=require("fs");
-            const r=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
-            let risk=r.riskLevel, changeType=r.changeType, reasons=r.riskReasons.slice();
+            const dir="audit-out";
+            const names=fs.readdirSync(dir).filter((f)=>f.endsWith(".audit.json")).sort();
+            if (names.length===0) {
+              console.error("::error::found=true 但 audit-out 里没有任何 .audit.json —— 没有报告就不定级，更不放行");
+              process.exit(1);
+            }
+            const order={low:1,medium:2,high:3};
+            // 读不懂的报告不是「低风险」。riskLevel 缺失或不在枚举里时按 high 排 ——
+            // 否则排序比较器拿到 undefined 会当成「相等」，一份坏报告就能把整条 PR 顶到 low。
+            const riskOf=(x)=>(typeof x.riskLevel === "string" && order[x.riskLevel] !== undefined) ? x.riskLevel : "high";
+            const reports=names.map((f)=>({
+              pkg:f.replace(/\.audit\.json$/,""),
+              r:JSON.parse(fs.readFileSync(dir+"/"+f,"utf8")),
+            }));
+            let risk=reports.map((x)=>riskOf(x.r)).sort((a,b)=>order[b]-order[a])[0];
+            const types=reports.map((x)=>x.r.changeType||"unknown");
+            const unique=[...new Set(types)];
+            const changeType=unique.length===1 ? unique[0] : unique.sort().join("+");
+            let reasons=reports.flatMap((x)=>(x.r.riskReasons||[])
+              .map((y)=> reports.length>1 ? `${x.pkg}: ${y}` : y));
+
             // LLM 复核只能加严，不能放宽静态结论
             let llmNote="仅静态扫描（未配置 AI_API_KEY，已跳过 LLM 复核）";
             if (fs.existsSync("audit-out/llm.json")) {
               let l; try { l=JSON.parse(fs.readFileSync("audit-out/llm.json","utf8")); } catch { l={agree:true}; }
               if (l && l.agree === false) {
-                const order={low:1,medium:2,high:3};
                 if ((order[l.risk]||3) > (order[risk]||1)) { risk=l.risk; }
                 // reasons 是模型产出的文本，而模型看到的投影里含投稿者可控的片段，
                 // 所以进 PR 评论前截断：条数与单条长度都封住。
@@ -681,22 +705,25 @@ jobs:
                 llmNote="已做 LLM 复核，模型同意静态结论";
               }
             }
+            const idOf=(r)=> (r.meta && r.meta.id) ? r.meta.id : "(缺失)";
+            const verOf=(r)=> (r.meta && r.meta.version) ? r.meta.version : "";
             const out=process.env.GITHUB_OUTPUT;
             const w=(k,v)=>fs.appendFileSync(out,`${k}=${String(v).replace(/\r?\n/g," ")}\n`);
             w("risk",risk); w("change_type",changeType);
-            w("module_id", r.meta && r.meta.id ? r.meta.id : "(缺失)");
-            w("module_version", r.meta && r.meta.version ? r.meta.version : "");
-            w("llm_note", llmNote);
-            w("reasons", reasons.join("；"));
+            w("module_id",[...new Set(reports.map((x)=>idOf(x.r)))].join(","));
+            w("module_version",[...new Set(reports.map((x)=>verOf(x.r)))].join(","));
+            w("package_count",String(reports.length));
+            w("llm_note",llmNote);
+            w("reasons",reasons.join("；"));
 
-            // 决策矩阵：唯一可自动放行的是「低风险 + 首次收录」
+            // 决策矩阵：唯一可自动放行的是「每一份都低风险 + 首次收录」
             if (risk === "low" && changeType === "first") {
               w("action","auto-approve"); w("label","auto-approved"); w("needs_human_review","false");
             } else {
               w("action", risk === "low" ? "request-review" : "block");
               w("label","needs-human-review"); w("needs_human_review","true");
             }
-          ' "$JSON"
+          '
 
       # ---------------------------------------------------------------
       # 4-b. 处置台账核对（三处拦截里的 CI 侧那道；判据在 scripts/dispositions.mjs，
@@ -751,6 +778,7 @@ jobs:
           CHANGE_TYPE: ${{ steps.triage.outputs.change_type }}
           LLM_NOTE: ${{ steps.triage.outputs.llm_note }}
           MODULE_ID: ${{ steps.triage.outputs.module_id }}
+          PACKAGE_COUNT: ${{ steps.triage.outputs.package_count }}
           REASONS: ${{ steps.triage.outputs.reasons }}
         with:
           script: |
@@ -758,19 +786,26 @@ jobs:
             const files = fs.existsSync('audit-out')
               ? fs.readdirSync('audit-out').filter(f => f.endsWith('.audit.md'))
               : [];
+            // 变更类型现在是「本 PR 内所有报告的并集」（会出现 first+update 这种值），
+            // 所以标签要做映射：把判据的内部拼法原样贴给投稿者看，等于让他读我们的变量名。
+            const CT = { first: '首次收录', update: '版本更新', unknown: '未知' };
+            const ctLabel = (s) => String(s || '').split('+').map((x) => CT[x] || x).join('＋') || '未知';
+            const COUNT = Number(process.env.PACKAGE_COUNT || 1);
             let body = `## 模块投稿安全审核\n\n`
+              + `- 本 PR 内投稿数：**${COUNT}**\n`
               + `- 模块 id：\`${process.env.MODULE_ID}\`\n`
-              + `- 风险等级：**${String(process.env.RISK).toUpperCase()}**\n`
-              + `- 变更类型：**${process.env.CHANGE_TYPE === 'first' ? '首次收录'
-                  : process.env.CHANGE_TYPE === 'update' ? '版本更新' : '未知'}**\n`
+              + `- 风险等级：**${String(process.env.RISK).toUpperCase()}**（取本 PR 全部报告里最严的一份）\n`
+              + `- 变更类型：**${ctLabel(process.env.CHANGE_TYPE)}**\n`
               + `- 处置：**\`${process.env.ACTION}\`** / 标签 \`${process.env.LABEL}\`\n`
               + `- 依据：${process.env.REASONS}\n`
               + `- 复核方式：${process.env.LLM_NOTE}\n`;
 
             if (process.env.ACTION === 'auto-approve') {
-              body += `\n✅ 静态扫描未发现风险且为首次收录，已自动合入索引。\n`;
-            } else if (process.env.CHANGE_TYPE === 'update' && process.env.RISK === 'low') {
-              body += `\n⚠️ 风险虽低，但这是对**已收录模块的版本更新**，按规则一律转人工审核，未自动合入。\n`;
+              body += `\n✅ 静态扫描未发现风险且每份投稿都是首次收录，已自动合入索引。\n`;
+            } else if (process.env.RISK === 'low') {
+              // 走到这一支只有两种可能：含已收录模块的更新，或多份投稿里不全是首次收录。
+              // 两种都不是「中/高风险」——把它写成中/高风险就是把我们的判据说反。
+              body += `\n⚠️ 风险虽低，但按规则不自动合入（含已收录模块的版本更新，或本 PR 内并非每份投稿都是首次收录）：转人工审核。\n`;
             } else {
               body += `\n⛔ 中/高风险，需人工审核后才可进入正式索引；本 PR 不会自动合入。\n`;
             }
@@ -778,7 +813,7 @@ jobs:
             if (files.length) {
               const md = fs.readFileSync(`audit-out/${files[0]}`, 'utf8');
               const MAX = 60000;
-              body += `\n<details><summary>完整报告（${files[0]}）</summary>\n\n`
+              body += `\n<details><summary>完整报告（${files[0]}${COUNT > 1 ? ` —— 共 ${COUNT} 份投稿里的这 1 份，其余见 workflow artifact` : ''}）</summary>\n\n`
                 + (md.length > MAX ? md.slice(0, MAX) + '\n\n…（报告过长已截断，完整版见 workflow artifact）' : md)
                 + `\n</details>\n`;
             }
