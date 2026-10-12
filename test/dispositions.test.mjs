@@ -29,7 +29,7 @@ const SHA_B = 'b'.repeat(64);
 function entry(over = {}) {
   return {
     id: 'demo',
-    coolapkUid: '2781460',
+    coolapkUid: '10086001',
     versions: [{ version: 'v1.0', versionCode: 100, sha256: SHA_A }],
     ...over,
   };
@@ -83,7 +83,7 @@ test('选择器全空 → 抛：它等价于「匹配一切」，绝不能生效
 test('versionCode 必须跟着 id：脱离 id 的版本号会变成按数字全局下架', () => {
   // 另一个选择器在场，才能走到这条检查（否则先被判「选择器全空」挡掉）。
   assert.throws(
-    () => parseDispositions(doc(d({ id: undefined, coolapkUid: '2781460', versionCode: 1 }))),
+    () => parseDispositions(doc(d({ id: undefined, coolapkUid: '10086001', versionCode: 1 }))),
     /versionCode 必须与 id 同时出现/,
   );
   assert.throws(
@@ -135,7 +135,7 @@ test('按 id+versionCode 命中：只抹那一个版本，同 id 其它版本不
 
 test('按 id 命中整个模块；按 coolapkUid 命中这个人的一切投稿', () => {
   assert.equal(matchDisposition(d(), entry())?.via, 'id');
-  const deny = d({ kind: 'deny', id: undefined, coolapkUid: '2781460' });
+  const deny = d({ kind: 'deny', id: undefined, coolapkUid: '10086001' });
   assert.equal(matchDisposition(deny, entry({ id: 'anything-else' }))?.via, 'coolapkUid');
   assert.equal(matchDisposition(deny, entry({ coolapkUid: '9999999' })), null);
 });
