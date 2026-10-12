@@ -1,7 +1,7 @@
 # 模块投稿安全审核流水线
 #
 # ⚠️ 这里是仓库里**实际生效**的那一份。母本在 monorepo 的 contrib/audit/workflows/audit.yml，
-#    两份只差首行标题。改了这份必须同步母本，否则下一次复制回去会把修过的东西冲掉。
+#    两份只差开头 4 行标题。改了这份必须同步母本，否则下一次复制回去会把修过的东西冲掉（对齐由 repo/test/verify-pending-proof.test.mjs 钉住）。
 #
 # 触发：**每一个** PR 都要跑（不能加 paths 过滤，原因见下面 on: 里的说明）。
 #
@@ -242,7 +242,13 @@ jobs:
           else
             # a. 找本次 PR 新增/修改的 pending/**/*.json（递归，含 pending/<id>/<vc>.json）
             #    注意：不再用 -- '*.zip'，PR 里没有 zip，只有元数据。
-            PENDING=$(git diff --name-only --diff-filter=AM "$BASE" HEAD -- "${PENDING_DIR}/**/*.json" || true)
+            #    --no-renames 是必需的，不是风格问题：默认行为会把「改名 + 顺手改一个字段」
+            #    折叠成 R068，而 --diff-filter=AM 不打印 R —— 于是 pending/demo/1.json 改成
+            #    pending/evil/1.json 时这里一条都不输出，found=false，后面的复核整个不跑。
+            #    打上 --no-renames 后同一笔改动是「删旧 + 增新」，新路径照常输出。
+            #    这条过滤本身仍不是可信边界（大写扩展名 .JSON 连 pathspec 都过不了）：
+            #    下面 proof 步会用 git ls-tree 自己再算一遍范围，漏了就把这次跑成红的。
+            PENDING=$(git diff --name-only --no-renames --diff-filter=AM "$BASE" HEAD -- "${PENDING_DIR}/**/*.json" || true)
             if [ -z "$PENDING" ]; then
               echo "found=false" >> "$GITHUB_OUTPUT"
               echo "pending_count=0" >> "$GITHUB_OUTPUT"
@@ -304,6 +310,72 @@ jobs:
             echo "待审核 zip："
             cat zips.txt
           fi
+
+      # ---------------------------------------------------------------
+      # 1a. pending 凭据与来源复核（设计文档 §14.2）
+      #
+      # 为什么单独立这一步：/submit 的归属闸只挡得住从表单进来的提交，而这个仓库还
+      # 公开吃着 hand-written 的 pending/** PR —— locate 的路径白名单认 pending 的
+      # 新增/修改，approve 只看扫描结论，此前没有任何一条检查看过 pending JSON 里的
+      # pledge/ownership/identity。栽赃一条假条目不碰酷安、不碰 /submit 也能达成。
+      #
+      # 三道检查各自买到什么（脚本头有全文，这里只留结论）：
+      #   (a) 推导复算：pledge.version 在已发布集合内、ownership.via === 'bio'、
+      #       ownership.proofPrefix === sha256(entry.id + ':' + <digest>)[0:8]。
+      #       离线、无密钥、无网络。挡的是「形状都不对」的伪造；**挡不住**会自己
+      #       算哈希的人拼一条自洽的 —— 那条路靠 (b) 封。它复算的是条目里**客户端自己上报**
+      #       的 sha256，这个值等于 Worker ⑤-f 绑进口令的那份摘要，只因为 ⑤-c 禁止
+      #       claimedSha ≠ computedSha（worker/src/index.ts:2136-2154）；那边放宽，这里就在
+      #       验一条 Worker 从没验过的串。
+      #   (b) 来源核对：带新增/修改 pending 的 PR 必须由 Worker 的 GitHub App 开出。
+      #       actor 值取自事件载荷；允许列表是 repo variable，默认值为 2026-10-12
+      #       从线上真 PR 载荷核实的那一个（gh api repos/SukiSU-Community/modules-repo
+      #       /pulls/30 --jq .user.login → sukisu-module-submissions[bot]，见 task-13 回报）。
+      #   (c) 范围自算：本步**不**把「查哪些文件」交给 locate 的那条 git diff。它自己用
+      #       rename-agnostic 的 `git ls-tree -r --name-only` 比 base/head 两棵 pending 树，
+      #       算出新增或正文变过的路径（同一手法见 scripts/verify-index-pr.mjs:300-322），
+      #       再要求每一条都能在 pending-changed/pending 里找到 —— 少一条就 ::error:: 退出 1。
+      #       为什么必须有这一条：`git diff --diff-filter=AM` 怎么分类是**攻击者能选的**
+      #       （改名带编辑折叠成 R068 → 一条都不打印；`.JSON` 大写扩展名过不了 case-sensitive
+      #       的 pathspec，却被 build-index 的 isPendingJson 照收）。这两种形状过去让
+      #       found=false，于是本步压根不跑，approve 按「无待审内容」退出 0，人看到绿勾就合，
+      #       publish-from-main.mjs:140-146 再把那个 success 当机器批准盖章进公开索引。
+      #
+      # 因此这一步的 if 不再挂 locate 的 found（每个 PR 都跑），改由脚本自己判断有没有
+      # 可检对象：独立推导为空 → 退出 0（docs/索引重建这类没碰 pending 的 PR 照常走）；
+      # 非空却在看不到那些文件的地方 → 红。附带一条：目录里一个元数据都没有也算失败，
+      # 「0 个 pending 文件」不是通过 —— 它只可能是选择集坏了。
+      #
+      # 买不到的两条，说破（旧注释把它写成「只剩内部人」，那是过度声称）：
+      #   * 有 main 写权限的内部人 —— 挡它的是 publish-from-main.mjs 人工路的 REQUIRED_SIGNERS=2。
+      #   * 【还没关的门】一个 PR 同时改 json/dispositions.json 与对得上的 json/modules.json，
+      #     会被下面的 kind 步判成 index_pr=true 并自动批准/自动合并：verify-index-pr.mjs 的
+      #     台账驱动分支（:172-177）只要求重算结果与 PR 里的索引一致，对台账 diff 既不看凭据
+      #     也不看署名（by 是自由文本）。那条路不需要任何写权限，也不经过本步。修它是另一个
+      #     设计决定，不在这次改动范围内 —— 但别把这里读成「手写路径已经全封住」。
+      #
+      # 只吃 pending-changed/pending：那是上面 locate 用 `git diff --no-renames --diff-filter=AM`
+      # 从 base..head 拷出来的「本 PR 新增/修改」集合，main 上的历史 pending（本轮之前
+      # 投稿的、没有这三个字段的）天然不在范围内。接线由 test/verify-pending-proof.test.mjs
+      # 钉住（指回整棵 pending/ 会让那条测试红）。
+      # 失败 = ::error:: + 非零退出 → audit 作业红 → approve 的「上游没过检」步拒绝批准。
+      # 不许 continue-on-error。
+      # ---------------------------------------------------------------
+      - name: pending 凭据与来源复核（§14.2）
+        id: proof
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          ACTOR: ${{ github.event.pull_request.user.login }}
+          REQUIRE_ACTORS: ${{ vars.SUBMISSION_PR_ACTORS || 'sukisu-module-submissions[bot]' }}
+          PREFIX: ${{ steps.locate.outputs.prefix }}
+          BASE_SHA: ${{ steps.pin.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          P="${PREFIX:+$PREFIX/}"
+          node "${P}scripts/verify-pending-proof.mjs" pending-changed/pending \
+            --require-actor "$REQUIRE_ACTORS" --actor "$ACTOR" \
+            --scope-base "$BASE_SHA" --scope-head HEAD --scope-dir "${P}pending"
 
       # ---------------------------------------------------------------
       # 1b. 判定这个 PR 是哪一类：投稿 / 索引重建 / 都不是
