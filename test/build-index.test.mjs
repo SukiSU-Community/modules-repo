@@ -512,8 +512,8 @@ test('P3：换皮重投被同一条 sha256 抓住（改了 id 也没用）', () 
 });
 
 test('P3：按 coolapkUid 拉黑能挡住投稿（normalizeEntry 不带 uid，漏接就会静默失效）', () => {
-  const d = { kind: 'deny', coolapkUid: '2781460', reason: 'impersonation', by: 'gh:x@1', at: '2026-10-11T00:00:00Z' };
-  const hit = buildIndex({ index: emptyIndex, entries: [entry({ coolapkUid: '2781460' })], dispositions: ledger(d) });
+  const d = { kind: 'deny', coolapkUid: '10086001', reason: 'impersonation', by: 'gh:x@1', at: '2026-10-11T00:00:00Z' };
+  const hit = buildIndex({ index: emptyIndex, entries: [entry({ coolapkUid: '10086001' })], dispositions: ledger(d) });
   assert.equal(hit.index.modules.length, 0, '这个人的投稿不进索引');
   assert.equal(hit.stats.blocked, 1);
   const miss = buildIndex({ index: emptyIndex, entries: [entry({ coolapkUid: '1111111' })], dispositions: ledger(d) });

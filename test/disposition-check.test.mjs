@@ -31,7 +31,7 @@ function tree({ ledger = null, pendings = {} } = {}) {
 }
 
 const entry = (over = {}) => ({
-  id: 'demo', name: 'Demo', author: 'a', description: 'd', coolapkUid: '2781460',
+  id: 'demo', name: 'Demo', author: 'a', description: 'd', coolapkUid: '10086001',
   audit: { status: 'auto-approved', by: 'ci:x', at: '2026-10-11T00:00:00Z', risk: 'low' },
   versions: [{ version: 'v1', versionCode: 1, zipUrl: 'https://e/1.zip', size: 1, time: 1, sha256: SHA('a') }],
   ...over,
@@ -72,7 +72,7 @@ test('换皮重投被 sha256 那条抓住（改了 id 也没用）', () => {
 
 test('按人拉黑（deny coolapkUid）命中', () => {
   const t = tree({
-    ledger: doc({ kind: 'deny', coolapkUid: '2781460', ...stamp, reason: 'impersonation' }),
+    ledger: doc({ kind: 'deny', coolapkUid: '10086001', ...stamp, reason: 'impersonation' }),
     pendings: { 'whatever/1.json': entry({ id: 'whatever' }) },
   });
   const r = checkFiles({ cwd: t.dir, ledgerFile: t.ledgerFile, files: t.files });
