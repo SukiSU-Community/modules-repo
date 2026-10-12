@@ -449,7 +449,85 @@ test('空目录 = 拒：本步只在有事可检时被调用，「0 个文件」
   } finally { rm(dir); }
 });
 
-/* --------------------------------------------------------- 与 Worker 的对齐 */
+/* ---------------------------------------------------------------- workflow */
+
+const WF = path.resolve(import.meta.dirname, '../.github/workflows/audit.yml');
+
+test('audit.yml 接线：复核只吃 pending-changed/pending，排在 locate 之后扫描之前，且不是 continue-on-error', () => {
+  const wf = fs.readFileSync(WF, 'utf8');
+  // locate 的文件集来自 `--no-renames --diff-filter=AM` 的 base..head diff —— main 上没被本
+  // PR 碰过的历史 pending 永远不会被拷进 pending-changed/pending。这是「旧条目不受影响」的
+  // 构造性证明；而「拷漏了怎么办」由下面那条范围自算的接线负责，两者缺一不可。
+  assert.match(wf, /--diff-filter=AM/);
+  assert.match(wf, /cp "\$f" "pending-changed\/pending\/\$REL"/);
+
+  const cmd = wf.match(/node "[^"\n]*verify-pending-proof\.mjs"\s+\S+/);
+  assert.ok(cmd, 'workflow 必须调用 verify-pending-proof.mjs');
+  assert.match(cmd[0], /pending-changed\/pending/,
+    '只许检查本 PR 新增/修改的集合；指向整棵 pending/ 会把历史条目一起判死');
+  assert.ok(wf.indexOf('定位投稿元数据') < wf.indexOf('verify-pending-proof.mjs'), '必须接在 locate 之后');
+  assert.ok(wf.indexOf('verify-pending-proof.mjs') < wf.indexOf('运行 scan.mjs'), '必须排在扫描之前');
+
+  const start = wf.indexOf('id: proof');
+  assert.ok(start >= 0, '复核步必须声明 id: proof');
+  const rest = wf.slice(start);
+  const end = rest.search(/\n {6}- (?:name|uses):/);
+  const block = rest.slice(0, end === -1 ? rest.length : end);
+  assert.ok(!block.includes('continue-on-error'), '这条检查不许 continue-on-error');
+  assert.match(block, /ACTOR: \$\{\{ github\.event\.pull_request\.user\.login \}\}/);
+  assert.match(block, /--require-actor "\$REQUIRE_ACTORS"/);
+  assert.match(block, /--actor "\$ACTOR"/);
+});
+
+/** 取出 proof 步整块（从 `id: proof` 到下一个同级步骤之前）。 */
+function proofBlock(wf) {
+  const start = wf.indexOf('id: proof');
+  assert.ok(start >= 0, '复核步必须声明 id: proof');
+  const rest = wf.slice(start);
+  const end = rest.search(/\n {6}- (?:name|uses):/);
+  return rest.slice(0, end === -1 ? rest.length : end);
+}
+
+test('locate 的那条 diff 带 --no-renames —— 改名带编辑不许被折叠成 R 而一条都不打印', () => {
+  const wf = fs.readFileSync(WF, 'utf8');
+  const line = wf.match(/^ *PENDING=\$\(git diff .*--diff-filter=AM.*$/m);
+  assert.ok(line, 'locate 里那条 git diff 得能找到（改写 workflow 时同步这条测试）');
+  assert.match(line[0], /--no-renames/,
+    '少了这个 flag：pending/demo/1.json 改名 + 改 id 会被 git 判成 R0xx，--diff-filter=AM 什么都不输出，'
+    + '于是 found=false、复核整步不跑、approve 退出 0（见上面夹具那条真 git 证明）');
+  assert.match(line[0], /"\$\{PENDING_DIR\}\/\*\*\/\*\.json"/, '路径白名单仍然由 PENDING_DIR 推导');
+});
+
+test('proof 步不再挂在 locate 的 found 上，并把「查哪些文件」交给脚本自己算', () => {
+  const wf = fs.readFileSync(WF, 'utf8');
+  const block = proofBlock(wf);
+  assert.match(block, /^ {8}if: github\.event_name == 'pull_request'$/m,
+    '每个 PR 都跑：found=false 正是攻击者能挑出来的形状，把 if 挂回 found 等于让覆盖断言永远不开火');
+  assert.ok(!block.includes('locate.outputs.found'), '不许再读 locate 的 found 来决定这一步跑不跑');
+  assert.match(block, /BASE_SHA: \$\{\{ steps\.pin\.outputs\.base_sha \}\}/,
+    '范围要比的 base 取自 pin 步已经解析并钉过的 commit，不在这里重新 origin/<ref> 一次');
+  assert.match(block, /--scope-base "\$BASE_SHA"/);
+  assert.match(block, /--scope-head HEAD/);
+  assert.match(block, /--scope-dir "\$\{P\}pending"/,
+    '范围要比的 pending 目录必须与 locate 的 PENDING_DIR 同源（都由 PREFIX 推导），否则两边比的不是同一棵树');
+});
+
+/* --------------------------------------------------------- 与母本 / Worker 的对齐 */
+
+const TEMPLATE = path.resolve(import.meta.dirname, '../../audit/workflows/audit.yml');
+
+test('生效副本与 contrib/audit/workflows/audit.yml 母本只差开头 4 行标题（两边必须一起改）', (t) => {
+  // 没有任何东西把这两份钉在一起 —— 母本的注释只是「说必须一起改」，那就由这条测试来当那个东西。
+  // 索引仓库单独克隆时母本不在树上，那是正常形态，跳过而不是失败。
+  if (!fs.existsSync(TEMPLATE)) return t.skip('母本不在这个 checkout 里（standalone 克隆的正常形态）');
+  const body = (p) => fs.readFileSync(p, 'utf8').replace(/\r\n/g, '\n').split('\n').slice(4).join('\n');
+  const head = (p) => fs.readFileSync(p, 'utf8').replace(/\r\n/g, '\n').split('\n').slice(0, 4).join('\n');
+  assert.equal(body(TEMPLATE), body(WF),
+    '除开头 4 行标题说明外必须逐字一致：改了这份没同步母本，下一次复制回去会把修过的东西冲掉');
+  assert.match(head(WF), /^# 模块投稿安全审核流水线\n/, '生效副本的标题不带「（模板）」');
+  assert.match(head(TEMPLATE), /^# 模块投稿安全审核流水线（模板）\n/);
+  assert.notEqual(head(WF), head(TEMPLATE), '差异只许落在开头 4 行的标题里');
+});
 
 test('Worker 真写出的 pending JSON 能过本步复算（读得到 worker/src/index.ts 时）', async (t) => {
   // 手写夹具留着给 forks（那里没有 worker/），但键名口径漂了必须由这条先红：
@@ -488,4 +566,14 @@ test('Worker 真写出的 pending JSON 能过本步复算（读得到 worker/src
   assert.equal(parsed.pledge.version, entry().pledge.version);
   assert.deepEqual(Object.keys(parsed.ownership).sort(), Object.keys(entry().ownership).sort(),
     'ownership 的键集合漂了（改了名/加了必填键）—— 本步读的就是这几个键');
+});
+
+test('actor 白名单住在 workflow 变量里（默认值是核实过的 App 登录名），不住在脚本常量里', () => {
+  const wf = fs.readFileSync(WF, 'utf8');
+  // 默认值 = 2026-10-12 用 gh api repos/SukiSU-Community/modules-repo/pulls/30 --jq .user.login
+  // 从线上一份真 PR 的载荷里核实的值（见 task-13 回报）。可被 vars.SUBMISSION_PR_ACTORS 覆盖。
+  assert.match(wf, /REQUIRE_ACTORS: \$\{\{ vars\.SUBMISSION_PR_ACTORS \|\| 'sukisu-module-submissions\[bot\]' \}\}/);
+  const script = fs.readFileSync(path.resolve(import.meta.dirname, '../scripts/verify-pending-proof.mjs'), 'utf8');
+  assert.ok(!script.includes('sukisu-module-submissions'),
+    '脚本里不许烧死 actor 名 —— 白名单必须来自调用方，换 App/换仓库不用改代码');
 });
