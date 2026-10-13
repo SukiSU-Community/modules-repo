@@ -15,9 +15,9 @@ import {
   scoreRisk, decide, countsTowardRisk, SEVERITY_ORDER, CATEGORY_LABEL,
   inspectStructure, unsafePathReason, detectBinary, checkCoverage, checkUnread, checkBinaries,
   MAX_TEXT, MAX_ENTRIES, MAX_RATIO,
-  EXEC_BUNDLED_FILE, PROP_BOOT_SPOOF,
+  EXEC_BUNDLED_FILE, EXEC_INDIRECT, PROP_BOOT_SPOOF,
 } from './risk-rules.mjs';
-import { scanZip, classify, renderMarkdown, renderJSON, mask, resolveChangeType, hasShebang, CANONICAL_SCRIPTS, FLASH_ENTRY_POINTS, readZip, resolveBundledTargets, resolveBundledRefs, normalizeRefPath, EXEC_UNRESOLVED_ADVICE } from './scan.mjs';
+import { scanZip, classify, renderMarkdown, renderJSON, mask, resolveChangeType, hasShebang, CANONICAL_SCRIPTS, FLASH_ENTRY_POINTS, readZip, resolveBundledTargets, resolveBundledRefs, normalizeRefPath, EXEC_UNRESOLVED_ADVICE, EXEC_UNPINNED_ADVICE, SCAN_TARGET_BUCKETS } from './scan.mjs';
 import { makeModuleZip, moduleProp, scanToReport } from './fixtures.mjs';
 
 // ---------------------------------------------------------------------------
@@ -46,8 +46,9 @@ function assertNoHit(ruleId, text, msg) {
 // ---------------------------------------------------------------------------
 
 test('规则表结构完整，每条规则都有 id/category/severity/advice', () => {
-  // 18 这个下限是钉住 T2 的扩容（15 -> 20）：留着 10，规则数从 14 涨到 19 这种事没人会被提醒。
-  assert.ok(CONTENT_RULES.length >= 18, `内容规则只剩 ${CONTENT_RULES.length} 条`);
+  // 18 这个下限是钉住 T2 的扩容（15 -> 20）；fix2 又加了两条执行链规则（EXEC_INDIRECT、
+  // MODDIR_RUNTIME_WRITE，20 -> 22），下限随之抬到 20：留着旧数字，规则被悄悄删掉没人被提醒。
+  assert.ok(CONTENT_RULES.length >= 20, `内容规则只剩 ${CONTENT_RULES.length} 条`);
   for (const r of CONTENT_RULES) {
     assert.ok(r.id, '缺少 id');
     assert.ok(r.category, `${r.id} 缺少 category`);
@@ -1528,3 +1529,250 @@ test('误伤哨兵：一个正经模块（注释 sepolicy.rule + .rc 服务定�
 
 
 
+
+// ---------------------------------------------------------------------------
+// ⑨ 第二轮修复（fix2）：P1 引用语法 / P2 变量间接 fail-closed / P3 运行期覆写 /
+//    P4 死分支与规则文本一致性 / P5 桶与分类守卫 / P6 注释豁免边界
+// ---------------------------------------------------------------------------
+
+// —— P1：EXEC_BUNDLED_FILE 语法补洞 ——
+// 评审实测（fix2 开工前逐条跑过）：下面 6 行在旧语法下全部 0 findings → low → auto-approve。
+
+test('fix2-P1：exec/setsid/trap 引号命令串/子 shell/无空白 sh —— 动词式引用必须被检出', () => {
+  for (const line of [
+    'exec $MODDIR/x.bin',
+    'setsid $MODDIR/x.bin',
+    'trap "sh $MODDIR/x" EXIT',
+    '(sh $MODDIR/x.bin)',
+    'sh"$MODDIR/x"',
+    'exec "${MODDIR}/clean" && exit 0',
+    'nohup $MODDIR/helper &',
+  ]) {
+    assert.ok(EXEC_BUNDLED_FILE.scan('service.sh', line).length > 0, 'EXEC_BUNDLED_FILE 未检出: ' + line);
+  }
+});
+
+test('fix2-P1：解释器动词 + 裸 $VAR 与 for-glob + do $VAR 必须被检出（EXEC_INDIRECT）', () => {
+  for (const line of [
+    'sh $X',
+    'bash ${X}',
+    'for f in $MODDIR/*.bin; do $f; done',
+    'trap "exec $X" EXIT',
+  ]) {
+    assert.ok(EXEC_INDIRECT.scan('service.sh', line).length > 0, 'EXEC_INDIRECT 未检出: ' + line);
+  }
+  // 假阳性边界：迭代子与模块目录无关的常规循环不许牵动（不许反向扩成「整行含 $MODDIR 就亮」）
+  assert.equal(EXEC_INDIRECT.scan('service.sh', 'for f in a b; do $f; done').length, 0);
+  // 模块目录前缀变量本身由 EXEC_BUNDLED_FILE 负责，不重复算间接
+  assert.equal(EXEC_INDIRECT.scan('service.sh', 'sh "$MODDIR/install.sh"').length, 0);
+});
+
+test('fix2-P1 端到端：六条实测曾 auto-approve 的形态全部转人工', async () => {
+  for (const line of [
+    'exec $MODDIR/x.bin',
+    'setsid $MODDIR/x.bin',
+    'trap "sh $MODDIR/x" EXIT',
+    '(sh $MODDIR/x.bin)',
+    'sh"$MODDIR/x"',
+    'for f in $MODDIR/*.bin; do $f; done',
+  ]) {
+    const zip = makeModuleZip({ id: 'eval.f2p1', files: [
+      ['service.sh', '#!/system/bin/sh\n' + line + '\n'],
+      ['x.bin', 'setenforce 0\n'],
+      ['x', 'setenforce 0\n'],
+    ] });
+    const r = await scanToReport(zip, { changeType: 'first' });
+    assert.equal(r.riskLevel, 'high', line + ' → ' + r.riskLevel + '/' + r.decision.action + '（旧语法实测 low/auto-approve）');
+    assert.equal(r.decision.action, 'block', line);
+  }
+});
+
+// —— P2：变量间接必须 fail closed ——
+
+test('fix2-P2：钉得住的变量按包内条目解析升级；钉不住的按「未验证引用」报 high；指向包外的撤销', async () => {
+  // (1) 钉得住：X 字面指向包内载荷 —— 必须解析成真实条目、进扫描面、逐行扫
+  const pinnedZip = makeModuleZip({ id: 'eval.f2p2a', files: [
+    ['service.sh', '#!/system/bin/sh\nX="$MODDIR/payload.bin"\nsh $X\n'],
+    ['payload.bin', 'setenforce 0\n'],
+  ] });
+  const a = await scanToReport(pinnedZip, { changeType: 'first' });
+  assert.deepEqual(a.escalated.map((e) => e.resolvedEntry), ['payload.bin'],
+    '钉得住的变量要解析成包内条目并升级（旧行为实测：0 findings → low → auto-approve）');
+  assert.ok(a.findings.some((f) => f.ruleId === 'SELINUX_DISABLE' && f.file === 'payload.bin'),
+    '升级之后必须真扫：' + JSON.stringify(a.findings.map((f) => f.ruleId)));
+  assert.equal(a.riskLevel, 'high');
+  assert.equal(a.decision.action, 'block');
+
+  // (2) 钉不住：扫描器无法确定 $X 指向哪 —— 报 high 并披露「没读过它」，不许悄悄放过
+  const b = await scanToReport(makeModuleZip({ id: 'eval.f2p2b', files: [
+    ['service.sh', '#!/system/bin/sh\nsh $X\n'],
+  ] }), { changeType: 'first' });
+  const fb = b.findings.find((x) => x.ruleId === 'EXEC_INDIRECT');
+  assert.ok(fb, '钉不住的变量执行必须报：' + JSON.stringify(b.findings.map((x) => x.ruleId)));
+  assert.equal(fb.severity, 'high');
+  assert.equal(b.riskLevel, 'high', 'fail closed：钉不住 ≠ 干净');
+  assert.equal(b.decision.action, 'block');
+  assert.equal(fb.advice, EXEC_UNPINNED_ADVICE, '报告要写明这条引用没被验证，而不是承诺读过');
+  assert.ok(!fb.advice.includes('读一遍'), '没读过的东西不许在建议里说「读一遍」');
+
+  // (3) 变量钉到包外路径（系统二进制）：不是包内引用，撤销，别淹人工队列
+  const c = await scanToReport(makeModuleZip({ id: 'eval.f2p2c', files: [
+    ['service.sh', '#!/system/bin/sh\nSCRIPT=/system/bin/sh\nsh $SCRIPT -c id\n'],
+  ] }), { changeType: 'first' });
+  assert.ok(!c.findings.some((x) => x.ruleId === 'EXEC_INDIRECT'), JSON.stringify(c.findings.map((x) => x.ruleId)));
+  assert.equal(c.riskLevel, 'low', JSON.stringify(c.findings));
+
+  // (4) 变量钉到包内且该条目已在扫描面：与裸写路径同判（撤销），但必须是「解析过」的撤销
+  const d = await scanToReport(makeModuleZip({ id: 'eval.f2p2d', files: [
+    ['service.sh', '#!/system/bin/sh\nX="$MODDIR/helper.sh"\nsh $X\n'],
+    ['helper.sh', 'echo ok\n'],
+  ] }), { changeType: 'first' });
+  assert.ok(!d.findings.some((x) => x.ruleId === 'EXEC_INDIRECT'), JSON.stringify(d.findings.map((x) => x.ruleId)));
+  assert.equal(d.riskLevel, 'low');
+});
+
+// —— P3：名字在扫描面 ≠ 字节被证实 ——
+
+test('fix2-P3：向模块目录写出/解包 + 执行同名条目必须升级（同名 ≠ 同字节）', async () => {
+  const zip = makeModuleZip({ id: 'eval.f2p3', files: [
+    ['customize.sh', '#!/system/bin/sh\nunzip -o /sdcard/x.zip -d $MODDIR\nsh $MODDIR/helper.sh\n'],
+    ['helper.sh', 'echo benign\n'],
+  ] });
+  const r = await scanToReport(zip, { changeType: 'first' });
+  const ids = r.findings.map((f) => f.ruleId);
+  assert.ok(ids.includes('MODDIR_RUNTIME_WRITE'), '写出/解包进模块目录本身要成为发现：' + JSON.stringify(ids));
+  assert.ok(ids.includes('EXEC_BUNDLED_FILE'), '引用撤销判据在存在覆写证据时必须失效（旧行为实测 low/auto-approve）');
+  const eb = r.findings.find((f) => f.ruleId === 'EXEC_BUNDLED_FILE');
+  assert.match(eb.snippet, /helper\.sh/, '报告要指名造成升级的那条引用');
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block');
+
+  // 反向哨兵：没有写出证据的常规多脚本模块照旧撤销（不许把 P3 变成「凡引用皆 high」）
+  const ok = await scanToReport(makeModuleZip({ id: 'eval.f2p3ok', files: [
+    ['customize.sh', '#!/system/bin/sh\nsh $MODDIR/install.sh\n'],
+    ['install.sh', 'echo install\n'],
+  ] }), { changeType: 'first' });
+  assert.ok(!ok.findings.some((f) => f.ruleId === 'EXEC_BUNDLED_FILE'), JSON.stringify(ok.findings.map((f) => f.ruleId)));
+  assert.ok(!ok.findings.some((f) => f.ruleId === 'MODDIR_RUNTIME_WRITE'));
+  assert.equal(ok.riskLevel, 'low');
+  assert.equal(ok.decision.action, 'auto-approve');
+
+  // 写出发现的证据字段要齐全
+  const wr = r.findings.find((f) => f.ruleId === 'MODDIR_RUNTIME_WRITE');
+  assert.equal(wr.file, 'customize.sh');
+  assert.equal(wr.line, 2);
+});
+
+test('fix2-P3：A 文件解包覆写、B 文件执行同名条目 —— 引用不许按「已扫过」撤销', async () => {
+  const zip = makeModuleZip({ id: 'eval.f2p3x', files: [
+    ['service.sh', '#!/system/bin/sh\nunzip -o /sdcard/pack.zip -d ${MODDIR}/\n'],
+    ['customize.sh', '#!/system/bin/sh\nsh $MODDIR/helper.sh\n'],
+    ['helper.sh', 'echo benign\n'],
+  ] });
+  const r = await scanToReport(zip, { changeType: 'first' });
+  assert.equal(r.riskLevel, 'high', '跨文件覆写不许停在 low：' + JSON.stringify(r.findings.map((f) => f.ruleId)));
+  const cross = r.findings.find((f) => f.file === 'customize.sh' && f.ruleId === 'MODDIR_RUNTIME_WRITE');
+  assert.ok(cross, '必须有一条指名 customize.sh 的覆写升级发现：' + JSON.stringify(r.findings.filter((f) => f.category === 'execution')));
+});
+
+test('fix2-P3 报告错配：良性最左引用 + 解析不到的引用同行时，snippet 必须指名后者', async () => {
+  const zip = makeModuleZip({ id: 'eval.f2p3b', files: [
+    ['customize.sh', '#!/system/bin/sh\nsh $MODDIR/install.sh && sh $MODDIR/ghost.dat\n'],
+    ['install.sh', 'echo ok\n'],
+  ] });
+  const r = await scanToReport(zip, { changeType: 'first' });
+  const f = r.findings.find((x) => x.ruleId === 'EXEC_BUNDLED_FILE');
+  assert.ok(f);
+  assert.match(f.snippet, /ghost\.dat/,
+    '旧行为实测 snippet 曾被写成 "sh $MODDIR/install.sh"（良性最左），报告指鹿为马');
+  assert.ok(!/install\.sh/.test(f.snippet), '报告不许把没造成升级的引用写成风险本体');
+});
+
+// —— P4 ——
+
+test('fix2-P4b：SELINUX_POLICY_RELAX 权限集里的 enforce 分支不许是死词', () => {
+  // `enforceforce` 不是任何真实策略里存在的权限名（旧 pattern 里的死分支，评审点名）；
+  // setenforce 才是 kernel:security 类里真实存在、且允许运行时关强制的权限。
+  assertHit('SELINUX_POLICY_RELAX', 'allow init kernel:security { setenforce };');
+  assertHit('SELINUX_POLICY_RELAX', 'allow su kernel:security { setenforce setbool };');
+  // 反向：不含执行类权限的 allow 不命中（别把集合换成 . 通配）
+  assertNoHit('SELINUX_POLICY_RELAX', 'allow init kernel:security { read };');
+});
+
+test('fix2-P4a：PROP_BOOT_SPOOF 只覆盖四个 ro.boot.* 完整性键 —— 规则文本与 pattern 同一个真相', () => {
+  // 本快照里 title/message/advice 没有承诺 ro.*/persist.* 广覆盖（评审描述的失配在本仓不存在），
+  // 这里把它钉成一致性锁：谁把文案改宽而 pattern 没跟着改宽，这条就红。
+  const rule = RULES_BY_ID.PROP_BOOT_SPOOF;
+  for (const txt of [rule.title, rule.advice]) {
+    assert.ok(!/persist\./.test(txt), 'advice/title 不许承诺 persist.* 而 pattern 不覆盖：' + txt);
+  }
+  for (const line of [
+    'ro.boot.verifiedbootstate=green', 'ro.boot.vbmeta.device_state=unlocked',
+    'ro.boot.flash.locked=0', 'ro.boot.veritymode=enforcing',
+  ]) assertHit('PROP_BOOT_SPOOF', line, line);
+  // 明确不在本规则范围内的键（.prop 通道的已知缺口，报告如实披露，不许文案与行为分叉）
+  for (const line of ['persist.sys.usb.config=adb', 'ro.secure=1', 'sys.usb.controller=adb_root']) {
+    assertNoHit('PROP_BOOT_SPOOF', line, line);
+  }
+});
+
+// —— P5 / P6：桶与分类守卫 ——
+
+test('fix2-P5：classify 的桶集合与 scanZip 的扫描面桶必须一一对应（新桶不许静默消失）', () => {
+  const p = writeZip('buckets.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'customize.sh', content: '#!/system/bin/sh\nexit 0\n' },           // canonical
+    { name: 'extra/helper.sh', content: 'echo x\n' },                          // otherScripts
+    { name: 'META-INF/com/google/android/updater-script', content: 'x\n' },    // handlers
+    { name: 'system.prop', content: 'ro.x.y=1\n' },                            // props
+    { name: 'sepolicy.rule', content: 'dontaudit su su:file read;\n' },        // policy
+    { name: 'blob', content: Buffer.from('\x7fELF\x02\x01', 'latin1') },       // binaries
+    { name: 'README.md', content: 'docs\n' },                                  // others
+  ]);
+  const files = readZip(p).files;
+  const buckets = Object.keys(classify(files)).filter((k) => k !== 'propEntry');
+  assert.deepEqual(buckets.sort(),
+    [...SCAN_TARGET_BUCKETS, 'binaries', 'others'].sort(),
+    'classify 新增了桶而 scanZip 没接：这就是 P5 复现过的静默消失');
+  const r = scanZip(p, { changeType: 'first' });
+  // 每一个扫描面桶都要同时出现在 inventory、scripts 与 Markdown 文件清单里
+  const invKeys = { canonical: 'canonicalScripts', otherScripts: 'otherScripts', handlers: 'handlers', props: 'props', policy: 'policyFiles' };
+  const md = renderMarkdown(r);
+  for (const b of SCAN_TARGET_BUCKETS) {
+    const c = classify(files)[b];
+    assert.ok(c.length, `夹具必须让桶 ${b} 非空，否则这条守卫是空转`);
+    const rows = r.inventory[invKeys[b]];
+    assert.ok(rows && rows.length === c.length, `inventory.${invKeys[b]} 少了 ${b} 桶的条目`);
+    for (const f of c) {
+      assert.ok(r.scripts.some((s) => s.name === f.name), `${f.name}（桶 ${b}）必须进 report.scripts`);
+      assert.ok(md.includes(f.name), `${f.name}（桶 ${b}）必须出现在 Markdown 清单里`);
+    }
+  }
+});
+
+test('fix2-P5：分类未识别的 finding 必须在 Markdown 里显式披露，不许渲染成没人看得见的分组', () => {
+  const p = writeZip('unknowncat.zip', [{ name: 'module.prop', content: CLEAN_PROP }]);
+  const r = scanZip(p, { changeType: 'first' });
+  r.findings = [{ ruleId: 'SOMETHING_NEW', category: 'quantum', severity: 'high', file: 'x.sh', line: 1,
+    snippet: 'x', message: 'm', advice: 'a' }];
+  const md = renderMarkdown(r);
+  assert.match(md, /分类未识别[：:] ?quantum/, '未知分类至少要写明「分类未识别」，这是 P5 那类白名单遗忘的最后防线');
+});
+
+test('fix2-P6：豁免只认整行注释 —— 行尾 # 的 sepolicy 授权照报（.te 没有 # 语法）', () => {
+  // 命中的行尾注释形状（magiskpolicy 会原样应用这行）
+  assertHit('SELINUX_POLICY_RELAX', 'allow su * fs:file { execute } # comment');
+  // 整行注释豁免维持既有先例（不许反向扩大成「行内含 # 就豁免」）
+  assertNoHit('SELINUX_POLICY_RELAX', '# allow su * fs:file { execute }');
+  assertNoHit('MAGISK_POLICY_LIVE', '# magiskpolicy --live "allow su * *"');
+  assertHit('MAGISK_POLICY_LIVE', 'magiskpolicy --live "allow su * *" # 行尾说明');
+});
+
+test('fix2-P6：inventory.policyFiles 不是死字段 —— Markdown 清单要渲染出策略文件行', () => {
+  const r = scanZip(writeZip('polinv.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'sepolicy.rule', content: 'dontaudit su su:file read;\n' },
+  ]), { changeType: 'first' });
+  assert.ok(r.inventory.policyFiles.some((f) => f.name === 'sepolicy.rule'));
+  assert.match(renderMarkdown(r), /策略\/初始化文件[^\n]*sepolicy\.rule/);
+});

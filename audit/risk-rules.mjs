@@ -211,21 +211,62 @@ export const EXEC_BUNDLED_FILE = makeLineRule({
   // 见 scan.mjs 的 resolveBundledRefs —— 它跑的是原始 pattern，不看 exclude。
   exclude: /^\s*#/,
   // 两种写法都要认：
-  //   ① 动词式：`[busybox ]sh / bash / ash / source / .` + 分隔符 + 引号? + 模块目录路径；
-  //   ② 命令位式：路径本身就在命令位（行首，或 ; && || 之后）—— 那是「直接执行 $MODDIR/tool.bin」
+  //   ① 动词式：`[busybox ]sh / bash / ash / source / . / exec / setsid / nohup` + 分隔 + 引号? + 模块目录路径；
+  //   ② 命令位式：路径本身就在命令位（行首，或 ; && || ( { 之后）—— 那是「直接执行 $MODDIR/tool.bin」
   //      这种不带解释器的写法，和 sh 它一模一样都是把它拿去跑。
   // 前缀认四种：$MODPATH/、${MODDIR}/、$TMPMODDIR/、绝对 /data/adb/modules/…（评审 F5：只写
   // $MODPATH 不够，本仓自己的 SAFE_RM_TOKEN（上面）就把 $MODDIR 当正规模块目录变量）。
-  // 分隔符允许空白或 ${IFS}/$IFS；引号允许双引号或单引号；路径分隔符允许 / 与 \ ——
-  // 这三个都是实测过的逃逸写法（评审 fix1-④）。
-  //
+  // 分隔符允许空白或 ${IFS}/$IFS，且允许完全不带空白（fix2-P1：`sh"$MODDIR/x"` 实测曾被放过）；
+  // 引号允许双引号或单引号；路径分隔符允许 / 与 \ —— 这三个都是实测过的逃逸写法（评审 fix1-④）。
+  // fix2-P1 补的四个家族（全部评审实测曾 0 findings → low → auto-approve）：
+  //   exec/setsid/nohup 前导（动词表扩容）；`trap "sh $MODDIR/x" EXIT` 与 `(sh $MODDIR/x)`
+  //   （动词左边接受 `(`/引号 —— 引号里的命令串照样会被 shell 求值）；
+  //   `sh"$MODDIR/x"`（动词与路径之间不再强制空白）。
   // **这里不再按「被引用的后缀像不像脚本」做排除**（评审 fix1-①：那是整条闸静默失效的根源）。
   // 排除条件必须是「它是否真的已经在扫描面里」，而那个判断只有 scan.mjs 的 scanZip 拿得到，
   // 所以「目标是已被逐行扫过的条目就撤掉这条 finding」写在 scan.mjs，不写在 pattern 里。
   // 后缀排除之所以必须删：classify() 让魔数赢过后缀，于是 ELF 改名 payload.js 时
   // 「后缀 .js」=「已被扫描」这个假设根本不成立。
-  pattern: /(?:^|[\s;&|])(?:(?:busybox\s+)?sh|bash|ash|source|\.)[\s]*(?:\$\{?IFS\}?[\s]*|[\s]+)["']?(?:\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/]|\/data\/adb\/modules\/)[^\s"']+|(?:^[\s]*|(?:&&|\|\||[;|])[\s]*)["']?(?:\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/]|\/data\/adb\/modules\/)[^\s"']+/,
+  pattern: /(?:^|[\s;&|({["'])(?:(?:busybox\s+)?sh|bash|ash|source|\.(?!\d)|exec|setsid|nohup)(?:\s*(?:\$\{?IFS\}?)?\s*)["']?(?:\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/]|\/data\/adb\/modules\/)[^\s"']+|(?:^[\s]*|(?:&&|\|\||[;|({])[\s]*)["']?(?:\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/]|\/data\/adb\/modules\/)[^\s"']+/,
   advice: '脚本执行了模块自带的另一个文件。审核必须把那个文件也当作可执行文本读一遍 —— 只扫被执行的这一行等于什么都没扫。',
+});
+
+// fix2-P1/P2：变量间接执行 —— `sh $X` / `do $f` 这类「目标在变量里」的写法。
+// 这条规则只在**形状层**存在：它把「解释器动词 + 裸 $VAR」与「for-in 模块目录 glob + do $VAR」
+// 这些 EXEC_BUNDLED_FILE（只认字面 $MODDIR 前缀）永远看不见的形状带进检测面；
+// 「变量到底钉不钉得住」的判断在 scan.mjs（那里拿得到同文件的赋值），纯逐行函数不替它说话。
+// 假阳性边界（评审要求「不许扩成整行含 $MODDIR 就亮」的反面）：
+//   * 三个模块目录前缀变量名（MODPATH/MODDIR/TMPMODDIR）本身不在这条触发 —— 那是
+//     EXEC_BUNDLED_FILE 的领地，重复触发只会双报；
+//   * 字面迭代子的常规循环（`for f in a b; do $f; done`，迭代子里没有 $）不触发。
+export const EXEC_INDIRECT = makeLineRule({
+  id: 'EXEC_INDIRECT', category: 'execution', severity: 'high',
+  title: '经变量间接执行目标，扫描器必须先钉住变量值',
+  exclude(m, line) {
+    if (/^\s*#/.test(line)) return true;
+    if (m[1] !== undefined) return false; // 动词位在裸 $VAR 上：一律触发，fail closed
+    const forIn = line.match(/\bfor\s+\w+\s+in\s+([^;&|\n]*)/);
+    if (forIn && !/\$/.test(forIn[1])) return true; // 字面迭代子的常规循环
+    return false;
+  },
+  // ① 解释器/前导动词 + 空白 + 引号? + $VAR；② do/then/else + $VAR。
+  // 两处都用负先行排除 MODPATH|MODDIR|TMPMODDIR 三个前缀变量（交给 EXEC_BUNDLED_FILE）。
+  pattern: /(?:^|[\s;&|({["'])(?:(?:busybox\s+)?sh|bash|ash|source|\.|exec|setsid|nohup)\s+["']?\$\{?(?!\{?(?:MODPATH|MODDIR|TMPMODDIR)\b)([A-Za-z_][A-Za-z0-9_]*)|(?:^|[\s;&|(])(?:do|then|else)\s+\$\{?(?!\{?(?:MODPATH|MODDIR|TMPMODDIR)\b)([A-Za-z_][A-Za-z0-9_]*)/,
+  advice: '脚本经变量间接执行一个目标；扫描器能否把变量钉成包内具体路径由 scanZip 判定，钉不住就按未验证引用处理。',
+});
+
+// fix2-P3：「名字在扫描面」不等于「字节被证实」。
+// 在设备上把外部字节写进模块目录的解包/拷贝/重定向动作，会让随后 `sh $MODDIR/x` 执行的
+// 磁盘内容不再是扫描面读过的那份 —— 所以这行本身就是发现，并且它让引用撤销判据失效（见 scan.mjs）。
+// 假阳性边界：`cp -f busybox $MODPATH/system/xbin/bb` 这种「向自有覆盖层拷模块自带文件」
+// 是本仓 CLEAN 夹具的正经写法，cp/mv 分支因此只认「源在包外（/sdcard、/storage、/data/local/tmp）」。
+export const MODDIR_RUNTIME_WRITE = makeLineRule({
+  id: 'MODDIR_RUNTIME_WRITE', category: 'execution', severity: 'high',
+  title: '运行期向模块目录写出/解包外部内容',
+  exclude: /^\s*#/,
+  pattern: /(?:\b(?:busybox\s+)?(?:unzip|tar|7z|gunzip|unxz)\b[^\n]*(?:\s-d\s+|\s-C\s+|--directory\s+)[^\n]*(?:["']?\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?(?:[\\/]|(?=[\s"']|$))|["']?\/data\/adb\/modules\/)|\b(?:cp|mv)\b(?:\s+-\w+)*\s+["']?(?:\/sdcard\/|\/storage\/|\/mnt\/sdcard\/|\/data\/local\/tmp\/)[^\s"']*\s+["']?\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?(?:[\\/]|(?=[\s"']|$))|>>?\s*["']?\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/][^\s"']*|>>?\s*["']?\/data\/adb\/modules\/[^\s"']+)/,
+  advice: '该写法会在设备上用外部字节覆盖模块目录里的文件：扫描面读过的同名条目与实际落盘内容不再是同一份。'
+    + '凡在此之后被执行的包内路径都必须人工核对写出来源（zip 在哪、从哪下载、校验什么）。',
 });
 
 // ---------------------------------------------------------------------------
@@ -269,9 +310,12 @@ export const SELINUX_POLICY_RELAX = makeLineRule({
   // 只认 `allow` —— deny/auditallow/dontaudit 是收紧或抑制日志，攻击者要的是授予，把它们打进来只会涨假阳性。
   // 权限集里去掉了旧写法里的 `write|create|getattr`：正经模块给自家文件写权限极常见，
   // 留在里面就是 F6 那类「合法模块被拦范围扩大」，而 execute/execmem/setattr 才是提权的形状。
+  // fix2-P4b：旧集合里的 `enforceforce` 不是任何真实 SELinux 策略里存在的权限名，是条死分支
+  // （写它的人想覆盖的是「授予运行时关强制的能力」）—— 换成 kernel:security 类里真实存在的
+  // `setenforce`（`allow init kernel:security { setenforce }` 就是 magiskpolicy 会照单执行的授权行）。
   // 行首锚定 `^\s*` 是这条规则唯一的收窄条件：它同时挡掉了 `echo "allow su * * { execute }"`
   // 与 `SELINUX_ALLOW="allow …"` 这两种「字符串常量里提到规则」的写法（见测试矩阵）。
-  pattern: /^\s*allow\s+[^{};]*\{[^}]*(?:\b(?:execute|execmem|execstack|execute_no_trans|setattr|enforceforce)\b|\*)/,
+  pattern: /^\s*allow\s+[^{};]*\{[^}]*(?:\b(?:execute|execmem|execstack|execute_no_trans|setattr|setenforce)\b|\*)/,
   advice: '放宽 SELinux 的 allow 规则。root 模块加 allow 就是给自己开权限，必须人工确认它授予了什么、给谁。',
 });
 
@@ -315,6 +359,10 @@ export const DEBUGGABLE_ENABLE = makeLineRule({
 // 人工队列，而这类模块在国内普遍存在（解锁 / bl 修复类）；假阳性来源正是那些合法改机模块，
 // 收益是关掉一条当前完全敞开的自动放行通道。定 high（转人工）而不是任何自动拒绝 ——
 // 让双签去承担判断，不让规则去承担结论。
+// fix2-P4a（真相二选一，这里选「不覆盖」）：本规则只覆盖四个 `ro.boot.*` 完整性键。
+// `persist.*`、裸 `ro.*` 安全键与 `sys.usb.controller` 一类运行期键**不在**范围内 ——
+// 文案（title/message/advice）不许承诺覆盖它们（scan.test.mjs 有一致性锁），
+// 而「.prop 直写非 boot 家族安全键」作为已知缺口在任务报告里如实披露，不偷偷扩面。
 export const PROP_BOOT_SPOOF = makeLineRule({
   id: 'PROP_BOOT_SPOOF', category: 'root', severity: 'high', title: '在属性文件里直写启动/完整性状态',
   // 行首锚定 + 必须有 `=`：注释行 `#ro.boot.verifiedbootstate=green` 与
@@ -426,6 +474,8 @@ export const CONTENT_RULES = [
   RM_RF_MUTABLE,
   PIPE_TO_SHELL,
   EXEC_BUNDLED_FILE,
+  EXEC_INDIRECT,
+  MODDIR_RUNTIME_WRITE,
   DOWNLOAD_TO_STDOUT,
   OBFUSCATED_DECODE_EXEC,
   OBFUSCATED_DECODE_ONLY,

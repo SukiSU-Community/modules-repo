@@ -28,7 +28,7 @@ import {
   CONTENT_RULES, scanContent, checkMetadata, parseModuleProp,
   scoreRisk, decide, countsTowardRisk, CATEGORY_LABEL, SEVERITY_ORDER,
   inspectStructure, checkCoverage, checkUnread, checkBinaries, detectBinary,
-  MAX_TEXT, MAX_ENTRY_UNCOMPRESSED, EXEC_BUNDLED_FILE, trimSnippet,
+  MAX_TEXT, MAX_ENTRY_UNCOMPRESSED, EXEC_BUNDLED_FILE, EXEC_INDIRECT, MODDIR_RUNTIME_WRITE, trimSnippet,
 } from './risk-rules.mjs';
 // ---------------------------------------------------------------------------
 // ZIP 解析（自带简易实现，失败时回退系统 unzip）
@@ -323,6 +323,10 @@ export function classify(files) {
   return { canonical, otherScripts, handlers, props, policy, binaries, others, propEntry };
 }
 
+// fix2-P5：scanZip 组扫描面用的桶名白名单。守卫测试把它与 classify() 的实际返回键做双向比对 ——
+// 新增桶忘了接线时不再是「文件静静不进扫描面、报告 0 发现」，而是测试当场变红。
+export const SCAN_TARGET_BUCKETS = ['canonical', 'otherScripts', 'handlers', 'props', 'policy'];
+
 // ---------------------------------------------------------------------------
 // 扫描
 // ---------------------------------------------------------------------------
@@ -410,22 +414,80 @@ function lookupEntries(index, rel) {
 }
 
 /**
+ * 同文件内的字面变量赋值表（fix2-P2）：`X="$MODDIR/payload.bin"` 里的 X 能不能钉成一个
+ * 具体的包内路径。判据保守到近乎挑剔：
+ *   * moddir   —— 值以模块目录前缀开头，且前缀之后不含新的展开/通配（能算出 rel 才算钉住）；
+ *   * external —— 值是以 `/` 开头的包外绝对路径（`SCRIPT=/system/bin/sh`），等价于「执行包外程序」，
+ *                 不是包内引用，撤销；
+ *   * unknown  —— 其它一切（没赋值、值走命令替换、相对路径、含 glob）：钉不住，fail closed。
+ * 只认 `NAME=` 一个形状；`declare -A`、数组、跨文件赋值都不认 —— 认得越多，误判越深。
+ */
+function pinLiteralValue(value, moduleId) {
+  const s = String(value == null ? '' : value).replace(/\\/g, '/');
+  if (!s) return { kind: 'unknown' };
+  if (REF_MODDIR_PREFIX.test(s)) {
+    const rel = normalizeRefPath(s.replace(REF_MODDIR_PREFIX, ''));
+    if (rel && !/[\s$?*{}[\]"'`\\]/.test(rel)) return { kind: 'moddir', rel };
+    return { kind: 'unknown' };
+  }
+  if (REF_ABS_PREFIX.test(s)) {
+    const p = s.replace(REF_ABS_PREFIX, '');
+    if (moduleId && p.startsWith(`${moduleId}/`)) {
+      const rel = normalizeRefPath(p.slice(moduleId.length + 1));
+      if (rel && !/[\s$?*{}[\]"'`\\]/.test(rel)) return { kind: 'moddir', rel };
+    }
+    return { kind: 'unknown' }; // 别的模块目录 / 越界 / glob：都不算钉住
+  }
+  if (/^\/[A-Za-z0-9_.-]+/.test(s) && !/\$\{?[A-Za-z_]/.test(s)) return { kind: 'external' };
+  return { kind: 'unknown' };
+}
+
+function collectVarValues(text, moduleId) {
+  const map = {};
+  const lines = String(text == null ? '' : text).split(/\r?\n/);
+  for (const raw of lines) {
+    if (/^\s*#/.test(raw)) continue;
+    const re = /(?:^|[;&|\s])(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(["']?)([^\s"'|;&<>]*)/g;
+    let m;
+    while ((m = re.exec(raw))) {
+      const name = m[1];
+      if (name === 'MODPATH' || name === 'MODDIR' || name === 'TMPMODDIR') continue; // 目录根变量不参与引用
+      if (!(name in map)) map[name] = pinLiteralValue(m[3], moduleId);
+    }
+  }
+  return map;
+}
+
+/** for-in 模块目录 glob 迭代子（`for f in $MODDIR/*.bin`）：把能枚举到的包内条目拿出来。 */
+function globIterableEntries(line, allEntries, moduleId) {
+  const gm = line.match(new RegExp(
+    '\\bfor\\s+\\w+\\s+in\\s+["\'} ]*(?:\\$\\{?(?:MODPATH|MODDIR|TMPMODDIR)\\}?[\\\\/]|\\/data\\/adb\\/modules\\/(?:'
+    + String(moduleId || '[^/\\s"]+').replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\/)?)([^\\s"\']*[*?][^\\s"\']*)'));
+  if (!gm) return [];
+  const rx = new RegExp('^' + gm[1].replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]') + '$');
+  return (Array.isArray(allEntries) ? allEntries : []).filter((e) => e && e.name && rx.test(e.name));
+}
+
+/**
  * 找出扫描面上每一条「执行包内另一个文件」的引用，并给出该拿它怎么办。
  *
- * 每条引用返回 { fromFile, fromLine, ref, rel, resolved, covered, entries }：
- *   resolved —— 归一化后能不能对上包内真实条目；对不上就不能在报告里假装读过它；
+ * fix2 起这条链有两个入口：
+ *   EXEC_BUNDLED_FILE —— 字面 $MODDIR 路径；
+ *   EXEC_INDIRECT     —— 变量间接（`sh $X` / `do $f`），变量值能用 collectVarValues 钉住时
+ *                        按钉住后的路径解析（钉不住就是未验证引用，fail closed 成发现）。
+ * 每条引用返回 { ruleId, fromFile, fromLine, ref, rel, resolved, covered, entries, unpinned }：
+ *   resolved —— 归一化后能不能对上包内真实条目（或钉死为包外路径）；对不上就不能在报告里假装读过它；
  *   covered  —— 能对上，且同名条目**全部**已经在扫描面里（`sh $MODPATH/install.sh` 那种常规写法：
- *               那个文件本来就被逐行扫过，这条 high 该撤掉）；
- *   entries  —— 需要升级进扫描面的条目（同名重复时可能多份，已在扫描面里的不重复取）。
- *
- * 判据是「它是否真的已经在扫描面里」，不是「它的后缀像不像脚本」（评审 fix1-①）：
- * classify() 让魔数赢过后缀，ELF 改名 payload.js 时「后缀 .js」根本不代表它被扫过。
+ *               那个文件本来就被逐行扫过，这条 high 该撤掉 —— 但见 applyBundledRefVerdicts 的 P3 闸）；
+ *   entries  —— 需要升级进扫描面的条目（同名重复时可能多份，已在扫描面里的不重复取）；
+ *   unpinned —— 变量钉不住：这是「未验证引用」，撤销判据对它永远不成立。
  * 只递归一层：只看初始扫描面的引用，不追随被升级条目自己的引用（防环）。
  * @param {Array<{name:string, content:string}>} scanTargets
  * @param {Array<{name:string}>} allEntries
  * @param {string} moduleId
+ * @param {Object<string, Object<string, {kind:string, rel?:string}> >} [varMapsByFile]
  */
-export function resolveBundledRefs(scanTargets = [], allEntries = [], moduleId = '') {
+export function resolveBundledRefs(scanTargets = [], allEntries = [], moduleId = '', varMapsByFile = {}) {
   const index = indexEntries(allEntries);
   const onSurface = new Set();
   const surfaceRows = new Set();
@@ -434,36 +496,66 @@ export function resolveBundledRefs(scanTargets = [], allEntries = [], moduleId =
     onSurface.add(f);
     surfaceRows.add(rowKey(f));
   }
-  const re = new RegExp(
-    EXEC_BUNDLED_FILE.pattern.source,
-    EXEC_BUNDLED_FILE.pattern.flags.includes('g') ? EXEC_BUNDLED_FILE.pattern.flags : EXEC_BUNDLED_FILE.pattern.flags + 'g',
-  );
+  const regs = [EXEC_BUNDLED_FILE, EXEC_INDIRECT].map((rule) => ({
+    rule,
+    re: new RegExp(rule.pattern.source,
+      rule.pattern.flags.includes('g') ? rule.pattern.flags : rule.pattern.flags + 'g'),
+  }));
   const refs = [];
   for (const f of Array.isArray(scanTargets) ? scanTargets : []) {
     const lines = String(f && f.content != null ? f.content : '').split(/\r?\n/);
     for (let i = 0; i < lines.length; i++) {
-      re.lastIndex = 0;
-      let m;
-      while ((m = re.exec(lines[i]))) {
-        const ref = m[0].trim();
-        const rel = refRelPath(m[0], moduleId);
-        const rec = { fromFile: f.name, fromLine: i + 1, ref, rel, resolved: false, covered: false, entries: [] };
-        const group = rel ? lookupEntries(index, rel) : [];
-        if (group.length) {
-          rec.resolved = true;
-          const seen = new Set();
-          for (const e of group) {
-            const k = rowKey(e);
-            // 要求 1：包内不存在就不升级；已在扫描面里的（同一个对象，或名字+内容同指纹）不再取一次。
-            if (onSurface.has(e) || surfaceRows.has(k) || seen.has(k)) continue;
-            seen.add(k);
-            rec.entries.push({ ...e, __from: f.name, __line: i + 1, __ref: ref });
+      const line = lines[i];
+      // 规则层的整行/字面迭代子豁免同样要在这跑：resolver 用原始 pattern，不看 exclude ——
+      // 但 EXEC_INDIRECT 的「注释行不报」在这里也要一致（注释行照样允许升级进扫描面，见 risk-rules 注释）。
+      for (const { rule, re } of regs) {
+        re.lastIndex = 0;
+        let m;
+        while ((m = re.exec(line))) {
+          const ref = m[0].trim();
+          const rec = { ruleId: rule.id, fromFile: f.name, fromLine: i + 1, ref,
+            rel: null, resolved: false, covered: false, entries: [], unpinned: false };
+          if (rule.id === 'EXEC_BUNDLED_FILE') {
+            rec.rel = refRelPath(m[0], moduleId);
+          } else {
+            const varName = m[1] !== undefined ? m[1] : m[2];
+            rec.varName = varName;
+            const pin = (varMapsByFile[f.name] || {})[varName];
+            if (pin && pin.kind === 'moddir') {
+              rec.rel = pin.rel;
+            } else if (pin && pin.kind === 'external') {
+              rec.resolved = true; rec.covered = true; rec.external = true;
+            } else {
+              rec.unpinned = true;
+              // for-in 模块目录 glob：迭代子本身是包内路径集合，能把没读过的载荷枚举出来升级
+              for (const e of globIterableEntries(line, allEntries, moduleId)) {
+                const k = rowKey(e);
+                if (onSurface.has(e) || surfaceRows.has(k)) continue;
+                if (!rec.entries.some((x) => rowKey(x) === k)) {
+                  rec.entries.push({ ...e, __from: f.name, __line: i + 1, __ref: ref });
+                }
+              }
+              if (rec.entries.length) rec.resolved = true;
+            }
           }
-          // 同名条目全都在扫描面里 = 这条引用没有把任何没读过的东西带进来，可以撤。
-          rec.covered = rec.entries.length === 0;
+          const group = rec.rel ? lookupEntries(index, rec.rel) : [];
+          if (group.length) {
+            rec.resolved = true;
+            const seen = new Set(rec.entries.map((e) => rowKey(e)));
+            for (const e of group) {
+              const k = rowKey(e);
+              // 要求 1：包内不存在就不升级；已在扫描面里的（同一个对象，或名字+内容同指纹）不再取一次。
+              if (onSurface.has(e) || surfaceRows.has(k) || seen.has(k)) continue;
+              seen.add(k);
+              rec.entries.push({ ...e, __from: f.name, __line: i + 1, __ref: ref });
+            }
+            // 同名条目全都在扫描面里 = 这条引用没有把任何没读过的东西带进来，可以撤。
+            // （撤不撤最终还过 applyBundledRefVerdicts 的 P3 覆写闸。）
+            if (!rec.unpinned) rec.covered = rec.entries.length === 0;
+          }
+          refs.push(rec);
+          if (m.index === re.lastIndex) re.lastIndex++;
         }
-        refs.push(rec);
-        if (m.index === re.lastIndex) re.lastIndex++;
       }
     }
   }
@@ -504,35 +596,86 @@ export const EXEC_UNRESOLVED_ADVICE =
   + '（路径不在包内，或上跳越出了模块根目录）：那个文件的内容本次**没有**被读过，本报告不能替你读它。'
   + '请人工确认它从哪来、运行期是否会被写出，再定处置。';
 
+// fix2-P2：变量钉不住时的 advice —— 与 EXEC_UNRESOLVED_ADVICE 同理，报告不许承诺读过它。
+export const EXEC_UNPINNED_ADVICE =
+  '脚本的执行目标走变量间接：扫描器无法把这个变量钉成包内具体路径（文件内没有可确认的字面赋值、'
+  + '值本身还含展开/通配，或赋值不在本次扫描面内）。变量运行期到底指向哪里没有核实过，'
+  + '本次**没有**读过那个目标 —— 这是未验证引用，不是「干净」。请人工确认变量来源与所有赋值点。';
+export const EXEC_OVERRIDDEN_ADVICE =
+  '引用的同名条目确实已在扫描面里，但这个脚本（或同包另一脚本）还会在运行期向模块目录写出/解包'
+  + '外部内容：真正落盘并被执行的字节不再是扫描面读过的那一份 —— 「同名」不等于「同字节」。'
+  + '这条引用不能按「已逐行扫过」撤销；请人工核对写出来源与解包内容。';
+
 /**
- * 用引用解析结果决定每条 EXEC_BUNDLED_FILE 发现的去处。这一步只能在 scanZip 里做 ——
+ * 用引用解析结果决定每条 EXEC_BUNDLED_FILE / EXEC_INDIRECT 发现的去处。这一步只能在 scanZip 里做 ——
  * 只有那里拿得到扫描面（risk-rules 的 makeLineRule 是纯逐行函数，拿不到它）。
- *   * 这一行的引用全部解析成功、且目标都已经逐行扫过 -> 撤掉这条发现（正经模块的常规写法）；
+ *   * 这一行的引用全部解析成功、且目标都已经逐行扫过、且包内没有「运行期写模块目录」的证据
+ *     -> 撤掉这条发现（正经模块的常规写法）；有写出证据时撤销失效（fix2-P3：同名 ≠ 同字节）；
  *   * 有升级进来的条目 -> 保留 high，并把 snippet 换成那个真正没被扫过的引用，
- *     否则会出现「命中的是 install.sh、被拦的却是 payload.dat」这种没法复验的错配；
+ *     否则会出现「命中的是 install.sh、被拦的却是 payload.dat」这种没法复验的错配（fix2-P3 报告错配）；
+ *   * 有钉不住的变量引用 -> 保留 high，advice 换成「未验证引用」文案（fix2-P2，fail closed）；
  *   * 有解析不到的引用（或这一行压根没有解析结果）-> 保留 high，但换成不承诺读过的 advice。
+ * snippet 永远指向**造成保留的那条引用**（优先级：被升级的 > 钉不住的 > 解析不到的），
+ * 报告不许把没造成升级的良性最左引用写成风险本体。
  * @param {object[]} findings
  * @param {object[]} refs resolveBundledRefs 的返回
+ * @param {Map<string, number>|null} [writeInfo] 文件 -> 首个「运行期写模块目录」命中行（fix2-P3）
  * @returns {object[]} 新的发现数组（不改入参对象）
  */
-export function applyBundledRefVerdicts(findings = [], refs = []) {
+export function applyBundledRefVerdicts(findings = [], refs = [], writeInfo = null) {
   const byLine = new Map();
   for (const rec of Array.isArray(refs) ? refs : []) {
-    const k = JSON.stringify([rec.fromFile, rec.fromLine]);
+    const k = JSON.stringify([rec.ruleId, rec.fromFile, rec.fromLine]);
     if (!byLine.has(k)) byLine.set(k, []);
     byLine.get(k).push(rec);
   }
   const out = [];
   for (const f of Array.isArray(findings) ? findings : []) {
-    if (!f || f.ruleId !== 'EXEC_BUNDLED_FILE') { out.push(f); continue; }
-    const recs = byLine.get(JSON.stringify([f.file, f.line])) || [];
+    if (!f || (f.ruleId !== 'EXEC_BUNDLED_FILE' && f.ruleId !== 'EXEC_INDIRECT')) { out.push(f); continue; }
+    const recs = byLine.get(JSON.stringify([f.ruleId, f.file, f.line])) || [];
     // 拿不到解析结果时保守：照报，只是不许承诺读过。
-    if (recs.length && recs.every((r) => r.resolved && r.covered)) continue;
+    const dismissable = recs.length && recs.every((r) => r.resolved && r.covered);
+    const hasPkgRef = recs.some((r) => !r.external);
+    const overridden = dismissable && hasPkgRef && Boolean(writeInfo) && writeInfo.has(f.file);
+    if (dismissable && !overridden) continue;
     const copy = { ...f };
     const escalated = recs.find((r) => r.entries && r.entries.length);
-    if (escalated) copy.snippet = trimSnippet(escalated.ref);
-    if (!recs.length || recs.some((r) => !r.resolved)) copy.advice = EXEC_UNRESOLVED_ADVICE;
+    const unpinned = recs.find((r) => r.unpinned);
+    const unresolved = recs.find((r) => !r.resolved);
+    const cause = escalated || unpinned || unresolved;
+    if (cause) copy.snippet = trimSnippet(cause.ref);
+    if (overridden) copy.advice = EXEC_OVERRIDDEN_ADVICE;
+    else if (unpinned) copy.advice = EXEC_UNPINNED_ADVICE;
+    else if (!recs.length || unresolved) copy.advice = EXEC_UNRESOLVED_ADVICE;
     out.push(copy);
+  }
+  return out;
+}
+
+/**
+ * fix2-P3 跨文件那一半：A 脚本把外部字节解包/写进模块目录，B 脚本「执行同名已在扫描面」的条目 ——
+ * B 的引用撤销不能替 A 写出后的磁盘字节作证。撤销闸只查同文件（applyBundledRefVerdicts），
+ * 这里把跨文件的形状补成一条指名 B 的显式发现，让人看得见是谁的字节没被证实。
+ */
+export function crossFileOverrideFindings(refs = [], writeInfo = null) {
+  if (!writeInfo || !writeInfo.size) return [];
+  const out = [];
+  const seen = new Set();
+  const writers = [...writeInfo.keys()];
+  for (const rec of Array.isArray(refs) ? refs : []) {
+    if (!rec.resolved || !rec.covered || rec.external || !rec.rel) continue;
+    if (writeInfo.has(rec.fromFile)) continue; // 同文件的情形已由撤销闸处理，不双报
+    const writer = writers.find((w) => w !== rec.fromFile);
+    if (!writer) continue;
+    const k = `${rec.fromFile}\u0000${rec.rel}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push({
+      ruleId: 'MODDIR_RUNTIME_WRITE', category: 'execution', severity: 'high',
+      file: rec.fromFile, line: rec.fromLine, snippet: trimSnippet(rec.ref),
+      message: '执行了包内条目，而同包的另一个脚本会在运行期向模块目录写出/解包外部内容',
+      advice: EXEC_OVERRIDDEN_ADVICE + `（写出证据：${writer}:${writeInfo.get(writer)}）`,
+    });
   }
   return out;
 }
@@ -546,14 +689,18 @@ export function scanZip(zipPath, opts = {}) {
   const started = Date.now();
   const maxEntryBytes = Number(opts.maxEntryBytes) > 0 ? Number(opts.maxEntryBytes) : MAX_ENTRY_UNCOMPRESSED;
   const { files, entries, unread, source, warnings } = readZip(zipPath, maxEntryBytes);
-  const { canonical, otherScripts, handlers, props, policy, binaries, propEntry } = classify(files);
+  const cls = classify(files);
+  const { canonical, otherScripts, handlers, props, policy, binaries, propEntry } = cls;
 
   // 行级规则覆盖「会被执行的文本」：规范脚本、其他脚本、安装期入口、属性文件、
   // 策略/初始化文件（sepolicy.rule / .rc / .te —— 内容本身就是可执行语义，T2 补的盲）。
   // 二进制只登记不逐行扫（见 checkBinaries 的理由），非脚本数据文件只进清单。
-  const scanTargets = [...canonical, ...otherScripts, ...handlers, ...props, ...policy];
+  // fix2-P5：桶清单从 classify() 的返回键里显式点名（SCAN_TARGET_BUCKETS）——
+  // 以前这里是手写的展开，新增桶忘接线时不会报错，只会让那个桶的文件「安静地不进扫描面」
+  // （P5 复现过的正是这种静默）。守卫测试对两边做双向比对，忘一条就红。
+  const scanTargets = SCAN_TARGET_BUCKETS.flatMap((b) => cls[b] || []);
 
-  // 载荷间接执行：被脚本 sh/source 引用的包内条目必须进扫描面，而且必须发生在下面那个
+  // 载荷间接执行：被脚本 sh/source/变量间接引用的包内条目必须进扫描面，而且必须发生在下面那个
   // 内容扫描循环之前 —— 追加在循环之后的话，那些条目一行都不会被扫，测试却照样能
   // 「命中 EXEC_BUNDLED_FILE」，于是这条闸变成只有名字没有牙的装饰。
   const escalated = [];
@@ -562,7 +709,10 @@ export function scanZip(zipPath, opts = {}) {
   // /data/adb/modules/[object Object]/，引用解析永远匹配不上真实条目（评审 F9）。
   const idField = propEntry ? parseModuleProp(propEntry.content).fields.id : null;
   const modId = (idField && idField.value) || opts.declaredId || '';
-  const bundledRefs = resolveBundledRefs(scanTargets, files, modId);
+  // fix2-P2：变量钉定表先按初始扫描面算好，resolver 判 `sh $X` 时才有「X 钉不钉得住」可查。
+  const varMapsByFile = {};
+  for (const f of scanTargets) varMapsByFile[f.name] = collectVarValues(f.content, modId);
+  const bundledRefs = resolveBundledRefs(scanTargets, files, modId, varMapsByFile);
   for (const e of escalationsFromRefs(bundledRefs)) {
     scanTargets.push(e);
     escalatedEntries.push(e);
@@ -574,7 +724,15 @@ export function scanZip(zipPath, opts = {}) {
     rawFindings.push(...scanContent(f.name, f.content));
   }
   // 「引用目标是否已经被逐行扫过」只能在这里判（扫描面到这儿才齐），见 applyBundledRefVerdicts。
-  const findings = applyBundledRefVerdicts(rawFindings, bundledRefs);
+  // fix2-P3：先把「运行期向模块目录写出/解包」的命中行收成一表 —— 有这种证据的文件里，
+  // 「同名条目已在扫描面」不再是字节证据，撤销闸必须失效。
+  const writeInfo = new Map();
+  for (const fd of rawFindings) {
+    if (fd.ruleId === 'MODDIR_RUNTIME_WRITE' && !writeInfo.has(fd.file)) writeInfo.set(fd.file, fd.line);
+  }
+  const findings = applyBundledRefVerdicts(rawFindings, bundledRefs, writeInfo);
+  // 跨文件的覆写形状（A 解包、B 执行）同样不许按「已扫过」静默放过：补成指名 B 的显式发现。
+  findings.push(...crossFileOverrideFindings(bundledRefs, writeInfo));
 
   // module.prop 也要过一遍内容规则（里面可能有外联地址或隐私路径）
   const propFindings = propEntry && !scanTargets.includes(propEntry)
@@ -857,7 +1015,12 @@ export function renderMarkdown(report) {
   } else {
     const byCat = groupBy(risk, (f) => f.category);
     for (const [cat, items] of byCat) {
-      L.push(`### ${CATEGORY_LABEL[cat] || cat}`);
+      // fix2-P5 的最后防线：CATEGORY_LABEL 是名字白名单，白名单漏了某个分类时
+      // 不许「文件顶着 0 发现出场」——分组照打，但标题必须写明「分类未识别」。
+      const label = CATEGORY_LABEL[cat]
+        ? CATEGORY_LABEL[cat]
+        : `未分类（分类未识别：${cat}）`;
+      L.push(`### ${label}`);
       L.push('');
       L.push('| 级别 | 规则 | 文件:行 | 原文片段 | 建议 |');
       L.push('|---|---|---|---|---|');
