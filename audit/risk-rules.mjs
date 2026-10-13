@@ -18,6 +18,7 @@ export const SEVERITY_ORDER = { info: 0, low: 1, medium: 2, high: 3 };
 
 export const CATEGORY_LABEL = {
   dangerous: '危险模式',
+  execution: '载荷间接执行',
   network: '外联',
   privacy: '投稿者隐私（不计入风险等级）',
   metadata: '元数据一致性',
@@ -198,6 +199,26 @@ export const HOSTS_MODIFY = makeLineRule({
 });
 
 // ---------------------------------------------------------------------------
+// ②-b 载荷间接执行（execution）
+// ---------------------------------------------------------------------------
+
+export const EXEC_BUNDLED_FILE = makeLineRule({
+  id: 'EXEC_BUNDLED_FILE', category: 'execution', severity: 'high',
+  title: '脚本执行模块自带的另一个文件',
+  // 前缀三种都要认：$MODPATH/、${MODDIR}/、$TMPMODDIR/、以及绝对路径 /data/adb/modules/…。
+  // 只写 $MODPATH 是不够的（评审 F5，实测）：本仓自己的 SAFE_RM_TOKEN（risk-rules.mjs:94）就把 $MODDIR
+  // 当正规模块目录变量，`sh $MODDIR/x`、`. ${MODDIR}/lib.sh.bin`、`busybox sh $MODDIR/x` 都是真实写法。
+  // 中间那个否定预查 `(?!.*\.(?:sh|lua|js|prop)(?:\s|$|"))` 是**评审 F6 的修法**：目标是已经在扫描面里的
+  // 文本后缀时不报 —— `sh $MODPATH/install.sh` 引用的文件已被逐行扫过，把它抬到 high 等于对所有多文件
+  // 正经模块无条件转人工，而 `scan.test.mjs:97` 恰恰把这个形状当良性写。规则的理由是「载荷在名单外」，
+  // 名单内的后缀就不该由它说话。这条排除写在 pattern 里而不是 resolveBundledTargets 里，
+  // 因为 makeLineRule 是纯逐行函数、拿不到扫描面 —— 把判断放到拿不到它的地方是假动作。
+  // 下面 16 例（9 应命中 / 7 应不命中）是本轮实测过的，T1 的测试要原样收进去。
+  pattern: /(?:^|\s)(?:(?:busybox\s+)?sh|bash|ash|source|\.)\s+"?\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?(?:\/)(?!.*\.(?:sh|lua|js|prop)(?:\s|$|"))[^\s"']+|(?:^|\s)(?:(?:busybox\s+)?sh|bash|ash|source)\s+"?\/data\/adb\/modules\/(?!.*\.(?:sh|lua|js|prop)(?:\s|$|"))[^\s"']+/,
+  advice: '脚本执行了模块自带的另一个文件。审核必须把那个文件也当作可执行文本读一遍 —— 只扫被执行的这一行等于什么都没扫。',
+});
+
+// ---------------------------------------------------------------------------
 // ③ 外联
 // ---------------------------------------------------------------------------
 
@@ -299,6 +320,7 @@ export const PRIVACY_SECRET = makeLineRule({
 export const CONTENT_RULES = [
   RM_RF_MUTABLE,
   PIPE_TO_SHELL,
+  EXEC_BUNDLED_FILE,
   DOWNLOAD_TO_STDOUT,
   OBFUSCATED_DECODE_EXEC,
   OBFUSCATED_DECODE_ONLY,

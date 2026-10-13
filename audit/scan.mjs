@@ -28,7 +28,7 @@ import {
   CONTENT_RULES, scanContent, checkMetadata, parseModuleProp,
   scoreRisk, decide, countsTowardRisk, CATEGORY_LABEL, SEVERITY_ORDER,
   inspectStructure, checkCoverage, checkUnread, checkBinaries, detectBinary,
-  MAX_TEXT, MAX_ENTRY_UNCOMPRESSED,
+  MAX_TEXT, MAX_ENTRY_UNCOMPRESSED, EXEC_BUNDLED_FILE,
 } from './risk-rules.mjs';
 // ---------------------------------------------------------------------------
 // ZIP 解析（自带简易实现，失败时回退系统 unzip）
@@ -297,6 +297,85 @@ export function classify(files) {
 // 扫描
 // ---------------------------------------------------------------------------
 
+// 引用写法里的模块目录前缀：$MODPATH/x、${MODDIR}/x、$TMPMODDIR/x 与
+// /data/adb/modules/<id>/x 都归一到「模块根目录下的 x」。
+const REF_MODDIR_PREFIX = /^\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?\//;
+const REF_ABS_PREFIX = /^\/data\/adb\/modules\//;
+
+/**
+ * 把一条 EXEC_BUNDLED_FILE 的命中还原成「相对模块根的被引用路径」。
+ *
+ * 只做前缀剥离，不做模糊匹配：命中文本的尾部 token 就是 pattern 里那个 `[^\s"']+`
+ * 匹配到的整段路径（引号被 `"?` 吃掉、路径本身不含空白），所以取尾部 token 是确定性的。
+ * @returns {string|null} 解析不出模块内路径时返回 null
+ */
+function refRelPath(matchText, moduleId = '') {
+  const token = (String(matchText).match(/[^\s"']+$/) || [''])[0];
+  if (!token) return null;
+  let p;
+  if (REF_MODDIR_PREFIX.test(token)) p = token.replace(REF_MODDIR_PREFIX, '');
+  else if (REF_ABS_PREFIX.test(token)) p = token.replace(REF_ABS_PREFIX, '');
+  else return null;
+  p = p.replace(/^\.\/+/, '');
+  // 绝对写法带着模块 id：只有等于本次模块 id 时才剥掉，否则那是指向别的模块，不是包内条目。
+  if (moduleId && p.startsWith(`${moduleId}/`)) p = p.slice(moduleId.length + 1);
+  return p || null;
+}
+
+/**
+ * 找出「被执行但当前不在扫描面里」的包内条目，供调用方追加进扫描面。
+ *
+ * 三条硬要求（缺一条这条闸就只剩名字）：
+ *  1. 引用的路径必须在包内真实存在 —— 指向 /data/local/tmp 这类下载物的不算（那是 T3）；
+ *  2. 条目名精确匹配、大小写原样，已在扫描面里或本次已取过的不重复追加（防环也防刷屏）；
+ *     已经是被扫描的文本后缀（.sh/.lua/.js/.prop）不再升级 —— 它们本来就被逐行扫过。
+ *  3. 只要被 sh/source 引用就当可执行文本纳入，**不管它像不像文本**：这条压过 T4 的
+ *     可打印比例阈值，否则「把 payload 填成二进制样」就是现成的逃逸阀。
+ * 返回的条目挂上 __from/__line/__ref，报告要能指出是谁在第几行引用了它。
+ * 只递归一层：本函数只看初始扫描面的引用，不追随被升级条目自己的引用。
+ * @param {Array<{name:string, content:string}>} scanTargets
+ * @param {Array<{name:string}>} allEntries
+ * @param {string} moduleId
+ */
+export function resolveBundledTargets(scanTargets = [], allEntries = [], moduleId = '') {
+  const scanned = new Set(scanTargets.map((f) => f && f.name));
+  const byName = new Map();
+  for (const f of Array.isArray(allEntries) ? allEntries : []) {
+    if (f && f.name && !byName.has(f.name)) byName.set(f.name, f);
+  }
+  const out = [];
+  const taken = new Set();
+  const re = new RegExp(
+    EXEC_BUNDLED_FILE.pattern.source,
+    EXEC_BUNDLED_FILE.pattern.flags.includes('g') ? EXEC_BUNDLED_FILE.pattern.flags : EXEC_BUNDLED_FILE.pattern.flags + 'g',
+  );
+  for (const f of scanTargets) {
+    const lines = String(f && f.content != null ? f.content : '').split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(lines[i]))) {
+        const rel = refRelPath(m[0], moduleId);
+        if (rel) {
+          const entry = byName.get(rel);
+          // 要求 1：包内不存在就不升级（引用行本身已由 EXEC_BUNDLED_FILE 报出）
+          if (entry && !scanned.has(entry.name) && !taken.has(entry.name)) {
+            const n = String(entry.name).replace(/\\/g, '/');
+            const ext = extname(basename(n)).toLowerCase();
+            // 要求 2：已在扫描面里的文本后缀不重复纳入
+            if (!SCRIPT_EXTS.includes(ext) && !PROP_EXTS.includes(ext)) {
+              taken.add(entry.name);
+              out.push({ ...entry, __from: f.name, __line: i + 1, __ref: m[0].trim() });
+            }
+          }
+        }
+        if (m.index === re.lastIndex) re.lastIndex++;
+      }
+    }
+  }
+  return out;
+}
+
 /**
  * @param {string} zipPath
  * @param {{ declaredId?:string, declaredVersion?:string, changeType?: 'first'|'update', index?: object,
@@ -311,6 +390,22 @@ export function scanZip(zipPath, opts = {}) {
   // 行级规则覆盖「会被执行的文本」：规范脚本、其他脚本、安装期入口、属性文件。
   // 二进制只登记不逐行扫（见 checkBinaries 的理由），非脚本数据文件只进清单。
   const scanTargets = [...canonical, ...otherScripts, ...handlers, ...props];
+
+  // 载荷间接执行：被脚本 sh/source 引用的包内条目必须进扫描面，而且必须发生在下面那个
+  // 内容扫描循环之前 —— 追加在循环之后的话，那些条目一行都不会被扫，测试却照样能
+  // 「命中 EXEC_BUNDLED_FILE」，于是这条闸变成只有名字没有牙的装饰。
+  const escalated = [];
+  const escalatedEntries = [];
+  // modId 只能取 fields.id.value：fields.id 是 {value,line}，直接拿它当字符串会拼出
+  // /data/adb/modules/[object Object]/，引用解析永远匹配不上真实条目（评审 F9）。
+  const idField = propEntry ? parseModuleProp(propEntry.content).fields.id : null;
+  const modId = (idField && idField.value) || opts.declaredId || '';
+  for (const e of resolveBundledTargets(scanTargets, files, modId)) {
+    scanTargets.push(e);
+    escalatedEntries.push(e);
+    escalated.push({ fromFile: e.__from, fromLine: e.__line, ref: e.__ref, resolvedEntry: e.name });
+  }
+
   const findings = [];
   for (const f of scanTargets) {
     findings.push(...scanContent(f.name, f.content));
@@ -377,17 +472,27 @@ export function scanZip(zipPath, opts = {}) {
     structure: struct.stats,
     unread,
     binaries: binaries.map((b) => ({ name: b.name, kind: b.binary.id, bytes: b.size })),
+    // 被引用而升级进扫描面的条目：谁在第几行、用什么写法引用了它，解析到了哪个条目。
+    // 人工复核与 T5 的 brief 都靠这个字段复现「引用 → 载荷」这条链。
+    escalated,
     inventory: {
       totalEntries: files.length,
       canonicalScripts: canonical.map((f) => toInventoryRow(f)),
       otherScripts: otherScripts.map((f) => toInventoryRow(f)),
       handlers: handlers.map((f) => toInventoryRow(f)),
       props: props.map((f) => toInventoryRow(f)),
+      // F11：升级过的条目同时要在清单里 —— 它们在 scanTargets 里，所以 othersCount 会把它们
+      // 从 otherFiles 排除掉；不单独列出来的话，人看得见的清单里就查不到这个文件。
+      escalated: escalatedEntries.map((e) => ({
+        ...toInventoryRow(e), fromFile: e.__from, fromLine: e.__line, ref: e.__ref,
+      })),
       otherFiles: othersCount(files, scanTargets, binaries),
     },
     // 全文内嵌只给人看的文本入口；二进制不进这一节（否则 PR 评论会被机器码灌满），
     // 它们单独出现在「包结构与审核覆盖度」一节里。
-    scripts: [...canonical, ...otherScripts, ...handlers, ...props].map((f) => ({
+    // 用 scanTargets 而不是四个桶重组：桶里没有「被引用升级进来的条目」，
+    // 走桶就等于把刚拉进扫描面的载荷从人看得见的一切清单里删掉（评审 F11）。
+    scripts: scanTargets.map((f) => ({
       ...toInventoryRow(f), content: f.content,
     })),
     findings: all,
@@ -482,6 +587,9 @@ export function renderMarkdown(report) {
   for (const s of inv.handlers) L.push(`| 安装期入口 | \`${s.name}\` | ${s.bytes} B | ${s.lines} |`);
   for (const s of inv.otherScripts) L.push(`| 其他脚本(.sh/.lua/.js) | \`${s.name}\` | ${s.bytes} B | ${s.lines} |`);
   for (const s of inv.props) L.push(`| 属性文件(.prop) | \`${s.name}\` | ${s.bytes} B | ${s.lines} |`);
+  for (const e of inv.escalated || []) {
+    L.push(`| 被引用升级（原本不在扫描面） | \`${e.name}\` | ${e.bytes} B | ${e.lines} |`);
+  }
   if (!inv.canonicalScripts.length && !inv.otherScripts.length && !inv.handlers.length) {
     L.push('| — | （无脚本类文件） | — | — |');
   }
@@ -490,6 +598,16 @@ export function renderMarkdown(report) {
     L.push('');
     L.push(`未纳入行级扫描的数据文件（${inv.otherFiles.length} 个，仅列前 30 个）：` +
       inv.otherFiles.slice(0, 30).map((n) => `\`${n}\``).join('、'));
+  }
+  if ((report.escalated || []).length) {
+    // 引用链要单独打出来：EXEC_BUNDLED_FILE 只说「这行执行了模块自带的另一个文件」，
+    // 而复核要看的是那个文件到底在哪、被哪一行拉进来的。
+    L.push('');
+    L.push(`被脚本引用而**升级进扫描面**的条目（${report.escalated.length} 个，其内容已逐行扫过并在「脚本全文」一节给出）：`);
+    L.push('');
+    for (const e of report.escalated) {
+      L.push(`- \`${e.resolvedEntry}\` ← \`${e.fromFile}:${e.fromLine}\`（引用写法：\`${escapeCell(redactText(e.ref))}\`）`);
+    }
   }
   L.push('');
 
