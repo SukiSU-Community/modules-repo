@@ -1406,7 +1406,8 @@ test('PROP_BOOT_SPOOF（评审 F4）：.prop 直写键名命中；注释与描�
   // F4 的实测原句：这条通道以前一条规则都不咬
   const fs = scanContent('system.prop', 'ro.boot.verifiedbootstate=green\nro.debuggable=1\nro.secure=0',
     [PROP_BOOT_SPOOF]);
-  assert.equal(fs.length, 1, '四个 boot 键里只有 verifiedbootstate 命中（另两行是 .prop 通道的已知缺口）');
+  assert.equal(fs.length, 1, '四个 boot 键里只有 verifiedbootstate 命中（本规则只管 boot 家族；'
+    + '另两行由 fix3-P9 的 PROP_SECURITY_WEAKEN 兜住，见「fix3-P9：新规则接进规则表」那条）');
   assert.equal(fs[0].line, 1);
   assert.equal(fs[0].severity, 'high', '已拍定 2026-10-13：纳入，severity high');
 });
@@ -1975,4 +1976,80 @@ test('fix3-P8：新规则接进规则表且分类/级别与简报一致，合法
   assert.ok(rule.title && rule.advice);
   assert.ok(CATEGORY_LABEL[rule.category], '分类必须有中文标题，否则报告分组是空的');
   for (const line of P8_SAFE) assert.equal(rule.scan('sepolicy.te', line).length, 0, line);
+});
+
+// —— P9：属性文件里直写削弱安全的键 ——
+// 简报实测：`ro.debuggable=1` 写进 system.prop 是 0 hits，而同一意图走 resetprop/setprop 是
+// DEBUGGABLE_ENABLE medium。同一意图、换个机制就完全免检，是一条平凡可达的绕行通道。
+// 范围必须窄：只认那四个具名键的**削弱值**，不是「任何 ro. 键」。
+
+test('fix3-P9：.prop 直写四个具名削弱键必须命中 medium（实测曾 0 hits → low → auto-approve）', () => {
+  const hit = [
+    'ro.debuggable=1',
+    'ro.secure=0',
+    'ro.adb.secure=0',
+    'service.adb.root=1',
+    '  ro.debuggable = 1',                 // 缩进与等号两侧空白不改属性语义
+    'ro.secure=0   # 说明写在行尾',
+  ];
+  for (const line of hit) {
+    const h = hits('PROP_SECURITY_WEAKEN', line);
+    assert.equal(h.length, 1, `应当命中且只命中 1 条：${line} —— 实际 ${JSON.stringify(h)}`);
+    assert.equal(h[0].severity, 'medium', `medium —— 镜像脚本侧 DEBUGGABLE_ENABLE，high 已判给启动状态伪造：${line}`);
+    assert.equal(h[0].category, 'root');
+  }
+  // 反向哨兵：范围不许扩成「任何 ro. 键」或「任何 =0/=1」
+  const safe = [
+    'ro.product.model=Pixel7',             // 正经模块改机型
+    'debug.sf.hw=1',                       // 图形性能开关，不是安全档位
+    'ro.debuggable=0',                     // no-op：这是默认安全值
+    'ro.secure=1',
+    'ro.adb.secure=1',
+    'service.adb.root=0',
+    'ro.build.version.security_patch=2021-01-05',
+    'ro.my.mod.enabled=1',
+    'persist.sys.usb.config=adb',          // 仍是不覆盖的缺口（见 PROP_BOOT_SPOOF 的说明）
+    'description=ro.debuggable=1 只是说明文字',
+    '# ro.debuggable=1',
+    'getprop ro.debuggable',
+    'ro.debuggable=12',                    // 不是那个具名值
+  ];
+  for (const line of safe) assertNoHit('PROP_SECURITY_WEAKEN', line, line);
+  // DEBUGGABLE_ENABLE 管脚本侧、本条管 .prop 侧：同一行只该由一条说话
+  assertNoHit('DEBUGGABLE_ENABLE', 'ro.debuggable=1', '脚本侧规则不越界到属性文件');
+});
+
+test('fix3-P9 端到端：只在 system.prop 里写 ro.debuggable=1 的模块不再判 low', async () => {
+  const r = await scanToReport(makeModuleZip({ id: 'eval.f3p9', files: [
+    ['module.prop', moduleProp('eval.f3p9')],
+    ['system.prop', 'ro.debuggable=1\nro.adb.secure=0\n'],
+  ] }), { changeType: 'first' });
+  const f = r.findings.filter((x) => x.ruleId === 'PROP_SECURITY_WEAKEN');
+  assert.equal(f.length, 2, JSON.stringify(r.findings.map((x) => `${x.ruleId}@${x.file}:${x.line}`)));
+  assert.deepEqual(f.map((x) => x.line), [1, 2], '行号要逐行对上，人工复核才找得到是哪两行');
+  assert.ok(r.counts.medium >= 2, '两条 medium 必须参与定级：' + JSON.stringify(r.counts));
+  assert.equal(r.riskLevel, 'medium', 'medium —— 与脚本侧同档');
+  assert.equal(r.decision.action, 'block', '旧行为实测 low → auto-approve');
+  // 反向哨兵：同一份夹具把四个键换成机型与图形开关，必须回到 low 并自动放行
+  const ok = await scanToReport(makeModuleZip({ id: 'eval.f3p9ok', files: [
+    ['module.prop', moduleProp('eval.f3p9ok')],
+    ['system.prop', 'ro.product.model=Pixel7\ndebug.sf.hw=1\nro.debuggable=0\n'],
+  ] }), { changeType: 'first' });
+  assert.ok(!ok.findings.some((x) => x.ruleId === 'PROP_SECURITY_WEAKEN'), JSON.stringify(ok.findings));
+  assert.equal(ok.riskLevel, 'low');
+  assert.equal(ok.decision.action, 'auto-approve', 'P9 不许把正经改属性变成人工排队');
+});
+
+test('fix3-P9：新规则接进规则表，且 .prop 通道现在由两条规则分头覆盖', () => {
+  assert.ok(CONTENT_RULES.some((r) => r.id === 'PROP_SECURITY_WEAKEN'));
+  const rule = RULES_BY_ID.PROP_SECURITY_WEAKEN;
+  assert.equal(rule.category, 'root');
+  assert.equal(rule.severity, 'medium');
+  assert.ok(rule.title && rule.advice);
+  assert.ok(!/persist\./.test(rule.title + rule.advice), '文案不许承诺覆盖 persist.*：' + rule.title + rule.advice);
+  // 简报 F4 那句实测原句：boot 键走 PROP_BOOT_SPOOF，另两行现在由本条兜住
+  const fs = scanContent('system.prop', 'ro.boot.verifiedbootstate=green\nro.debuggable=1\nro.secure=0');
+  assert.deepEqual(fs.map((f) => `${f.ruleId}:${f.severity}`).sort(),
+    ['PROP_BOOT_SPOOF:high', 'PROP_SECURITY_WEAKEN:medium', 'PROP_SECURITY_WEAKEN:medium'].sort(),
+    JSON.stringify(fs.map((f) => `${f.ruleId}@${f.line}`)));
 });

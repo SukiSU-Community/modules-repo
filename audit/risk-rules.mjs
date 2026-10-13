@@ -411,15 +411,35 @@ export const DEBUGGABLE_ENABLE = makeLineRule({
 // 收益是关掉一条当前完全敞开的自动放行通道。定 high（转人工）而不是任何自动拒绝 ——
 // 让双签去承担判断，不让规则去承担结论。
 // fix2-P4a（真相二选一，这里选「不覆盖」）：本规则只覆盖四个 `ro.boot.*` 完整性键。
-// `persist.*`、裸 `ro.*` 安全键与 `sys.usb.controller` 一类运行期键**不在**范围内 ——
+// `persist.*` 与 `sys.usb.controller` 一类运行期键**不在**范围内 ——
 // 文案（title/message/advice）不许承诺覆盖它们（scan.test.mjs 有一致性锁），
 // 而「.prop 直写非 boot 家族安全键」作为已知缺口在任务报告里如实披露，不偷偷扩面。
+// fix3-P9 更新了这句话的一半：裸 `ro.*` 安全键里**具名的四个削弱键**现在由下面
+// PROP_SECURITY_WEAKEN 兜住；`persist.*` / `sys.usb.controller` 仍是上面披露的缺口。
 export const PROP_BOOT_SPOOF = makeLineRule({
   id: 'PROP_BOOT_SPOOF', category: 'root', severity: 'high', title: '在属性文件里直写启动/完整性状态',
   // 行首锚定 + 必须有 `=`：注释行 `#ro.boot.verifiedbootstate=green` 与
   // module.prop 的 `description=ro.boot.verifiedbootstate=green` 都不命中（说明文字不是配置）。
   pattern: /^\s*ro\.boot\.(?:verifiedbootstate|vbmeta\.device_state|flash\.locked|veritymode)\s*=/m,
   advice: '绕过完整性校验（Play Integrity / 安全检测）。它与模块自称的功能是否相符，只能人来判。',
+});
+
+// fix3-P9：同一意图换个机制就完全免检 —— `ro.debuggable=1` 写进 system.prop 实测是 0 hits，
+// 而它经由 resetprop/setprop 就是 DEBUGGABLE_ENABLE medium。`.prop` 是 Magisk 最惯用的通道
+// （不改脚本，只写属性文件），所以这条必须存在，否则「用 setprop 还是写 .prop」决定过不过闸。
+// 范围严格锁死在**具名键 + 削弱值**这四种配对上（简报点名的集合），不是「任何 ro. 键」：
+//   ro.debuggable=1 / ro.secure=0 / ro.adb.secure=0 / service.adb.root=1
+// 因此这些都不命中：`ro.product.model=Pixel7`（改机型）、`debug.sf.hw=1`（图形开关）、
+// `ro.debuggable=0` 与 `ro.secure=1`（no-op，本来就是安全值）、`ro.debuggable=12`（不是那个值）。
+// severity `medium`：镜像脚本侧那条同档 —— `high` 已经拍给启动/完整性状态伪造（上面 PROP_BOOT_SPOOF），
+// 这里是「放宽调试面」而不是「伪造校验结果」，档位不该混。
+// 行首锚定的理由与 PROP_BOOT_SPOOF 一致：`description=ro.debuggable=1 只是说明` 是文案不是配置。
+export const PROP_SECURITY_WEAKEN = makeLineRule({
+  id: 'PROP_SECURITY_WEAKEN', category: 'root', severity: 'medium',
+  title: '在属性文件里直写削弱整机安全档位的键',
+  pattern: /^\s*(?:ro\.debuggable\s*=\s*1|ro\.secure\s*=\s*0|ro\.adb\.secure\s*=\s*0|service\.adb\.root\s*=\s*1)(?![0-9.])/m,
+  advice: 'ro.debuggable / ro.secure / ro.adb.secure / service.adb.root 决定整机能不能被调试、adb 要不要授权；'
+    + '写进 .prop 就是在刷机后长期降档，作者必须在描述里说明为什么模块需要它。',
 });
 
 // ---------------------------------------------------------------------------
@@ -539,6 +559,7 @@ export const CONTENT_RULES = [
   VERIFIED_BOOT_SPOOF,
   DEBUGGABLE_ENABLE,
   PROP_BOOT_SPOOF,
+  PROP_SECURITY_WEAKEN,
   HARDCODED_IP,
   SUSPICIOUS_DOMAIN_RULE,
   NETWORK_FETCH,
