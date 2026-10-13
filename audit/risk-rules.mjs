@@ -442,11 +442,32 @@ export const DEBUGGABLE_ENABLE = makeLineRule({
 // 而「.prop 直写非 boot 家族安全键」作为已知缺口在任务报告里如实披露，不偷偷扩面。
 // fix3-P9 更新了这句话的一半：裸 `ro.*` 安全键里**具名的四个削弱键**现在由下面
 // PROP_SECURITY_WEAKEN 兜住；`persist.*` / `sys.usb.controller` 仍是上面披露的缺口。
+// fix4-P13 的两个键表与「写出动词」前缀各只有一份字面量：行首那一支与「脚本写出」那一支共用同一份，
+// 免得键表在两条臂里各写一遍然后慢慢漂移（简报：键表不许扩）。
+// WRITE_FORM 的三个判据：
+//   ① 动词只在命令位（行首或紧跟一个非单词字符）—— `ui_print` 里那个 print 不算；
+//   ② 动词到键名之间不许跨命令边界 `[^|;&\n]*`（fix3-P7 同一判据：贪心的 `[^\n]*` 会把一行里
+//      两条命令并成一个匹配，于是豁免判断只能看最左那半行）；
+//   ③ 键名之后必须出现重定向 `>>?` —— `echo "ro.x=1"` 只是把它打印出来，
+//      `echo "ro.x=1" >> system.prop` 才是落盘。这一条是**豁免侧**的收窄，载荷侧不加条件。
+const BOOT_STATE_KEYS = 'ro\\.boot\\.(?:verifiedbootstate|vbmeta\\.device_state|flash\\.locked|veritymode)\\s*=';
+const WEAKEN_KEYS = '(?:ro\\.debuggable\\s*=\\s*1|ro\\.secure\\s*=\\s*0|ro\\.adb\\.secure\\s*=\\s*0|service\\.adb\\.root\\s*=\\s*1)(?![0-9.])';
+const WRITE_FORM = '(?:^|[^\\w])(?:printf|echo|cat|tee)\\b[^|;&\\n]*["\']?\\s*';
+
 export const PROP_BOOT_SPOOF = makeLineRule({
+  anchor: 'line-start', // fix4-P14：这一支只在行首成立（.prop 的键就在行首）；行中形态见本规则第二支（anchorSibling 指它自己）
+  anchorSibling: 'PROP_BOOT_SPOOF',
   id: 'PROP_BOOT_SPOOF', category: 'root', severity: 'high', title: '在属性文件里直写启动/完整性状态',
-  // 行首锚定 + 必须有 `=`：注释行 `#ro.boot.verifiedbootstate=green` 与
-  // module.prop 的 `description=ro.boot.verifiedbootstate=green` 都不命中（说明文字不是配置）。
-  pattern: /^\s*ro\.boot\.(?:verifiedbootstate|vbmeta\.device_state|flash\.locked|veritymode)\s*=/m,
+  // 第一支（行首）：注释行 `#ro.boot.verifiedbootstate=green` 与 module.prop 的
+  // `description=ro.boot.verifiedbootstate=green` 都不命中（说明文字不是配置），真实 .prop 条目照常命中。
+  // 第二支（fix4-P13，脚本写出）：简报在 d235927 上实测这两条是 0 命中 ——
+  //   service.sh  printf "ro.boot.verifiedbootstate=green\n" >> /data/adb/modules/x/system.prop
+  //   service.sh  echo "ro.boot.verifiedbootstate=green" >> system.prop
+  // 「不改脚本、只在刷写时把属性写进 .prop」与直写 system.prop 是同一个意图的同一个机制，
+  // 只是换了个入口文件；缺这一支时整条通道只有邻居规则 MODDIR_RUNTIME_WRITE 在写 $MODDIR/ 绝对路径时
+  // 才顺带抓到（写相对路径 system.prop 时实测整包 0 发现 → low → auto-approve）。
+  exclude: isDocOnlyMention, // 整行注释仍然豁免；说明位（没有重定向）本来也进不了第二支
+  pattern: new RegExp(`(?:^\\s*${BOOT_STATE_KEYS}|${WRITE_FORM}${BOOT_STATE_KEYS}[^|;&\\n]*>>?)`, 'm'),
   advice: '绕过完整性校验（Play Integrity / 安全检测）。它与模块自称的功能是否相符，只能人来判。',
 });
 
@@ -459,11 +480,18 @@ export const PROP_BOOT_SPOOF = makeLineRule({
 // `ro.debuggable=0` 与 `ro.secure=1`（no-op，本来就是安全值）、`ro.debuggable=12`（不是那个值）。
 // severity `medium`：镜像脚本侧那条同档 —— `high` 已经拍给启动/完整性状态伪造（上面 PROP_BOOT_SPOOF），
 // 这里是「放宽调试面」而不是「伪造校验结果」，档位不该混。
-// 行首锚定的理由与 PROP_BOOT_SPOOF 一致：`description=ro.debuggable=1 只是说明` 是文案不是配置。
+// 行首那一支的理由与 PROP_BOOT_SPOOF 一致：`description=ro.debuggable=1 只是说明` 是文案不是配置；
+// 第二支（fix4-P13）管的是脚本把这个键写进属性文件的那条通道，两条共用同一份 WEAKEN_KEYS。
 export const PROP_SECURITY_WEAKEN = makeLineRule({
+  anchor: 'line-start', // fix4-P14：这一支只在行首成立（.prop 的键就在行首）；行中形态见本规则第二支（anchorSibling 指它自己）
+  anchorSibling: 'PROP_SECURITY_WEAKEN',
   id: 'PROP_SECURITY_WEAKEN', category: 'root', severity: 'medium',
   title: '在属性文件里直写削弱整机安全档位的键',
-  pattern: /^\s*(?:ro\.debuggable\s*=\s*1|ro\.secure\s*=\s*0|ro\.adb\.secure\s*=\s*0|service\.adb\.root\s*=\s*1)(?![0-9.])/m,
+  // 第一支（行首）与 PROP_BOOT_SPOOF 同形；第二支（fix4-P13）认脚本把键写进属性文件的那条通道：
+  //   printf "ro.debuggable=1\n" >> /data/adb/modules/x/system.prop   —— 简报实测 0 命中
+  // 两支共用同一份 WEAKEN_KEYS，键表一个字都没动。
+  exclude: isDocOnlyMention,
+  pattern: new RegExp(`(?:^\\s*${WEAKEN_KEYS}|${WRITE_FORM}${WEAKEN_KEYS}[^|;&\\n]*>>?)`, 'm'),
   advice: 'ro.debuggable / ro.secure / ro.adb.secure / service.adb.root 决定整机能不能被调试、adb 要不要授权；'
     + '写进 .prop 就是在刷机后长期降档，作者必须在描述里说明为什么模块需要它。',
 });

@@ -2140,3 +2140,95 @@ test('fix4-P12 端到端：post-fs-data.sh 里 printf >> policy 的模块不再�
   assert.equal(r.riskLevel, 'high', '旧行为实测 low → auto-approve');
   assert.equal(r.decision.action, 'block');
 });
+
+// —— P13：属性文件规则需要「脚本写出」这一支 ——
+const P13_BOOT_HIT = [
+  'printf "ro.boot.verifiedbootstate=green\\n" >> /data/adb/modules/x/system.prop',
+  'x=1; printf "ro.boot.vbmeta.device_state=unlocked\\n" >> $MODDIR/system.prop',
+  'echo "ro.boot.flash.locked=0" >> system.prop',
+  'echo ro.boot.veritymode=enforcing > /data/adb/modules/m/system.prop',
+  'cat f > /data/adb/modules/m/system.prop && echo "ro.boot.verifiedbootstate=green" >> /data/adb/modules/m/system.prop',
+];
+const P13_BOOT_SAFE = [
+  '# printf "ro.boot.verifiedbootstate=green\\n" >> /data/adb/modules/x/system.prop',
+  'echo "ro.boot.verifiedbootstate=green"',                        // 只是打印，没有写出动作
+  'getprop ro.boot.verifiedbootstate',
+  'ui_print "- 本模块不会写 ro.boot.verifiedbootstate=green"',
+  'printf "ro.product.model=Pixel7\\n" >> f',                      // 键不在四个里
+  'printf "ro.debuggable=1\\n" >> f',                              // 那是 PROP_SECURITY_WEAKEN 的键
+  'printf "ro.boot.verifiedbootstatex=green\\n" >> f',             // 不是那个键名
+  'description=ro.boot.verifiedbootstate=green 这个模块不上锁',
+];
+
+const P13_WEAK_HIT = [
+  'printf "ro.debuggable=1\\n" >> /data/adb/modules/x/system.prop',
+  'x=1; printf "ro.secure=0\\n" >> /data/adb/service.d/x.prop',
+  'echo "ro.adb.secure=0" >> custom.prop',
+  'echo service.adb.root=1 >> $MODDIR/system.prop',
+];
+const P13_WEAK_SAFE = [
+  '# printf "ro.debuggable=1\\n" >> f',
+  'echo "ro.debuggable=1"',                                        // 没有写出
+  'printf "ro.debuggable=12\\n" >> f',                             // 不是那个具名值
+  'printf "ro.debuggable=0\\n" >> f',                              // no-op：默认安全值
+  'printf "ro.product.model=Pixel7\\n" >> f',
+  'printf "persist.sys.usb.config=adb\\n" >> f',                   // 仍是已披露的缺口
+  'printf "ro.secure=1\\n" >> f',
+  'description=ro.debuggable=1 只是说明文字',
+];
+
+test('fix4-P13：PROP_BOOT_SPOOF 必须有「脚本写进属性文件」那一支，severity 仍是 high（实测曾 0 命中）', () => {
+  for (const line of P13_BOOT_HIT) {
+    const h = hits('PROP_BOOT_SPOOF', line);
+    assert.ok(h.length > 0, `PROP_BOOT_SPOOF 应当命中：${line} —— 实际 0 命中`);
+    assert.equal(h[0].severity, 'high', `启动/完整性状态伪造是 high（简报已拍定）：${line}`);
+  }
+  for (const line of P13_BOOT_SAFE) assertNoHit('PROP_BOOT_SPOOF', line, line);
+  // 行首那一支不许因为加了第二支而退化：真实 .prop 条目照常命中
+  for (const line of ['ro.boot.verifiedbootstate=green', 'ro.boot.flash.locked=0', '  ro.boot.veritymode=enforcing']) {
+    assertHit('PROP_BOOT_SPOOF', line, line);
+  }
+  // 键表不许扩
+  assertNoHit('PROP_BOOT_SPOOF', 'printf "persist.sys.bootloader.locked=0\\n" >> f', '非 boot 家族仍是不覆盖的缺口');
+});
+
+test('fix4-P13：PROP_SECURITY_WEAKEN 同形那一支，severity 仍是 medium，四个具名键不许扩', () => {
+  for (const line of P13_WEAK_HIT) {
+    const h = hits('PROP_SECURITY_WEAKEN', line);
+    assert.ok(h.length > 0, `PROP_SECURITY_WEAKEN 应当命中：${line} —— 实际 0 命中`);
+    assert.equal(h[0].severity, 'medium', `medium —— 镜像脚本侧 DEBUGGABLE_ENABLE：${line}`);
+  }
+  for (const line of P13_WEAK_SAFE) assertNoHit('PROP_SECURITY_WEAKEN', line, line);
+  for (const line of ['ro.debuggable=1', 'ro.secure=0', 'ro.adb.secure=0', 'service.adb.root=1']) {
+    assertHit('PROP_SECURITY_WEAKEN', line, line);
+  }
+  // 两条规则各管各的键，同一行只该由一条说话
+  assertNoHit('PROP_BOOT_SPOOF', 'printf "ro.debuggable=1\\n" >> f', '削弱键归 P9 那条');
+  assertNoHit('PROP_SECURITY_WEAKEN', 'printf "ro.boot.verifiedbootstate=green\\n" >> f', 'boot 键归 F4 那条');
+});
+
+test('fix4-P13 端到端：customize.sh 里 printf >> system.prop 的模块不再判 low，且改机型仍自动放行', async () => {
+  // 用**相对路径**的 system.prop —— `>> $MODDIR/system.prop` 那种形状至少还被邻居规则 MODDIR_RUNTIME_WRITE
+  // 抓着（实测 eval.f4p14：high，但三条目标规则自己全是 0 命中）；而 customize.sh 刷写时工作目录就是模块目录，
+  // `printf … >> system.prop` 是它最惯用的写法，P13 之前整条包里一条发现都没有（low → auto-approve）。
+  const r = await scanToReport(makeModuleZip({ id: 'eval.f4p13', files: [
+    ['module.prop', moduleProp('eval.f4p13')],
+    ['customize.sh', '#!/system/bin/sh\nui_print "- writing props"\nprintf "ro.boot.verifiedbootstate=green\\n" >> system.prop\nprintf "ro.debuggable=1\\n" >> system.prop\n'],
+  ] }), { changeType: 'first' });
+  const prop = r.findings.filter((f) => f.ruleId === 'PROP_BOOT_SPOOF' || f.ruleId === 'PROP_SECURITY_WEAKEN');
+  assert.deepEqual(prop.map((f) => `${f.ruleId}@${f.line}:${f.severity}`).sort(),
+    ['PROP_BOOT_SPOOF@3:high', 'PROP_SECURITY_WEAKEN@4:medium'].sort(),
+    JSON.stringify(r.findings.map((f) => `${f.ruleId}@${f.line}`)));
+  assert.equal(r.riskLevel, 'high', '旧行为实测 low → auto-approve');
+  assert.equal(r.decision.action, 'block');
+  // 反向哨兵：同一形状写合法键，必须回到 low + auto-approve
+  // （注意这里也写相对路径：`>> $MODDIR/…` 会被既有规则 MODDIR_RUNTIME_WRITE 判 high，与本条要证的不是同一件事）
+  const ok = await scanToReport(makeModuleZip({ id: 'eval.f4p13ok', files: [
+    ['module.prop', moduleProp('eval.f4p13ok')],
+    ['customize.sh', '#!/system/bin/sh\nui_print "- writing props"\nprintf "ro.product.model=Pixel7\\n" >> system.prop\n'],
+  ] }), { changeType: 'first' });
+  assert.ok(!ok.findings.some((f) => f.ruleId === 'PROP_BOOT_SPOOF' || f.ruleId === 'PROP_SECURITY_WEAKEN'),
+    JSON.stringify(ok.findings.map((f) => f.ruleId)));
+  assert.equal(ok.riskLevel, 'low');
+  assert.equal(ok.decision.action, 'auto-approve');
+});
