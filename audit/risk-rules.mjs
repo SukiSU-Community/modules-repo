@@ -205,16 +205,25 @@ export const HOSTS_MODIFY = makeLineRule({
 export const EXEC_BUNDLED_FILE = makeLineRule({
   id: 'EXEC_BUNDLED_FILE', category: 'execution', severity: 'high',
   title: '脚本执行模块自带的另一个文件',
-  // 前缀三种都要认：$MODPATH/、${MODDIR}/、$TMPMODDIR/、以及绝对路径 /data/adb/modules/…。
-  // 只写 $MODPATH 是不够的（评审 F5，实测）：本仓自己的 SAFE_RM_TOKEN（risk-rules.mjs:94）就把 $MODDIR
-  // 当正规模块目录变量，`sh $MODDIR/x`、`. ${MODDIR}/lib.sh.bin`、`busybox sh $MODDIR/x` 都是真实写法。
-  // 中间那个否定预查 `(?!.*\.(?:sh|lua|js|prop)(?:\s|$|"))` 是**评审 F6 的修法**：目标是已经在扫描面里的
-  // 文本后缀时不报 —— `sh $MODPATH/install.sh` 引用的文件已被逐行扫过，把它抬到 high 等于对所有多文件
-  // 正经模块无条件转人工，而 `scan.test.mjs:97` 恰恰把这个形状当良性写。规则的理由是「载荷在名单外」，
-  // 名单内的后缀就不该由它说话。这条排除写在 pattern 里而不是 resolveBundledTargets 里，
-  // 因为 makeLineRule 是纯逐行函数、拿不到扫描面 —— 把判断放到拿不到它的地方是假动作。
-  // 下面 16 例（9 应命中 / 7 应不命中）是本轮实测过的，T1 的测试要原样收进去。
-  pattern: /(?:^|\s)(?:(?:busybox\s+)?sh|bash|ash|source|\.)\s+"?\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?(?:\/)(?!.*\.(?:sh|lua|js|prop)(?:\s|$|"))[^\s"']+|(?:^|\s)(?:(?:busybox\s+)?sh|bash|ash|source)\s+"?\/data\/adb\/modules\/(?!.*\.(?:sh|lua|js|prop)(?:\s|$|"))[^\s"']+/,
+  // 注释行里的引用不是执行，按本仓既有先例豁免（HARDCODED_IP / SUSPICIOUS_DOMAIN / PRIVACY_SECRET
+  // 都用 exclude: /^\s*#/）。豁免只作用于「报不报」：被引用的条目照样进扫描面，
+  // 见 scan.mjs 的 resolveBundledRefs —— 它跑的是原始 pattern，不看 exclude。
+  exclude: /^\s*#/,
+  // 两种写法都要认：
+  //   ① 动词式：`[busybox ]sh / bash / ash / source / .` + 分隔符 + 引号? + 模块目录路径；
+  //   ② 命令位式：路径本身就在命令位（行首，或 ; && || 之后）—— 那是「直接执行 $MODDIR/tool.bin」
+  //      这种不带解释器的写法，和 sh 它一模一样都是把它拿去跑。
+  // 前缀认四种：$MODPATH/、${MODDIR}/、$TMPMODDIR/、绝对 /data/adb/modules/…（评审 F5：只写
+  // $MODPATH 不够，本仓自己的 SAFE_RM_TOKEN（上面）就把 $MODDIR 当正规模块目录变量）。
+  // 分隔符允许空白或 ${IFS}/$IFS；引号允许双引号或单引号；路径分隔符允许 / 与 \ ——
+  // 这三个都是实测过的逃逸写法（评审 fix1-④）。
+  //
+  // **这里不再按「被引用的后缀像不像脚本」做排除**（评审 fix1-①：那是整条闸静默失效的根源）。
+  // 排除条件必须是「它是否真的已经在扫描面里」，而那个判断只有 scan.mjs 的 scanZip 拿得到，
+  // 所以「目标是已被逐行扫过的条目就撤掉这条 finding」写在 scan.mjs，不写在 pattern 里。
+  // 后缀排除之所以必须删：classify() 让魔数赢过后缀，于是 ELF 改名 payload.js 时
+  // 「后缀 .js」=「已被扫描」这个假设根本不成立。
+  pattern: /(?:^|[\s;&|])(?:(?:busybox\s+)?sh|bash|ash|source|\.)[\s]*(?:\$\{?IFS\}?[\s]*|[\s]+)["']?(?:\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/]|\/data\/adb\/modules\/)[^\s"']+|(?:^[\s]*|(?:&&|\|\||[;|])[\s]*)["']?(?:\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/]|\/data\/adb\/modules\/)[^\s"']+/,
   advice: '脚本执行了模块自带的另一个文件。审核必须把那个文件也当作可执行文本读一遍 —— 只扫被执行的这一行等于什么都没扫。',
 });
 

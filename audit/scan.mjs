@@ -28,7 +28,7 @@ import {
   CONTENT_RULES, scanContent, checkMetadata, parseModuleProp,
   scoreRisk, decide, countsTowardRisk, CATEGORY_LABEL, SEVERITY_ORDER,
   inspectStructure, checkCoverage, checkUnread, checkBinaries, detectBinary,
-  MAX_TEXT, MAX_ENTRY_UNCOMPRESSED, EXEC_BUNDLED_FILE,
+  MAX_TEXT, MAX_ENTRY_UNCOMPRESSED, EXEC_BUNDLED_FILE, trimSnippet,
 } from './risk-rules.mjs';
 // ---------------------------------------------------------------------------
 // ZIP 解析（自带简易实现，失败时回退系统 unzip）
@@ -297,81 +297,212 @@ export function classify(files) {
 // 扫描
 // ---------------------------------------------------------------------------
 
-// 引用写法里的模块目录前缀：$MODPATH/x、${MODDIR}/x、$TMPMODDIR/x 与
-// /data/adb/modules/<id>/x 都归一到「模块根目录下的 x」。
-const REF_MODDIR_PREFIX = /^\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?\//;
+// 引用写法里的模块目录前缀：$MODPATH/x、${MODDIR}/x、$TMPMODDIR/x、反斜杠形态，以及
+// /data/adb/modules/<id>/x —— 全部归一到「模块根目录下的 x」。
+const REF_MODDIR_PREFIX = /^\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/]/;
 const REF_ABS_PREFIX = /^\/data\/adb\/modules\//;
+const REF_IFS = /\$\{?IFS\}?/g;
+
+/**
+ * 相对路径归一化：反斜杠 -> 正斜杠、折叠重复斜杠、解析 ./ 与 ../。
+ * 上跳越出模块根目录（`$MODDIR/../outside`）时返回 null：那不是包内条目，
+ * 不能假装解析成功 —— 归一化只用来「认得出真实条目」，不用来把引用折到包外。
+ * @returns {string|null}
+ */
+export function normalizeRefPath(rel) {
+  if (!rel) return null;
+  const segs = String(rel).replace(/\\/g, '/').split('/').filter((s) => s !== '' && s !== '.');
+  const out = [];
+  for (const s of segs) {
+    if (s !== '..') { out.push(s); continue; }
+    if (!out.length) return null;
+    out.pop();
+  }
+  return out.length ? out.join('/') : null;
+}
 
 /**
  * 把一条 EXEC_BUNDLED_FILE 的命中还原成「相对模块根的被引用路径」。
  *
- * 只做前缀剥离，不做模糊匹配：命中文本的尾部 token 就是 pattern 里那个 `[^\s"']+`
- * 匹配到的整段路径（引号被 `"?` 吃掉、路径本身不含空白），所以取尾部 token 是确定性的。
+ * 顺序是固定的：先把 ${IFS}/$IFS 当空白展开（`sh${IFS}$MODDIR/x` 的尾部 token 连着 IFS，
+ * 不归一化就剥不出前缀），再取尾部 token，再把反斜杠归成正斜杠，然后剥模块目录前缀与
+ * 模块 id，最后做路径归一化。仍然只做前缀剥离 + 归一化，不做模糊匹配。
  * @returns {string|null} 解析不出模块内路径时返回 null
  */
 function refRelPath(matchText, moduleId = '') {
-  const token = (String(matchText).match(/[^\s"']+$/) || [''])[0];
+  const spread = String(matchText).replace(REF_IFS, ' ');
+  const token = (spread.match(/[^\s"']+$/) || [''])[0];
   if (!token) return null;
+  const slashed = token.replace(/\\/g, '/');
   let p;
-  if (REF_MODDIR_PREFIX.test(token)) p = token.replace(REF_MODDIR_PREFIX, '');
-  else if (REF_ABS_PREFIX.test(token)) p = token.replace(REF_ABS_PREFIX, '');
+  if (REF_MODDIR_PREFIX.test(slashed)) p = slashed.replace(REF_MODDIR_PREFIX, '');
+  else if (REF_ABS_PREFIX.test(slashed)) p = slashed.replace(REF_ABS_PREFIX, '');
   else return null;
-  p = p.replace(/^\.\/+/, '');
   // 绝对写法带着模块 id：只有等于本次模块 id 时才剥掉，否则那是指向别的模块，不是包内条目。
   if (moduleId && p.startsWith(`${moduleId}/`)) p = p.slice(moduleId.length + 1);
-  return p || null;
+  return normalizeRefPath(p);
+}
+
+/** 条目指纹：名字 + 长度 + 抽样哈希 + 首尾片段。同名不同内容的重复条目要能区分开。 */
+function rowKey(f) {
+  const c = String(f && f.content != null ? f.content : '');
+  let h = c.length;
+  for (let i = 0; i < c.length; i += 4099) h = (h * 31 + c.charCodeAt(i)) >>> 0;
+  const name = f && f.name ? f.name : '';
+  return `${name}|${c.length}|${h.toString(16)}|${c.slice(0, 64)}|${c.slice(-64)}`;
+}
+
+/** 按名字与小写名字建索引；同名重复条目全收，不偷偷只留第一份。 */
+function indexEntries(allEntries) {
+  const byName = new Map();
+  const byLower = new Map();
+  for (const f of Array.isArray(allEntries) ? allEntries : []) {
+    if (!f || !f.name) continue;
+    if (!byName.has(f.name)) byName.set(f.name, []);
+    byName.get(f.name).push(f);
+    const lo = String(f.name).toLowerCase();
+    if (!byLower.has(lo)) byLower.set(lo, new Set());
+    byLower.get(lo).add(f.name);
+  }
+  return { byName, byLower };
 }
 
 /**
- * 找出「被执行但当前不在扫描面里」的包内条目，供调用方追加进扫描面。
+ * 引用路径 -> 包内条目。精确匹配优先；只有「大小写不敏感后只剩唯一一个候选名」时才退到
+ * 不区分大小写（评审 fix1-⑤：大小写变体以前解析不到，而 finding 文案承诺去读那个文件）。
+ * 候选名多于一个时不猜 —— 那是把 A 的引用算到 B 头上。
+ */
+function lookupEntries(index, rel) {
+  if (index.byName.has(rel)) return index.byName.get(rel);
+  const names = index.byLower.get(String(rel).toLowerCase());
+  if (!names || names.size !== 1) return [];
+  return index.byName.get([...names][0]) || [];
+}
+
+/**
+ * 找出扫描面上每一条「执行包内另一个文件」的引用，并给出该拿它怎么办。
  *
- * 三条硬要求（缺一条这条闸就只剩名字）：
- *  1. 引用的路径必须在包内真实存在 —— 指向 /data/local/tmp 这类下载物的不算（那是 T3）；
- *  2. 条目名精确匹配、大小写原样，已在扫描面里或本次已取过的不重复追加（防环也防刷屏）；
- *     已经是被扫描的文本后缀（.sh/.lua/.js/.prop）不再升级 —— 它们本来就被逐行扫过。
- *  3. 只要被 sh/source 引用就当可执行文本纳入，**不管它像不像文本**：这条压过 T4 的
- *     可打印比例阈值，否则「把 payload 填成二进制样」就是现成的逃逸阀。
- * 返回的条目挂上 __from/__line/__ref，报告要能指出是谁在第几行引用了它。
- * 只递归一层：本函数只看初始扫描面的引用，不追随被升级条目自己的引用。
+ * 每条引用返回 { fromFile, fromLine, ref, rel, resolved, covered, entries }：
+ *   resolved —— 归一化后能不能对上包内真实条目；对不上就不能在报告里假装读过它；
+ *   covered  —— 能对上，且同名条目**全部**已经在扫描面里（`sh $MODPATH/install.sh` 那种常规写法：
+ *               那个文件本来就被逐行扫过，这条 high 该撤掉）；
+ *   entries  —— 需要升级进扫描面的条目（同名重复时可能多份，已在扫描面里的不重复取）。
+ *
+ * 判据是「它是否真的已经在扫描面里」，不是「它的后缀像不像脚本」（评审 fix1-①）：
+ * classify() 让魔数赢过后缀，ELF 改名 payload.js 时「后缀 .js」根本不代表它被扫过。
+ * 只递归一层：只看初始扫描面的引用，不追随被升级条目自己的引用（防环）。
  * @param {Array<{name:string, content:string}>} scanTargets
  * @param {Array<{name:string}>} allEntries
  * @param {string} moduleId
  */
-export function resolveBundledTargets(scanTargets = [], allEntries = [], moduleId = '') {
-  const scanned = new Set(scanTargets.map((f) => f && f.name));
-  const byName = new Map();
-  for (const f of Array.isArray(allEntries) ? allEntries : []) {
-    if (f && f.name && !byName.has(f.name)) byName.set(f.name, f);
+export function resolveBundledRefs(scanTargets = [], allEntries = [], moduleId = '') {
+  const index = indexEntries(allEntries);
+  const onSurface = new Set();
+  const surfaceRows = new Set();
+  for (const f of Array.isArray(scanTargets) ? scanTargets : []) {
+    if (!f || !f.name) continue;
+    onSurface.add(f);
+    surfaceRows.add(rowKey(f));
   }
-  const out = [];
-  const taken = new Set();
   const re = new RegExp(
     EXEC_BUNDLED_FILE.pattern.source,
     EXEC_BUNDLED_FILE.pattern.flags.includes('g') ? EXEC_BUNDLED_FILE.pattern.flags : EXEC_BUNDLED_FILE.pattern.flags + 'g',
   );
-  for (const f of scanTargets) {
+  const refs = [];
+  for (const f of Array.isArray(scanTargets) ? scanTargets : []) {
     const lines = String(f && f.content != null ? f.content : '').split(/\r?\n/);
     for (let i = 0; i < lines.length; i++) {
       re.lastIndex = 0;
       let m;
       while ((m = re.exec(lines[i]))) {
+        const ref = m[0].trim();
         const rel = refRelPath(m[0], moduleId);
-        if (rel) {
-          const entry = byName.get(rel);
-          // 要求 1：包内不存在就不升级（引用行本身已由 EXEC_BUNDLED_FILE 报出）
-          if (entry && !scanned.has(entry.name) && !taken.has(entry.name)) {
-            const n = String(entry.name).replace(/\\/g, '/');
-            const ext = extname(basename(n)).toLowerCase();
-            // 要求 2：已在扫描面里的文本后缀不重复纳入
-            if (!SCRIPT_EXTS.includes(ext) && !PROP_EXTS.includes(ext)) {
-              taken.add(entry.name);
-              out.push({ ...entry, __from: f.name, __line: i + 1, __ref: m[0].trim() });
-            }
+        const rec = { fromFile: f.name, fromLine: i + 1, ref, rel, resolved: false, covered: false, entries: [] };
+        const group = rel ? lookupEntries(index, rel) : [];
+        if (group.length) {
+          rec.resolved = true;
+          const seen = new Set();
+          for (const e of group) {
+            const k = rowKey(e);
+            // 要求 1：包内不存在就不升级；已在扫描面里的（同一个对象，或名字+内容同指纹）不再取一次。
+            if (onSurface.has(e) || surfaceRows.has(k) || seen.has(k)) continue;
+            seen.add(k);
+            rec.entries.push({ ...e, __from: f.name, __line: i + 1, __ref: ref });
           }
+          // 同名条目全都在扫描面里 = 这条引用没有把任何没读过的东西带进来，可以撤。
+          rec.covered = rec.entries.length === 0;
         }
+        refs.push(rec);
         if (m.index === re.lastIndex) re.lastIndex++;
       }
     }
+  }
+  return refs;
+}
+
+/**
+ * 引用记录里要升级进扫描面的条目，跨引用去重：
+ * 同一个载荷被三行引用（或三种写法引用：`$MODDIR/x`、`$MODDIR//x`、`${MODDIR}/x`）时
+ * 只进扫描面一次，`report.escalated` 与 `report.scripts` 里也不会出现两次。
+ */
+export function escalationsFromRefs(refs = []) {
+  const out = [];
+  const seen = new Set();
+  for (const rec of Array.isArray(refs) ? refs : []) {
+    for (const e of rec.entries || []) {
+      const k = rowKey(e);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(e);
+    }
+  }
+  return out;
+}
+
+/**
+ * 原契约保持不变：返回「被执行但当前不在扫描面里」的包内条目，供调用方追加进扫描面。
+ * 三条硬要求都还在（包内真实存在 / 不重复追加 / 不管像不像文本都要纳入），
+ * 但「不重复追加」的判据从后缀换成了「它真的在不在扫描面里」—— 见 resolveBundledRefs。
+ */
+export function resolveBundledTargets(scanTargets = [], allEntries = [], moduleId = '') {
+  return escalationsFromRefs(resolveBundledRefs(scanTargets, allEntries, moduleId));
+}
+
+/** 归一化后仍解析不到条目时，advice 不许再承诺「把那个文件也读一遍」—— 那是报告在说谎。 */
+export const EXEC_UNRESOLVED_ADVICE =
+  '脚本执行了模块自带的另一个文件，但这条引用归一化后解析不到包内条目'
+  + '（路径不在包内，或上跳越出了模块根目录）：那个文件的内容本次**没有**被读过，本报告不能替你读它。'
+  + '请人工确认它从哪来、运行期是否会被写出，再定处置。';
+
+/**
+ * 用引用解析结果决定每条 EXEC_BUNDLED_FILE 发现的去处。这一步只能在 scanZip 里做 ——
+ * 只有那里拿得到扫描面（risk-rules 的 makeLineRule 是纯逐行函数，拿不到它）。
+ *   * 这一行的引用全部解析成功、且目标都已经逐行扫过 -> 撤掉这条发现（正经模块的常规写法）；
+ *   * 有升级进来的条目 -> 保留 high，并把 snippet 换成那个真正没被扫过的引用，
+ *     否则会出现「命中的是 install.sh、被拦的却是 payload.dat」这种没法复验的错配；
+ *   * 有解析不到的引用（或这一行压根没有解析结果）-> 保留 high，但换成不承诺读过的 advice。
+ * @param {object[]} findings
+ * @param {object[]} refs resolveBundledRefs 的返回
+ * @returns {object[]} 新的发现数组（不改入参对象）
+ */
+export function applyBundledRefVerdicts(findings = [], refs = []) {
+  const byLine = new Map();
+  for (const rec of Array.isArray(refs) ? refs : []) {
+    const k = JSON.stringify([rec.fromFile, rec.fromLine]);
+    if (!byLine.has(k)) byLine.set(k, []);
+    byLine.get(k).push(rec);
+  }
+  const out = [];
+  for (const f of Array.isArray(findings) ? findings : []) {
+    if (!f || f.ruleId !== 'EXEC_BUNDLED_FILE') { out.push(f); continue; }
+    const recs = byLine.get(JSON.stringify([f.file, f.line])) || [];
+    // 拿不到解析结果时保守：照报，只是不许承诺读过。
+    if (recs.length && recs.every((r) => r.resolved && r.covered)) continue;
+    const copy = { ...f };
+    const escalated = recs.find((r) => r.entries && r.entries.length);
+    if (escalated) copy.snippet = trimSnippet(escalated.ref);
+    if (!recs.length || recs.some((r) => !r.resolved)) copy.advice = EXEC_UNRESOLVED_ADVICE;
+    out.push(copy);
   }
   return out;
 }
@@ -400,16 +531,19 @@ export function scanZip(zipPath, opts = {}) {
   // /data/adb/modules/[object Object]/，引用解析永远匹配不上真实条目（评审 F9）。
   const idField = propEntry ? parseModuleProp(propEntry.content).fields.id : null;
   const modId = (idField && idField.value) || opts.declaredId || '';
-  for (const e of resolveBundledTargets(scanTargets, files, modId)) {
+  const bundledRefs = resolveBundledRefs(scanTargets, files, modId);
+  for (const e of escalationsFromRefs(bundledRefs)) {
     scanTargets.push(e);
     escalatedEntries.push(e);
     escalated.push({ fromFile: e.__from, fromLine: e.__line, ref: e.__ref, resolvedEntry: e.name });
   }
 
-  const findings = [];
+  const rawFindings = [];
   for (const f of scanTargets) {
-    findings.push(...scanContent(f.name, f.content));
+    rawFindings.push(...scanContent(f.name, f.content));
   }
+  // 「引用目标是否已经被逐行扫过」只能在这里判（扫描面到这儿才齐），见 applyBundledRefVerdicts。
+  const findings = applyBundledRefVerdicts(rawFindings, bundledRefs);
 
   // module.prop 也要过一遍内容规则（里面可能有外联地址或隐私路径）
   const propFindings = propEntry && !scanTargets.includes(propEntry)
@@ -484,7 +618,8 @@ export function scanZip(zipPath, opts = {}) {
       // F11：升级过的条目同时要在清单里 —— 它们在 scanTargets 里，所以 othersCount 会把它们
       // 从 otherFiles 排除掉；不单独列出来的话，人看得见的清单里就查不到这个文件。
       escalated: escalatedEntries.map((e) => ({
-        ...toInventoryRow(e), fromFile: e.__from, fromLine: e.__line, ref: e.__ref,
+        ...toInventoryRow(e), nonText: isNonTextContent(e),
+        fromFile: e.__from, fromLine: e.__line, ref: e.__ref,
       })),
       otherFiles: othersCount(files, scanTargets, binaries),
     },
@@ -492,9 +627,10 @@ export function scanZip(zipPath, opts = {}) {
     // 它们单独出现在「包结构与审核覆盖度」一节里。
     // 用 scanTargets 而不是四个桶重组：桶里没有「被引用升级进来的条目」，
     // 走桶就等于把刚拉进扫描面的载荷从人看得见的一切清单里删掉（评审 F11）。
-    scripts: scanTargets.map((f) => ({
-      ...toInventoryRow(f), content: f.content,
-    })),
+    // 但扫描面与渲染面要分开：升级条目照常进 scanContent，非文本条目在这里只给有界预览
+    // （评审 fix1-③：1 MiB ELF 改名 .conf 实测把 Markdown 灌成 1.03 MB / 52 万个 NUL，
+    //   8 MiB 把 JSON 灌成 50 MB —— 这些产物会作为公开 PR 评论发出去）。
+    scripts: scanTargets.map((f) => scriptRow(f)),
     findings: all,
     counts,
     riskLevel: level,
@@ -511,6 +647,49 @@ function toInventoryRow(f) {
 }
 
 function countLines(s) { return s === '' ? 0 : s.split(/\r?\n/).length; }
+
+/** 非文本条目在报告里给多少个字节的十六进制预览 */
+const PREVIEW_BYTES = 64;
+
+/** 内容里 NUL 的个数（渲染层与测试都要用得到这个数字，所以单独拿出来） */
+function nulCount(text) {
+  const c = String(text == null ? '' : text);
+  let n = 0;
+  for (let i = 0; i < c.length; i++) if (c.charCodeAt(i) === 0) n++;
+  return n;
+}
+
+/**
+ * 这条内容是不是「非文本」：魔数认得的机器码，或正文里含 NUL。
+ * 判据刻意不依赖后缀 —— 后缀是投稿者自己起的（评审 fix1-① 的根源就在这儿）。
+ */
+export function isNonTextContent(f) {
+  if (!f) return false;
+  if (f.head && f.head.length && detectBinary(f.head)) return true;
+  return String(f.content == null ? '' : f.content).indexOf('\u0000') >= 0;
+}
+
+/** 非文本条目的有界预览：NUL 计数 + 前 64 字节十六进制 + 一句「已按文本扫过」。 */
+function nonTextPreview(f) {
+  const nul = nulCount(f.content);
+  const src = Buffer.isBuffer(f.head) && f.head.length
+    ? f.head
+    : Buffer.from(String(f.content == null ? '' : f.content).slice(0, PREVIEW_BYTES), 'latin1');
+  const hex = src.subarray(0, PREVIEW_BYTES).toString('hex').replace(/(..)/g, '$1 ').trim();
+  return `内容非文本（NUL ${nul} 个 / 共 ${f.size} B），已按文本逐行扫过；`
+    + `机器码原文不进本报告，这里只给前 ${Math.min(PREVIEW_BYTES, src.length)} 字节十六进制预览：\n${hex}`;
+}
+
+/**
+ * report.scripts 的一行。文本条目给全文；非文本条目给有界预览（contentKind 标出来），
+ * 这样「扫过」与「贴出来」是两件事 —— 前者是审核职责，后者受公开评论的体积与注入面约束。
+ */
+function scriptRow(f) {
+  const row = toInventoryRow(f);
+  if (!isNonTextContent(f)) return { ...row, content: f.content };
+  return { ...row, contentKind: 'non-text-preview', nonText: true, nulCount: nulCount(f.content),
+    content: nonTextPreview(f) };
+}
 
 function othersCount(files, scanned, binaries) {
   const set = new Set([...scanned, ...binaries].map((f) => f.name));
@@ -583,30 +762,37 @@ export function renderMarkdown(report) {
   L.push('| 类别 | 文件 | 大小 | 行数 |');
   L.push('|---|---|---:|---:|');
   const inv = report.inventory;
-  for (const s of inv.canonicalScripts) L.push(`| 规范脚本 | \`${s.name}\` | ${s.bytes} B | ${s.lines} |`);
-  for (const s of inv.handlers) L.push(`| 安装期入口 | \`${s.name}\` | ${s.bytes} B | ${s.lines} |`);
-  for (const s of inv.otherScripts) L.push(`| 其他脚本(.sh/.lua/.js) | \`${s.name}\` | ${s.bytes} B | ${s.lines} |`);
-  for (const s of inv.props) L.push(`| 属性文件(.prop) | \`${s.name}\` | ${s.bytes} B | ${s.lines} |`);
+  // 条目名是投稿者自己起的，表格里也要过 escapeCell：反引号能提前关掉行内代码。
+  for (const s of inv.canonicalScripts) L.push(`| 规范脚本 | \`${escapeCell(s.name)}\` | ${s.bytes} B | ${s.lines} |`);
+  for (const s of inv.handlers) L.push(`| 安装期入口 | \`${escapeCell(s.name)}\` | ${s.bytes} B | ${s.lines} |`);
+  for (const s of inv.otherScripts) L.push(`| 其他脚本(.sh/.lua/.js) | \`${escapeCell(s.name)}\` | ${s.bytes} B | ${s.lines} |`);
+  for (const s of inv.props) L.push(`| 属性文件(.prop) | \`${escapeCell(s.name)}\` | ${s.bytes} B | ${s.lines} |`);
   for (const e of inv.escalated || []) {
-    L.push(`| 被引用升级（原本不在扫描面） | \`${e.name}\` | ${e.bytes} B | ${e.lines} |`);
+    L.push(`| 被引用升级（原本不在扫描面） | \`${escapeCell(e.name)}\` | ${e.bytes} B | ${e.lines} |`);
   }
   if (!inv.canonicalScripts.length && !inv.otherScripts.length && !inv.handlers.length) {
     L.push('| — | （无脚本类文件） | — | — |');
   }
-  for (const b of report.binaries || []) L.push(`| 二进制（不逐行扫） | \`${b.name}\` | ${b.bytes} B | ${b.kind} |`);
+  for (const b of report.binaries || []) L.push(`| 二进制（不逐行扫） | \`${escapeCell(b.name)}\` | ${b.bytes} B | ${b.kind} |`);
   if (inv.otherFiles.length) {
     L.push('');
     L.push(`未纳入行级扫描的数据文件（${inv.otherFiles.length} 个，仅列前 30 个）：` +
-      inv.otherFiles.slice(0, 30).map((n) => `\`${n}\``).join('、'));
+      inv.otherFiles.slice(0, 30).map((n) => `\`${escapeCell(n)}\``).join('、'));
   }
   if ((report.escalated || []).length) {
     // 引用链要单独打出来：EXEC_BUNDLED_FILE 只说「这行执行了模块自带的另一个文件」，
     // 而复核要看的是那个文件到底在哪、被哪一行拉进来的。
     L.push('');
-    L.push(`被脚本引用而**升级进扫描面**的条目（${report.escalated.length} 个，其内容已逐行扫过并在「脚本全文」一节给出）：`);
+    L.push(`被脚本引用而**升级进扫描面**的条目（${report.escalated.length} 个，其内容已按文本逐行扫过；`
+      + '文本条目在「脚本全文」一节给全文，非文本条目只给有界预览）：');
     L.push('');
+    const invEsc = (report.inventory && report.inventory.escalated) || [];
     for (const e of report.escalated) {
-      L.push(`- \`${e.resolvedEntry}\` ← \`${e.fromFile}:${e.fromLine}\`（引用写法：\`${escapeCell(redactText(e.ref))}\`）`);
+      const row = invEsc.find((x) => x.name === e.resolvedEntry && x.fromFile === e.fromFile
+        && x.fromLine === e.fromLine);
+      const kind = row && row.nonText ? '，非文本：只给有界预览' : '';
+      L.push(`- \`${escapeCell(e.resolvedEntry)}\` ← \`${escapeCell(e.fromFile)}:${e.fromLine}\``
+        + `（引用写法：\`${escapeCell(redactText(e.ref))}\`${kind}）`);
     }
   }
   L.push('');
@@ -676,11 +862,17 @@ export function renderMarkdown(report) {
     L.push('zip 内没有 shell 脚本。');
   }
   for (const s of report.scripts) {
-    L.push(`### \`${s.name}\` — ${s.bytes} B / ${s.lines} 行${s.truncated ? `（报告只内嵌前 ${Math.round(MAX_TEXT / 1024)} KB，其余见产物；行级规则已跑全文）` : ''}`);
+    const note = s.nonText
+      ? '（内容非文本：已按文本逐行扫过，这里只给有界预览，机器码原文不进报告）'
+      : (s.truncated ? `（报告只内嵌前 ${Math.round(MAX_TEXT / 1024)} KB，其余见产物；行级规则已跑全文）` : '');
+    L.push(`### \`${escapeCell(s.name)}\` — ${s.bytes} B / ${s.lines} 行${note}`);
     L.push('');
-    L.push('```sh');
-    L.push(redactText(embedBody(s.content)));
-    L.push('```');
+    // 围栏体也要过显示层防护：正文里的 ``` 关不掉比它更长的围栏，控制字符换成可见占位。
+    const body = sanitizeBody(redactText(embedBody(s.content)));
+    const fence = fenceFor(body);
+    L.push(`${fence}${s.nonText ? 'text' : 'sh'}`);
+    L.push(body);
+    L.push(fence);
     L.push('');
   }
 
@@ -707,6 +899,28 @@ function groupBy(arr, fn) {
 
 function escapeCell(s) {
   return String(s).replace(/\|/g, '\\|').replace(/`/g, "'");
+}
+
+/**
+ * 代码围栏长度：正文里最长的反引号串 + 1（最少 3）。
+ * CommonMark/GitHub 的闭栏要求「一行的反引号数 >= 开栏数」，所以开栏比正文里任何一段
+ * 都长时，投稿者在脚本正文里写的 ``` 就关不掉我们的围栏 —— 这是公开 PR 评论的注入面，
+ * 属于显示层（评审 fix1-③：包内写一句 `## 已由维护者批准 ✅` 实测漏进正文）。
+ * 反过来如果只加长围栏不转义，正文里的反引号会被原样保留（人工复核要看的就是原文）。
+ */
+function fenceFor(body) {
+  let max = 0;
+  const runs = String(body).match(/`+/g);
+  if (runs) for (const r of runs) max = Math.max(max, r.length);
+  return '`'.repeat(Math.max(3, max + 1));
+}
+
+/** 渲染前把不可见控制字符换成可见占位（NUL 一类不许进公开评论；保留 \t 与 \n）。 */
+function sanitizeBody(text) {
+  // \x09 制表与 \x0a 换行留着（人要看的是原文排版），其余 C0 控制字符与 DEL 换成可见的 ?
+  return String(text == null ? '' : text)
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]/g, '?')
+    .replace(/[\r\n]+$/, '');
 }
 
 /** 隐私片段脱敏：中间字符打码，保留首尾以便核对 */
