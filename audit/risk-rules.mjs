@@ -6,6 +6,10 @@
 //   severity  默认风险等级：info / low / medium / high
 //   title     人读标题
 //   advice    处置建议
+//   anchor    fix4-P14：'line-start' | 'anywhere'（工厂默认 'anywhere'）——
+//             这一支从哪儿开始找载荷。声明 line-start 的规则必须同时给出 anchorSibling，
+//             即「脚本里写出这个载荷」那一支属于哪条规则；audit/scan.test.mjs 的锚点闭包表
+//             逐条验证这两个字段说的都是真话。
 //   scan(file, text) -> Finding[]
 //
 // Finding = { ruleId, category, severity, file, line, snippet, message, advice }
@@ -37,6 +41,18 @@ export function trimSnippet(s, max = MAX_SNIPPET) {
 // 行级规则构造器
 // ---------------------------------------------------------------------------
 
+// fix4-P14：锚点是这条规则对「载荷出现在哪里」做出的声明，不是注释。
+//   'anywhere'   —— 载荷出现在一行里的任何位置都算（工作规则一律用左边界类
+//                    `(?:^|[\s"';&|`(])` 表达这件事，而不是裸 `^\s*`）。
+//   'line-start' —— 这一支**只在行首**才成立（`.prop` 的键就在行首）。声明它的前提是同时给出
+//                    anchorSibling，指名「脚本里把这个载荷写进文件」那一支在哪条规则里；
+//                    没有 sibling 的 line-start 声明就是自我申报的盲区，闭包表直接判红。
+// 为什么要有这个字段：同一族缺陷已经复发三次（fix1 的注释豁免、fix3-P7 的首匹配、本轮的行首锚点），
+// 每一次都是「一条规则看得出行中写法、它的邻居看不出」，靠人逐条盯是盯不住的。
+// 默认值只许住在这里（工厂），不许住在测试里替规则补 —— 否则表就成了装饰。
+// 枚举就两个值：'line-start' | 'anywhere'；判据由闭包表拿着（下面 ANCHOR_WITNESS 那张表），
+// 这里不设第二套校验：拼错的 anchor 会被表判红，而不是让工厂在 import 阶段把整条审核链崩掉。
+
 function makeLineRule(spec) {
   const {
     id, category, title, advice,
@@ -45,10 +61,16 @@ function makeLineRule(spec) {
     exclude = null,        // RegExp（整行命中则跳过）或 (match, line) => boolean
     severityFor = null,    // (match, line) => severity，用于同一规则内分档；返回 null 表示不构成发现
     maxPerFile = 20,       // 同一文件同一规则最多报多少条，防止刷屏
+    anchor = 'anywhere',   // fix4-P14：'line-start' | 'anywhere'，见上面工厂前的说明与 scan.test.mjs 的锚点闭包表
+    anchorSibling = null,  // anchor === 'line-start' 时必填：覆盖行中形态的那一条规则（同规则里的另一支就写自己的 id）
   } = spec;
+  // 这里**不抛**：判「声明合不合法、sibling 给没给」的活儿归 audit/scan.test.mjs 的锚点闭包表。
+  // 工厂抛错会让整条审核链在 import 时崩掉（扫描器停摆比一条规则红更糟），而闭包表既拦得住
+  // 缺声明、也拦得住谎报声明（变异 (c)/(d) 实测都判红），所以默认值住在这里、执法住在那里。
 
   return {
     id, category, title, advice, severity,
+    anchor, anchorSibling,
     // 暴露 pattern 供报告渲染时对脚本全文做隐私脱敏（见 scan.mjs redactText）
     pattern,
     scan(file, text) {
@@ -132,6 +154,7 @@ function isBroadRmTarget(p) {
 }
 
 export const RM_RF_MUTABLE = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'RM_RF_MUTABLE',
   category: 'dangerous',
   severity: 'medium',
@@ -153,6 +176,7 @@ export const RM_RF_MUTABLE = makeLineRule({
 });
 
 export const PIPE_TO_SHELL = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'PIPE_TO_SHELL',
   category: 'dangerous',
   severity: 'high',
@@ -162,6 +186,7 @@ export const PIPE_TO_SHELL = makeLineRule({
 });
 
 export const DOWNLOAD_TO_STDOUT = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'DOWNLOAD_TO_STDOUT',
   category: 'dangerous',
   severity: 'low',
@@ -171,6 +196,7 @@ export const DOWNLOAD_TO_STDOUT = makeLineRule({
 });
 
 export const OBFUSCATED_DECODE_EXEC = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'OBFUSCATED_DECODE_EXEC',
   category: 'dangerous',
   severity: 'high',
@@ -180,6 +206,7 @@ export const OBFUSCATED_DECODE_EXEC = makeLineRule({
 });
 
 export const OBFUSCATED_DECODE_ONLY = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'OBFUSCATED_DECODE_ONLY',
   category: 'dangerous',
   severity: 'medium',
@@ -192,6 +219,7 @@ export const OBFUSCATED_DECODE_ONLY = makeLineRule({
 const MODULE_OWN_DIR = /\$MODDIR|\$MODPATH|\$MOD\b|\$\{MODPATH\}|\$\{MODDIR\}|^\s*#/;
 
 export const WRITE_SYSTEM_VENDOR = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'WRITE_SYSTEM_VENDOR',
   category: 'dangerous',
   severity: 'high',
@@ -202,6 +230,7 @@ export const WRITE_SYSTEM_VENDOR = makeLineRule({
 });
 
 export const SELINUX_DISABLE = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'SELINUX_DISABLE',
   category: 'dangerous',
   severity: 'high',
@@ -211,6 +240,7 @@ export const SELINUX_DISABLE = makeLineRule({
 });
 
 export const HOSTS_MODIFY = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'HOSTS_MODIFY',
   category: 'dangerous',
   severity: 'medium',
@@ -224,6 +254,7 @@ export const HOSTS_MODIFY = makeLineRule({
 // ---------------------------------------------------------------------------
 
 export const EXEC_BUNDLED_FILE = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'EXEC_BUNDLED_FILE', category: 'execution', severity: 'high',
   title: '脚本执行模块自带的另一个文件',
   // 注释行里的引用不是执行，按本仓既有先例豁免（HARDCODED_IP / SUSPICIOUS_DOMAIN / PRIVACY_SECRET
@@ -260,6 +291,7 @@ export const EXEC_BUNDLED_FILE = makeLineRule({
 //     EXEC_BUNDLED_FILE 的领地，重复触发只会双报；
 //   * 字面迭代子的常规循环（`for f in a b; do $f; done`，迭代子里没有 $）不触发。
 export const EXEC_INDIRECT = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'EXEC_INDIRECT', category: 'execution', severity: 'high',
   title: '经变量间接执行目标，扫描器必须先钉住变量值',
   exclude(m, line) {
@@ -281,6 +313,7 @@ export const EXEC_INDIRECT = makeLineRule({
 // 假阳性边界：`cp -f busybox $MODPATH/system/xbin/bb` 这种「向自有覆盖层拷模块自带文件」
 // 是本仓 CLEAN 夹具的正经写法，cp/mv 分支因此只认「源在包外（/sdcard、/storage、/data/local/tmp）」。
 export const MODDIR_RUNTIME_WRITE = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'MODDIR_RUNTIME_WRITE', category: 'execution', severity: 'high',
   title: '运行期向模块目录写出/解包外部内容',
   exclude: /^\s*#/,
@@ -325,7 +358,7 @@ function isDocOnlyMention(m, line) {
 // 「把规则文本存进变量 / 写进说明字段」的写法。判据看的是匹配**左边紧邻**的那一串：
 // 行首只有一个 `标识符 =` 加可选引号，且整行没有重定向 / 命令替换 / 并行语句的痕迹。
 // 为什么非但不能省还得单独写：这条豁免原来是 `^\s*` 锚点顺带挡出来的，锚点一撤就露出来，
-// 所以豁免要显式搬进 exclude 里 —— 只往豁免侧收窄，不许往载荷侧收（简报同一句话）。
+// 所以豁免要显式搬进 exclude 里，只往豁免侧收窄，不许往载荷侧收（简报同一句话）。
 const ASSIGNMENT_POSITION = /^\s*[A-Za-z_][A-Za-z0-9_.]*\s*=\s*["']?$/;
 function isAssignedStringConstant(m, line) {
   if (!ASSIGNMENT_POSITION.test(line.slice(0, m.index))) return false;
@@ -334,6 +367,7 @@ function isAssignedStringConstant(m, line) {
 }
 
 export const SELINUX_POLICY_RELAX = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'SELINUX_POLICY_RELAX', category: 'root', severity: 'high', title: '放宽 SELinux 策略',
   // 原写法（评审 F2，实测打不中自己的夹具）：`allow\s+\S+\s+\S+\s+[^\s{]*\*\s*:\s*[^\s{]*\{` ——
   // 它要求第 4 个 token 里带 `*`，而 `allow su * fs:file { … }` 的 `*` 是**独立一个 token**，
@@ -380,6 +414,7 @@ export const SELINUX_POLICY_RELAX = makeLineRule({
 // 已知未覆盖（写在这里，不当成已修）：`magiskpolicy "typepermissive su"` 这种不带 `--live`
 // 也不带 `;` 的引号参数形态；带 `--live` 的由 MAGISK_POLICY_LIVE 判 high，结论一样是转人工。
 export const SELINUX_TYPE_PERMISSIVE = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'SELINUX_TYPE_PERMISSIVE', category: 'root', severity: 'high',
   title: 'permissive/typepermissive 关掉整个域的 SELinux 强制',
   advice: 'permissive 让该域的所有拒绝降级为只记日志，等同把这台机器上的一个域移出强制访问控制；'
@@ -389,6 +424,7 @@ export const SELINUX_TYPE_PERMISSIVE = makeLineRule({
 });
 
 export const MAGISK_POLICY_LIVE = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'MAGISK_POLICY_LIVE', category: 'root', severity: 'high', title: '运行时改全局 SELinux 策略',
   // `[^|;\n]*` 把动词与 --live 锁在同一条命令里：`supolicy` 打完 `--live` 才算这台机器改了整机策略。
   // 已知漏检（如实写着，不当成合法写法）：`MP="magiskpolicy"; $MP --live …` 这种变量间接。
@@ -398,6 +434,7 @@ export const MAGISK_POLICY_LIVE = makeLineRule({
 });
 
 export const VERIFIED_BOOT_SPOOF = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'VERIFIED_BOOT_SPOOF', category: 'root', severity: 'high', title: '篡改启动/完整性状态属性',
   // 旧写法的 `dm-?verity[_-]?verity` 拼不出任何真实属性名（实测 `ro.boot.veritymode` MISS），
   // `vbstate` 也不是真键名。换成四个真实存在的键。
@@ -416,6 +453,7 @@ export const VERIFIED_BOOT_SPOOF = makeLineRule({
 });
 
 export const DEBUGGABLE_ENABLE = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'DEBUGGABLE_ENABLE', category: 'root', severity: 'medium', title: '改变整机安全档位',
   // 同样要覆盖 `.prop` 里的 `key=value` 形态，见下面那条 PROP_* 的说明；这里管脚本里的 set/resetprop。
   // `[=\s]+[01]\b` 是它的收窄条件：`resetprop ro.debuggable`（只删不改）、
@@ -503,6 +541,7 @@ export const PROP_SECURITY_WEAKEN = makeLineRule({
 const PRIVATE_IP = /^(?:127\.|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|0\.0\.0\.0$|255\.255\.255\.255$)/;
 
 export const HARDCODED_IP = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'HARDCODED_IP',
   category: 'network',
   severity: 'medium',
@@ -519,6 +558,7 @@ const SUSPICIOUS_TLD = /\.(?:xyz|top|tk|ml|ga|cf|gq|pw|cc|icu|rest|cyou|buzz|cli
 const SUSPICIOUS_KEYWORD = /(?:telemetry|tracker|tracking|analytics|adservice|ads?\.(?:com|net)|doubleclick|googlesyndication|googletagmanager|umeng|talkingdata|appsflyer|adjust\.com|branch\.io|sentry\.io|mixpanel|amplitude|bugly|jiagu|igexin)/i;
 
 export const SUSPICIOUS_DOMAIN = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'SUSPICIOUS_DOMAIN',
   category: 'network',
   severity: 'medium',
@@ -543,6 +583,7 @@ const SUSPICIOUS_DOMAIN_RULE = {
 };
 
 export const NETWORK_FETCH = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'NETWORK_FETCH',
   category: 'network',
   severity: 'low',
@@ -558,6 +599,7 @@ export const NETWORK_FETCH = makeLineRule({
 const GENERIC_USER = /^(?:root|user|admin|none|null|home|users|default|test|ubuntu| Administrator)$/i;
 
 export const PRIVACY_HOME_USER = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'PRIVACY_HOME_USER',
   category: 'privacy',
   severity: 'info',
@@ -571,6 +613,7 @@ export const PRIVACY_HOME_USER = makeLineRule({
 });
 
 export const PRIVACY_EMAIL = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'PRIVACY_EMAIL',
   category: 'privacy',
   severity: 'info',
@@ -582,6 +625,7 @@ export const PRIVACY_EMAIL = makeLineRule({
 });
 
 export const PRIVACY_SECRET = makeLineRule({
+  anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'PRIVACY_SECRET',
   category: 'privacy',
   severity: 'info',
