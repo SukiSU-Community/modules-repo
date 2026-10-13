@@ -260,6 +260,29 @@ export const SCRIPT_EXTS = ['.sh', '.lua', '.js'];
 /** key=value 形式的属性文件，installer/resetprop 会读，同样纳入内容规则 */
 export const PROP_EXTS = ['.prop'];
 
+/**
+ * 头两个字节是不是 shebang（`#!`）。
+ * 只看 head（readZip 给的前 512 字节），不整读 —— 整读会把大二进制也读一遍，
+ * 而且「后面某一行有 #!」不是 shebang（第二行的 `#!/x` 只是正文）。
+ * 判据放在这里而不是后缀上：投稿者自己起名字，`post-fs-data` 不带 .sh 以前直接免检。
+ * @param {Uint8Array|undefined} head
+ */
+export function hasShebang(head) {
+  const b = head && head.length ? head : null;
+  if (!b || b.length < 2) return false;
+  return b[0] === 0x23 && b[1] === 0x21; // `#` `!`
+}
+
+/**
+ * 不是 .sh，但内容本身就是可执行语义的文件：
+ *   * `sepolicy.rule` —— Magisk/KernelSU 逐行喂给策略引擎的 SELinux 授权；
+ *   * `.rc`           —— init 读的服务与触发器（模块放 system/etc/init/*.rc 是常规做法）；
+ *   * `.te`           —— SELinux 策略源。
+ * 它们以前落在 others 里一行都不扫，等于「把授权写进一个不像脚本的文件名」就能免检。
+ */
+export const POLICY_BASENAMES = ['sepolicy.rule'];
+export const POLICY_EXTS = ['.rc', '.te'];
+
 export function classify(files) {
   const norm = (p) => String(p).replace(/\\/g, '/');
   const base = (p) => basename(norm(p));
@@ -267,6 +290,7 @@ export function classify(files) {
   const otherScripts = [];
   const handlers = [];
   const props = [];
+  const policy = [];
   const binaries = [];
   const others = [];
   let propEntry = null;
@@ -277,7 +301,8 @@ export function classify(files) {
     if (b === 'module.prop' && !propEntry) propEntry = f;
 
     // 二进制优先于扩展名判断：把 ELF 改名成 config.js 是绕过扩展名分类的最省事做法，
-    // 所以先看魔数，再看名字。
+    // 所以先看魔数，再看名字。上面那三类新纳入的文件同样受这条闸管着 ——
+    // 改名成 sepolicy.rule 的机器码照样落到 binaries，不许被「进扫描面」这一步捞回文本。
     const bin = detectBinary(f.head);
     if (bin) { binaries.push({ ...f, binary: bin }); continue; }
 
@@ -286,11 +311,16 @@ export function classify(files) {
     const ext = extname(b).toLowerCase();
     if (SCRIPT_EXTS.includes(ext)) { otherScripts.push(f); continue; }
     if (PROP_EXTS.includes(ext)) { props.push(f); continue; }
+    // 会被真正读进策略引擎 / init 的文件（放在后缀判断之后、others 之前，且已经在魔数闸之后）
+    if (POLICY_BASENAMES.includes(b) || POLICY_EXTS.includes(ext)) { policy.push(f); continue; }
+    // 无后缀但首行是 shebang 的条目 —— 这次实测的漏检面之一（`post-fs-data` 不带 .sh 就直接免检）
+    if (!ext && hasShebang(f.head)) { otherScripts.push(f); continue; }
     others.push(f);
   }
-  // 规范脚本按既定顺序排列，便于阅读
+  // 规范脚本按既定顺序排列，便于阅读（policy 不参与这个排序：它不是 CANONICAL_SCRIPTS 的成员，
+  // 混进 canonical 会被那个 sort 排到 customize.sh 前面，还会让报告把策略文件叫成「规范脚本」）
   canonical.sort((a, b) => CANONICAL_SCRIPTS.indexOf(base(a.name)) - CANONICAL_SCRIPTS.indexOf(base(b.name)));
-  return { canonical, otherScripts, handlers, props, binaries, others, propEntry };
+  return { canonical, otherScripts, handlers, props, policy, binaries, others, propEntry };
 }
 
 // ---------------------------------------------------------------------------
@@ -516,11 +546,12 @@ export function scanZip(zipPath, opts = {}) {
   const started = Date.now();
   const maxEntryBytes = Number(opts.maxEntryBytes) > 0 ? Number(opts.maxEntryBytes) : MAX_ENTRY_UNCOMPRESSED;
   const { files, entries, unread, source, warnings } = readZip(zipPath, maxEntryBytes);
-  const { canonical, otherScripts, handlers, props, binaries, propEntry } = classify(files);
+  const { canonical, otherScripts, handlers, props, policy, binaries, propEntry } = classify(files);
 
-  // 行级规则覆盖「会被执行的文本」：规范脚本、其他脚本、安装期入口、属性文件。
+  // 行级规则覆盖「会被执行的文本」：规范脚本、其他脚本、安装期入口、属性文件、
+  // 策略/初始化文件（sepolicy.rule / .rc / .te —— 内容本身就是可执行语义，T2 补的盲）。
   // 二进制只登记不逐行扫（见 checkBinaries 的理由），非脚本数据文件只进清单。
-  const scanTargets = [...canonical, ...otherScripts, ...handlers, ...props];
+  const scanTargets = [...canonical, ...otherScripts, ...handlers, ...props, ...policy];
 
   // 载荷间接执行：被脚本 sh/source 引用的包内条目必须进扫描面，而且必须发生在下面那个
   // 内容扫描循环之前 —— 追加在循环之后的话，那些条目一行都不会被扫，测试却照样能
@@ -615,6 +646,9 @@ export function scanZip(zipPath, opts = {}) {
       otherScripts: otherScripts.map((f) => toInventoryRow(f)),
       handlers: handlers.map((f) => toInventoryRow(f)),
       props: props.map((f) => toInventoryRow(f)),
+      // T2：策略/初始化文件（sepolicy.rule / .rc / .te）单独一栏 —— 它们不是脚本，
+      // 混进「规范脚本」会让报告说假话，混进 others 又等于没进扫描面。
+      policyFiles: policy.map((f) => toInventoryRow(f)),
       // F11：升级过的条目同时要在清单里 —— 它们在 scanTargets 里，所以 othersCount 会把它们
       // 从 otherFiles 排除掉；不单独列出来的话，人看得见的清单里就查不到这个文件。
       escalated: escalatedEntries.map((e) => ({
@@ -765,12 +799,14 @@ export function renderMarkdown(report) {
   // 条目名是投稿者自己起的，表格里也要过 escapeCell：反引号能提前关掉行内代码。
   for (const s of inv.canonicalScripts) L.push(`| 规范脚本 | \`${escapeCell(s.name)}\` | ${s.bytes} B | ${s.lines} |`);
   for (const s of inv.handlers) L.push(`| 安装期入口 | \`${escapeCell(s.name)}\` | ${s.bytes} B | ${s.lines} |`);
-  for (const s of inv.otherScripts) L.push(`| 其他脚本(.sh/.lua/.js) | \`${escapeCell(s.name)}\` | ${s.bytes} B | ${s.lines} |`);
+  for (const s of inv.otherScripts) L.push(`| 脚本(.sh/.lua/.js 或无后缀带 shebang) | \`${escapeCell(s.name)}\` | ${s.bytes} B | ${s.lines} |`);
   for (const s of inv.props) L.push(`| 属性文件(.prop) | \`${escapeCell(s.name)}\` | ${s.bytes} B | ${s.lines} |`);
+  for (const s of inv.policyFiles || []) L.push(`| 策略/初始化文件（会被读进策略引擎或 init） | \`${escapeCell(s.name)}\` | ${s.bytes} B | ${s.lines} |`);
   for (const e of inv.escalated || []) {
     L.push(`| 被引用升级（原本不在扫描面） | \`${escapeCell(e.name)}\` | ${e.bytes} B | ${e.lines} |`);
   }
-  if (!inv.canonicalScripts.length && !inv.otherScripts.length && !inv.handlers.length) {
+  if (!inv.canonicalScripts.length && !inv.otherScripts.length && !inv.handlers.length
+    && !(inv.policyFiles || []).length) {
     L.push('| — | （无脚本类文件） | — | — |');
   }
   for (const b of report.binaries || []) L.push(`| 二进制（不逐行扫） | \`${escapeCell(b.name)}\` | ${b.bytes} B | ${b.kind} |`);

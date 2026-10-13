@@ -12,12 +12,12 @@ import { deflateRawSync, crc32 } from 'node:zlib';
 
 import {
   RULES_BY_ID, CONTENT_RULES, scanContent, checkMetadata, parseModuleProp,
-  scoreRisk, decide, countsTowardRisk, SEVERITY_ORDER,
+  scoreRisk, decide, countsTowardRisk, SEVERITY_ORDER, CATEGORY_LABEL,
   inspectStructure, unsafePathReason, detectBinary, checkCoverage, checkUnread, checkBinaries,
   MAX_TEXT, MAX_ENTRIES, MAX_RATIO,
-  EXEC_BUNDLED_FILE,
+  EXEC_BUNDLED_FILE, PROP_BOOT_SPOOF,
 } from './risk-rules.mjs';
-import { scanZip, classify, renderMarkdown, renderJSON, mask, resolveChangeType, CANONICAL_SCRIPTS, FLASH_ENTRY_POINTS, readZip, resolveBundledTargets, resolveBundledRefs, normalizeRefPath, EXEC_UNRESOLVED_ADVICE } from './scan.mjs';
+import { scanZip, classify, renderMarkdown, renderJSON, mask, resolveChangeType, hasShebang, CANONICAL_SCRIPTS, FLASH_ENTRY_POINTS, readZip, resolveBundledTargets, resolveBundledRefs, normalizeRefPath, EXEC_UNRESOLVED_ADVICE } from './scan.mjs';
 import { makeModuleZip, moduleProp, scanToReport } from './fixtures.mjs';
 
 // ---------------------------------------------------------------------------
@@ -46,7 +46,8 @@ function assertNoHit(ruleId, text, msg) {
 // ---------------------------------------------------------------------------
 
 test('规则表结构完整，每条规则都有 id/category/severity/advice', () => {
-  assert.ok(CONTENT_RULES.length >= 10);
+  // 18 这个下限是钉住 T2 的扩容（15 -> 20）：留着 10，规则数从 14 涨到 19 这种事没人会被提醒。
+  assert.ok(CONTENT_RULES.length >= 18, `内容规则只剩 ${CONTENT_RULES.length} 条`);
   for (const r of CONTENT_RULES) {
     assert.ok(r.id, '缺少 id');
     assert.ok(r.category, `${r.id} 缺少 category`);
@@ -1230,5 +1231,300 @@ test('fixtures：干净模块带 changeType: first 仍可自动放行，不带 o
 
   assert.match(moduleProp('eval.x'), /^id=eval\.x$/m);
 });
+
+// ---------------------------------------------------------------------------
+// ⑧ root 提权语义（T2：sepolicy.rule/.rc/.te/shebang 无后缀进扫描面 + 5 条新规则）
+// ---------------------------------------------------------------------------
+
+// —— 简报 Step 1 原文，四条各一条，全用实测原句 ——
+const ROOT_CASES = [
+  ['sepolicy.rule', 'allow su * fs:file { read write open execute };\n', 'SELINUX_POLICY_RELAX'],
+  ['service.sh', 'magiskpolicy --live "allow su * *"\n', 'MAGISK_POLICY_LIVE'],
+  ['service.sh', 'resetprop -w ro.boot.verifiedbootstate green\n', 'VERIFIED_BOOT_SPOOF'],
+  ['service.sh', 'resetprop -w ro.debuggable 1\n', 'DEBUGGABLE_ENABLE'],
+];
+for (const [name, body, ruleId] of ROOT_CASES) {
+  test(`${ruleId}：${name} 命中且判 high/medium 正确`, async () => {
+    const r = await scanToReport(makeModuleZip({ id: 'eval.t2', files: [['module.prop', moduleProp('eval.t2')], [name, body]] }));
+    assert.ok(r.findings.some((f) => f.ruleId === ruleId), JSON.stringify(r.findings.map((f) => f.ruleId)));
+    assert.notEqual(r.riskLevel, 'low', '这四类都不许停在 low —— 之前是 low → auto-approve');
+  });
+}
+
+test('sepolicy.rule 只加 deny/auditallow 不命中 RELAX；resetprop 改自有键不命中', async () => {
+  const r = await scanToReport(makeModuleZip({ id: 'eval.t2b', files: [['module.prop', moduleProp('eval.t2b')],
+    ['sepolicy.rule', 'deny magisk magisk:process *;\n'],
+    ['service.sh', 'resetprop ro.my.mod.thing ok\n']] }));
+  assert.equal(r.riskLevel, 'low');
+});
+
+// —— 反例的加强版：注释、echo 说明、变量名、getprop 只读，四种合法写法都不许命中 ——
+const ROOT_SAFE_MODULE = [
+  ['sepolicy.rule', [
+    '# 本模块不给任何域开执行权限，下面全是收紧与抑制日志的写法：',
+    'dontaudit su * fs:file { read write };',
+    'auditallow magisk magisk:process *;',
+    'allow magisk magisk:file { read write create getattr };',
+    'allow untrusted_app system_file:file { read write open getattr };',
+  ].join('\n')],
+];
+
+test('SELINUX_POLICY_RELAX：命中矩阵（10 命中 / 12 不命中，含注释与字符串常量）', () => {
+  const hit = [
+    'allow su * fs:file { read write open execute };',
+    'allow su u:r:magisk:s0 fs:file { read write open execute };',
+    'allow magisk daemons:process { transition noatsecure execute }',
+    'allow su * * { * };',
+    '  allow untrusted_app system_file:file { execute };',
+    'allow su fs:file { read write setattr };',
+    'allow appdomain magisk_data:file { read execute_no_trans };',
+    'allow init * magisk:process { fork execmem };',
+    'allow su shell:process { create setattr getattr };',
+    'allow xyz abc:def { execute } ; # 行尾还有说明',
+  ];
+  const safe = [
+    'deny magisk magisk:process *;',
+    'dontaudit su * fs:file { read write };',
+    'auditallow magisk magisk:process *;',
+    'typepermissive su;',
+    '# allow su * fs:file { execute };',
+    '   # 注释：allow su * * { execute } 只是说明文字',
+    'allow magisk magisk:file { read write create getattr }',
+    'allow su shell:process transition;',
+    'SELINUX_ALLOW="allow su * fs:file { execute }"',
+    'echo "allow su * fs:file { execute }"',
+    'allow su * fs:file { };',
+    'genfscon magiskfs /data/adb/magisk u:object_r:magisk_file:s0',
+  ];
+  assert.equal(hit.length + safe.length, 22);
+  for (const line of hit) assertHit('SELINUX_POLICY_RELAX', line, line);
+  for (const line of safe) assertNoHit('SELINUX_POLICY_RELAX', line, line);
+  // 证据字段形状与既有规则一致（file/line/snippet/message/advice 都在）
+  const [f] = hits('SELINUX_POLICY_RELAX', '# 注释\nallow su * fs:file { execute };');
+  assert.equal(f.line, 2, '行号是 sepolicy.rule 的行号');
+  assert.equal(f.file, 'customize.sh');
+  assert.match(f.message, /放宽 SELinux 策略/);
+  assert.ok(f.advice && f.snippet);
+});
+
+test('MAGISK_POLICY_LIVE：命中矩阵（8 命中 / 6 不命中）', () => {
+  const hit = [
+    'magiskpolicy --live "allow su * *"',
+    'magiskpolicy --live --output precompiled_sepolicy',
+    'su -c \'magiskpolicy --live "allow init * *"\'',
+    '  supolicy --live "allow magisk su:process *";',
+    'busybox sh -c \'magiskpolicy --live "allow su * fs:file { execute }"\'',
+    'magiskpolicy --live "allow zygote system_file:dir { search write }" && magiskpolicy --live "allow su * *"',
+    'echo "$(magiskpolicy --live allow su * *)"',
+    'log_and_patch() { magiskpolicy --live "allow su * *" }',
+  ];
+  const safe = [
+    '# magiskpolicy --live "allow su * *"',
+    'magiskpolicy --stdin < sepolicy.rule',
+    'echo "usage: magiskpolicy --live is not used here"',
+    'echo "log: magiskpolicy --live 未使用"',
+    'ui_print "本模块不调用 supolicy --live"',
+    'MAGISK_POLICY_LIVE_DESCR="supolicy 已废弃"',
+  ];
+  assert.equal(hit.length + safe.length, 14);
+  for (const line of hit) assertHit('MAGISK_POLICY_LIVE', line, line);
+  for (const line of safe) assertNoHit('MAGISK_POLICY_LIVE', line, line);
+});
+
+test('VERIFIED_BOOT_SPOOF：命中矩阵（8 命中 / 8 不命中，getprop 只读与 echo 说明不命中）', () => {
+  const hit = [
+    'resetprop -w ro.boot.verifiedbootstate green',
+    'resetprop ro.boot.verifiedbootstate green',
+    'setprop ro.boot.flash.locked 0',
+    'resetprop --delete ro.boot.vbmeta.device_state',
+    'su -c "resetprop -n ro.boot.veritymode enforcing"',
+    'resetprop ro.my.thing a && resetprop -w ro.boot.verifiedbootstate green',
+    'echo "$(resetprop -w ro.boot.verifiedbootstate green)"',
+    'echo "resetprop -w ro.boot.verifiedbootstate green" > /data/adb/s.sh',
+  ];
+  const safe = [
+    '# resetprop -w ro.boot.verifiedbootstate green',
+    'getprop ro.boot.verifiedbootstate',
+    'echo "resetprop -w ro.boot.verifiedbootstate green"',
+    'ui_print "- 本模块不会改 ro.boot.verifiedbootstate"',
+    'resetprop ro.my.mod.thing ok',
+    'PROP_RO_BOOT_VERIFIEDBOOTSTATE=green',
+    'ro.boot.verifiedbootstate=green',
+    'setprop ro.product.model Pixel',
+  ];
+  assert.equal(hit.length + safe.length, 16);
+  for (const line of hit) assertHit('VERIFIED_BOOT_SPOOF', line, line);
+  for (const line of safe) assertNoHit('VERIFIED_BOOT_SPOOF', line, line);
+});
+
+test('DEBUGGABLE_ENABLE：命中矩阵（6 命中 / 9 不命中，值走变量或只读不命中）', () => {
+  const hit = [
+    'resetprop -w ro.debuggable 1',
+    'setprop ro.secure 0',
+    'resetprop ro.debuggable=1',
+    'su -c "resetprop -n ro.secure 0"',
+    'resetprop -w ro.secure 0  # 说明写在行尾',
+    'echo "$(resetprop ro.debuggable 1)"',
+  ];
+  const safe = [
+    '# resetprop -w ro.debuggable 1',
+    'getprop ro.debuggable',
+    'resetprop ro.debuggable',
+    'resetprop -w ro.debuggable $VALUE',
+    'echo "setprop ro.secure 0"',
+    'echo "setprop ro.secure 0 (debug only)"',
+    'resetprop ro.mydebuggable 1',
+    'setprop ro.build.version.security_patch 2021-01-05',
+    'ro.debuggable=1',
+  ];
+  assert.equal(hit.length + safe.length, 15);
+  for (const line of hit) assertHit('DEBUGGABLE_ENABLE', line, line);
+  for (const line of safe) assertNoHit('DEBUGGABLE_ENABLE', line, line);
+  assert.equal(assertHit('DEBUGGABLE_ENABLE', 'resetprop -w ro.debuggable 1')[0].severity, 'medium',
+    'DEBUGGABLE_ENABLE 是 medium —— 不是 high');
+});
+
+test('PROP_BOOT_SPOOF（评审 F4）：.prop 直写键名命中；注释与描述文字不命中', () => {
+  const hit = [
+    'ro.boot.verifiedbootstate=green',
+    'ro.boot.vbmeta.device_state=unlocked',
+    'ro.boot.flash.locked=0',
+    '  ro.boot.veritymode=enforcing',
+  ];
+  const safe = [
+    '#ro.boot.verifiedbootstate=green',
+    '# ro.boot.flash.locked=0',
+    'getprop ro.boot.verifiedbootstate',
+    'description=ro.boot.verifiedbootstate=green 这个模块不上锁',
+    'ro.debuggable=1',
+    'ro.boot.verifiedbootstatex=green',
+  ];
+  assert.equal(hit.length + safe.length, 10);
+  for (const line of hit) assertHit('PROP_BOOT_SPOOF', line, line);
+  for (const line of safe) assertNoHit('PROP_BOOT_SPOOF', line, line);
+  // F4 的实测原句：这条通道以前一条规则都不咬
+  const fs = scanContent('system.prop', 'ro.boot.verifiedbootstate=green\nro.debuggable=1\nro.secure=0',
+    [PROP_BOOT_SPOOF]);
+  assert.equal(fs.length, 1, '四个 boot 键里只有 verifiedbootstate 命中（另两行是 .prop 通道的已知缺口）');
+  assert.equal(fs[0].line, 1);
+  assert.equal(fs[0].severity, 'high', '已拍定 2026-10-13：纳入，severity high');
+});
+
+test('F4 端到端：只在 system.prop 里写 boot 状态的模块不再被判 low', async () => {
+  const r = await scanToReport(makeModuleZip({ id: 'eval.t2c',
+    files: [['module.prop', moduleProp('eval.t2c')], ['system.prop', 'ro.boot.verifiedbootstate=green\n']] }));
+  assert.ok(r.findings.some((f) => f.ruleId === 'PROP_BOOT_SPOOF'), JSON.stringify(r.findings));
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block', 'high 只可能是不自动合入（block），不是拒绝投稿');
+});
+
+// —— 扫描面：sepolicy.rule / *.rc / *.te / 有 shebang 的无后缀条目 ——
+
+test('classify：sepolicy.rule / .rc / .te / 有 shebang 的无后缀条目进扫描面，后缀相同的伪装二进制仍归 binaries', () => {
+  const mk = (name, content) => ({ name, content, size: content.length, head: Buffer.from(content, 'utf8') });
+  const c = classify([
+    mk('sepolicy.rule', 'allow su * fs:file { execute };\n'),
+    mk('common/service.rc', 'service myd /system/bin/sh $MODDIR/run.sh\n'),
+    mk('sepolicy.te', 'allow magisk magisk:process { execute };\n'),
+    mk('post-fs-data', '#!/system/bin/sh\nresetprop -w ro.debuggable 1\n'),
+    mk('NOTICE', 'plain text, no shebang\n'),
+    mk('evil/sepolicy.rule', '\u0000\u0000\u0000 allow su * * { * }'),
+  ]);
+  assert.deepEqual(c.policy.map((f) => f.name), ['sepolicy.rule', 'common/service.rc', 'sepolicy.te'],
+    '三类「会被策略引擎/init 真读」的文件进 policy 桶');
+  assert.deepEqual(c.otherScripts.map((f) => f.name), ['post-fs-data'],
+    '无后缀但首行 shebang 的条目按脚本纳入（post-fs-data 不带 .sh 不再免检）');
+  assert.deepEqual(c.others.map((f) => f.name), ['NOTICE'], '无后缀又没 shebang 的纯文本仍然不进扫描面');
+  assert.deepEqual(c.binaries.map((f) => f.name), ['evil/sepolicy.rule'],
+    '魔数判定先于后缀：改名成 sepolicy.rule 的机器码照样落到 binaries');
+});
+
+test('hasShebang 只认头两字节的 #!，不看整段内容也不整读', () => {
+  assert.equal(hasShebang(Buffer.from('#!/system/bin/sh\n', 'utf8')), true);
+  assert.equal(hasShebang(Buffer.from('#!/system/bin/sh', 'utf8')), true);
+  assert.equal(hasShebang(Buffer.from('# comment\n#!/x\n', 'utf8')), false, '第二行的 #! 不算 shebang');
+  assert.equal(hasShebang(Buffer.from('#', 'utf8')), false, '只有一个字节不能越界读');
+  assert.equal(hasShebang(Buffer.from('\u0000#!/x', 'utf8')), false);
+  assert.equal(hasShebang(undefined), false);
+});
+
+test('端到端：sepolicy.rule 的命中带着文件与行号进报告，且 Markdown 有「root 提权语义」这一节', async () => {
+  const r = await scanToReport(makeModuleZip({ id: 'eval.t2d', files: [
+    ['module.prop', moduleProp('eval.t2d')],
+    ['sepolicy.rule', '# 说明\nallow su u:r:magisk:s0 fs:file { read execute };\n'],
+  ] }));
+  const f = r.findings.find((x) => x.ruleId === 'SELINUX_POLICY_RELAX');
+  assert.ok(f, JSON.stringify(r.findings.map((x) => x.ruleId)));
+  assert.equal(f.file, 'sepolicy.rule');
+  assert.equal(f.line, 2, '注释行不进命中，行号是第 2 行');
+  assert.equal(f.category, 'root');
+  assert.equal(f.severity, 'high');
+  const md = renderMarkdown(r);
+  assert.match(md, /### root 提权语义/);
+  assert.match(md, /sepolicy\.rule/, '文件清单里要看得见 sepolicy.rule');
+  assert.ok(r.scripts.some((s) => s.name === 'sepolicy.rule'), '全文内嵌也要有它，否则人工复核看不到');
+  assert.ok(r.inventory.policyFiles.some((s) => s.name === 'sepolicy.rule'), JSON.stringify(r.inventory));
+});
+
+test('端到端：有 shebang 的无后缀 post-fs-data 里的 --live 不再免检', async () => {
+  const r = await scanToReport(makeModuleZip({ id: 'eval.t2e', files: [
+    ['module.prop', moduleProp('eval.t2e')],
+    ['post-fs-data', '#!/system/bin/sh\nmagiskpolicy --live "allow su * *"\n'],
+  ] }));
+  assert.ok(r.findings.some((f) => f.ruleId === 'MAGISK_POLICY_LIVE'), JSON.stringify(r.findings.map((f) => f.ruleId)));
+  assert.equal(r.riskLevel, 'high');
+});
+
+// —— 接线与定级 ——
+
+test('root 五条规则都接进 CONTENT_RULES，分类/级别与简报一致且参与定级', () => {
+  const expect = [
+    ['SELINUX_POLICY_RELAX', 'high'], ['MAGISK_POLICY_LIVE', 'high'], ['VERIFIED_BOOT_SPOOF', 'high'],
+    ['DEBUGGABLE_ENABLE', 'medium'], ['PROP_BOOT_SPOOF', 'high'],
+  ];
+  for (const [id, sev] of expect) {
+    assert.ok(CONTENT_RULES.some((r) => r.id === id), `${id} 不进 CONTENT_RULES 的话 scanContent 根本不会跑它`);
+    const rule = RULES_BY_ID[id];
+    assert.equal(rule.category, 'root', `${id} 的分类`);
+    assert.equal(rule.severity, sev, `${id} 的 severity`);
+    assert.ok(rule.title && rule.advice, `${id} 缺 title/advice`);
+    const finding = rule.scan('service.sh', 'x').length ? rule.scan('service.sh', 'x')[0] : null;
+    assert.ok(finding === null || countsTowardRisk(finding), `${id} 不许出现 info 级`);
+  }
+  assert.equal(SEVERITY_ORDER[RULES_BY_ID.DEBUGGABLE_ENABLE.severity], 2, 'medium 是 2 档');
+});
+
+test('每条规则的 category 都在 CATEGORY_LABEL 里有标题（报告分组不许出现空标题）', () => {
+  const cats = new Set(CONTENT_RULES.map((r) => r.category));
+  for (const c of cats) assert.ok(CATEGORY_LABEL[c], `分类 ${c} 没有中文标题`);
+  assert.equal(CATEGORY_LABEL.root, 'root 提权语义');
+});
+
+test('误伤哨兵：一个正经模块（注释 sepolicy.rule + .rc 服务定义 + 只读 getprop + echo 说明）仍然判 low 并自动放行', async () => {
+  const r = await scanToReport(makeModuleZip({ id: 'eval.t2legit', files: [
+    ['module.prop', moduleProp('eval.t2legit')],
+    ['customize.sh', '#!/system/bin/sh\nui_print "- installing"\ncp -f busybox $MODPATH/system/xbin/bb\nrm -rf $MODDIR/cache\n'],
+    ['service.sh', [
+      '#!/system/bin/sh',
+      'MODDIR=${0%/*}',
+      'getprop ro.boot.verifiedbootstate',
+      'echo "本模块只调整音量，不会 resetprop ro.boot.verifiedbootstate green"',
+      'echo "也不会 setprop ro.secure 0"',
+      'while [ ! -f /data/adb/magisk/magisk ]; do sleep 1; done',
+    ].join('\n') + '\n'],
+    ['sepolicy.rule', ROOT_SAFE_MODULE[0][1]],
+    ['system.prop', 'ro.my.mod.enabled=1\n'],
+    ['common/service.rc', 'service mydaemon /system/bin/sh /data/adb/modules/eval.t2legit/daemon.sh\nclass late_start\n'],
+    ['daemon.sh', '#!/system/bin/sh\nlog_msg "started"\n'],
+  ] }), { changeType: 'first' });
+  const rootHits = r.findings.filter((f) => f.category === 'root');
+  assert.deepEqual(rootHits.map((f) => `${f.ruleId}@${f.file}:${f.line}`), [],
+    'root 规则在正经模块上一条都不许命中：' + JSON.stringify(rootHits));
+  assert.equal(r.riskLevel, 'low', JSON.stringify(r.findings));
+  assert.equal(r.decision.action, 'auto-approve');
+  assert.ok(r.scripts.some((s) => s.name === 'sepolicy.rule') && r.scripts.some((s) => s.name === 'common/service.rc'),
+    '不进扫描面的话「没命中」只是因为没看，所以这里必须证明它确实被读过');
+});
+
 
 

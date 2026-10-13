@@ -19,6 +19,7 @@ export const SEVERITY_ORDER = { info: 0, low: 1, medium: 2, high: 3 };
 export const CATEGORY_LABEL = {
   dangerous: '危险模式',
   execution: '载荷间接执行',
+  root: 'root 提权语义',
   network: '外联',
   privacy: '投稿者隐私（不计入风险等级）',
   metadata: '元数据一致性',
@@ -228,6 +229,101 @@ export const EXEC_BUNDLED_FILE = makeLineRule({
 });
 
 // ---------------------------------------------------------------------------
+// ②-c root 提权语义（root）
+// ---------------------------------------------------------------------------
+//
+// 这一节管的不是「用了什么危险命令」，而是「模块拿着 root 干了什么」：
+// 放宽 SELinux 策略、运行时改整机策略、伪造启动/完整性状态、改变整机安全档位。
+// 这四类以前一条都不咬 —— sepolicy.rule 压根不在扫描面里，resetprop 改 boot 状态也没有规则，
+// 于是「把 payload 写成 SELinux 授权」是全自动放行的通道。
+//
+// 误伤是这里的主要成本（烧的是人工容量），所以每条规则的锚点都是「动词 + 参数形状」，
+// 不是裸关键词：HARDCODED_IP 在一个正经模块上白送 9 条 medium 就是前车之鉴。
+// 注释行按本仓既有先例（HARDCODED_IP / SUSPICIOUS_DOMAIN / PRIVACY_SECRET / EXEC_BUNDLED_FILE
+// 都用 exclude: /^\s*#/）一律跳过。
+
+/**
+ * 「这一行只是在打印或说明里提到这条命令」的写法不算执行 —— 只在同一行内判断。
+ * 真要去执行，执行那一行一定带痕迹（`$(…)`、反引号、`;` `&` `|`、函数体 `{`、重定向 `<` `>`），
+ * 有任一痕迹就不豁免；纯说明行（`echo "setprop ro.secure 0"`）由此不再占用人工容量。
+ * 注意要看到动词**左边**那一串（`line.slice(0, m.index)`），而不是 m[0] 之后：
+ * `$(resetprop …` 里触发豁免判断的是 `$`，`echo x; resetprop …` 里是 `;`，
+ * `$(magiskpolicy …` 里是 `(` —— 三类规则吃掉的字符数不一样，只有「左边紧邻」这个判据对谁都成立。
+ */
+const DOC_ONLY_VERB = /^\s*(?:echo|printf?|print|ui_print|log[a-z0-9_]*|debug[a-z0-9_]*|set_?progress|abort|notify)\b/;
+const EXECUTION_POSITION = /[$`;&|{(]\s*$/;
+function isDocOnlyMention(m, line) {
+  if (/^\s*#/.test(line)) return true;
+  if (!DOC_ONLY_VERB.test(line)) return false;
+  if (EXECUTION_POSITION.test(line.slice(0, m.index))) return false;
+  if (/[<>]/.test(line)) return false;
+  return true;
+}
+
+export const SELINUX_POLICY_RELAX = makeLineRule({
+  id: 'SELINUX_POLICY_RELAX', category: 'root', severity: 'high', title: '放宽 SELinux 策略',
+  // 原写法（评审 F2，实测打不中自己的夹具）：`allow\s+\S+\s+\S+\s+[^\s{]*\*\s*:\s*[^\s{]*\{` ——
+  // 它要求第 4 个 token 里带 `*`，而 `allow su * fs:file { … }` 的 `*` 是**独立一个 token**，
+  // `allow su u:r:magisk:s0 fs:file { … }` 更是根本没有 `*`。两种真实写法全 MISS。
+  // 新写法不猜 token 位置：`allow` 之后到 `{` 之前随便什么，只要求权限块里出现执行类权限或 `*`。
+  // 只认 `allow` —— deny/auditallow/dontaudit 是收紧或抑制日志，攻击者要的是授予，把它们打进来只会涨假阳性。
+  // 权限集里去掉了旧写法里的 `write|create|getattr`：正经模块给自家文件写权限极常见，
+  // 留在里面就是 F6 那类「合法模块被拦范围扩大」，而 execute/execmem/setattr 才是提权的形状。
+  // 行首锚定 `^\s*` 是这条规则唯一的收窄条件：它同时挡掉了 `echo "allow su * * { execute }"`
+  // 与 `SELINUX_ALLOW="allow …"` 这两种「字符串常量里提到规则」的写法（见测试矩阵）。
+  pattern: /^\s*allow\s+[^{};]*\{[^}]*(?:\b(?:execute|execmem|execstack|execute_no_trans|setattr|enforceforce)\b|\*)/,
+  advice: '放宽 SELinux 的 allow 规则。root 模块加 allow 就是给自己开权限，必须人工确认它授予了什么、给谁。',
+});
+
+export const MAGISK_POLICY_LIVE = makeLineRule({
+  id: 'MAGISK_POLICY_LIVE', category: 'root', severity: 'high', title: '运行时改全局 SELinux 策略',
+  // `[^|;\n]*` 把动词与 --live 锁在同一条命令里：`supolicy` 打完 `--live` 才算这台机器改了整机策略。
+  // 已知漏检（如实写着，不当成合法写法）：`MP="magiskpolicy"; $MP --live …` 这种变量间接。
+  exclude: isDocOnlyMention,
+  pattern: /\b(?:magiskpolicy|supolicy)\b[^|;\n]*--live\b/,
+  advice: '--live 改的是整机策略，影响面超出本模块；需要人工确认改的是哪几条域。',
+});
+
+export const VERIFIED_BOOT_SPOOF = makeLineRule({
+  id: 'VERIFIED_BOOT_SPOOF', category: 'root', severity: 'high', title: '篡改启动/完整性状态属性',
+  // 旧写法的 `dm-?verity[_-]?verity` 拼不出任何真实属性名（实测 `ro.boot.veritymode` MISS），
+  // `vbstate` 也不是真键名。换成四个真实存在的键。
+  // 允许 resetprop 与 setprop 两种写法（模块里两种都在用），并要求前面是行首/空白/引号，
+  // 免得 `getprop ro.boot.verifiedbootstate` 这种**只读**的行被当成篡改。
+  // 前缀类比简报多了 `& | ; ( 反引号`：`echo "$(resetprop -w ro.boot.verifiedbootstate green)"`
+  // 用原写法实测打不中（`$(` 不在类里），而命令替换是真执行，不是文档。
+  exclude: isDocOnlyMention,
+  pattern: /(?:^|[\s"';&|`(])(?:resetprop|setprop)[^\n]*\bro\.boot\.(?:verifiedbootstate|vbmeta\.device_state|flash\.locked|veritymode)\b/,
+  advice: '绕过完整性校验（Play Integrity / 安全检测）。它与模块自称的功能是否相符，只能人来判。',
+});
+
+export const DEBUGGABLE_ENABLE = makeLineRule({
+  id: 'DEBUGGABLE_ENABLE', category: 'root', severity: 'medium', title: '改变整机安全档位',
+  // 同样要覆盖 `.prop` 里的 `key=value` 形态，见下面那条 PROP_* 的说明；这里管脚本里的 set/resetprop。
+  // `[=\s]+[01]\b` 是它的收窄条件：`resetprop ro.debuggable`（只删不改）、
+  // `resetprop -w ro.debuggable $VALUE`（值走变量）、`getprop ro.debuggable`（只读）都不命中。
+  exclude: isDocOnlyMention,
+  pattern: /(?:^|[\s"';&|`(])(?:resetprop|setprop)[^\n]*\bro\.(?:debuggable|secure)\b[^\n]*[=\s]+[01]\b/,
+  advice: 'ro.debuggable / ro.secure 会改变整机安全档位，作者必须在描述里说明理由。',
+});
+
+// 评审 F4（复现属实）：`.prop` 直写是完整通道，四条 resetprop 锚定的规则一条都不咬。
+// 实测 scanContent('system.prop', 'ro.boot.verifiedbootstate=green…') 曾经是 []，而 `.prop`
+// 本来就在扫描面内（scan.mjs 的 PROP_EXTS），所以「未扫描文本」那条覆盖度规则也兜不住它。
+// 这是 Magisk 最惯用的写法（不改脚本，只在 system.prop 里写属性），锚点必须换成「键名」本身。
+// 已拍定（2026-10-13）：纳入，severity `high`。它把「在 .prop 里写 boot 状态」的模块全都推入
+// 人工队列，而这类模块在国内普遍存在（解锁 / bl 修复类）；假阳性来源正是那些合法改机模块，
+// 收益是关掉一条当前完全敞开的自动放行通道。定 high（转人工）而不是任何自动拒绝 ——
+// 让双签去承担判断，不让规则去承担结论。
+export const PROP_BOOT_SPOOF = makeLineRule({
+  id: 'PROP_BOOT_SPOOF', category: 'root', severity: 'high', title: '在属性文件里直写启动/完整性状态',
+  // 行首锚定 + 必须有 `=`：注释行 `#ro.boot.verifiedbootstate=green` 与
+  // module.prop 的 `description=ro.boot.verifiedbootstate=green` 都不命中（说明文字不是配置）。
+  pattern: /^\s*ro\.boot\.(?:verifiedbootstate|vbmeta\.device_state|flash\.locked|veritymode)\s*=/m,
+  advice: '绕过完整性校验（Play Integrity / 安全检测）。它与模块自称的功能是否相符，只能人来判。',
+});
+
+// ---------------------------------------------------------------------------
 // ③ 外联
 // ---------------------------------------------------------------------------
 
@@ -336,6 +432,11 @@ export const CONTENT_RULES = [
   WRITE_SYSTEM_VENDOR,
   SELINUX_DISABLE,
   HOSTS_MODIFY,
+  SELINUX_POLICY_RELAX,
+  MAGISK_POLICY_LIVE,
+  VERIFIED_BOOT_SPOOF,
+  DEBUGGABLE_ENABLE,
+  PROP_BOOT_SPOOF,
   HARDCODED_IP,
   SUSPICIOUS_DOMAIN_RULE,
   NETWORK_FETCH,
