@@ -571,6 +571,15 @@ export const SELINUX_POLICY_RELAX = makeLineRule({
 // 而「同行前置一句 echo 说明」挡不住后面的真语句 —— 那要靠 fix3-P7 的逐匹配豁免。
 // 已知未覆盖（写在这里，不当成已修）：`magiskpolicy "typepermissive su"` 这种不带 `--live`
 // 也不带 `;` 的引号参数形态；带 `--live` 的由 MAGISK_POLICY_LIVE 判 high，结论一样是转人工。
+// fix7-P15（本轮）：分支二尾部原来还挂着 `(?:\s+[A-Za-z0-9_.\-:]+)*` ——「permissive 之后可以跟
+// 任意多个空格分隔的词，只要整段以 `;` 收尾」。这就是英文散文被读成策略语句的**唯一**原因：
+// SELinux 的一条语句不会含空格隔开的散文。实测烧掉的是人工容量（PerformanC/ReZygisk 的
+// `webroot/LICENSE:189` `-permissive terms added in accord with section 7 apply to the code;`
+// 被判 high），而 GPL 许可证几乎是投稿包里最常见的随附文本。删掉那一个组、不加分支也不加谓词：
+// 加一条豁免就少一条能咬人的形状，这笔账要留给真实投稿量再算。
+// 分支一（行首那支）一个字没动，所以 `permissive su_t magisk_t;` 这种行首多类型写法继续由它接住；
+// 代价是「行中 + 一行多类型 + 不带花括号」（`x=1; permissive su_t magisk_t;`）本轮起不再命中，
+// 这一处由 audit/scan.test.mjs 的 P15 已知限度用例钉住，不许日后当「顺手简化」放回去。
 export const SELINUX_TYPE_PERMISSIVE = makeLineRule({
   anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'SELINUX_TYPE_PERMISSIVE', category: 'root', severity: 'high',
@@ -578,7 +587,7 @@ export const SELINUX_TYPE_PERMISSIVE = makeLineRule({
   advice: 'permissive 让该域的所有拒绝降级为只记日志，等同把这台机器上的一个域移出强制访问控制；'
     + '必须人工确认放开的是哪个域、模块自称的功能为什么需要它。',
   exclude: isDocOnlyMention,
-  pattern: /(?:^\s*(?:type)?permissive\s+(?:\{[^}]*\}|[A-Za-z0-9_.\-:]+)|[^\w](?:type)?permissive\s+(?:\{[^}]*\}|[A-Za-z0-9_.\-:]+(?:\s+[A-Za-z0-9_.\-:]+)*)\s*;)/,
+  pattern: /(?:^\s*(?:type)?permissive\s+(?:\{[^}]*\}|[A-Za-z0-9_.\-:]+)|[^\w](?:type)?permissive\s+(?:\{[^}]*\}|[A-Za-z0-9_.\-:]+)\s*;)/,
 });
 
 export const MAGISK_POLICY_LIVE = makeLineRule({

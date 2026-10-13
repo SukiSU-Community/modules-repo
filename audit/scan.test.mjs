@@ -2741,3 +2741,103 @@ test('fix6-F1：豁免不许把「上一行的动词」当成免检通行证传�
   const h = assertHit('EXEC_BUNDLED_FILE', t, '第 5 行前面是 ui_print，不是续行');
   assert.deepEqual(h.map((f) => f.line), [5], JSON.stringify(h.map((f) => `${f.line}:${f.snippet}`)));
 });
+
+// ===========================================================================
+// 第七轮（Task 2.6）—— P15：`SELINUX_TYPE_PERMISSIVE` 的散文分支 / P11：名单外可读文本进扫描面
+// ===========================================================================
+//
+// 两条都是实测出来的，不是推出来的（Temp 快照三方对照，见 §0.11 与本任务报告）：
+//   P15 —— PerformanC/ReZygisk 的 `webroot/LICENSE:189`
+//          `-permissive terms added in accord with section 7 apply to the code;`
+//          被判成 SELINUX_TYPE_PERMISSIVE/high。GPL 许可证散文里「permissive … ;」读成策略语句的
+//          唯一原因是分支二尾部那个 `(?:\s+[A-Za-z0-9_.\-:]+)*` ——「permissive 后面可以跟任意多个
+//          空格分隔的词，只要整段以 ; 收尾」。SELinux 的一条语句不会含空格隔开的散文，所以删掉它，
+//          不加分支、不加谓词（加一条豁免就少一条能咬人的形状）。
+//          分支一（`^\s*(?:type)?permissive …`，本来就不要求 `;`）一个字没动 ⇒ 行首多类型写法仍由它接住。
+//   P11 —— 「把 `cls.others` 也接进扫描面」那一行（scan.mjs 的 `.concat(cls.others || [])`）本轮实测否决，
+//          已回退：扩面之后 `sh $MODDIR/payload.dat` 那条 EXEC_BUNDLED_FILE/high 会被「目标已在扫描面
+//          ⇒ 引用不需要单独发现」的撤销判据撤掉，整包从 high/block 掉到 low/auto-approve。
+//          P15 单独上今天什么都不改变（`LICENSE` 不在扫描面里），所以本轮只落 P15。
+//
+// 已知限度（如实钉在下面第 3 条里，不当成已解决）：行中且一行多类型不带花括号
+// （`x=1; permissive su_t magisk_t;`）本轮起不再命中；`/* permissive layout; */` 这种
+// 「一个词 + 分号」的 CSS/JS 注释仍然命中。逐条见任务报告「残余限度」。
+
+const hitsP15 = (id, file, line) => RULES_BY_ID[id].scan(file, line);
+
+test('P15：许可证散文里的 "permissive … ;" 不算 SELinux 语句（实测曾送出一条 high）', () => {
+  for (const [file, line] of [
+    ['webroot/LICENSE', '-permissive terms added in accord with section 7 apply to the code;'],
+    ['webroot/LICENSE', 'and permissive terms applies to the work;'],
+    ['config.toml', 'description = "redistributable under terms; permissive licensing applies;"'],
+  ]) {
+    assert.equal(hitsP15('SELINUX_TYPE_PERMISSIVE', file, line).length, 0, `许可证/配置散文不该命中：${line}`);
+  }
+});
+
+test('P15：策略语句的形状一个都不许放过（含 P7 decoy 与 P14 锚点闭包两类写法）', () => {
+  for (const [file, line] of [
+    ['sepolicy.rule', 'permissive su_t;'],
+    ['sepolicy.rule', 'typepermissive su;'],
+    ['sepolicy.rule', 'permissive magisk;'],
+    ['sepolicy.rule', 'permissive { su magisk };'],
+    ['sepolicy.rule', 'typepermissive untrusted_app;'],
+    ['sepolicy.rule', 'permissive su_t magisk_t;'],           // 行首那支不要求 ;
+    ['service.sh', 'x=1; typepermissive su;'],
+    ['service.sh', 'echo "本模块不 typepermissive su;"; typepermissive su;'],
+    ['service.sh', 'MODDIR=${0%/*}; typepermissive su;'],
+    ['service.sh', 'typepermissive su; # 行尾说明'],
+  ]) {
+    const h = hitsP15('SELINUX_TYPE_PERMISSIVE', file, line);
+    assert.equal(h.length, 1, `必须恰好一条：${file} << ${line}`);
+    assert.equal(h[0].severity, 'high', `permissive 仍然是 high：${line}`);
+  }
+});
+
+test('P15 已知限度（如实钉住，不许日后当「顺手简化」把它放回去）：行中且一行多类型不带花括号', () => {
+  assert.equal(hitsP15('SELINUX_TYPE_PERMISSIVE', 'service.sh', 'x=1; permissive su_t magisk_t;').length, 0,
+    '打桩前 1 条、打桩后 0 条：这是本轮唯一一处「认得出的合法写法变严不起来」的地方');
+  assert.equal(hitsP15('MAGISK_POLICY_LIVE', 'service.sh', 'magiskpolicy --live "permissive su"').length, 1,
+    'permissive 走命令行那条路必须有另一条规则说话 —— 这条线不是裸奔');
+});
+
+// ---------------------------------------------------------------------------
+// 反 P11 撤销钉：扩扫描面不许把「目标已在扫描面 ⇒ 这条引用不需要单独发现」变成全哑
+// ---------------------------------------------------------------------------
+// 扩扫描面必须同时收缩 covered 集 —— 见 Task 2.7（扩扫描面必须带 covered 集收缩）。
+// 钉两件事：(a) `others` 今天不在扫描面上（那条洞还开着，钉住现状不等于认可现状）；
+// (b) 载荷名字像数据、内容无规则命中时，那条 EXEC_BUNDLED_FILE/high 与它的 escalated 证人必须还在。
+
+test('反 P11 撤销钉：名单外文本今天不进扫描面，且扩面撤销不掉 EXEC_BUNDLED_FILE/high', () => {
+  // (a) 今天的真行为：`stage.dat` 里那行 `setenforce 0` 没有被逐行扫过。
+  const silent = scanZip(makeModuleZip({
+    id: 'eval.p11silent',
+    files: [
+      ['module.prop', moduleProp('eval.p11silent')],
+      ['service.sh', '#!/system/bin/sh\necho ready\n'],
+      ['stage.dat', 'setenforce 0\n'],
+    ],
+  }), {});
+  assert.equal(silent.findings.filter((f) => f.file === 'stage.dat').length, 0,
+    'stage.dat 不在扫描面上：这是 Task 2.7 要补的洞，不许把它写成已修');
+
+  // (b) 要保护的性质：payload.dat 内容无规则命中，整包唯一的发现就是那条引用 —— 撤销它就是整包哑掉。
+  const pin = scanZip(makeModuleZip({
+    id: 'eval.p11pin',
+    files: [
+      ['module.prop', moduleProp('eval.p11pin')],
+      ['service.sh', '#!/system/bin/sh\nsh $MODDIR/payload.dat\n'],
+      ['payload.dat', 'LABEL_ALPHA\nLABEL_BETA\nLABEL_GAMMA\n'],
+    ],
+  }), { changeType: 'first' });
+  const exec = pin.findings.filter((f) => f.ruleId === 'EXEC_BUNDLED_FILE');
+  assert.equal(exec.length, 1, JSON.stringify(pin.findings.map((f) => `${f.ruleId}@${f.file}:${f.line}`)));
+  assert.equal(exec[0].severity, 'high', '执行一个名字像数据的包内条目必须是 high');
+  assert.deepEqual([exec[0].file, exec[0].line], ['service.sh', 2], JSON.stringify(exec[0]));
+  assert.equal(pin.findings.length, 1, 'payload.dat 无规则命中：这条引用就是整包唯一的发现');
+  assert.ok(pin.escalated.length > 0, 'escalated 证人不能跟着发现一起没');
+  assert.deepEqual(pin.escalated.map((e) => [e.fromFile, e.fromLine, e.resolvedEntry]),
+    [['service.sh', 2, 'payload.dat']], JSON.stringify(pin.escalated));
+  assert.notEqual(pin.decision.action, 'auto-approve',
+    '首次收录正是「撤销一旦成立就放行」落到的那一档 —— 这条线不许被任何扫描面改动推开');
+});
