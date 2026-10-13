@@ -480,6 +480,8 @@ function globIterableEntries(line, allEntries, moduleId) {
  *   covered  —— 能对上，且同名条目**全部**已经在扫描面里（`sh $MODPATH/install.sh` 那种常规写法：
  *               那个文件本来就被逐行扫过，这条 high 该撤掉 —— 但见 applyBundledRefVerdicts 的 P3 闸）；
  *   entries  —— 需要升级进扫描面的条目（同名重复时可能多份，已在扫描面里的不重复取）；
+ *   resolvedEntry —— 归一化后命中的**包内真实条目名**（引用里的拼法可能是大小写变体，
+ *               fix8-E 的撤销记录要指认「机器读过的是哪一个条目」，不能抄引用写法）；
  *   unpinned —— 变量钉不住：这是「未验证引用」，撤销判据对它永远不成立。
  * 只递归一层：只看初始扫描面的引用，不追随被升级条目自己的引用（防环）。
  * @param {Array<{name:string, content:string}>} scanTargets
@@ -514,7 +516,7 @@ export function resolveBundledRefs(scanTargets = [], allEntries = [], moduleId =
         while ((m = re.exec(line))) {
           const ref = m[0].trim();
           const rec = { ruleId: rule.id, fromFile: f.name, fromLine: i + 1, ref,
-            rel: null, resolved: false, covered: false, entries: [], unpinned: false };
+            rel: null, resolved: false, covered: false, entries: [], unpinned: false, resolvedEntry: null };
           if (rule.id === 'EXEC_BUNDLED_FILE') {
             rec.rel = refRelPath(m[0], moduleId);
           } else {
@@ -541,6 +543,8 @@ export function resolveBundledRefs(scanTargets = [], allEntries = [], moduleId =
           const group = rec.rel ? lookupEntries(index, rec.rel) : [];
           if (group.length) {
             rec.resolved = true;
+            // 命中的条目名（不是引用里的拼法）：大小写变体解析成功时，报告要指认真读过的那个条目。
+            rec.resolvedEntry = group[0].name;
             const seen = new Set(rec.entries.map((e) => rowKey(e)));
             for (const e of group) {
               const k = rowKey(e);
@@ -617,12 +621,23 @@ export const EXEC_OVERRIDDEN_ADVICE =
  *   * 有解析不到的引用（或这一行压根没有解析结果）-> 保留 high，但换成不承诺读过的 advice。
  * snippet 永远指向**造成保留的那条引用**（优先级：被升级的 > 钉不住的 > 解析不到的），
  * 报告不许把没造成升级的良性最左引用写成风险本体。
+ *
+ * fix8-E：撤销仍然撤销（等级、findings 内容一字不动 —— 那是正经模块的常规写法），
+ * 但不再静默丢弃：每一次「机器替包内某个条目作过证」都要在 `revokedOut` 里留下一笔记录，
+ * 由 `scanZip` 放进报告的专用字段 `revokedBundledRefs`，并让自动通道认下它。
+ * 沉默必须显式声明，不许由「没命中」反推 —— 见 P14 立的那条规矩。
+ * 放专用字段而不是 `findings` 里的一条 info：`renderJSON` 对所有
+ * `countsTowardRisk() === false` 的 finding 无条件 `snippet: mask(...)`，而 info 混在
+ * findings 里会让人分不清「这条为什么定级不算」。
+ * 引用解析成**包外**程序（`SCRIPT=/system/bin/sh`）时不记这一笔：那时机器没有替任何包内条目作证。
  * @param {object[]} findings
  * @param {object[]} refs resolveBundledRefs 的返回
  * @param {Map<string, number>|null} [writeInfo] 文件 -> 首个「运行期写模块目录」命中行（fix2-P3）
+ * @param {object[]|null} [revokedOut] 可选收集数组：每撤销一条 finding 推一项
+ *        { ruleId, file, line, ref, resolvedEntry, covered }
  * @returns {object[]} 新的发现数组（不改入参对象）
  */
-export function applyBundledRefVerdicts(findings = [], refs = [], writeInfo = null) {
+export function applyBundledRefVerdicts(findings = [], refs = [], writeInfo = null, revokedOut = null) {
   const byLine = new Map();
   for (const rec of Array.isArray(refs) ? refs : []) {
     const k = JSON.stringify([rec.ruleId, rec.fromFile, rec.fromLine]);
@@ -637,7 +652,18 @@ export function applyBundledRefVerdicts(findings = [], refs = [], writeInfo = nu
     const dismissable = recs.length && recs.every((r) => r.resolved && r.covered);
     const hasPkgRef = recs.some((r) => !r.external);
     const overridden = dismissable && hasPkgRef && Boolean(writeInfo) && writeInfo.has(f.file);
-    if (dismissable && !overridden) continue;
+    if (dismissable && !overridden) {
+      // 撤销成立。记的是「哪一个包内条目被读过而没有被单独报出来」，
+      // 取第一条真正的包内引用（外部目标不算替包内条目作证）。
+      const vouched = recs.find((r) => !r.external && r.resolved && r.covered && r.resolvedEntry);
+      if (vouched && Array.isArray(revokedOut)) {
+        revokedOut.push({
+          ruleId: f.ruleId, file: f.file, line: f.line,
+          ref: trimSnippet(vouched.ref), resolvedEntry: vouched.resolvedEntry, covered: vouched.covered,
+        });
+      }
+      continue;
+    }
     const copy = { ...f };
     const escalated = recs.find((r) => r.entries && r.entries.length);
     const unpinned = recs.find((r) => r.unpinned);
@@ -730,7 +756,10 @@ export function scanZip(zipPath, opts = {}) {
   for (const fd of rawFindings) {
     if (fd.ruleId === 'MODDIR_RUNTIME_WRITE' && !writeInfo.has(fd.file)) writeInfo.set(fd.file, fd.line);
   }
-  const findings = applyBundledRefVerdicts(rawFindings, bundledRefs, writeInfo);
+  // fix8-E：撤销记录。它不是发现（等级不动、评论噪声不动），但自动通道要认下它 ——
+  // 见 risk-rules.decide 的第三个参数。
+  const revokedBundledRefs = [];
+  const findings = applyBundledRefVerdicts(rawFindings, bundledRefs, writeInfo, revokedBundledRefs);
   // 跨文件的覆写形状（A 解包、B 执行）同样不许按「已扫过」静默放过：补成指名 B 的显式发现。
   findings.push(...crossFileOverrideFindings(bundledRefs, writeInfo));
 
@@ -775,7 +804,12 @@ export function scanZip(zipPath, opts = {}) {
 
   const { level, counts, reasons } = scoreRisk(all);
   const changeType = resolveChangeType(opts, propMeta);
-  const decision = decide(level, changeType);
+  // 撤销覆盖度：decide 只需要「发生过几次撤销」与「撤销的是哪些条目」两件事。
+  const decisionCoverage = {
+    revokedCount: revokedBundledRefs.length,
+    revokedEntries: [...new Set(revokedBundledRefs.map((r) => r.resolvedEntry))],
+  };
+  const decision = decide(level, changeType, decisionCoverage);
 
   return {
     schema: 'module-audit-report/v1',
@@ -798,6 +832,11 @@ export function scanZip(zipPath, opts = {}) {
     // 被引用而升级进扫描面的条目：谁在第几行、用什么写法引用了它，解析到了哪个条目。
     // 人工复核与 T5 的 brief 都靠这个字段复现「引用 → 载荷」这条链。
     escalated,
+    // fix8-E：被「目标已在扫描面 ⇒ 这条引用不必单独报」撤销掉的执行类发现，逐笔留痕。
+    // 与 `escalated` 是两种证人：那边是「确实读过一个没读过的东西」，这边是「机器替读过的东西
+    // 撤了一条发现」。撤销本身照旧（等级不变），但它不再是静默的，也不再能换来自动放行。
+    // 单独成字段而不是塞进 findings 当 info：见 applyBundledRefVerdicts 的理由。
+    revokedBundledRefs,
     inventory: {
       totalEntries: files.length,
       canonicalScripts: canonical.map((f) => toInventoryRow(f)),

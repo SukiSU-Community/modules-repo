@@ -845,7 +845,12 @@ test('EXEC_BUNDLED_FILE：撤销判据是「它真的在扫描面里」，不是
   assert.ok(!r1.findings.some((f) => f.ruleId === 'EXEC_BUNDLED_FILE'),
     JSON.stringify(r1.findings.map((f) => f.ruleId)));
   assert.equal(r1.riskLevel, 'low', JSON.stringify(r1.findings));
-  assert.equal(r1.decision.action, 'auto-approve', '多文件正经模块不能被这条规则抬成人工队列');
+  // fix8-E 改动此行（原为 'auto-approve'，附言「多文件正经模块不能被这条规则抬成人工队列」）：
+  // 上面两条断言已经确认这里确实发生过两次撤销（install.sh、lib.sh 都在扫描面上，那条 high 被撤），
+  // 而 E 拍定的就是「撤销过就不许走自动通道」——旧期望与本轮规格直接冲突，按规格改。
+  // 撤销本身、等级、findings 内容一字未动，代价只落在决策上。见 task-2.8-report.md「与现有用例的冲突」。
+  assert.equal(r1.decision.action, 'request-review', '撤销过两次就不许自动放行（fix8-E）');
+  assert.equal(r1.revokedBundledRefs.length, 2, JSON.stringify(r1.revokedBundledRefs));
 
   // 同一个形状，但那个 .sh 不在包里（运行期才写出来）：解析不到 -> 照报 high，且不许承诺读过
   const ghost = makeModuleZip({ id: 'eval.t1ghost', files: [
@@ -1656,7 +1661,12 @@ test('fix2-P3：向模块目录写出/解包 + 执行同名条目必须升级（
   assert.ok(!ok.findings.some((f) => f.ruleId === 'EXEC_BUNDLED_FILE'), JSON.stringify(ok.findings.map((f) => f.ruleId)));
   assert.ok(!ok.findings.some((f) => f.ruleId === 'MODDIR_RUNTIME_WRITE'));
   assert.equal(ok.riskLevel, 'low');
-  assert.equal(ok.decision.action, 'auto-approve');
+  // fix8-E 改动此行（原为 'auto-approve'）：这条反向哨兵钉的是「没有覆写证据时撤销照旧」，
+  // 上面两条断言仍在钉这件事，且 EXEC_BUNDLED_FILE 确实被撤掉了。
+  // 但撤销一旦发生（这里是常规写法 sh $MODDIR/install.sh），E 就关掉自动通道 ——
+  // 旧期望与本轮规格直接冲突，按规格改；代价落在决策上，不落进散文。
+  assert.equal(ok.decision.action, 'request-review', '有撤销记录就不自动放行（fix8-E）');
+  assert.deepEqual(ok.revokedBundledRefs.map((x) => x.resolvedEntry), ['install.sh'], JSON.stringify(ok.revokedBundledRefs));
 
   // 写出发现的证据字段要齐全
   const wr = r.findings.find((f) => f.ruleId === 'MODDIR_RUNTIME_WRITE');
@@ -2840,4 +2850,186 @@ test('反 P11 撤销钉：名单外文本今天不进扫描面，且扩面撤销
     [['service.sh', 2, 'payload.dat']], JSON.stringify(pin.escalated));
   assert.notEqual(pin.decision.action, 'auto-approve',
     '首次收录正是「撤销一旦成立就放行」落到的那一档 —— 这条线不许被任何扫描面改动推开');
+});
+
+// ---------------------------------------------------------------------------
+// Task 2.8（fix8-E）：撤销过就不许走自动通道
+// ---------------------------------------------------------------------------
+// 洞（§0.13）：applyBundledRefVerdicts() 的 covered 撤销把「扫过且行级规则没命中」当成
+// 「读过并且无罪」，而**被执行文件的名字由投稿者挑** —— 改名成 .js/.sh/.lua 就落在扫描面上，
+// 撤销成立，首次收录直接 auto-approve；改名成 .dat 才是 high/block。
+// 用户拍的是 E 不是 A：撤销照旧（等级、findings 内容、评论噪声一字不动），
+// 但每次撤销都要在报告专用字段里留下记录，且发生过撤销的包不许走自动通道 ——
+// 代价落在决策上，不落在散文里。
+// 硬边界：本任务只把 auto-approve 翻成 request-review；medium/high 的路径一字不改，
+// 所以不可能让任何包变得比改动前更容易自动放行。
+
+const E8_PAYLOAD_TEXT = 'just a string table, nothing to run\n';
+
+/** 同一个包，只换被执行条目的名字：这样「名字决定结论」这件事在测试里是可复现的，不是叙述。 */
+function e8Zip(id, name, refLine) {
+  return makeModuleZip({
+    id,
+    files: [
+      ['module.prop', moduleProp(id)],
+      ['service.sh', `#!/system/bin/sh\n${refLine}\n`],
+      [name, E8_PAYLOAD_TEXT],
+    ],
+  });
+}
+
+test('fix8-E：载荷改名成 .js/.sh/.lua 骗到撤销后，等级不动但不许再走自动通道（同一个洞的三个名字）', () => {
+  for (const name of ['payload.js', 'payload.sh', 'payload.lua']) {
+    const r = scanZip(e8Zip('eval.e8disguise', name, `sh $MODDIR/${name}`), { index: [] });
+    // 撤销仍然撤销：E 不新增发现、不抬等级、不往 findings[] 里塞 info。
+    assert.equal(r.riskLevel, 'low', `${name}：E 不动等级`);
+    assert.equal(r.findings.length, 0, `${name}：那条 finding 仍然被撤销，不回到 findings[]`);
+    assert.equal(r.counts.info, 0, `${name}：撤销记录不是 findings 里的 info（renderJSON 会连带脱敏）`);
+    assert.equal(r.escalated.length, 0, `${name}：本来就在扫描面上，没有升级证人`);
+    // 唯一的行为变化：自动通道关上，且只朝更严的方向翻。
+    // 这条放在记录断言之前 —— 改前的红应当直接写成 auto-approve ≠ request-review（那个洞本身），
+    // 而不是「字段不存在」的 TypeError。
+    assert.equal(r.decision.action, 'request-review', `${name}：撤销过就不许自动放行`);
+    assert.equal(r.decision.label, 'needs-human-review', name);
+    assert.equal(r.decision.needsHumanReview, true, name);
+    assert.ok(r.decision.reason.includes(name),
+      `${name}：reason 必须指名被撤销的条目，人看得见是哪个文件`);
+    // 但撤销不再静默：专用字段里要有指名条目的一笔记录。
+    assert.equal(r.revokedBundledRefs.length, 1, `${name}：撤销过一次就要记一笔`);
+    const rec = r.revokedBundledRefs[0];
+    assert.equal(rec.ruleId, 'EXEC_BUNDLED_FILE', name);
+    assert.deepEqual([rec.file, rec.line], ['service.sh', 2], name);
+    assert.equal(rec.ref, `sh $MODDIR/${name}`, name);
+    assert.equal(rec.resolvedEntry, name, `${name}：记录要写被撤销的那个条目路径`);
+    assert.equal(rec.covered, true, name);
+    // §2.7 文案纪律：说的是机器不作证，不是把投稿人写成嫌犯。
+    for (const w of ['可疑', '恶意', '攻击', '违法', '嫌犯', '绕过']) {
+      assert.ok(!r.decision.reason.includes(w), `${name}：reason 不许出现「${w}」—— ${r.decision.reason}`);
+    }
+  }
+});
+
+test('fix8-E 反证：payload.dat 那一格撤销并未发生，记录里不能凭空多出一笔', () => {
+  const r = scanZip(e8Zip('eval.e8dat', 'payload.dat', 'sh $MODDIR/payload.dat'), { index: [] });
+  const exec = r.findings.filter((f) => f.ruleId === 'EXEC_BUNDLED_FILE');
+  assert.equal(exec.length, 1, JSON.stringify(r.findings.map((f) => `${f.ruleId}/${f.severity}`)));
+  assert.equal(exec[0].severity, 'high', '这条仍是 high —— E 不靠改等级闭洞');
+  assert.equal(r.riskLevel, 'high', JSON.stringify(r.counts));
+  assert.equal(r.decision.action, 'block');
+  assert.equal(r.escalated.length, 1, '载荷被拉进扫描面：那是「真读过」的证人，与撤销记录是两回事');
+  assert.deepEqual(r.escalated.map((e) => [e.fromFile, e.fromLine, e.resolvedEntry]),
+    [['service.sh', 2, 'payload.dat']], JSON.stringify(r.escalated));
+  assert.equal(r.revokedBundledRefs.length, 0,
+    '没撤销过的事不许写进撤销记录 —— 反证：记录必须只说发生过的事');
+});
+
+test('fix8-E 单元：decide 第三参可选、默认 null；medium/high 与 update/unknown 一字不改（硬边界）', () => {
+  const revoked = { revokedCount: 1, revokedEntries: ['payload.js'] };
+  assert.equal(decide('low', 'first').action, 'auto-approve', '两参调用保持原样');
+  assert.equal(decide('low', 'first', null).action, 'auto-approve', '显式传 null 也照旧');
+  assert.equal(decide('low', 'first', { revokedCount: 0, revokedEntries: [] }).action, 'auto-approve',
+    '没发生过撤销就照旧放行');
+  const d = decide('low', 'first', revoked);
+  assert.equal(d.action, 'request-review');
+  assert.equal(d.label, 'needs-human-review');
+  assert.equal(d.needsHumanReview, true);
+  assert.ok(d.reason.includes('payload.js'), JSON.stringify(d));
+  // 其余分支必须逐字段不动：撤销记录不给 medium/high 加任何新措辞。
+  assert.deepEqual(decide('low', 'update', { revokedCount: 3, revokedEntries: ['a.js', 'b.js'] }),
+    decide('low', 'update'), 'update 路径不受影响');
+  assert.deepEqual(decide('low', 'unknown', { revokedCount: 3, revokedEntries: ['a.js'] }),
+    decide('low', 'unknown'), 'unknown 路径不受影响');
+  for (const lv of ['medium', 'high']) {
+    for (const ct of ['first', 'update', 'unknown']) {
+      assert.deepEqual(decide(lv, ct, { revokedCount: 5, revokedEntries: ['x.js'] }), decide(lv, ct),
+        `${lv}/${ct} 带着撤销记录也必须一字不改（它本来就 block）`);
+    }
+  }
+});
+
+test('fix8-E：撤销记录写包内真实条目名，引用里的大小写拼法留在 ref 上；多条撤销逐条记账', () => {
+  // 大小写变体：引用写 PAYLOAD.js，包内条目是 payload.js。报告要指认的是被读过的那个条目。
+  const lo = scanZip(makeModuleZip({
+    id: 'eval.e8case',
+    files: [
+      ['module.prop', moduleProp('eval.e8case')],
+      ['service.sh', '#!/system/bin/sh\nsh $MODDIR/PAYLOAD.js\n'],
+      ['payload.js', E8_PAYLOAD_TEXT],
+    ],
+  }), { index: [] });
+  assert.equal(lo.revokedBundledRefs.length, 1, JSON.stringify(lo.revokedBundledRefs));
+  assert.equal(lo.revokedBundledRefs[0].resolvedEntry, 'payload.js', '写真实条目名');
+  assert.equal(lo.revokedBundledRefs[0].ref, 'sh $MODDIR/PAYLOAD.js', '引用原文照抄，供人工复验');
+  assert.equal(lo.decision.action, 'request-review');
+  assert.ok(lo.decision.reason.includes('payload.js'), lo.decision.reason);
+
+  // 两条撤销：两个被执行条目各自记账，reason 把两个条目都点名。
+  const two = scanZip(makeModuleZip({
+    id: 'eval.e8two',
+    files: [
+      ['module.prop', moduleProp('eval.e8two')],
+      ['service.sh', '#!/system/bin/sh\nsh $MODDIR/a.js\n. $MODDIR/b.sh\n'],
+      ['a.js', E8_PAYLOAD_TEXT],
+      ['b.sh', '#!/system/bin/sh\necho ok\n'],
+    ],
+  }), { index: [] });
+  assert.equal(two.riskLevel, 'low', JSON.stringify(two.findings));
+  assert.equal(two.revokedBundledRefs.length, 2, JSON.stringify(two.revokedBundledRefs));
+  assert.deepEqual(two.revokedBundledRefs.map((x) => [x.file, x.line, x.resolvedEntry]),
+    [['service.sh', 2, 'a.js'], ['service.sh', 3, 'b.sh']], JSON.stringify(two.revokedBundledRefs));
+  assert.ok(two.decision.reason.includes('a.js') && two.decision.reason.includes('b.sh'),
+    two.decision.reason);
+});
+
+test('fix8-E 代价一侧也钉住：标准写法被撤销同样记账转人工，纯包外引用不记撤销', () => {
+  // 正经模块的 `sh $MODPATH/verify.sh` 是同一形状的撤销 —— E 承认识别的代价落在决策上，
+  // 不写成罪名：首次收录的这一档从此进人工队列（这正是它换掉 A 的理由）。
+  const legit = scanZip(makeModuleZip({
+    id: 'eval.e8legit',
+    files: [
+      ['module.prop', moduleProp('eval.e8legit')],
+      ['customize.sh', '#!/system/bin/sh\nsh $MODPATH/verify.sh\n'],
+      ['verify.sh', '#!/system/bin/sh\necho verified\n'],
+    ],
+  }), { index: [] });
+  assert.equal(legit.riskLevel, 'low', JSON.stringify(legit.findings));
+  assert.equal(legit.findings.length, 0, 'E 不给标准写法新增任何发现');
+  assert.equal(legit.revokedBundledRefs.length, 1, JSON.stringify(legit.revokedBundledRefs));
+  assert.equal(legit.revokedBundledRefs[0].resolvedEntry, 'verify.sh');
+  assert.equal(legit.decision.action, 'request-review');
+  assert.ok(!/可疑|恶意|绕过|嫌犯/.test(legit.decision.reason), legit.decision.reason);
+
+  // 撤销的另一半：引用指向包外程序时，机器没有替任何**包内条目**作过证，不该记这一笔。
+  const external = scanZip(makeModuleZip({
+    id: 'eval.e8ext',
+    files: [
+      ['module.prop', moduleProp('eval.e8ext')],
+      ['service.sh', '#!/system/bin/sh\nS="/system/bin/sh"\nsh $S /dev/null\n'],
+    ],
+  }), { index: [] });
+  assert.equal(external.findings.length, 0, JSON.stringify(external.findings));
+  assert.equal(external.revokedBundledRefs.length, 0,
+    '包外目标不是「被撤销的包内条目」，记进那一栏会让报告说假话');
+  assert.equal(external.decision.action, 'auto-approve',
+    '没有包内撤销时，自动通道保持今天的样子（E 只关撤销那一格）');
+});
+
+test('fix8-E：EXEC_INDIRECT 的撤销在同一条 net 里（变量钉成包内 .js 也要记账、也转人工）', () => {
+  // 两条入口共用同一个撤销分支：EXEC_BUNDLED_FILE（字面路径）与 EXEC_INDIRECT（变量间接）。
+  // 这条不是推演 —— 若只有字面路径被记，改名 + 变量包装就还留着一条静默通路。
+  const r = scanZip(makeModuleZip({
+    id: 'eval.e8indirect',
+    files: [
+      ['module.prop', moduleProp('eval.e8indirect')],
+      ['service.sh', '#!/system/bin/sh\nPL="$MODDIR/payload.js"\nsh $PL\n'],
+      ['payload.js', E8_PAYLOAD_TEXT],
+    ],
+  }), { index: [] });
+  assert.equal(r.riskLevel, 'low', JSON.stringify(r.findings));
+  assert.equal(r.findings.length, 0, '撤销照旧');
+  assert.equal(r.revokedBundledRefs.length, 1, JSON.stringify(r.revokedBundledRefs));
+  assert.equal(r.revokedBundledRefs[0].ruleId, 'EXEC_INDIRECT', JSON.stringify(r.revokedBundledRefs[0]));
+  assert.equal(r.revokedBundledRefs[0].resolvedEntry, 'payload.js');
+  assert.equal(r.decision.action, 'request-review');
+  assert.ok(r.decision.reason.includes('payload.js'), r.decision.reason);
 });

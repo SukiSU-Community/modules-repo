@@ -1229,11 +1229,32 @@ export function scoreRisk(findings) {
 /**
  * 决策：结合风险等级与“首次收录 / 版本更新”
  * 已定案规则：低风险 + 首次收录 → 自动进索引；其余一律人工审。
+ *
+ * fix8-E（撤销过就不许自动放行）：第三个参数**可选、默认 null**，所以现有调用点与现有测试
+ * 一字不动就是兼容的。`coverage.revokedCount > 0` 表示扫描器曾经把「执行模块自带条目」这类
+ * 发现按「那个条目本来就在扫描面上、已经逐行读过」撤销过 —— 那是机器替被执行文件作的证，
+ * 不能同时又是自动放行的理由。撤销照旧（等级、评论噪声、findings 内容都不动），
+ * 代价只落在决策上：`low + first` 这一档从 auto-approve 改成 request-review。
+ * 硬边界：本分支只把 auto-approve 翻成 request-review。medium/high 与 update/unknown 的
+ * 返回值一字不改（它们本来就不是自动通道），所以这个参数不可能让任何包变得比原来更容易自动放行。
+ * 措辞纪律见计划 §2.7：说的是「机器不替它作证」，不许写成可疑，不许把投稿人写成嫌犯。
  * @param {'low'|'medium'|'high'} level
  * @param {'first'|'update'|'unknown'} changeType
+ * @param {{ revokedCount?:number, revokedEntries?:string[] }|null} [coverage] 撤销覆盖度
  */
-export function decide(level, changeType) {
+export function decide(level, changeType, coverage = null) {
   if (level === 'low' && changeType === 'first') {
+    const revokedCount = coverage && Number(coverage.revokedCount) > 0 ? Number(coverage.revokedCount) : 0;
+    if (revokedCount > 0) {
+      const entries = (Array.isArray(coverage.revokedEntries) ? coverage.revokedEntries : [])
+        .filter((x) => typeof x === 'string' && x);
+      // reason 必须指名被撤销的那个条目路径 —— 人看得见是哪个文件，这条才有可复验性。
+      const shown = entries.length ? entries.join('、') : `共 ${revokedCount} 次撤销涉及的条目`;
+      const noun = entries.length > 1 ? '这些条目' : '该条目';
+      return { action: 'request-review', label: 'needs-human-review', needsHumanReview: true,
+        reason: `静态结论是 low，但它执行了模块自带的 ${shown}；${noun}已读且行级规则无命中，`
+          + '机器不替它作证，需人工确认' };
+    }
     return { action: 'auto-approve', label: 'auto-approved', needsHumanReview: false,
       reason: '静态扫描 low 风险，且该 id 尚未收录（首次收录）' };
   }
