@@ -321,6 +321,18 @@ function isDocOnlyMention(m, line) {
   return true;
 }
 
+// fix4-P12：赋值位 —— `SELINUX_ALLOW="allow … { execute }"`、`description=allow …` 这类
+// 「把规则文本存进变量 / 写进说明字段」的写法。判据看的是匹配**左边紧邻**的那一串：
+// 行首只有一个 `标识符 =` 加可选引号，且整行没有重定向 / 命令替换 / 并行语句的痕迹。
+// 为什么非但不能省还得单独写：这条豁免原来是 `^\s*` 锚点顺带挡出来的，锚点一撤就露出来，
+// 所以豁免要显式搬进 exclude 里 —— 只往豁免侧收窄，不许往载荷侧收（简报同一句话）。
+const ASSIGNMENT_POSITION = /^\s*[A-Za-z_][A-Za-z0-9_.]*\s*=\s*["']?$/;
+function isAssignedStringConstant(m, line) {
+  if (!ASSIGNMENT_POSITION.test(line.slice(0, m.index))) return false;
+  if (/[<>$`;&|]/.test(line)) return false; // 写出 / 命令替换 / 同行还有别的语句 ⇒ 不是纯赋值位
+  return true;
+}
+
 export const SELINUX_POLICY_RELAX = makeLineRule({
   id: 'SELINUX_POLICY_RELAX', category: 'root', severity: 'high', title: '放宽 SELinux 策略',
   // 原写法（评审 F2，实测打不中自己的夹具）：`allow\s+\S+\s+\S+\s+[^\s{]*\*\s*:\s*[^\s{]*\{` ——
@@ -333,9 +345,23 @@ export const SELINUX_POLICY_RELAX = makeLineRule({
   // fix2-P4b：旧集合里的 `enforceforce` 不是任何真实 SELinux 策略里存在的权限名，是条死分支
   // （写它的人想覆盖的是「授予运行时关强制的能力」）—— 换成 kernel:security 类里真实存在的
   // `setenforce`（`allow init kernel:security { setenforce }` 就是 magiskpolicy 会照单执行的授权行）。
-  // 行首锚定 `^\s*` 是这条规则唯一的收窄条件：它同时挡掉了 `echo "allow su * * { execute }"`
-  // 与 `SELINUX_ALLOW="allow …"` 这两种「字符串常量里提到规则」的写法（见测试矩阵）。
-  pattern: /^\s*allow\s+[^{};]*\{[^}]*(?:\b(?:execute|execmem|execstack|execute_no_trans|setattr|setenforce)\b|\*)/,
+  // fix2 之前这里的说法是「行首锚定 `^\s*` 是这条规则唯一的收窄条件」—— 那句话在本轮被推翻：
+  // 锚点确实顺带挡掉了 `echo "allow …"` 与 `SELINUX_ALLOW="allow …"`，但它同时把
+  // `printf "allow …\n" >> 策略文件` 这种**合法写法**一起挡成了隐形载荷（见下面 fix4-P12）。
+  // fix4-P12：`^\s*` 换成左边界类（与 VERIFIED_BOOT_SPOOF / EXEC_BUNDLED_FILE 同一写法）。
+  // 原锚点表达的是「.te 文件的一行以 allow 开头」，可同一语法出现在脚本里就是真载荷通道，
+  // 简报在 d235927 上实测这两条常规写法全是 0 命中：
+  //   x=1; allow su * * { execute };
+  //   printf "allow su * * { execute }\n" >> /data/adb/magisk/policy
+  // 后一条根本不是花招，而是模块写 SELinux 策略最普通的写法（printf >> 策略文件）。
+  // 锚点挡掉的从来不是攻击者，是写在下一行、下一个语句里的真 payload；原先由锚点顺带
+  // 兼任的两条豁免（整行注释、字符串常量/赋值位）现在显式写在 exclude 里。
+  // 载荷侧一个字都没收：{…} 权限集与前后的 token 判据与 fix2 之后一致。
+  exclude(m, line) {
+    if (isDocOnlyMention(m, line)) return true;     // 整行注释（编译器只认行首 #）+ echo/printf 说明位
+    return isAssignedStringConstant(m, line);        // 变量赋值位与 description= 文案位
+  },
+  pattern: /(?:^|[\s"';&|`(])allow\s+[^{};]*\{[^}]*(?:\b(?:execute|execmem|execstack|execute_no_trans|setattr|setenforce)\b|\*)/,
   advice: '放宽 SELinux 的 allow 规则。root 模块加 allow 就是给自己开权限，必须人工确认它授予了什么、给谁。',
 });
 

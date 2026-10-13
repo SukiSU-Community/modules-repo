@@ -2053,3 +2053,90 @@ test('fix3-P9：新规则接进规则表，且 .prop 通道现在由两条规则
     ['PROP_BOOT_SPOOF:high', 'PROP_SECURITY_WEAKEN:medium', 'PROP_SECURITY_WEAKEN:medium'].sort(),
     JSON.stringify(fs.map((f) => `${f.ruleId}@${f.line}`)));
 });
+
+// ---------------------------------------------------------------------------
+// ⑪ 第四轮修复（fix4）：P12 行首锚点 / P13 属性文件的「脚本写出」一支 / P14 锚点闭包
+// ---------------------------------------------------------------------------
+//
+// 简报实测（d235927，单行输入；`0 命中` = 载荷对扫描器隐形）：
+//   0 命中  SELINUX_POLICY_RELAX   sepolicy.rule     x=1; allow su * * { execute };
+//   0 命中  SELINUX_POLICY_RELAX   post-fs-data.sh   printf "allow su * * { execute }\n" >> /data/adb/magisk/policy
+//   0 命中  PROP_SECURITY_WEAKEN   service.sh        printf "ro.debuggable=1\n" >> /data/adb/modules/x/system.prop
+//   0 命中  PROP_BOOT_SPOOF        service.sh        echo "ro.boot.verifiedbootstate=green" >> system.prop
+//   high    VERIFIED_BOOT_SPOOF    service.sh        x=1; resetprop -w ro.boot.verifiedbootstate green
+// 用 `^\s*` 表达「这一行的开头就是载荷」的规则会被行前缀绕过，用左边界类的不会 ——
+// 这是同一个形状第三次复发（fix1 的注释豁免、fix3-P7 的首匹配、本轮的锚点）。
+// P12/P13 补这一族的两个洞，P14 把形状关掉：**沉默必须有声明，声明必须有 witness**。
+
+// —— P12：SELINUX_POLICY_RELAX 不许要求行首 ——
+const P12_HIT = [
+  'x=1; allow su * * { execute };',
+  'printf "allow su * * { execute }\\n" >> /data/adb/magisk/policy',
+  'printf "allow su * fs:file { read write open execute };\\n" >> sepolicy.rule',
+  'echo "allow su * * { execute }" > /data/adb/service.d/p',            // 带写出就不是说明位
+  'MODDIR=${0%/*}; allow su * * { execute };',
+  'dontaudit su su:file read; allow su * * { execute };',
+  'ui_print "先看一眼"; allow su magisk su:process { execmem };',
+  'allow su * * { execute } # 行尾说明关不掉这一行（fix2-P6 同判据）',
+];
+
+// 豁免侧的形状（本轮只许往这里加，不许往 P12_HIT 那边收）：
+// 整行注释 / 纯打印说明位 / 变量与 key=value 的赋值位。
+const P12_SAFE = [
+  '# allow su * * { execute };',
+  '   # 注释：allow su * * { execute } 只是说明文字',
+  'echo "allow su * fs:file { execute }"',
+  'SELINUX_ALLOW="allow su * fs:file { execute }"',
+  'description=allow su * * { execute } 是文案',
+  'auditallow magisk magisk:process *;',           // 词里含 allow，边界类不认 i
+  'dontaudit su su:file read;',
+  'allow su shell:process transition;',            // 没有权限块
+  'allow su * fs:file { };',
+  'genfscon magiskfs /data/adb/magisk u:object_r:magisk_file:s0',
+];
+
+test('fix4-P12：allow 规则出现在行中间也必须命中 high（实测曾 0 命中 → low → auto-approve）', () => {
+  for (const line of P12_HIT) {
+    const h = hits('SELINUX_POLICY_RELAX', line);
+    assert.equal(h.length, 1, `应当命中且只命中 1 条：${line} —— 实际 ${JSON.stringify(h)}`);
+    assert.equal(h[0].severity, 'high', `RELAX 是 high：${line}`);
+    assert.equal(h[0].category, 'root');
+  }
+});
+
+test('fix4-P12：证据要指名 allow 那一句，不许指名前缀的 printf/echo', () => {
+  for (const line of [
+    'x=1; allow su * * { execute };',
+    'printf "allow su * * { execute }\\n" >> /data/adb/magisk/policy',
+    'ui_print "先看一眼"; allow su magisk su:process { execmem };',
+  ]) {
+    const [f] = assertHit('SELINUX_POLICY_RELAX', line, line);
+    assert.match(f.snippet, /allow\s+su/, `snippet 要指到授权那一句：${f.snippet}`);
+    assert.ok(!/^(?:printf|echo|ui_print|x=1)/.test(f.snippet),
+      `snippet 被前缀那半行顶掉了（fix3-P7 同判据，contract 4）：${f.snippet}`);
+  }
+});
+
+test('fix4-P12：豁免侧只收窄到「整行注释 / 说明位 / 赋值位」—— 行内 # 依然不许关嘴', () => {
+  for (const line of P12_SAFE) assertNoHit('SELINUX_POLICY_RELAX', line, line);
+  // 反向哨兵：豁免只认整行注释；载荷之后出现的 # 是策略文本的一部分，不是注释
+  assertHit('SELINUX_POLICY_RELAX', 'allow su * * { execute } # 只是说明');
+  assertHit('SELINUX_POLICY_RELAX', 'x=1; allow su * * { execute }; # 只是说明');
+  // fix3 报告 §8.1 披露的那三条，本轮必须一起闭掉
+  assertHit('SELINUX_POLICY_RELAX', 'echo "本模块不授权执行"; allow su * fs:file { execute_no_trans };');
+  assertHit('SELINUX_POLICY_RELAX', 'dontaudit su su:file read; allow su * * { execute };');
+  assertHit('SELINUX_POLICY_RELAX', 'MODDIR=${0%/*}; allow su * * { execute };');
+});
+
+test('fix4-P12 端到端：post-fs-data.sh 里 printf >> policy 的模块不再判 low', async () => {
+  const r = await scanToReport(makeModuleZip({ id: 'eval.f4p12', files: [
+    ['module.prop', moduleProp('eval.f4p12')],
+    ['post-fs-data.sh', '#!/system/bin/sh\nprintf "allow su * * { execute }\\n" >> /data/adb/magisk/policy\n'],
+  ] }), { changeType: 'first' });
+  const f = r.findings.find((x) => x.ruleId === 'SELINUX_POLICY_RELAX');
+  assert.ok(f, JSON.stringify(r.findings.map((x) => x.ruleId)));
+  assert.equal(f.severity, 'high');
+  assert.equal(f.line, 2);
+  assert.equal(r.riskLevel, 'high', '旧行为实测 low → auto-approve');
+  assert.equal(r.decision.action, 'block');
+});
