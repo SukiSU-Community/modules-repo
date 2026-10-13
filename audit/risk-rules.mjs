@@ -58,21 +58,41 @@ function makeLineRule(spec) {
       for (let i = 0; i < lines.length && findings.length < maxPerFile; i++) {
         const line = lines[i];
         const re = new RegExp(pattern.source, flags);
-        const m = re.exec(line);
-        if (!m) continue;
-        if (exclude) {
-          const skipped = typeof exclude === 'function' ? exclude(m, line) : exclude.test(line);
-          if (skipped) continue;
+        // fix3-P7：一行要看**全部**匹配。旧写法只取第一个匹配，然后拿这一个匹配去判豁免与定档，
+        // 于是「写在前面的那半行」替后面的真载荷决定了一切 —— 审批闸里的 fail-open：
+        //   echo "resetprop -w ro.boot.verifiedbootstate green"; resetprop -w ro.boot.verifiedbootstate green
+        //   rm -rf "$TMP_PATH"; rm -rf /data        （第一个匹配把第二个的 high 压成 medium）
+        // 四条契约（评审实测后才定稿，改任一条都要重跑真实包的影响面）：
+        //   1. 基数不变：一条规则一行**最多**一条发现。朴素「每个匹配都报」在 5 个真实社区包上
+        //      实测 +10,046 条发现，其中 +10,001 条来自 SUSPICIOUS_DOMAIN（压缩过的 bundle 一行能命中几万次），
+        //      那个版本不可用，所以这里遍历匹配但只收敛出一条。
+        //   2. 豁免逐个匹配判：只有「这一行的全部匹配都可豁免」才跳过整行。
+        //      （exclude 是 RegExp 时判据是整个 line，同一行每个匹配拿到的结论相同 —— 那些规则的
+        //        行级豁免语义原样保留；只有函数式 exclude 才因 m.index 而逐个匹配分叉。）
+        //   3. 定档取非豁免匹配里的**最大**档。
+        //   4. snippet 取产生结论的那个匹配（最重的哪个就是哪个），不是最左的那个 ——
+        //      指鹿为马的证据比没有证据更糟。平档取先出现的，保证纯函数确定性。
+        // maxPerFile 仍是「每文件每规则的上限」，且因为基数按行收敛，它按**行**计（与旧实现一致）。
+        let best = null;
+        let m;
+        while ((m = re.exec(line)) !== null) {
+          if (m.index === re.lastIndex) re.lastIndex++; // 零宽匹配不许把 while 钉死（投稿者可控的 DoS）
+          if (exclude) {
+            const skipped = typeof exclude === 'function' ? exclude(m, line) : exclude.test(line);
+            if (skipped) continue;                      // 这个匹配可豁免；别的匹配未必
+          }
+          const sev = typeof severityFor === 'function' ? severityFor(m, line) : severity;
+          if (sev === null || sev === undefined) continue; // 该匹配不构成发现（规则内分档说了不算）
+          if (!best || SEVERITY_ORDER[sev] > SEVERITY_ORDER[best.severity]) best = { severity: sev, m };
         }
-        const sev = typeof severityFor === 'function' ? severityFor(m, line) : severity;
-        if (sev === null || sev === undefined) continue; // 规则内判定为“不构成发现”
+        if (!best) continue; // 全部匹配都被豁免或都不构成发现 —— 这才跳过整行
         findings.push({
           ruleId: id,
           category,
-          severity: sev,
+          severity: best.severity,
           file,
           line: i + 1,
-          snippet: trimSnippet(m[0]),
+          snippet: trimSnippet(best.m[0]),
           message: title,
           advice,
         });
@@ -336,8 +356,13 @@ export const VERIFIED_BOOT_SPOOF = makeLineRule({
   // 免得 `getprop ro.boot.verifiedbootstate` 这种**只读**的行被当成篡改。
   // 前缀类比简报多了 `& | ; ( 反引号`：`echo "$(resetprop -w ro.boot.verifiedbootstate green)"`
   // 用原写法实测打不中（`$(` 不在类里），而命令替换是真执行，不是文档。
+  // fix3-P7：动词与键名之间的 `[^\n]*` 改成 `[^|;&\n]*`（与上面 MAGISK_POLICY_LIVE 同例）。
+  // 贪心的 `[^\n]*` 会把一行里的**两条**命令并成**一个**匹配 ——
+  // `echo "resetprop -w ro.boot.verifiedbootstate green"; resetprop -w ro.boot.verifiedbootstate green`
+  // 实测 matches=1，而那一个匹配以 `echo "` 开头 ⇒ 被 isDocOnlyMention 豁免，工厂再逐匹配看也救不回来。
+  // 锁在同一条命令里之后每行有两个匹配：前半行豁免、后半行照报 high。
   exclude: isDocOnlyMention,
-  pattern: /(?:^|[\s"';&|`(])(?:resetprop|setprop)[^\n]*\bro\.boot\.(?:verifiedbootstate|vbmeta\.device_state|flash\.locked|veritymode)\b/,
+  pattern: /(?:^|[\s"';&|`(])(?:resetprop|setprop)[^|;&\n]*\bro\.boot\.(?:verifiedbootstate|vbmeta\.device_state|flash\.locked|veritymode)\b/,
   advice: '绕过完整性校验（Play Integrity / 安全检测）。它与模块自称的功能是否相符，只能人来判。',
 });
 
@@ -346,8 +371,11 @@ export const DEBUGGABLE_ENABLE = makeLineRule({
   // 同样要覆盖 `.prop` 里的 `key=value` 形态，见下面那条 PROP_* 的说明；这里管脚本里的 set/resetprop。
   // `[=\s]+[01]\b` 是它的收窄条件：`resetprop ro.debuggable`（只删不改）、
   // `resetprop -w ro.debuggable $VALUE`（值走变量）、`getprop ro.debuggable`（只读）都不命中。
+  // fix3-P7：两处 `[^\n]*` 一并换成 `[^|;&\n]*`（同 VERIFIED_BOOT_SPOOF 的理由）——
+  // `echo "setprop ro.secure 0"; setprop ro.secure 0` 实测曾经 matches=1（两条命令被贪心 span 并成一个匹配）
+  // → 整行被豁免 → 0 findings。锁成「动词、键名、值都在同一条命令里」之后是两个匹配，前半行豁免、后半行照报。
   exclude: isDocOnlyMention,
-  pattern: /(?:^|[\s"';&|`(])(?:resetprop|setprop)[^\n]*\bro\.(?:debuggable|secure)\b[^\n]*[=\s]+[01]\b/,
+  pattern: /(?:^|[\s"';&|`(])(?:resetprop|setprop)[^|;&\n]*\bro\.(?:debuggable|secure)\b[^|;&\n]*[=\s]+[01]\b/,
   advice: 'ro.debuggable / ro.secure 会改变整机安全档位，作者必须在描述里说明理由。',
 });
 

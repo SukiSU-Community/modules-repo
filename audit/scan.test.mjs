@@ -1776,3 +1776,133 @@ test('fix2-P6：inventory.policyFiles 不是死字段 —— Markdown 清单要�
   assert.ok(r.inventory.policyFiles.some((f) => f.name === 'sepolicy.rule'));
   assert.match(renderMarkdown(r), /策略\/初始化文件[^\n]*sepolicy\.rule/);
 });
+
+// ---------------------------------------------------------------------------
+// ⑩ 第三轮修复（fix3）：P7 行工厂看全部匹配 / P8 permissive / P9 .prop 直写削弱安全键
+// ---------------------------------------------------------------------------
+//
+// 评审在 cd79136 的规则表上逐条实测（单行输入），四条同根因：
+//   echo "resetprop -w ro.boot.verifiedbootstate green"; resetprop -w ro.boot.verifiedbootstate green -> 0 hits
+//   echo "magiskpolicy --live"; magiskpolicy --live "allow su * fs:file { execute_no_trans }"         -> 0 hits
+//   rm -rf "$TMP_PATH"; rm -rf /data                                                                  -> medium（裸 /data 是 high）
+//   resetprop -w ro.boot.verifiedbootstate green                                                      -> high（基数必须仍是 1）
+// 根因：makeLineRule.scan 只取一行里**第一个**匹配，再拿这一个匹配去判豁免与定档 ——
+// 于是「写在前面的那半行」决定后面真载荷要不要被看一眼。审批闸里的 fail-open：
+// 前置一句 echo 说明就能让所有 root 语义规则闭嘴，包判 low，decide() 自动合入。
+
+const P7_BOOT_DECOY = 'echo "resetprop -w ro.boot.verifiedbootstate green"; resetprop -w ro.boot.verifiedbootstate green';
+const P7_LIVE_DECOY = 'echo "magiskpolicy --live"; magiskpolicy --live "allow su * fs:file { execute_no_trans }"';
+
+/** 数一行里到底有几个匹配 —— 用来证明「基数」类夹具本身不是空转。 */
+function matchCount(ruleId, line) {
+  const r = RULES_BY_ID[ruleId];
+  assert.ok(r, `规则 ${ruleId} 不存在`);
+  const flags = r.pattern.flags.includes('g') ? r.pattern.flags : r.pattern.flags + 'g';
+  const re = new RegExp(r.pattern.source, flags);
+  let n = 0, m;
+  while ((m = re.exec(line)) !== null) {
+    n++;
+    if (m.index === re.lastIndex) re.lastIndex++;
+  }
+  return n;
+}
+
+test('fix3-P7：echo 前缀 decoy 不许让同行真命令静默（VERIFIED_BOOT_SPOOF 实测曾 0 findings → low → auto-approve）', () => {
+  assert.ok(matchCount('VERIFIED_BOOT_SPOOF', P7_BOOT_DECOY) >= 1, '夹具必须真命中，否则下面的断言是空转');
+  const h = hits('VERIFIED_BOOT_SPOOF', P7_BOOT_DECOY);
+  assert.equal(h.length, 1, `一行只出 1 条发现，但必须有：${JSON.stringify(h)}`);
+  assert.equal(h[0].severity, 'high');
+  assert.equal(h[0].line, 1);
+  assert.match(h[0].snippet, /resetprop -w ro\.boot\.verifiedbootstate/, 'snippet 要指名造成结论的那个匹配');
+  assert.ok(!/echo/.test(h[0].snippet), `证据不许是被豁免的最左 decoy：${h[0].snippet}`);
+  // 单独一行真命令的行为必须原样保留（基数与档位都没被这次改动动过）
+  const alone = hits('VERIFIED_BOOT_SPOOF', 'resetprop -w ro.boot.verifiedbootstate green');
+  assert.equal(alone.length, 1, 'resetprop 单独一行仍然只报 1 条');
+  assert.equal(alone[0].severity, 'high');
+});
+
+test('fix3-P7：同行 decoy 的 magiskpolicy --live 照样 high，且 decoy 动词不许顶掉真动词的 snippet', () => {
+  const line = 'echo "usage: supolicy --live 未使用"; magiskpolicy --live "allow su * *"';
+  assert.equal(matchCount('MAGISK_POLICY_LIVE', line), 2, '夹具必须在一行里造出两个匹配');
+  const h = hits('MAGISK_POLICY_LIVE', line);
+  assert.equal(h.length, 1, '基数不变：一行一条');
+  assert.equal(h[0].severity, 'high');
+  assert.match(h[0].snippet, /magiskpolicy --live/);
+  assert.ok(!/supolicy/.test(h[0].snippet), `snippet 必须是产生结论的那个匹配，不是最左的 supolicy decoy：${h[0].snippet}`);
+  const h2 = hits('MAGISK_POLICY_LIVE', P7_LIVE_DECOY);
+  assert.equal(h2.length, 1);
+  assert.equal(h2[0].severity, 'high', P7_LIVE_DECOY);
+});
+
+test('fix3-P7：decoy rm 行的 severity 取「非豁免匹配里的最大档」（实测曾 medium，裸 rm -rf /data 是 high）', () => {
+  const bare = hits('RM_RF_MUTABLE', 'rm -rf /data');
+  assert.equal(bare.length, 1);
+  assert.equal(bare[0].severity, 'high', '基准：裸 rm -rf /data 一直是 high');
+  const decoy = hits('RM_RF_MUTABLE', 'rm -rf "$TMP_PATH"; rm -rf /data');
+  assert.equal(decoy.length, 1, '基数不变：一行一条');
+  assert.equal(decoy[0].severity, 'high', `写在前面那半行不许把 /data 降成 medium：${JSON.stringify(decoy)}`);
+});
+
+test('fix3-P7：豁免是逐个匹配的 —— 只有「该行全部匹配都可豁免」才跳过整行', () => {
+  // 反向哨兵（不许把工厂改成「不再豁免」）：两个匹配都落在模块自有目录 → 0 条
+  assert.equal(matchCount('RM_RF_MUTABLE', 'rm -rf $MODDIR/cache; rm -rf $MODPATH/tmp'), 2);
+  assert.equal(hits('RM_RF_MUTABLE', 'rm -rf $MODDIR/cache; rm -rf $MODPATH/tmp').length, 0,
+    '全部匹配都可豁免时必须仍然跳过整行');
+  // 注释行里的两个 resetprop 都只说明不执行 → 0 条
+  assert.ok(matchCount('VERIFIED_BOOT_SPOOF', '# resetprop ro.boot.verifiedbootstate green 与 resetprop ro.boot.flash.locked 0') >= 1);
+  assert.equal(hits('VERIFIED_BOOT_SPOOF', '# resetprop ro.boot.verifiedbootstate green 与 resetprop ro.boot.flash.locked 0').length, 0);
+  // 一个可豁免 + 一个不可豁免 → 1 条，且按不可豁免那个定档
+  const mixed = hits('RM_RF_MUTABLE', 'rm -rf $MODDIR/cache; rm -rf /system');
+  assert.equal(mixed.length, 1);
+  assert.equal(mixed[0].severity, 'high', JSON.stringify(mixed));
+});
+
+test('fix3-P7：同一个根因的另一条通道 —— 贪心 [^\\n]* 不许把同行两条命令并成一个匹配', () => {
+  // 工厂改完仍然打不中的形状：pattern 里动词与键名之间是贪心的 `[^\n]*`，一行里的两条命令被并成
+  // **一个**匹配（实测 matches=1 → 0 findings），于是「可豁免的前半行」把后半行的真载荷一起吃掉。
+  // 修法与 MAGISK_POLICY_LIVE 的 `[^|;\n]*` 同例：动词与键名锁在同一条命令里。
+  const boot = 'echo "resetprop -w ro.boot.verifiedbootstate green"; resetprop -w ro.boot.verifiedbootstate green';
+  assert.equal(matchCount('VERIFIED_BOOT_SPOOF', boot), 2, '不许并成一个匹配，否则豁免判断只能看最左那条');
+  const dbg = 'echo "setprop ro.secure 0"; setprop ro.secure 0';
+  assert.equal(matchCount('DEBUGGABLE_ENABLE', dbg), 2, 'DEBUGGABLE_ENABLE 是同一条 pattern 形状的第二个受害者');
+  const h = hits('DEBUGGABLE_ENABLE', dbg);
+  assert.equal(h.length, 1);
+  assert.equal(h[0].severity, 'medium', '与脚本侧规则同档：medium（high 已判给启动状态伪造）');
+  assert.equal(h[0].snippet, 'setprop ro.secure 0', `证据要指名真命令：${JSON.stringify(h)}`);
+});
+
+test('fix3-P7：基数不变 —— 同一行同一规则最多 1 条发现（朴素「每个匹配都报」在真实包上实测 +10,046 条，其中 +10,001 条是 SUSPICIOUS_DOMAIN）', () => {
+  const line = 'var a="https://a.tk/1",b="https://b.xyz/2",c="https://c.top/3";'.repeat(8);
+  assert.ok(matchCount('SUSPICIOUS_DOMAIN', line) > 10, `夹具必须造出 >10 个匹配，实际 ${matchCount('SUSPICIOUS_DOMAIN', line)}`);
+  const h = hits('SUSPICIOUS_DOMAIN', line);
+  assert.equal(h.length, 1, '压缩过的 bundle 一行命中几十次也只许报 1 条');
+  assert.equal(h[0].severity, 'medium');
+});
+
+test('fix3-P7：maxPerFile 语义保留 —— 上限按行计（每行一条），不是按匹配计', () => {
+  const text = Array.from({ length: 30 }, (_, i) => `rm -rf /data # 第 ${i} 行`).join('\n');
+  const h = hits('RM_RF_MUTABLE', text);
+  assert.equal(h.length, 20, `默认 maxPerFile=20，按行计：实际 ${h.length}`);
+  assert.equal(new Set(h.map((f) => f.line)).size, 20, '20 条要来自 20 个不同行号');
+  assert.deepEqual(h.map((f) => f.line), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+});
+
+test('fix3-P7：定档取最大时 snippet 跟着最重的那个匹配走（HARDCODED_IP 内外网同行）', () => {
+  const h = hits('HARDCODED_IP', 'ping 10.0.0.1 && curl http://203.0.113.9/x');
+  assert.equal(h.length, 1);
+  assert.equal(h[0].severity, 'medium', '内网 low 在前、公网 medium 在后 —— 结论取最大档');
+  assert.equal(h[0].snippet, '203.0.113.9', `snippet 必须指名公网 IP：${h[0].snippet}`);
+  assert.ok(!/10\.0\.0\.1/.test(h[0].snippet), '不许把最左的低档匹配写成风险本体');
+});
+
+test('fix3-P7 端到端：两行 echo decoy 组成的 service.sh 不再被判 low、不再自动放行', async () => {
+  const r = await scanToReport(makeModuleZip({ id: 'eval.f3p7', files: [
+    ['module.prop', moduleProp('eval.f3p7')],
+    ['service.sh', `#!/system/bin/sh\n${P7_BOOT_DECOY}\n${P7_LIVE_DECOY}\n`],
+  ] }), { changeType: 'first' });
+  const hi = r.findings.filter((f) => f.severity === 'high');
+  assert.equal(hi.length, 2, JSON.stringify(r.findings.map((f) => `${f.ruleId}@${f.line}:${f.snippet}`)));
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block', '旧行为实测 low → auto-approve');
+  for (const f of hi) assert.ok(!/^\s*echo\b/.test(f.snippet), `证据指名了 decoy 而不是真命令：${f.snippet}`);
+});
