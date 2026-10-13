@@ -339,6 +339,29 @@ export const SELINUX_POLICY_RELAX = makeLineRule({
   advice: '放宽 SELinux 的 allow 规则。root 模块加 allow 就是给自己开权限，必须人工确认它授予了什么、给谁。',
 });
 
+// fix3-P8：`typepermissive su;` / `permissive magisk;` 关掉的是**整个域**的强制 —— 该域之后
+// 任何越权都只记日志不拦，比上面那条 allow 授予得更宽，实测在 cd79136 上却是 0 hits（没有规则）。
+// 坑（简报确认）：SELINUX_POLICY_RELAX 的 pattern 硬要求动词之后出现 `{`，
+// 所以「把 allow 扩成 allow|permissive|typepermissive」这条捷径打不中 —— 必须自成一支。
+// 分成两支的理由（假阳性边界，误伤烧的是人工容量）：
+//   ① 行首位（`^\s*(?:type)?permissive`）：策略文件里这就是语句本体，`;` 可省
+//      （很多 sepolicy.rule 真的写 `typepermissive su` 不带分号）；
+//   ② 行中间（前一个字符是非单词字符）：**必须**带 `;` 才算语句。
+//      少了这个分号要求，`description=permissive license` 这类英文说明就会变 high ——
+//      而 `description=` 这类 key=value 行是本仓扫描面里最常见的合法散文。
+// 豁免沿用 isDocOnlyMention：整行注释与 echo 说明位仍然豁免；
+// 而「同行前置一句 echo 说明」挡不住后面的真语句 —— 那要靠 fix3-P7 的逐匹配豁免。
+// 已知未覆盖（写在这里，不当成已修）：`magiskpolicy "typepermissive su"` 这种不带 `--live`
+// 也不带 `;` 的引号参数形态；带 `--live` 的由 MAGISK_POLICY_LIVE 判 high，结论一样是转人工。
+export const SELINUX_TYPE_PERMISSIVE = makeLineRule({
+  id: 'SELINUX_TYPE_PERMISSIVE', category: 'root', severity: 'high',
+  title: 'permissive/typepermissive 关掉整个域的 SELinux 强制',
+  advice: 'permissive 让该域的所有拒绝降级为只记日志，等同把这台机器上的一个域移出强制访问控制；'
+    + '必须人工确认放开的是哪个域、模块自称的功能为什么需要它。',
+  exclude: isDocOnlyMention,
+  pattern: /(?:^\s*(?:type)?permissive\s+(?:\{[^}]*\}|[A-Za-z0-9_.\-:]+)|[^\w](?:type)?permissive\s+(?:\{[^}]*\}|[A-Za-z0-9_.\-:]+(?:\s+[A-Za-z0-9_.\-:]+)*)\s*;)/,
+});
+
 export const MAGISK_POLICY_LIVE = makeLineRule({
   id: 'MAGISK_POLICY_LIVE', category: 'root', severity: 'high', title: '运行时改全局 SELinux 策略',
   // `[^|;\n]*` 把动词与 --live 锁在同一条命令里：`supolicy` 打完 `--live` 才算这台机器改了整机策略。
@@ -511,6 +534,7 @@ export const CONTENT_RULES = [
   SELINUX_DISABLE,
   HOSTS_MODIFY,
   SELINUX_POLICY_RELAX,
+  SELINUX_TYPE_PERMISSIVE,
   MAGISK_POLICY_LIVE,
   VERIFIED_BOOT_SPOOF,
   DEBUGGABLE_ENABLE,

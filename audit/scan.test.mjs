@@ -1906,3 +1906,73 @@ test('fix3-P7 端到端：两行 echo decoy 组成的 service.sh 不再被判 lo
   assert.equal(r.decision.action, 'block', '旧行为实测 low → auto-approve');
   for (const f of hi) assert.ok(!/^\s*echo\b/.test(f.snippet), `证据指名了 decoy 而不是真命令：${f.snippet}`);
 });
+
+// —— P8：permissive / typepermissive ——
+// 简报实测：`typepermissive su;` 与 `permissive magisk;` 在 cd79136 上是 0 hits。
+// 它比任何 allow 都弱（该域的所有拒绝只记日志不拦），却没有规则。
+// 坑（简报已确认）：SELINUX_POLICY_RELAX 的 pattern 硬要求动词后面出现 `{`，
+// 所以「把动词表从 allow 扩成 allow|permissive|typepermissive」打不中 —— 必须自成一支。
+
+const P8_SAFE = [
+  '# permissive su;',                                  // 整行注释：仍然豁免
+  '   # 说明：本模块不会 typepermissive su;',
+  'description=permissive license',                    // 英文说明里的形容词不是策略语句
+  'ui_print "- 我们不写 permissive 规则"',
+  'permissive_note=1',                                 // 属性键名里含这个词
+  'enforce su;',
+  'getenforce',
+];
+
+test('fix3-P8：typepermissive / permissive 必须有规则命中 high（实测曾 0 hits → low → auto-approve）', () => {
+  const hit = [
+    'typepermissive su;',
+    'permissive magisk;',
+    '  typepermissive su;',
+    'permissive { su magisk };',
+    'typepermissive untrusted_app;',
+    'echo "本模块不 typepermissive su;"; typepermissive su;',   // P7：decoy 顶不掉真语句
+    'MODDIR=${0%/*}; typepermissive su;',
+  ];
+  for (const line of hit) {
+    const h = hits('SELINUX_TYPE_PERMISSIVE', line);
+    assert.equal(h.length, 1, `应当命中且只命中 1 条：${line} —— 实际 ${JSON.stringify(h)}`);
+    assert.equal(h[0].severity, 'high', `permissive 是 high：${line}`);
+    assert.equal(h[0].category, 'root');
+    assert.match(h[0].snippet, /(?:type)?permissive/, `证据要指名这半句：${h[0].snippet}`);
+  }
+  // RELAX 那条规则不许顺手把 permissive 也报一遍（两条规则各自说话，snippet 才对得上）
+  assertNoHit('SELINUX_POLICY_RELAX', 'typepermissive su;', 'RELAX 硬要求 `{`，这条由新规则负责');
+});
+
+test('fix3-P8：注释行与英文说明里的 permissive 仍然豁免（假阳性烧的是人工容量）', () => {
+  for (const line of P8_SAFE) {
+    assertNoHit('SELINUX_TYPE_PERMISSIVE', line, line);
+  }
+  // 反向哨兵：豁免只认「整行注释 / 说明位」，行尾 # 关不掉策略语句（fix2-P6 同一判据）
+  assert.equal(hits('SELINUX_TYPE_PERMISSIVE', 'typepermissive su; # 行尾说明').length, 1);
+});
+
+test('fix3-P8 端到端：sepolicy.rule 里一行 typepermissive su; 不再被判 low', async () => {
+  const r = await scanToReport(makeModuleZip({ id: 'eval.f3p8', files: [
+    ['module.prop', moduleProp('eval.f3p8')],
+    ['sepolicy.rule', '# 收紧自家域的日志噪音\ndontaudit su su:file read;\ntypepermissive su;\n'],
+  ] }), { changeType: 'first' });
+  const f = r.findings.find((x) => x.ruleId === 'SELINUX_TYPE_PERMISSIVE');
+  assert.ok(f, JSON.stringify(r.findings.map((x) => x.ruleId)));
+  assert.equal(f.file, 'sepolicy.rule');
+  assert.equal(f.line, 3, '注释行与 dontaudit 行都不许占用行号');
+  assert.equal(f.severity, 'high');
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block');
+  assert.match(renderMarkdown(r), /SELINUX_TYPE_PERMISSIVE|关闭整个域/, 'Markdown 里要看得见这条结论');
+});
+
+test('fix3-P8：新规则接进规则表且分类/级别与简报一致，合法模块夹具仍然 0 命中', () => {
+  assert.ok(CONTENT_RULES.some((r) => r.id === 'SELINUX_TYPE_PERMISSIVE'), '不进 CONTENT_RULES 的话 scanContent 根本不会跑它');
+  const rule = RULES_BY_ID.SELINUX_TYPE_PERMISSIVE;
+  assert.equal(rule.category, 'root');
+  assert.equal(rule.severity, 'high');
+  assert.ok(rule.title && rule.advice);
+  assert.ok(CATEGORY_LABEL[rule.category], '分类必须有中文标题，否则报告分组是空的');
+  for (const line of P8_SAFE) assert.equal(rule.scan('sepolicy.te', line).length, 0, line);
+});
