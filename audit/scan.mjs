@@ -171,7 +171,8 @@ function readZipViaUnzip(zipPath, name) {
  *
  * 为什么必须有：行级规则是「逐行 × 每条规则」的，而正则在最坏的一行上是**平方级**——
  * `PRIVACY_EMAIL` 的 `[A-Za-z0-9._%+-]+@…` 在 `a`×N 这种行上从每个起点都试到行尾。
- * 2026-10-14 在 `f79b784` 上实测（24 条内容规则，单行 UTF-8，Temp/ruler.mjs）：
+ * 2026-10-14 在 `f79b784` 上实测（24 条内容规则，单行 UTF-8；曲线表与测量脚本见本轮报告
+ * `.superpowers/sdd/2026-10-12-malicious-module-detection-hardening/task-2.9-report.md` 第 0/12 节）：
  *   8 KB=100.6ms 16 KB=337.1ms 24 KB=781.9ms 32 KB=1429.7ms 48 KB=2901.3ms
  *   64 KB=5218.3ms 120 KB=18273.8ms 240 KB=76572.2ms（指数 1.8–2.3，热点就是 PRIVACY_EMAIL）
  * 512 KB（= 报告内嵌上限 `MAX_TEXT`）单行按同一指数外推是**分钟级**，所以内嵌上限那一档
