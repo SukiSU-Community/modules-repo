@@ -41,6 +41,74 @@ export function trimSnippet(s, max = MAX_SNIPPET) {
 // 行级规则构造器
 // ---------------------------------------------------------------------------
 
+const UNQUOTE_EDGE = /^["']+|["']+$/g;
+
+/**
+ * fix6-F1：续行（line continuation）与逻辑行 —— 「这一行站在命令位还是参数位」的判据。
+ *
+ * 这是 shell 的解析事实，不是这一行自己的形状：上一条物理行以**奇数个**反斜杠结尾时，
+ * 这一行接在那条命令后面（`\\` 是转义后的字面量反斜杠、行到此为止；`\\\` 才是续行）。
+ * 把连续的物理行拼起来就是「逻辑行」，逻辑行的第一个词才是命令位。
+ *
+ * makeLineRule 本来就拿到整篇 text（scan(file, text)），所以这件事能在逐行匹配之前算出来。
+ * 成本：每篇文本一次线性扫描；logicalLine 只在规则真的去读它时才拼（getter + 记忆化），
+ * 单行成组（绝大多数）不产生任何额外分配 —— 攻击者能控制行数，别给他免费的 O(文件²)。
+ */
+function trailingBackslashes(line) {
+  const m = /(\\+)$/.exec(String(line));
+  return m ? m[1].length : 0;
+}
+
+function endsWithContinuation(line) {
+  return trailingBackslashes(line) % 2 === 1;
+}
+
+// 逻辑行的命令位词：跳过空白行与「整行只有反斜杠」那种纯续行行，取第一个空白分词，
+// 再去掉外层引号与词尾反斜杠。只取**第一个**词 —— 判据要窄，多解析一个词就多一分猜测。
+function logicalFirstToken(lines, head, end) {
+  for (let k = head; k <= end; k++) {
+    const raw = String(lines[k]).trim();
+    if (!raw) continue;
+    const t = raw.split(/\s+/)[0];
+    if (/^\\+$/.test(t)) continue;
+    return t.replace(UNQUOTE_EDGE, '').replace(/\\+$/, '');
+  }
+  return '';
+}
+
+// 给 matcher（exclude / severityFor）的第三个可选参数：这一行在逻辑行里的位置。
+// 老规则一个都不用改签名 —— 它是**加参数**，不是改既有参数顺序。
+function buildLineContexts(lines) {
+  const n = lines.length;
+  const cont = new Array(n);
+  for (let i = 0; i < n; i++) cont[i] = i > 0 && endsWithContinuation(lines[i - 1]);
+  const out = new Array(n);
+  let i = 0;
+  while (i < n) {
+    let j = i;
+    while (j + 1 < n && cont[j + 1]) j++;
+    const head = i;
+    const end = j;
+    const firstToken = logicalFirstToken(lines, head, end);
+    let memo = null;
+    for (let k = head; k <= end; k++) {
+      out[k] = {
+        lineNumber: k + 1,
+        logicalFirstLine: head + 1,
+        logicalLastLine: end + 1,
+        isContinuation: cont[k],
+        firstToken,
+        get logicalLine() {
+          if (memo === null) memo = lines.slice(head, end + 1).join(' ');
+          return memo;
+        },
+      };
+    }
+    i = end + 1;
+  }
+  return out;
+}
+
 // fix4-P14：锚点是这条规则对「载荷出现在哪里」做出的声明，不是注释。
 //   'anywhere'   —— 载荷出现在一行里的任何位置都算（工作规则一律用左边界类
 //                    `(?:^|[\s"';&|`(])` 表达这件事，而不是裸 `^\s*`）。
@@ -58,8 +126,8 @@ function makeLineRule(spec) {
     id, category, title, advice,
     severity = 'medium',
     pattern,               // RegExp，用于逐行匹配
-    exclude = null,        // RegExp（整行命中则跳过）或 (match, line) => boolean
-    severityFor = null,    // (match, line) => severity，用于同一规则内分档；返回 null 表示不构成发现
+    exclude = null,        // RegExp（整行命中则跳过）或 (match, line, ctx) => boolean
+    severityFor = null,    // (match, line, ctx) => severity，用于同一规则内分档；返回 null 表示不构成发现
     maxPerFile = 20,       // 同一文件同一规则最多报多少条，防止刷屏
     anchor = 'anywhere',   // fix4-P14：'line-start' | 'anywhere'，见上面工厂前的说明与 scan.test.mjs 的锚点闭包表
     anchorSibling = null,  // anchor === 'line-start' 时必填：覆盖行中形态的那一条规则（同规则里的另一支就写自己的 id）
@@ -76,9 +144,11 @@ function makeLineRule(spec) {
     scan(file, text) {
       const findings = [];
       const lines = String(text == null ? '' : text).split(/\r?\n/);
+      const contexts = buildLineContexts(lines); // fix6-F1：见上面 buildLineContexts 的说明
       const flags = pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g';
       for (let i = 0; i < lines.length && findings.length < maxPerFile; i++) {
         const line = lines[i];
+        const ctx = contexts[i];
         const re = new RegExp(pattern.source, flags);
         // fix3-P7：一行要看**全部**匹配。旧写法只取第一个匹配，然后拿这一个匹配去判豁免与定档，
         // 于是「写在前面的那半行」替后面的真载荷决定了一切 —— 审批闸里的 fail-open：
@@ -100,10 +170,10 @@ function makeLineRule(spec) {
         while ((m = re.exec(line)) !== null) {
           if (m.index === re.lastIndex) re.lastIndex++; // 零宽匹配不许把 while 钉死（投稿者可控的 DoS）
           if (exclude) {
-            const skipped = typeof exclude === 'function' ? exclude(m, line) : exclude.test(line);
+            const skipped = typeof exclude === 'function' ? exclude(m, line, ctx) : exclude.test(line);
             if (skipped) continue;                      // 这个匹配可豁免；别的匹配未必
           }
-          const sev = typeof severityFor === 'function' ? severityFor(m, line) : severity;
+          const sev = typeof severityFor === 'function' ? severityFor(m, line, ctx) : severity;
           if (sev === null || sev === undefined) continue; // 该匹配不构成发现（规则内分档说了不算）
           if (!best || SEVERITY_ORDER[sev] > SEVERITY_ORDER[best.severity]) best = { severity: sev, m };
         }
@@ -273,7 +343,6 @@ export const HOSTS_MODIFY = makeLineRule({
 const MOD_PATH_TOKEN = /^(?:\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/]|\/data\/adb\/modules\/)/;
 // 命令位那一支的行首匹配：整个匹配从「可选引号 + 模块路径」开始，里面没有任何动词。
 const BARE_MOD_PATH_MATCH = /^["']?(?:\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/]|\/data\/adb\/modules\/)/;
-const UNQUOTE_EDGE = /^["']+|["']+$/g;
 
 function isModulePathListLine(line) {
   const tokens = String(line).trim().split(/\s+/);
