@@ -504,18 +504,47 @@ export const VERIFIED_BOOT_SPOOF = makeLineRule({
   advice: '绕过完整性校验（Play Integrity / 安全检测）。它与模块自称的功能是否相符，只能人来判。',
 });
 
+/**
+ * fix5-F2：「哪个键的哪个值是削弱整机安全档位」只许有一份字面量。
+ * 简报实测（snake-4/Zygisk-Assistant 的 post-fs-data.sh —— 那个包的全部工作就是把属性刷回锁定值）：
+ * 旧 DEBUGGABLE_ENABLE 的尾巴是 `[=\s]+[01]\b`，0 与 1 两个方向都收，于是
+ *   medium  resetprop_if_diff ro.secure 1        <- 加固，被当成罪状
+ *   medium  resetprop_if_diff ro.debuggable 0    <- 加固，被当成罪状
+ * 把整包 medium 从 7 顶到 9 —— 报的是「作者在恢复安全」这件事本身。
+ * 现在脚本侧（set/resetprop）与 .prop 侧（key=value，fix3-P9 那一条）都从这张表生成 pattern，
+ * 配对只有一个方向：`weaken` 是**削弱值**，它的反值是加固/默认安全状态，不构成发现。
+ * 键集与 fix3-P9 那份完全一致（四个具名键）。脚本侧以前只认前两个键、且不看值 ——
+ * 这里补齐成同一张表是「同一意图换个入口（setprop 还是写 .prop）不该决定过不过闸」，
+ * 实测四个真包与干净语料上新增 0 条发现（唯一的 `ro.adb.secure` 出现处是加固值 1，正确地不命中）。
+ * `persist.*` / `sys.usb.controller` 仍是不覆盖的缺口（见下面 PROP_BOOT_SPOOF 的披露），
+ * 不许往这张表里偷偷加键。
+ */
+export const SECURITY_WEAKEN_PAIRS = Object.freeze([
+  { key: 'ro.debuggable', weaken: '1' },      // 1 = 整机可调试
+  { key: 'ro.secure', weaken: '0' },          // 0 = adb 无需授权
+  { key: 'ro.adb.secure', weaken: '0' },      // 0 = 同上（运行期那一半）
+  { key: 'service.adb.root', weaken: '1' },   // 1 = adb 直接拿到 root
+]);
+
+const reEsc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 export const DEBUGGABLE_ENABLE = makeLineRule({
   anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'DEBUGGABLE_ENABLE', category: 'root', severity: 'medium', title: '改变整机安全档位',
   // 同样要覆盖 `.prop` 里的 `key=value` 形态，见下面那条 PROP_* 的说明；这里管脚本里的 set/resetprop。
-  // `[=\s]+[01]\b` 是它的收窄条件：`resetprop ro.debuggable`（只删不改）、
+  // `[=\s]+<削弱值>\b` 是它的收窄条件：`resetprop ro.debuggable`（只删不改）、
   // `resetprop -w ro.debuggable $VALUE`（值走变量）、`getprop ro.debuggable`（只读）都不命中。
   // fix3-P7：两处 `[^\n]*` 一并换成 `[^|;&\n]*`（同 VERIFIED_BOOT_SPOOF 的理由）——
   // `echo "setprop ro.secure 0"; setprop ro.secure 0` 实测曾经 matches=1（两条命令被贪心 span 并成一个匹配）
   // → 整行被豁免 → 0 findings。锁成「动词、键名、值都在同一条命令里」之后是两个匹配，前半行豁免、后半行照报。
+  // fix5-F2：值从 `[01]` 换成「这个键自己的削弱值」，四个键的配对由 SECURITY_WEAKEN_PAIRS 生成，
+  // 与 .prop 侧同源；键名与值之间仍不许跨命令边界。
   exclude: isDocOnlyMention,
-  pattern: /(?:^|[\s"';&|`(])(?:resetprop|setprop)[^|;&\n]*\bro\.(?:debuggable|secure)\b[^|;&\n]*[=\s]+[01]\b/,
-  advice: 'ro.debuggable / ro.secure 会改变整机安全档位，作者必须在描述里说明理由。',
+  pattern: new RegExp('(?:^|[\\s"\';&|`(])(?:resetprop|setprop)[^|;&\\n]*(?:'
+    + SECURITY_WEAKEN_PAIRS.map((p) => `\\b${reEsc(p.key)}\\b[^|;&\\n]*[=\\s]+${p.weaken}\\b`).join('|')
+    + ')'),
+  advice: 'ro.debuggable / ro.secure / ro.adb.secure / service.adb.root 被改成削弱值（1 / 0 / 0 / 1）'
+    + '就是长期放宽整机调试面，作者必须在描述里说明理由；把同一批键刷回安全值不算 offence。',
 });
 
 // 评审 F4（复现属实）：`.prop` 直写是完整通道，四条 resetprop 锚定的规则一条都不咬。
@@ -541,7 +570,12 @@ export const DEBUGGABLE_ENABLE = makeLineRule({
 //   ③ 键名之后必须出现重定向 `>>?` —— `echo "ro.x=1"` 只是把它打印出来，
 //      `echo "ro.x=1" >> system.prop` 才是落盘。这一条是**豁免侧**的收窄，载荷侧不加条件。
 const BOOT_STATE_KEYS = 'ro\\.boot\\.(?:verifiedbootstate|vbmeta\\.device_state|flash\\.locked|veritymode)\\s*=';
-const WEAKEN_KEYS = '(?:ro\\.debuggable\\s*=\\s*1|ro\\.secure\\s*=\\s*0|ro\\.adb\\.secure\\s*=\\s*0|service\\.adb\\.root\\s*=\\s*1)(?![0-9.])';
+// fix5-F2：这一份不再自己写键值对 —— 与脚本侧 DEBUGGABLE_ENABLE 共用 SECURITY_WEAKEN_PAIRS，
+// 两边不可能各说各话。生成的字面量与旧的手写串逐字符等值（键序、`\\s*=\\s*`、尾部 `(?![0-9.])` 都没变），
+// 变的只有 DEBUGGABLE_ENABLE 那一侧：它以前看值 `[01]` 两个方向都收，现在只收这个表里的削弱值。
+const WEAKEN_KEYS = '(?:'
+  + SECURITY_WEAKEN_PAIRS.map((p) => `${reEsc(p.key)}\\s*=\\s*${p.weaken}`).join('|')
+  + ')(?![0-9.])';
 const WRITE_FORM = '(?:^|[^\\w])(?:printf|echo|cat|tee)\\b[^|;&\\n]*["\']?\\s*';
 
 export const PROP_BOOT_SPOOF = makeLineRule({

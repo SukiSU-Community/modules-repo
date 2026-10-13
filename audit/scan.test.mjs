@@ -2539,14 +2539,19 @@ test('fix5-F2：脚本侧与 .prop 侧共用同一份「键→削弱值」表，
     assertNoHit('PROP_SECURITY_WEAKEN', `resetprop ${key} ${weaken}`, '脚本那一行归脚本侧：' + key);
     assertNoHit('DEBUGGABLE_ENABLE', `${key}=${weaken}`, '属性文件那一行归文件侧：' + key);
   }
-  // 表的键集与两条规则的 pattern 字面量同源：表里每一对都要出现在两边的 pattern.source 里
+  // 两边的 pattern 都必须是从这张表生成的：表里每个键都出现在两条规则的 pattern.source 里；
+  // 而表外的键两条都不许说话 —— 单边加键、单边删键、单边改值，三个方向都拦得住。
   for (const [id, rule] of [['DEBUGGABLE_ENABLE', RULES_BY_ID.DEBUGGABLE_ENABLE], ['PROP_SECURITY_WEAKEN', RULES_BY_ID.PROP_SECURITY_WEAKEN]]) {
-    for (const { key, weaken } of PAIRS) {
+    for (const { key } of PAIRS) {
       const esc = key.replace(/\./g, '\\.');
-      assert.ok(rule.pattern.source.includes(esc), `${id} 的 pattern 里没有表里的键 ${key} —— 那份键表是抄的，不是同源的`);
-      assert.ok(new RegExp(`${esc}[^|;&\\n]*?[=\\s]*${weaken}\\b`).test(rule.pattern.source)
-        || new RegExp(`${esc}\\s*=\\s*${weaken}`).test(rule.pattern.source),
-        `${id} 的 pattern 里 ${key} 没和削弱值 ${weaken} 配成一对：${rule.pattern.source}`);
+      assert.ok(rule.pattern.source.includes(esc),
+        `${id} 的 pattern 里没有表里的键 ${key} —— 那份键表是抄的，不是同源的`);
+    }
+  }
+  for (const key of ['ro.force.debuggable', 'debug.sf.hw', 'ro.boot.flash.locked']) {
+    for (const v of ['0', '1']) {
+      assertNoHit('DEBUGGABLE_ENABLE', `setprop ${key} ${v}`, `表外的键不许从脚本侧进来：${key}=${v}`);
+      assertNoHit('PROP_SECURITY_WEAKEN', `${key}=${v}`, `表外的键不许从 .prop 侧进来：${key}=${v}`);
     }
   }
 });
@@ -2573,7 +2578,7 @@ test('fix5-F2 端到端：把属性刷回锁定值的模块不再白送 medium�
       'setprop ro.adb.secure 0'].join('\n') + '\n'],
   ] }), { changeType: 'first' });
   const dbg = weakening.findings.filter((f) => f.ruleId === 'DEBUGGABLE_ENABLE');
-  assert.deepEqual(dbg.map((f) => f.line), [2, 4],
-    `同一份文件里的两条削弱值都要报、三条加固值都不报：${JSON.stringify(dbg.map((f) => f.line))}`);
+  assert.deepEqual(dbg.map((f) => f.line), [3, 5],
+    `同一份文件里的两条削弱值（第 3、5 行）都要报、三条加固值（2、4 与 shebang）都不报：${JSON.stringify(dbg.map((f) => f.line))}`);
   assert.ok(dbg.every((f) => f.severity === 'medium'), JSON.stringify(dbg));
 });
