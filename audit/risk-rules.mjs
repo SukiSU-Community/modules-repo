@@ -331,12 +331,17 @@ export const HOSTS_MODIFY = makeLineRule({
  *   $MODPATH/system/placeholder $MODPATH/customize.sh \
  *   $MODPATH/README.md $MODPATH/.git* 2>/dev/null
  * 那两行是上一条 `rm -rf` 的参数续行，一行里没有任何东西被执行；照抄官方模板的包每个白送两条 high。
- * 三个条件同时成立才算清单（条件③是刻意留的：行尾停在路径上时它更像「拿第二个路径当参数执行第一个」，
- * 那一支照旧说话，所以 `$MODDIR/payload.bin $MODDIR/cfg` 仍然是发现）：
+ * 三个条件同时成立才算清单：
  *   ① 空白分词后 ≥2 个 token 以模块目录前缀开头（只有一个不算：`$MODDIR/tool.bin` 单独一行就是执行）；
  *   ② 其余 token 只能是重定向（`2>/dev/null`）、续行反斜杠或引号残留 —— 混进任何别的词（选项、参数、
  *      管道）就不当它是清单；
  *   ③ 行尾停在续行反斜杠或重定向上。
+ * fix6-F1 对本判据的定位（判据本身一个字没改）：第五轮把它当成「这一行处于参数位」的**全部**
+ * 证据，于是 `"$MODPATH/payload" "$MODPATH/x" 2>/dev/null` 这样单独成行的攻击也被读成清单 ——
+ * 形状是投稿者挑的，条件③就成了可伪造的免死金牌。现在它降级成四条判据里的**最后一条**（形状），
+ * 承重的那条换成了逻辑行的命令位（见下面 exclude 与 buildLineContexts）。条件③留着不删：
+ * 留着它 ⇒ 新豁免 ⊆ 旧豁免 ⇒ 命中只增不减，代价是 `rm -rf \` 之后「行尾停在路径上」的那种清单
+ * 仍是误报（第五轮就报，本轮照报，见任务报告的残余限度）。
  * 这条豁免只作用于「报不报」：scan.mjs 的 resolveBundledRefs 跑的是原始 pattern、不看 exclude，
  * 所以清单行引用的条目照样被拉进扫描面逐行读（见 scan.test.mjs 的 fix5-F1 端到端用例）。
  */
@@ -360,6 +365,28 @@ function isModulePathListLine(line) {
   return last === '' || /^\\+$/.test(last) || /[<>]/.test(last);
 }
 
+// fix6-F1：逻辑行的命令位如果是这个词表里的动词，那么续行上的模块路径就只是它的参数。
+// 词表只收「操作文件、不会把参数当程序跑起来」的命令，且以实测为依据 —— 真实包里的这一族
+// 全部形状都是官方模板的 `rm -rf \` + 续行清单（PerformanC_ReZygisk 的 update-binary 177-179）。
+// **fail closed**：词表外的任何命令位（包括 `:`、`foo`、赋值前缀、裸反斜杠、没见过的命令）
+// 一律不豁免。故意不收的：
+//   * 解释器与前导词：sh / bash / ash / source / `.` / exec / setsid / nohup —— 它们就是把参数跑起来的东西；
+//   * xargs / env / time / sudo / eval / busybox —— 「看起来像包装、实际会执行第一个参数」的那一族
+//     （`busybox sh \` + 续行 `$MODPATH/x` 就是执行，词表外 ⇒ 照报）；
+//   * mount / insmod / magiskpolicy 这类语义里带执行的动词。
+const ARG_ONLY_VERB = new Set([
+  'rm', 'rmdir', 'mkdir', 'touch', 'cp', 'mv', 'ln', 'install',
+  'chmod', 'chown', 'chgrp', 'chcon', 'restorecon', 'set_perm', 'set_perm_recursive',
+  'set_metadata', 'set_context', 'context',
+  'ls', 'du', 'stat', 'wc', 'file', 'cat', 'head', 'tail', 'md5sum', 'sha1sum', 'sha256sum', 'cksum',
+  'unzip', 'tar', '7z', 'gzip', 'gunzip', 'bzip2', 'bunzip2', 'xz', 'unxz',
+]);
+
+function isModulePathToken(t) {
+  if (!t) return false;
+  return MOD_PATH_TOKEN.test(String(t).replace(/\\/g, '/'));
+}
+
 export const EXEC_BUNDLED_FILE = makeLineRule({
   anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'EXEC_BUNDLED_FILE', category: 'execution', severity: 'high',
@@ -370,10 +397,20 @@ export const EXEC_BUNDLED_FILE = makeLineRule({
   // fix5-F1 追加第二条豁免：纯模块路径清单（上一条命令的参数续行）不是执行，见上面
   // isModulePathListLine 的三个判据。它只看「行首那一支」的匹配，动词式与 `&&`/`||`/`(`/`;`
   // 之后的那一支照旧说话（实测真包里 `$(…)` 与 JS 的 exec('…') 都走后面那一支）。
-  exclude(m, line) {
+  // fix6-F1：第五轮那一条只看形状，形状可伪造 —— 现在「处于参数位」由逻辑行的命令位说话，
+  // 四条同时成立才沉默（缺一即报）：① 这一行确实是续行；② 逻辑行的命令位不是模块路径；
+  // ③ 命令位在 ARG_ONLY_VERB 词表里；④ 这一行仍是第五轮那条纯清单形状。
+  exclude(m, line, ctx) {
     if (/^\s*#/.test(line)) return true;
     if (!BARE_MOD_PATH_MATCH.test(m[0])) return false;       // 不是行首那一支，管不着
     if (!/^[\s]*$/.test(line.slice(0, m.index))) return false; // 前面还有词，不是行首形态
+    // ① 上一条物理行没有以奇数个反斜杠结尾 ⇒ 这一行本身就站在命令位上 ⇒ 是执行，照报
+    if (!ctx || !ctx.isContinuation) return false;
+    // ② 逻辑行的命令位是模块路径 ⇒ 整条逻辑行都是「执行第一个路径，后面全是参数」，照报
+    if (isModulePathToken(ctx.firstToken)) return false;
+    // ③ 命令位不是「只吃文件参数的动词」⇒ 判不了它会不会把参数跑起来，fail closed 照报
+    if (!ARG_ONLY_VERB.has(ctx.firstToken)) return false;
+    // ④ 这一行里除了模块路径就只有重定向/续行反斜杠/引号残留（第五轮的判据，原样复用）
     return isModulePathListLine(line);
   },
   // 两种写法都要认：

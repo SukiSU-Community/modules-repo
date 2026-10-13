@@ -2394,6 +2394,10 @@ test('fix4-P14 端到端：同一族的前缀写法一起进报告，不再靠�
 //   * 命令位那一支：行首形态的承诺是「这一行的第一个词就是被执行的模块路径」，而一整行都只是
 //     模块路径清单、行尾停在续行反斜杠或重定向上时，它是上一条命令的参数表 —— Magisk 官方模板
 //     就是这么写的，于是每个照抄模板的包都白送两条 high。
+//   【fix6 更正】上面这一支的修法按「这一行自己的形状」判参数位，形状是投稿者挑的 ⇒ fail-open
+//   （详见下面 fix6-F1 那一节）。承重的那条判据换成了「上一条物理行是否以奇数个反斜杠结尾」，
+//   也就是逻辑行的命令位；本用例里那两条单行断言随之翻成「必须报」，第五轮的真收益（带
+//   `rm -rf \` 上下文的清单沉默）由本用例的第二组断言和下面的端到端用例继续钉住。
 // 收窄只作用于「报不报」：被引用的条目照样被 resolveBundledRefs 拉进扫描面（它跑原始 pattern，
 // 不看 exclude），所以下面的端到端用例同时钉住「清单行不报」与「清单行引用的东西照样被读过」。
 
@@ -2401,13 +2405,16 @@ test('fix5-F1：`rm -rf` 续行的纯路径清单 0 命中；同文件那行真 
   const CONT1 = '$MODPATH/system/placeholder $MODPATH/customize.sh \\';
   const CONT2 = '$MODPATH/README.md $MODPATH/.git* 2>/dev/null';
   const REAL_SOURCE = '[ -f $MODPATH/customize.sh ] && . $MODPATH/customize.sh';
-  // 包里的原文（简报贴的那两串是报告 snippet 的外层加引号渲染，见下面一组）
-  for (const line of [CONT1, CONT2]) {
-    assertNoHit('EXEC_BUNDLED_FILE', line, `刷写清理清单不是执行：${line}`);
+  // fix6 更正：本用例原来在这两行上断言 0 命中 —— 那正是第五轮留下的 fail-open（形状豁免脱离
+  // 了上下文）。同一串字符单独成行时命令位就是那个路径，必须报；把它放回 `rm -rf \` 的续行里
+  // 才是参数表，才该沉默。第五轮的真收益由下面那个端到端用例（带上下文的形状）继续钉住。
+  for (const line of [CONT1, CONT2, `"${CONT1}"`, `"${CONT2}"`]) {
+    assertHit('EXEC_BUNDLED_FILE', line, `脱离续行上下文时它就是执行：${line}`);
   }
-  // 简报实测字符串本身，同样 0 命中
-  for (const line of [`"${CONT1}"`, `"${CONT2}"`]) {
-    assertNoHit('EXEC_BUNDLED_FILE', line, `snippet 渲染形态同样不许命中：${line}`);
+  for (const line of [CONT1, CONT2]) {
+    const t = ['rm -rf \\', CONT1, CONT2].join('\n') + '\n';
+    assert.equal(hits('EXEC_BUNDLED_FILE', t, 'service.sh').length, 0,
+      `回到 rm -rf 的参数位就不许报：${line}`);
   }
   // 第三行是真的 source：必须还是 high，且是这一行唯一的解释
   const h = assertHit('EXEC_BUNDLED_FILE', REAL_SOURCE, REAL_SOURCE);
@@ -2581,4 +2588,156 @@ test('fix5-F2 端到端：把属性刷回锁定值的模块不再白送 medium�
   assert.deepEqual(dbg.map((f) => f.line), [3, 5],
     `同一份文件里的两条削弱值（第 3、5 行）都要报、三条加固值（2、4 与 shebang）都不报：${JSON.stringify(dbg.map((f) => f.line))}`);
   assert.ok(dbg.every((f) => f.severity === 'medium'), JSON.stringify(dbg));
+});
+
+// ===========================================================================
+// fix6（第六轮）—— F1：续行豁免不许只看这一行的形状 —— 命令位判在**逻辑行**上
+// ===========================================================================
+// 第五轮为了抹掉 ReZygisk 的 update-binary:178/179 那两条 FP，给 EXEC_BUNDLED_FILE 加了一条
+// 形状豁免：「整行是纯模块路径清单、行尾停在续行反斜杠或重定向上」就不报。形状是投稿者自己
+// 挑的，于是它成了第六个可伪造的免死金牌。以下全部在第五轮的提交（5a5a3ff）上实测为 0 命中：
+//   $MODPATH/payload $MODPATH/x \                            0 命中
+//   $MODPATH/payload $MODPATH/x 2>/dev/null                  0 命中
+//   "$MODPATH/payload" "$MODPATH/x" \                        0 命中
+//   /data/adb/modules/eval/x /data/adb/modules/eval/y \      0 命中
+// shell 的语义是：一行第一个 token 是路径 = **执行它**，后面的全是参数。所以
+// `"$MODPATH/payload" "$MODPATH/x" 2>/dev/null` 真的把随包提交的那个文件跑了一遍，而扫描器
+// 一个字都没说。豁免只有在「这一行确实处于参数位」时才是对的，而参数位与否由**上一条物理行
+// 是否以奇数个反斜杠结尾**决定（`\\` 是转义反斜杠、不算续行），不由这一行自己的形状决定。
+// 新判据四条同时成立才沉默（fail closed）：
+//   ① 这一行是上一条的续行；
+//   ② 拼出的逻辑行的命令位不是模块路径（是路径就是执行，照报）；
+//   ③ 逻辑行的命令位是「只吃文件参数、不执行参数」的动词白名单里的词（rm/cp/chmod/chcon/…）；
+//   ④ 这一行本身仍是第五轮那条纯清单形状（复用 isModulePathListLine，没有另起炉灶）。
+// 四条都是收不是放：新豁免 ⊆ 旧豁免 ⇒ 命中只增不减，第五轮的真收益一条都没丢。
+
+const FIX6_LIST_A = '$MODPATH/system/placeholder $MODPATH/customize.sh \\';
+const FIX6_LIST_B = '$MODPATH/README.md $MODPATH/.git* 2>/dev/null';
+const FIX6_LIST_C = '$MODPATH/payload $MODPATH/x 2>/dev/null';
+const bs = (n) => '\\'.repeat(n);
+
+test('fix6-F1：单成的「纯模块路径清单 + 续行反斜杠/重定向」一律照报 —— 命令位就是那个路径', () => {
+  // 第五轮把这四种形状读成了「上一条命令的参数表」，可它们前面根本没有上一条命令：
+  // 第一个 token 是路径，就是执行随包提交的那个文件。
+  for (const line of [
+    '$MODPATH/payload $MODPATH/x \\',
+    FIX6_LIST_C,
+    '"$MODPATH/payload" "$MODPATH/x" \\',
+    '"$MODPATH/payload" "$MODPATH/x" 2>/dev/null',
+    "'$MODPATH/payload' '$MODPATH/x' 2>/dev/null",
+    '${MODDIR}/payload ${MODDIR}/x \\',
+    '${MODDIR}/payload ${MODDIR}/x 2>/dev/null',
+    '$TMPMODDIR/payload $TMPMODDIR/x \\',
+    '/data/adb/modules/eval/x /data/adb/modules/eval/y \\',
+    '/data/adb/modules/eval/x /data/adb/modules/eval/y 2>/dev/null',
+    '   $MODPATH/payload $MODPATH/x 2>/dev/null',
+    // 第五轮实测吃掉的正是 ReZygisk 那两行的形状 —— 单独成行时它就是「执行第一个路径」
+    FIX6_LIST_A,
+    FIX6_LIST_B,
+  ]) {
+    const h = assertHit('EXEC_BUNDLED_FILE', line, `行首命令位是模块路径：${line}`);
+    assert.equal(h[0].severity, 'high', `这一行在执行随包提交的文件，不许降档：${line}`);
+  }
+});
+
+test('fix6-F1：命令位判在逻辑行上 —— `rm -rf \\` 之后的清单照旧沉默（第五轮的真收益）', () => {
+  const text = (head) => ['#!/system/bin/sh', head, FIX6_LIST_A, FIX6_LIST_B].join('\n') + '\n';
+  for (const head of [
+    'rm -rf \\',
+    'rm -rf ${MODDIR}/old \\',
+    'cp -af \\',
+    'chmod 750 \\',
+    'chown root:root \\',
+    'chcon u:object_r:system_file:s0 \\',
+    'restorecon -RF \\',
+  ]) {
+    const h = hits('EXEC_BUNDLED_FILE', text(head), 'service.sh');
+    assert.equal(h.length, 0,
+      `${head} 之后那两行是它的参数表，一行里没有任何东西被执行：${JSON.stringify(h.map((f) => `${f.line}:${f.snippet}`))}`);
+  }
+  // 官方模板就是这个形状（ReZygisk 的 stock update-binary 177-179 行）—— 三个动词连写也照样沉默
+  const chained = ['rm -rf ${MODDIR}/system \\', 'rm -rf \\', FIX6_LIST_A, FIX6_LIST_B, 'ui_print done'].join('\n') + '\n';
+  assert.equal(hits('EXEC_BUNDLED_FILE', chained, 'service.sh').length, 0, JSON.stringify(hits('EXEC_BUNDLED_FILE', chained, 'service.sh')));
+});
+
+test('fix6-F1：伪造一条以反斜杠结尾的前导行不是免死金牌 —— 白名单外的命令位一律照报', () => {
+  // 这一条是本轮的正面主张：豁免的成立与否只取决于命令位，而命令位是投稿者写出来的**动词**，
+  // 白名单外的任何词（空操作、没见过的命令、eval、赋值前缀、解释器、路径本身）都不构成
+  // 「这一行处于参数位」的立论依据。判不了就当它是执行。
+  for (const head of [
+    ': \\',                    // 空操作 + 续行：它确实不执行参数，但它也不在动词白名单里
+    'foo \\',                  // 没见过的命令：判不了，fail closed
+    'eval \\',                 // eval 会把它拼出来的东西跑一遍
+    'xargs \\',                // xargs 把第一个参数当命令执行
+    'env \\', 'time \\', 'sudo \\', // 前导类：后面的词就是要跑的东西
+    'sh \\', 'bash \\', 'source \\', 'exec \\', 'nohup \\',
+    'x=$MODPATH/probe \\',     // 赋值前缀：`VAR=… cmd args` 里 cmd 照样执行
+    '$MODPATH/probe \\',       // 命令位本身就是模块路径 —— 整条逻辑行都是执行
+    '"$MODPATH/probe" \\',
+    bs(1) + ' echo ok',        // 前导行不以反斜杠结尾（这里反斜杠在行首）—— 第二行是新命令
+  ]) {
+    const t = [head, FIX6_LIST_C].join('\n') + '\n';
+    const h = assertHit('EXEC_BUNDLED_FILE', t, `前导行 ${JSON.stringify(head)} 不构成立论依据`);
+    assert.ok(h.some((f) => f.line === 2),
+      `清单那一行（第 2 行）必须在发现里：${JSON.stringify(h.map((f) => `${f.line}:${f.snippet}`))}`);
+    assert.equal(h[0].severity, 'high', JSON.stringify(h[0]));
+  }
+});
+
+test('fix6-F1：续行的判据是「行尾奇数个反斜杠」—— `\\\\` 是转义反斜杠，不是续行', () => {
+  // 偶数个行尾反斜杠 = 一个转义后的字面量反斜杠，物理行到此为止 ⇒ 下一行站在命令位上
+  const evenText = ['rm -rf "$MODPATH/old"' + bs(2), FIX6_LIST_C].join('\n') + '\n';
+  const even = assertHit('EXEC_BUNDLED_FILE', evenText, '行尾 \\\\ 不是续行，第二行是命令位');
+  assert.deepEqual(even.map((f) => f.line), [2], JSON.stringify(even.map((f) => `${f.line}:${f.snippet}`)));
+  // 奇数个（3）才是续行：前两个拼成字面量反斜杠参数，第三个把命令接下去
+  const oddText = ['rm -rf "$MODPATH/old"' + bs(3), FIX6_LIST_A, FIX6_LIST_B].join('\n') + '\n';
+  assert.equal(hits('EXEC_BUNDLED_FILE', oddText, 'service.sh').length, 0,
+    JSON.stringify(hits('EXEC_BUNDLED_FILE', oddText, 'service.sh').map((f) => `${f.line}:${f.snippet}`)));
+  // 续行链上任意一行都共用同一个命令位：中间那行末尾又是反斜杠时，最后一行仍在参数位
+  const deep = ['rm -rf \\', FIX6_LIST_A, FIX6_LIST_A, FIX6_LIST_C].join('\n') + '\n';
+  assert.equal(hits('EXEC_BUNDLED_FILE', deep, 'service.sh').length, 0, JSON.stringify(hits('EXEC_BUNDLED_FILE', deep, 'service.sh')));
+  // 但逻辑行一旦在清单之前收口，后面那行就重新站到命令位上
+  const after = ['rm -rf \\', FIX6_LIST_B, FIX6_LIST_C].join('\n') + '\n';
+  const h = assertHit('EXEC_BUNDLED_FILE', after, '第二行没有以续行结尾，第三行是新命令的命令位');
+  assert.deepEqual(h.map((f) => f.line), [3], JSON.stringify(h.map((f) => `${f.line}:${f.snippet}`)));
+});
+
+test('fix6-F1 端到端：`rm -rf` 续行的清单沉默，紧随其后的同形状攻击行必须报，扫描面不许缩小', async () => {
+  const ub = [
+    '#!/system/bin/sh',
+    'rm -rf \\',
+    FIX6_LIST_A,
+    FIX6_LIST_B,
+    '$MODPATH/webroot/stager.bin $MODPATH/webroot/cfg.bin 2>/dev/null',
+  ].join('\n') + '\n';
+  const zip = makeModuleZip({ id: 'eval.f6f1', files: [
+    ['module.prop', moduleProp('eval.f6f1')],
+    ['META-INF/com/google/android/update-binary', ub],
+    ['system/placeholder', 'setenforce 0\n'],
+  ] });
+  const r = await scanToReport(zip, { changeType: 'first' });
+  const eb = r.findings.filter((f) => f.ruleId === 'EXEC_BUNDLED_FILE');
+  assert.deepEqual(eb.map((f) => f.line), [5],
+    `第 3、4 行是 rm 的参数表（不许报），第 5 行是攻击者挑的形状（必须报）：${JSON.stringify(eb.map((f) => `${f.line}:${f.snippet}`))}`);
+  assert.equal(eb[0].severity, 'high', `第 5 行在跑随包提交的文件：${JSON.stringify(eb[0])}`);
+  // 豁免只作用于「报不报」：被引用的条目照样被拉进扫描面并逐行读过
+  assert.ok(r.escalated.map((e) => e.resolvedEntry).includes('system/placeholder'),
+    `扫描面不许因为这条豁免而缩小：${JSON.stringify(r.escalated)}`);
+  assert.ok(r.findings.some((f) => f.ruleId === 'SELINUX_DISABLE' && f.file === 'system/placeholder'),
+    `被引用的载荷必须真的被读过：${JSON.stringify(r.findings.map((f) => `${f.ruleId}@${f.file}:${f.line}`))}`);
+  assert.equal(r.riskLevel, 'high', '整包定级不因为这 FP 撤掉而变松');
+});
+
+test('fix6-F1：豁免不许把「上一行的动词」当成免检通行证传给整条逻辑行 —— 逻辑行内部仍是逐行判', () => {
+  // rm -rf \ 之后跟的第一行确实是参数位；但同一文件里另一条以清单形状开头、前面没有续行
+  // 关系的行，必须重新按命令位判。这条与上面那条端到端用例是同一条主张的两种粒度。
+  const t = [
+    'rm -rf \\',
+    FIX6_LIST_A,
+    FIX6_LIST_B,
+    'ui_print "- done"',
+    '$MODPATH/payload $MODPATH/x \\',
+  ].join('\n') + '\n';
+  const h = assertHit('EXEC_BUNDLED_FILE', t, '第 5 行前面是 ui_print，不是续行');
+  assert.deepEqual(h.map((f) => f.line), [5], JSON.stringify(h.map((f) => `${f.line}:${f.snippet}`)));
 });
