@@ -1146,21 +1146,51 @@ export function inspectStructure(entries = []) {
   };
 }
 
-/** 内容读到了一半就截断 —— 人工复核看不全，属于覆盖度缺口，必须参与定级 */
-export function checkCoverage(files = [], maxText = MAX_TEXT) {
+/**
+ * 「读到一半」的覆盖度缺口 —— 人工复核看不全、行级规则也没跑完，必须参与定级。
+ *
+ * Task 2.9 起这条规则有两种触发条件（同一个 ruleId，不另立新规）：
+ *   ① `f.truncated`     —— 条目超过报告内嵌上限 `maxText`，人只看得见前缀；
+ *   ② `f.scanTruncated` —— 条目超过**行级规则的输入上限**（`scan.mjs` 的
+ *                          `MAX_SCAN_BYTES_PER_ENTRY`）并且真的进了扫描面：
+ *                          上限之后的字节一行都没判过。
+ * ②才是本轮要关的那格：载荷挪到上限之后，换来的必须是这条记录，而不是 0 命中。
+ * 所以记录里三个数缺一不可 —— 哪个条目、原始多少字节、实际喂进规则多少字节。
+ *
+ * fix8 之前 advice 里那句「行级规则跑的是全文」在 ② 存在后就是假话，删了。
+ * @param {Array<{name,size,truncated,scanTruncated?,scanBytes?}>} files
+ * @param {number} maxText 报告内嵌上限（只影响文案）
+ * @param {number|null} scanCap 本次生效的行级规则输入上限（只影响文案；实扫字节看 f.scanBytes）
+ */
+export function checkCoverage(files = [], maxText = MAX_TEXT, scanCap = null) {
   const out = [];
   for (const f of files) {
-    if (!f || !f.truncated) continue;
+    if (!f || (!f.truncated && !f.scanTruncated)) continue;
+    const size = Number(f.size) || 0;
+    const scanCut = Boolean(f.scanTruncated);
+    const fed = Number.isFinite(f.scanBytes) ? f.scanBytes : null;
+    const capKb = Number.isFinite(scanCap) && scanCap > 0 ? `${(scanCap / 1024).toFixed(0)} KB` : '未设上限';
+    let body;
+    let advice;
+    if (scanCut) {
+      body = `原文 ${size} B，行级规则只喂进前 ${fed} B（单条目上限 ${capKb}），`
+        + `其余 ${Math.max(0, size - fed)} B 没有逐行判过`;
+      advice = '「读到一半」不等于「干净」：上限之后的字节没有逐行判过，本次审核对这个条目是不完整的，不予自动放行。'
+        + '请把内容拆成多个被引用的文件（每个都留在上限之内），或由人工下载产物通读全文。';
+    } else {
+      body = `有 ${(size / 1048576).toFixed(2)} MB`;
+      advice = '人工复核与 PR 评论只能看到前缀，全文在本次审核的 JSON 产物里。请不要把单个条目塞到这么大；'
+        + '确实需要长文件时把它拆成多个被引用的文件，或由人工下载产物通读。';
+    }
     out.push({
       ruleId: 'AUDIT_COVERAGE_TRUNCATED',
       category: 'structure',
       severity: 'medium',
       file: String(f.name == null ? '' : f.name),
       line: 0,
-      snippet: `${f.size} B`,
-      message: `${f.name} 有 ${(f.size / 1048576).toFixed(2)} MB，报告只内嵌前 ${(maxText / 1024).toFixed(0)} KB`,
-      advice: '行级规则跑的是全文，但人工复核与 PR 评论只能看到前缀。请不要把脚本塞到这么大；'
-        + '确实需要长文件时把它拆成多个被引用的文件，或由人工下载产物通读。',
+      snippet: trimSnippet(scanCut ? `${size} B -> ${fed} B` : `${size} B`),
+      message: `${f.name} ${body}，报告只内嵌前 ${(maxText / 1024).toFixed(0)} KB`,
+      advice,
     });
   }
   return out;

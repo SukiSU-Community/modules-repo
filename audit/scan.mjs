@@ -166,6 +166,55 @@ function readZipViaUnzip(zipPath, name) {
 }
 
 /**
+ * 单条目喂给**行级规则**的字节上限（Task 2.9，2026-10-14 用户拍定：字节上限 + 截断记账，
+ * 不改 `PRIVACY_EMAIL` 的实现）。
+ *
+ * 为什么必须有：行级规则是「逐行 × 每条规则」的，而正则在最坏的一行上是**平方级**——
+ * `PRIVACY_EMAIL` 的 `[A-Za-z0-9._%+-]+@…` 在 `a`×N 这种行上从每个起点都试到行尾。
+ * 2026-10-14 在 `f79b784` 上实测（24 条内容规则，单行 UTF-8，Temp/ruler.mjs）：
+ *   8 KB=100.6ms 16 KB=337.1ms 24 KB=781.9ms 32 KB=1429.7ms 48 KB=2901.3ms
+ *   64 KB=5218.3ms 120 KB=18273.8ms 240 KB=76572.2ms（指数 1.8–2.3，热点就是 PRIVACY_EMAIL）
+ * 512 KB（= 报告内嵌上限 `MAX_TEXT`）单行按同一指数外推是**分钟级**，所以内嵌上限那一档
+ * 当不得扫描上限：它只挡住了「报告贴多少」，挡不住「规则跑多少」。取 24 KB 是
+ * 实测里最后一个让整包扫描留在 1 s 内的档位（32 KB 单行光规则就 1.43 s）。
+ * 真包侧的代价照实记：`device_faker` 有 8 个压缩过的 Vue 打包件（最大 111,460 B 单行）
+ * 会因此各得一条 `AUDIT_COVERAGE_TRUNCATED`（medium），结论仍是 block，不是放行。
+ *
+ * 硬边界（本轮验收的两条方向用例）：上限**只能让扫描更早停**，
+ * 前 N 字节里的载荷照旧命中；落在 N 之后的载荷必须换成一条参与定级的截断记录，
+ * 「读到一半」永远不等于「干净」。
+ */
+export const MAX_SCAN_BYTES_PER_ENTRY = 24 * 1024;
+
+/**
+ * 把上限落点退到一个完整的 UTF-8 码点边界，返回可以安全切开的字节数。
+ * 尾字节 0x80–0xBF 是延续字节：`bytes[end]` 还是延续字节就说明那个字符正跨在边界上，
+ * 往前退到某个字符的首字节为止 —— 否则半截序列会被 `toString('utf8')` 变成 U+FFFD 混进规则输入。
+ * @param {Buffer} bytes
+ * @param {number} max 上限（字节）
+ */
+export function scanFeedBytes(bytes, max = MAX_SCAN_BYTES_PER_ENTRY) {
+  const len = Buffer.isBuffer(bytes) ? bytes.length : Buffer.byteLength(String(bytes == null ? '' : bytes), 'utf8');
+  if (len <= max) return len;
+  let end = max;
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end--;
+  return end;
+}
+
+/**
+ * 这个条目真正喂给行级规则的那段文本。
+ * 未超限时直接返回全文（一个字节都不许多切，也不许多拷一份）；超限时只返回前缀。
+ * 全文 `content` 仍然是报告与 JSON 产物的依据 —— 上限只管「喂给规则多少」，
+ * 不管「给人看多少」（见 checkCoverage 与 renderJSON 的分工）。
+ * @param {{content:string, scanCapped?:boolean, scanText?:string|null}} f
+ */
+function lineRuleInput(f) {
+  if (!f) return '';
+  if (f.scanCapped && typeof f.scanText === 'string') return f.scanText;
+  return String(f.content == null ? '' : f.content);
+}
+
+/**
  * 读取 zip 中所有文件
  * @param {string} zipPath
  * @param {number} [maxEntryBytes] 单条解压硬上限（测试与低配 runner 会想收紧）
@@ -223,14 +272,24 @@ function readZipFallback(zipPath, warnings) {
 function toFileEntry(name, buf) {
   const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
   const truncated = bytes.length > MAX_TEXT;
+  // Task 2.9：行级规则的输入上限。这里只算「准备喂多少」，不声称「喂过了」——
+  // 谁真的进了扫描面由 scanZip 决定（scanTruncated 在那儿打上），因为非条目面（图片、
+  // 机器码）本来就不逐行扫，给它们记截断只是噪声。
+  const scanBytes = scanFeedBytes(bytes);
+  const scanCapped = scanBytes < bytes.length;
   return {
     name,
     size: bytes.length,
-    // 行级规则必须跑全文：截断只能限制「报告里内嵌多少」，绝不能让后缀字节
-    // 逃过检测，否则把 payload 塞到 512 KB 之后就是免检通道。
+    // 全文留给报告与 JSON 产物：截断只能限制「喂给规则多少」和「人看得见多少」，
+    // 不能把产物里的正文也剪了 —— AUDIT_COVERAGE_TRUNCATED 的「其余见产物」靠它。
+    // 注意 content 是全文，而 scanText 才是行级规则真正吃进去的那一段。
     content: bytes.toString('utf8'),
     head: bytes.subarray(0, 512),
     truncated,
+    scanBytes,
+    scanCapped,
+    scanText: scanCapped ? bytes.subarray(0, scanBytes).toString('utf8') : null,
+    scanTruncated: false,
   };
 }
 
@@ -745,9 +804,20 @@ export function scanZip(zipPath, opts = {}) {
     escalated.push({ fromFile: e.__from, fromLine: e.__line, ref: e.__ref, resolvedEntry: e.name });
   }
 
+  // Task 2.9：扫描面到这儿才算齐（升级条目也在里面），所以「谁被喂进过行级规则、
+  // 谁被上限砍过」只能在这里记账。escalated 那些是 `{...文件条目}` 的拷贝，
+  // 按名字回到 files 里的原件上打标记，checkCoverage(files) 才看得见同一个数。
+  const lineRuleNames = new Set();
+  for (const f of scanTargets) if (f && f.name) lineRuleNames.add(f.name);
+  if (propEntry) lineRuleNames.add(propEntry.name); // propFindings 那条通道同样吃上限
+  for (const f of files) {
+    if (f.scanCapped && lineRuleNames.has(f.name)) f.scanTruncated = true;
+  }
+
   const rawFindings = [];
   for (const f of scanTargets) {
-    rawFindings.push(...scanContent(f.name, f.content));
+    // 上限只管这里：lineRuleInput(f) 是前缀（未超限时就是全文）。
+    rawFindings.push(...scanContent(f.name, lineRuleInput(f)));
   }
   // 「引用目标是否已经被逐行扫过」只能在这里判（扫描面到这儿才齐），见 applyBundledRefVerdicts。
   // fix2-P3：先把「运行期向模块目录写出/解包」的命中行收成一表 —— 有这种证据的文件里，
@@ -764,8 +834,10 @@ export function scanZip(zipPath, opts = {}) {
   findings.push(...crossFileOverrideFindings(bundledRefs, writeInfo));
 
   // module.prop 也要过一遍内容规则（里面可能有外联地址或隐私路径）
+  // Task 2.9：这条通道吃的也是同一个上限 —— module.prop 的名字由投稿者给，塞 2 MB 进来
+  // 就走「不在扫描面上」这条路躲开上限的话，上限就成了按桶生效的半截闸。
   const propFindings = propEntry && !scanTargets.includes(propEntry)
-    ? scanContent(propEntry.name, propEntry.content)
+    ? scanContent(propEntry.name, lineRuleInput(propEntry))
     : [];
 
   const propMeta = propEntry
@@ -778,7 +850,9 @@ export function scanZip(zipPath, opts = {}) {
   const struct = inspectStructure(source === 'builtin' ? entries : files.map((f) => ({ name: f.name })));
   // 报告里的上限必须是这次真正生效的上限，否则「按阈值放行」无法复核。
   struct.stats.limits.MAX_ENTRY_UNCOMPRESSED = maxEntryBytes;
-  const coverFindings = checkCoverage(files);
+  struct.stats.limits.MAX_SCAN_BYTES_PER_ENTRY = MAX_SCAN_BYTES_PER_ENTRY;
+  // 第三个参数只用来把阈值写进文案；「哪个条目被砍了多少」在 files[].scanBytes 上。
+  const coverFindings = checkCoverage(files, MAX_TEXT, MAX_SCAN_BYTES_PER_ENTRY);
   const unreadFindings = checkUnread(unread);
   const binFindings = checkBinaries(binaries.map((b) => ({ name: b.name, id: b.binary.id, why: b.binary.why, bytes: b.size })));
   const metadataFindings = source === 'unzip' ? [{
@@ -874,7 +948,10 @@ export function scanZip(zipPath, opts = {}) {
 }
 
 function toInventoryRow(f) {
-  return { name: f.name, bytes: f.size, lines: countLines(f.content), truncated: f.truncated };
+  return { name: f.name, bytes: f.size, lines: countLines(f.content), truncated: f.truncated,
+    // Task 2.9：清单要能自证「这个条目实际被行级规则读了多少字节」——
+    // 人工复核对着 AUDIT_COVERAGE_TRUNCATED 那条记录时，第二个数就在这儿。
+    scanBytes: f.scanBytes, scanCapped: Boolean(f.scanCapped) };
 }
 
 function countLines(s) { return s === '' ? 0 : s.split(/\r?\n/).length; }
@@ -1043,7 +1120,13 @@ export function renderMarkdown(report) {
   L.push(`- 不支持的压缩方式：${list(st.unsupportedMethods)}`);
   L.push(`- 反斜杠路径条目：${list(st.backslashPaths)}`);
   L.push(`- 解压失败的条目：${list((report.unread || []).map((u) => u.name))}`);
-  L.push(`- 报告内嵌全文的上限：${st.limits ? (st.limits.MAX_TEXT / 1024).toFixed(0) : '512'} KB/文件（行级规则跑的仍是全文，截断只影响人工能看到多少）`);
+  // Task 2.9：这两行是分开的两件事 —— 内嵌上限管「人看得见多少」，扫描上限管「规则跑过多少」。
+  // 旧文案在这里写「行级规则跑的仍是全文」，上限落地后那就是假话，所以按本次真正生效的阈值重说。
+  const scanCap = st.limits ? st.limits.MAX_SCAN_BYTES_PER_ENTRY : MAX_SCAN_BYTES_PER_ENTRY;
+  L.push(`- 行级规则的输入上限：${st.limits ? (scanCap / 1024).toFixed(0) : '24'} KB/条目（超出只把前缀喂给规则，`
+    + '并逐条记 `AUDIT_COVERAGE_TRUNCATED`：哪个条目、原文多少字节、实扫多少字节）');
+  L.push(`- 报告内嵌全文的上限：${st.limits ? (st.limits.MAX_TEXT / 1024).toFixed(0) : '512'} KB/文件`
+    + `（Markdown 只贴前缀，全文在 JSON 产物里；上限之外的字节连规则也没读过，见上一条）`);
   L.push('');
 
   L.push('## 风险发现');
@@ -1102,7 +1185,13 @@ export function renderMarkdown(report) {
   for (const s of report.scripts) {
     const note = s.nonText
       ? '（内容非文本：已按文本逐行扫过，这里只给有界预览，机器码原文不进报告）'
-      : (s.truncated ? `（报告只内嵌前 ${Math.round(MAX_TEXT / 1024)} KB，其余见产物；行级规则已跑全文）` : '');
+      : (s.scanCapped
+        // Task 2.9：这一行必须自己说清读了多少 —— 上限之外的字节连规则都没读过，
+        // 只写「报告只内嵌前 N KB」会把「读到一半」渲染成「规则读完了、只是人看不全」。
+        ? `（行级规则只跑了前 ${s.scanBytes} B（单条目上限 ${Math.round(MAX_SCAN_BYTES_PER_ENTRY / 1024)} KB），`
+          + `原文 ${s.bytes} B；其余字节未逐行判过，已记 AUDIT_COVERAGE_TRUNCATED`
+          + (s.truncated ? `；报告只内嵌前 ${Math.round(MAX_TEXT / 1024)} KB，其余见产物` : '') + '）'
+        : (s.truncated ? `（报告只内嵌前 ${Math.round(MAX_TEXT / 1024)} KB，其余见产物）` : ''));
     L.push(`### \`${escapeCell(s.name)}\` — ${s.bytes} B / ${s.lines} 行${note}`);
     L.push('');
     // 围栏体也要过显示层防护：正文里的 ``` 关不掉比它更长的围栏，控制字符换成可见占位。

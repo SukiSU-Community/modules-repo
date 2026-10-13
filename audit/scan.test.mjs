@@ -672,7 +672,7 @@ test('端到端：把 ELF 改名成 config.js 也只能落到「二进制」，�
   assert.equal(r2.riskLevel, 'high', '改名成 .js 的 ELF 被引用时必须 high');
 });
 
-test('端到端：payload 藏在 512 KB 之后照样被行级规则命中，同时报覆盖度缺口', () => {
+test('端到端：payload 藏在行级规则输入上限之后 ⇒ 记账而不是免检（原「照样命中」用例，见下列注解）', () => {
   const filler = '# 填充行，用于把危险语句推到报告内嵌上限之外\n'.repeat(1 + Math.ceil(MAX_TEXT / 60));
   const body = filler + '\nsetenforce 0\n';
   const p = writeZip('late-payload.zip', [
@@ -684,12 +684,191 @@ test('端到端：payload 藏在 512 KB 之后照样被行级规则命中，同�
   assert.ok(big.bytes > MAX_TEXT, `样本必须超过内嵌上限，实际 ${big.bytes}`);
   assert.equal(big.truncated, true);
   const sel = r.findings.find((f) => f.ruleId === 'SELINUX_DISABLE');
-  assert.ok(sel, '规则必须跑全文：藏在尾部的 setenforce 不能因为报告截断而漏掉');
-  assert.ok(sel.line > 1000, `命中的是尾部行，实际第 ${sel && sel.line} 行`);
-  assert.equal(r.riskLevel, 'high');
+  // 注解（Task 2.9）：原断言是 `assert.ok(sel, '规则必须跑全文：藏在尾部的 setenforce 不能因为报告截断而漏掉')`
+  // —— 它钉的是「行级规则跑全文」这条旧口径，与本轮「单条目字节上限」直接冲突：上限的意义就是
+  // 后缀不再逐行判过。现在改成断言「没读到」，而「读到一半 ≠ 干净」由下面那条截断记录兜住。
+  assert.ok(!sel, '上限之后的字节没有喂给行级规则（旧期望：必须命中，已随 2.9 的字节上限作废）');
+  // 注解（Task 2.9）：原断言是 `assert.ok(sel.line > 1000, '命中的是尾部行')` —— 随上一条一起作废，
+  // 换成「这条载荷根本没进规则输入」的可复核证据：实扫字节数必须明显小于原文。
+  assert.ok(big.scanBytes <= CAP29 && big.scanBytes > CAP29 - 4,
+    `实扫字节必须贴住上限（UTF-8 码点边界最多回退 3 B），实际 ${big.scanBytes} / 上限 ${CAP29}`);
+  assert.ok(big.bytes > big.scanBytes * 10, `样本要在上限之外留出一大段，实际 ${big.bytes} B`);
+  assert.equal(r.riskLevel, 'medium', '旧期望 high（载荷命中）→ 新期望 medium：等级只能由截断记录撑起来');
   assert.ok(r.findings.some((f) => f.ruleId === 'AUDIT_COVERAGE_TRUNCATED'), '看不全本身也要报，挡住自动放行');
+  const cov = r.findings.find((f) => f.ruleId === 'AUDIT_COVERAGE_TRUNCATED');
+  assert.equal(cov.file, 'customize.sh', '记录必须指名是哪个条目');
+  assert.match(cov.message, /只喂进前/, '记录必须写出实际喂进规则多少字节');
+  assert.notEqual(r.decision.action, 'auto-approve', '读到一半永远换不到自动放行');
   assert.match(renderMarkdown(r), /包结构与审核覆盖度/);
   assert.match(renderMarkdown(r), /报告只内嵌前/);
+});
+
+// ---------------------------------------------------------------------------
+// Task 2.9：内容扫描的字节上限（单条目喂给行级规则的字节数）
+//
+// 上限常量在这里走**命名空间**取值而不是具名 import：red-first 阶段常量还不存在，
+// 具名 import 会让整个文件在加载期就抛（143 条一起红），拿不到「只有新用例红」这个数。
+// ---------------------------------------------------------------------------
+import * as scanMod29 from './scan.mjs';
+
+const CAP29 = scanMod29.MAX_SCAN_BYTES_PER_ENTRY;
+/** 41 B 一行（40 个 ASCII + 换行）的填充：条目总量超上限，但每行都短 ⇒ 行级规则本身线性，测试不被平方级拖住 */
+const LINE29 = '# filler line for byte cap 0123456789abcdef\n';
+const pad29 = (n) => LINE29.repeat(n);
+/** 载荷行放在「上限之前最后一整行」与「上限之后第一整行」用的行号 */
+const LINES_BEFORE29 = Math.floor((CAP29 || 24576) / LINE29.length);
+const BYTE_AT29 = (n) => n * LINE29.length;
+
+test('T2.9-①：载荷落在上限之内 ⇒ ruleId / 级别 / 行号 / 决策与不设上限时一模一样', () => {
+  assert.ok(Number.isFinite(CAP29) && CAP29 > 0, `MAX_SCAN_BYTES_PER_ENTRY 必须是正数，实际 ${CAP29}`);
+  // 载荷在第 LINES_BEFORE29+1 行：它的起始字节 BYTE_AT29(LINES_BEFORE29) < 上限，整行也在上限之内。
+  const body = pad29(LINES_BEFORE29) + 'setenforce 0\n' + pad29(2000);
+  assert.ok(BYTE_AT29(LINES_BEFORE29) + 'setenforce 0\n'.length <= CAP29,
+    '夹具必须把载荷整行放在上限之内');
+  assert.ok(Buffer.byteLength(body) > CAP29, '夹具必须超过上限，否则测的是另一件事');
+  const p = writeZip('cap-early.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'customize.sh', content: body },
+  ]);
+  const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+  const sel = r.findings.find((f) => f.ruleId === 'SELINUX_DISABLE');
+  assert.ok(sel, '上限只许让扫描更早停，不许让上限之内的载荷漏掉');
+  assert.equal(sel.severity, 'high', '级别必须与 f79b784 一致');
+  assert.equal(sel.file, 'customize.sh');
+  assert.equal(sel.line, LINES_BEFORE29 + 1, `行号必须与 f79b784 一致（第 ${sel.line} 行）`);
+  assert.equal(sel.snippet, 'setenforce 0');
+  assert.equal(r.riskLevel, 'high', '与 f79b784 同判 high');
+  assert.equal(r.decision.action, 'block', '与 f79b784 同判 block');
+  // 后面的字节确实没读 ⇒ 截断同时记账（两条并存：命中照旧，覆盖度缺口也照实说）
+  assert.ok(r.findings.some((f) => f.ruleId === 'AUDIT_COVERAGE_TRUNCATED'),
+    '条目超限却没记截断 ⇒ 上限成了「读到一半就算读完」');
+});
+
+test('T2.9-②：载荷落在上限之后 ⇒ 记 AUDIT_COVERAGE_TRUNCATED，且绝不是「0 命中 / low / auto-approve」', () => {
+  const payloadLine = LINES_BEFORE29 + 2; // 起始字节 = BYTE_AT29(LINES_BEFORE29+1) > CAP29
+  assert.ok(BYTE_AT29(payloadLine - 1) > CAP29, '夹具必须把载荷整行放到上限之外');
+  const body = pad29(payloadLine - 1) + 'setenforce 0\n' + pad29(2000);
+  const p = writeZip('cap-late.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'customize.sh', content: body },
+  ]);
+  const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+  assert.ok(!r.findings.some((f) => f.ruleId === 'SELINUX_DISABLE'),
+    '上限之后的字节确实没喂给行级规则 —— 这条断言是「上限真的生效」的证据');
+  const cov = r.findings.filter((f) => f.ruleId === 'AUDIT_COVERAGE_TRUNCATED');
+  assert.equal(cov.length, 1, JSON.stringify(cov));
+  assert.equal(cov[0].file, 'customize.sh', '必须指名是哪个条目');
+  assert.equal(countsTowardRisk(cov[0]), true, '「读不完」必须参与定级，不许是 info');
+  assert.ok(SEVERITY_ORDER[cov[0].severity] >= SEVERITY_ORDER.medium, '截断记录的级别不得低于 medium');
+  const size = Buffer.byteLength(body);
+  assert.match(cov[0].message, new RegExp(String(size)), 'message 要写出原始字节数');
+  assert.match(cov[0].message, new RegExp(String(CAP29)), 'message 要写出实际喂进去的字节数');
+  assert.match(cov[0].snippet, new RegExp(`${size}.*${CAP29}|${size}`), 'snippet 要带上原始/实扫字节两个数');
+  assert.notEqual(r.findings.length, 0, '载荷被上限挡住时，findings 不能归零');
+  assert.notEqual(r.riskLevel, 'low', '「读到一半」不等于「干净」');
+  assert.notEqual(r.decision.action, 'auto-approve', '上限不许开出一条自动放行的门');
+});
+
+test('T2.9 硬边界：任何进入扫描面的条目形状，载荷挪到上限之后都只能换来更严的结论', () => {
+  // 「上限只能让扫描更早停」这条不变量的覆盖面：不同桶、不同文件名形状都要拦住。
+  // 每个形状都跑两遍 —— 载荷在上限前 / 载荷在上限后 —— 后者必须仍然不是 auto-approve。
+  const shapes = [
+    ['customize.sh', 'canonicalScripts'],
+    ['webroot/helper.js', 'otherScripts'],
+    ['sepolicy.rule', 'policyFiles'],
+    ['system.prop', 'props'],
+    ['META-INF/com/google/android/update-binary', 'handlers'],
+  ];
+  for (const [name, bucket] of shapes) {
+    const late = pad29(LINES_BEFORE29 + 1) + 'setenforce 0\n' + pad29(1500);
+    const p = writeZip(`cap-shape-${bucket}.zip`, [
+      { name: 'module.prop', content: CLEAN_PROP },
+      { name, content: late },
+    ]);
+    const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+    const rows = r.inventory[bucket] || [];
+    assert.ok(rows.some((x) => x.name === name), `${name} 没进扫描面，本条用例测不到它`);
+    const cov = r.findings.filter((f) => f.ruleId === 'AUDIT_COVERAGE_TRUNCATED' && f.file === name);
+    assert.equal(cov.length, 1, `${name}：超限必须记账，实际 ${JSON.stringify(r.findings.map((f) => f.ruleId))}`);
+    assert.notEqual(r.riskLevel, 'low', `${name}：只读到前缀就判 low 等于「读到一半 = 干净」`);
+    assert.notEqual(r.decision.action, 'auto-approve', `${name}：上限之后不许通向自动放行`);
+  }
+  // module.prop 走的是 propEntry 那条独立通道（不在扫描面上时也要记账）
+  const bigProp = CLEAN_PROP + pad29(LINES_BEFORE29 + 1) + 'setenforce 0\n' + pad29(1500);
+  const p2 = writeZip('cap-shape-module.prop.zip', [{ name: 'module.prop', content: bigProp }]);
+  const r2 = scanZip(p2, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+  assert.ok(r2.findings.some((f) => f.ruleId === 'AUDIT_COVERAGE_TRUNCATED' && f.file === 'module.prop'),
+    'module.prop 走 propFindings 通道时同样要记截断');
+  assert.notEqual(r2.decision.action, 'auto-approve');
+});
+
+test('T2.9：上限就是报告里写的那个阈值，且它低于报告内嵌上限才有意义', () => {
+  assert.ok(CAP29 < MAX_TEXT,
+    `单条目上限必须低于内嵌上限 MAX_TEXT=${MAX_TEXT}，否则单行超长样本还在闸外（实测 512 KB 单行 ≈ 数分钟）`);
+  const body = pad29(1200);
+  const p = writeZip('cap-limits.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'customize.sh', content: body },
+  ]);
+  const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+  assert.equal(r.structure.limits.MAX_SCAN_BYTES_PER_ENTRY, CAP29,
+    '报告里的阈值必须就是这次真正生效的那个（与 MAX_ENTRY_UNCOMPRESSED 同一口径）');
+  const md = renderMarkdown(r);
+  assert.match(md, /行级规则的输入上限/, '报告要写明行级规则的输入上限');
+  assert.doesNotMatch(md, /行级规则跑的仍是全文/, '上限之后这句话就是假话');
+});
+
+test('T2.9：截断点退到 UTF-8 码点边界 —— 半截多字节字符不许变成 U+FFFD 混进规则输入', () => {
+  // 1 个 ASCII + 若干 3 字节汉字 ⇒ 上限落点正卡在某个汉字的中间， naive 的 slice 会切出残缺序列。
+  const body = 'a' + '中文载荷'.repeat(1 + Math.ceil(CAP29 / 12));
+  assert.ok(Buffer.byteLength(body) > CAP29, '夹具必须超过上限');
+  const p = writeZip('cap-utf8.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'customize.sh', content: body },
+  ]);
+  const { files } = readZip(p);
+  const f = files.find((x) => x.name === 'customize.sh');
+  assert.equal(f.scanCapped, true);
+  assert.ok(f.scanBytes <= CAP29, `实扫字节 ${f.scanBytes} 必须 ≤ 上限 ${CAP29}`);
+  assert.equal(Buffer.byteLength(f.scanText, 'utf8'), f.scanBytes, '记账的字节数必须就是喂进去的字节数');
+  assert.ok(!f.scanText.includes('\uFFFD'), `喂进去的前缀里有残缺码点：${JSON.stringify(f.scanText.slice(-8))}`);
+  assert.ok(f.content.length > f.scanText.length, '全文仍然要留着（报告/产物靠它，上限只管行级规则的输入）');
+});
+
+test('T2.9：没超限的条目一个字节都不许多记 —— 上限不产生噪声也不改变结论', () => {
+  const body = pad29(50);
+  assert.ok(Buffer.byteLength(body) < CAP29, '夹具必须在上限之内');
+  const p = writeZip('cap-small.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'customize.sh', content: body },
+    { name: 'service.sh', content: '#!/system/bin/sh\nexit 0\n' },
+  ]);
+  const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+  assert.equal(r.findings.length, 0, JSON.stringify(r.findings));
+  assert.equal(r.riskLevel, 'low');
+  assert.equal(r.decision.action, 'auto-approve', '干净且没超限的小模块照旧自动放行 —— 上限不许收紧这一格');
+  const row = r.inventory.canonicalScripts.find((s) => s.name === 'customize.sh');
+  assert.equal(row.scanCapped, false, '未超限的条目不许标成截断');
+  assert.equal(row.scanBytes, Buffer.byteLength(body), '未超限时实扫字节数就是条目大小');
+});
+
+test('T2.9 方向②续：被引用升级进来的大条目同样受上限约束，且记账指到那个条目', () => {
+  // 载荷不在脚本桶里（改名 .dat），由 service.sh 引用它而升级进扫描面 ——
+  // 升级进来的条目要是绕开上限，P11 扩面之后这条就是漏口。
+  const payload = pad29(LINES_BEFORE29 + 1) + 'setenforce 0\n' + pad29(1500);
+  const p = writeZip('cap-escalated.zip', [
+    { name: 'module.prop', content: CLEAN_PROP },
+    { name: 'service.sh', content: '#!/system/bin/sh\nsh /data/adb/modules/cool_mod/stage.dat\n' },
+    { name: 'stage.dat', content: payload },
+  ]);
+  const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
+  assert.deepEqual(r.escalated.map((e) => e.resolvedEntry), ['stage.dat'], '夹具前提：stage.dat 被升级进扫描面');
+  assert.ok(!r.findings.some((f) => f.ruleId === 'SELINUX_DISABLE'), '上限之后的载荷不该被读到（上限生效）');
+  const cov = r.findings.find((f) => f.ruleId === 'AUDIT_COVERAGE_TRUNCATED' && f.file === 'stage.dat');
+  assert.ok(cov, '升级进来的条目超限也必须记账', JSON.stringify(r.findings.map((f) => f.ruleId)));
+  assert.equal(SEVERITY_ORDER[cov.severity] >= SEVERITY_ORDER.medium, true);
+  assert.notEqual(r.decision.action, 'auto-approve');
+  assert.notEqual(r.riskLevel, 'low');
 });
 
 test('端到端：声明解压 1 GB 的条目按 zip bomb 拦下', () => {
