@@ -253,6 +253,44 @@ export const HOSTS_MODIFY = makeLineRule({
 // ②-b 载荷间接执行（execution）
 // ---------------------------------------------------------------------------
 
+/**
+ * fix5-F1：「这一整行就是一份模块路径清单」的判据 —— 只给 EXEC_BUNDLED_FILE 命令位那一支的
+ * **行首形态**用（那一支的承诺是「这一行的第一个词就是被执行的模块路径」）。
+ * 实测反例（PerformanC_ReZygisk 的 stock update-binary 第 177-179 行）：
+ *   rm -rf \
+ *   $MODPATH/system/placeholder $MODPATH/customize.sh \
+ *   $MODPATH/README.md $MODPATH/.git* 2>/dev/null
+ * 那两行是上一条 `rm -rf` 的参数续行，一行里没有任何东西被执行；照抄官方模板的包每个白送两条 high。
+ * 三个条件同时成立才算清单（条件③是刻意留的：行尾停在路径上时它更像「拿第二个路径当参数执行第一个」，
+ * 那一支照旧说话，所以 `$MODDIR/payload.bin $MODDIR/cfg` 仍然是发现）：
+ *   ① 空白分词后 ≥2 个 token 以模块目录前缀开头（只有一个不算：`$MODDIR/tool.bin` 单独一行就是执行）；
+ *   ② 其余 token 只能是重定向（`2>/dev/null`）、续行反斜杠或引号残留 —— 混进任何别的词（选项、参数、
+ *      管道）就不当它是清单；
+ *   ③ 行尾停在续行反斜杠或重定向上。
+ * 这条豁免只作用于「报不报」：scan.mjs 的 resolveBundledRefs 跑的是原始 pattern、不看 exclude，
+ * 所以清单行引用的条目照样被拉进扫描面逐行读（见 scan.test.mjs 的 fix5-F1 端到端用例）。
+ */
+const MOD_PATH_TOKEN = /^(?:\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/]|\/data\/adb\/modules\/)/;
+// 命令位那一支的行首匹配：整个匹配从「可选引号 + 模块路径」开始，里面没有任何动词。
+const BARE_MOD_PATH_MATCH = /^["']?(?:\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/]|\/data\/adb\/modules\/)/;
+const UNQUOTE_EDGE = /^["']+|["']+$/g;
+
+function isModulePathListLine(line) {
+  const tokens = String(line).trim().split(/\s+/);
+  if (!tokens[0]) return false;
+  let paths = 0;
+  for (const token of tokens) {
+    const bare = token.replace(UNQUOTE_EDGE, '');
+    if (bare === '' || /^\\+$/.test(bare)) continue;   // 引号残留 / 续行反斜杠
+    if (/[<>]/.test(bare)) continue;                    // 重定向（`2>/dev/null`）
+    if (MOD_PATH_TOKEN.test(bare.replace(/\\/g, '/'))) { paths++; continue; }
+    return false;                                       // 别的词：这不是清单
+  }
+  if (paths < 2) return false;
+  const last = tokens[tokens.length - 1].replace(UNQUOTE_EDGE, '');
+  return last === '' || /^\\+$/.test(last) || /[<>]/.test(last);
+}
+
 export const EXEC_BUNDLED_FILE = makeLineRule({
   anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'EXEC_BUNDLED_FILE', category: 'execution', severity: 'high',
@@ -260,7 +298,15 @@ export const EXEC_BUNDLED_FILE = makeLineRule({
   // 注释行里的引用不是执行，按本仓既有先例豁免（HARDCODED_IP / SUSPICIOUS_DOMAIN / PRIVACY_SECRET
   // 都用 exclude: /^\s*#/）。豁免只作用于「报不报」：被引用的条目照样进扫描面，
   // 见 scan.mjs 的 resolveBundledRefs —— 它跑的是原始 pattern，不看 exclude。
-  exclude: /^\s*#/,
+  // fix5-F1 追加第二条豁免：纯模块路径清单（上一条命令的参数续行）不是执行，见上面
+  // isModulePathListLine 的三个判据。它只看「行首那一支」的匹配，动词式与 `&&`/`||`/`(`/`;`
+  // 之后的那一支照旧说话（实测真包里 `$(…)` 与 JS 的 exec('…') 都走后面那一支）。
+  exclude(m, line) {
+    if (/^\s*#/.test(line)) return true;
+    if (!BARE_MOD_PATH_MATCH.test(m[0])) return false;       // 不是行首那一支，管不着
+    if (!/^[\s]*$/.test(line.slice(0, m.index))) return false; // 前面还有词，不是行首形态
+    return isModulePathListLine(line);
+  },
   // 两种写法都要认：
   //   ① 动词式：`[busybox ]sh / bash / ash / source / . / exec / setsid / nohup` + 分隔 + 引号? + 模块目录路径；
   //   ② 命令位式：路径本身就在命令位（行首，或 ; && || ( { 之后）—— 那是「直接执行 $MODDIR/tool.bin」
@@ -278,7 +324,11 @@ export const EXEC_BUNDLED_FILE = makeLineRule({
   // 所以「目标是已被逐行扫过的条目就撤掉这条 finding」写在 scan.mjs，不写在 pattern 里。
   // 后缀排除之所以必须删：classify() 让魔数赢过后缀，于是 ELF 改名 payload.js 时
   // 「后缀 .js」=「已被扫描」这个假设根本不成立。
-  pattern: /(?:^|[\s;&|({["'])(?:(?:busybox\s+)?sh|bash|ash|source|\.(?!\d)|exec|setsid|nohup)(?:\s*(?:\$\{?IFS\}?)?\s*)["']?(?:\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/]|\/data\/adb\/modules\/)[^\s"']+|(?:^[\s]*|(?:&&|\|\||[;|({])[\s]*)["']?(?:\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/]|\/data\/adb\/modules\/)[^\s"']+/,
+  // fix5-F1：dot-source 那个动词以前写成 `\.(?!\\d)` —— 它只挡了 `.0` 这种数字开头，
+  // 却把文件名里那个点当成了 source 内建（`.` 只有独立成词才是动词）。现在要求动词后面
+  // 紧跟空白或 ${IFS}：`.$MODPATH/x` 展开成 `.data/adb/modules/…` 那种相对文件名，不再算执行；
+  // `. $MODDIR/functions`、`.${IFS}$MODPATH/x` 这些真 source 一个字都没动。
+  pattern: /(?:^|[\s;&|({["'])(?:(?:busybox\s+)?sh|bash|ash|source|\.(?=\s|\$\{?IFS)|exec|setsid|nohup)(?:\s*(?:\$\{?IFS\}?)?\s*)["']?(?:\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/]|\/data\/adb\/modules\/)[^\s"']+|(?:^[\s]*|(?:&&|\|\||[;|({])[\s]*)["']?(?:\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/]|\/data\/adb\/modules\/)[^\s"']+/,
   advice: '脚本执行了模块自带的另一个文件。审核必须把那个文件也当作可执行文本读一遍 —— 只扫被执行的这一行等于什么都没扫。',
 });
 
@@ -303,6 +353,8 @@ export const EXEC_INDIRECT = makeLineRule({
   },
   // ① 解释器/前导动词 + 空白 + 引号? + $VAR；② do/then/else + $VAR。
   // 两处都用负先行排除 MODPATH|MODDIR|TMPMODDIR 三个前缀变量（交给 EXEC_BUNDLED_FILE）。
+  // fix5-F1 顺手核对过同一份动词表里的 `.`：这条的动词后面本来就写死了 `\s+`，
+  // 所以 `.` 在这条里只能独立成词，没有 EXEC_BUNDLED_FILE 那个「文件名里的点」的问题。
   pattern: /(?:^|[\s;&|({["'])(?:(?:busybox\s+)?sh|bash|ash|source|\.|exec|setsid|nohup)\s+["']?\$\{?(?!\{?(?:MODPATH|MODDIR|TMPMODDIR)\b)([A-Za-z_][A-Za-z0-9_]*)|(?:^|[\s;&|(])(?:do|then|else)\s+\$\{?(?!\{?(?:MODPATH|MODDIR|TMPMODDIR)\b)([A-Za-z_][A-Za-z0-9_]*)/,
   advice: '脚本经变量间接执行一个目标；扫描器能否把变量钉成包内具体路径由 scanZip 判定，钉不住就按未验证引用处理。',
 });

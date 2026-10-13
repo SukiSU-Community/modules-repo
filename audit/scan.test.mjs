@@ -2377,3 +2377,203 @@ test('fix4-P14 端到端：同一族的前缀写法一起进报告，不再靠�
   assert.equal(r.riskLevel, 'high');
   assert.equal(r.decision.action, 'block');
 });
+
+// ===========================================================================
+// fix5（第五轮）—— F1：文件名里的点被当成 dot-source 动词 / 命令位那一支把清理清单读成执行
+// ===========================================================================
+// 简报在 PerformanC_ReZygisk 的 stock update-binary 第 177-179 行实测到两条 high：
+//   rm -rf \
+//   $MODPATH/system/placeholder $MODPATH/customize.sh \        <- 实测 high
+//   $MODPATH/README.md $MODPATH/.git* 2>/dev/null              <- 实测 high
+// 而同一个文件第 153 行 `[ -f $MODPATH/customize.sh ] && . $MODPATH/customize.sh` 才是真的 source。
+// 上面那两行是上一条 `rm -rf` 的**参数续行清单**，一行里没有任何东西被执行。
+// 实测归因（见任务报告）：这两条命中来自「命令位那一支」的**行首形态**，不是 dot-source 那一支；
+// 两支都要收窄，理由不同，谁也不是装饰：
+//   * dot-source 那一支：`.` 只有独立成词才是 source 内建，所以动词后面必须跟空白或 ${IFS}。
+//     `.$MODPATH/x` 展开成 `.data/adb/modules/…` 那种相对文件名，`customize.sh` 里那个点更是文件名。
+//   * 命令位那一支：行首形态的承诺是「这一行的第一个词就是被执行的模块路径」，而一整行都只是
+//     模块路径清单、行尾停在续行反斜杠或重定向上时，它是上一条命令的参数表 —— Magisk 官方模板
+//     就是这么写的，于是每个照抄模板的包都白送两条 high。
+// 收窄只作用于「报不报」：被引用的条目照样被 resolveBundledRefs 拉进扫描面（它跑原始 pattern，
+// 不看 exclude），所以下面的端到端用例同时钉住「清单行不报」与「清单行引用的东西照样被读过」。
+
+test('fix5-F1：`rm -rf` 续行的纯路径清单 0 命中；同文件那行真 source 仍 high', () => {
+  const CONT1 = '$MODPATH/system/placeholder $MODPATH/customize.sh \\';
+  const CONT2 = '$MODPATH/README.md $MODPATH/.git* 2>/dev/null';
+  const REAL_SOURCE = '[ -f $MODPATH/customize.sh ] && . $MODPATH/customize.sh';
+  // 包里的原文（简报贴的那两串是报告 snippet 的外层加引号渲染，见下面一组）
+  for (const line of [CONT1, CONT2]) {
+    assertNoHit('EXEC_BUNDLED_FILE', line, `刷写清理清单不是执行：${line}`);
+  }
+  // 简报实测字符串本身，同样 0 命中
+  for (const line of [`"${CONT1}"`, `"${CONT2}"`]) {
+    assertNoHit('EXEC_BUNDLED_FILE', line, `snippet 渲染形态同样不许命中：${line}`);
+  }
+  // 第三行是真的 source：必须还是 high，且是这一行唯一的解释
+  const h = assertHit('EXEC_BUNDLED_FILE', REAL_SOURCE, REAL_SOURCE);
+  assert.equal(h.length, 1, `一行只该有一条发现：${JSON.stringify(h)}`);
+  assert.equal(h[0].severity, 'high', `真 source 那行不许被顺手降档：${JSON.stringify(h[0])}`);
+  // 命令位那一支本身不许被关掉：一个路径开头、后面是参数/重定向/到行尾，那仍是「直接执行」
+  for (const line of [
+    '$MODDIR/tool.bin',
+    '  "$MODDIR/tool.bin" --help',
+    '$MODDIR/tool.bin > /dev/null',
+    '$MODDIR/payload.bin $MODDIR/cfg',
+    '$MODDIR/payload.bin $MODDIR/cfg --force',
+    '$MODDIR/payload.bin $MODDIR/cfg | tee log',
+    'do_thing || $MODDIR/stage2.bin',
+  ]) {
+    assertHit('EXEC_BUNDLED_FILE', line, `行首命令位形态必须照旧说话：${line}`);
+  }
+});
+
+test('fix5-F1：`.` 作动词要独立成词 —— 后接空白或 ${IFS}；`.$MODPATH/x` 是相对文件名', () => {
+  for (const line of [
+    '. $MODDIR/functions',
+    '.  $MODPATH/customize.sh',
+    '. ${MODDIR}/functions',
+    '.\t$MODPATH/x',
+    '. "$MODPATH/customize.d/00-verify-resources.sh"',
+    '.${IFS}$MODPATH/x',
+  ]) {
+    assertHit('EXEC_BUNDLED_FILE', line, `真 dot-source：${line}`);
+  }
+  // 点后面紧跟名字字符 = 文件名的一部分，不是 source 内建：这里以前被 `\.(?!\\d)` 放过
+  for (const line of [
+    'cp .$MODPATH/payload /tmp/',
+    'chmod 755 .$MODPATH/x',
+    'rm -rf .$MODPATH/.cache "$TMPDIR/out"',
+  ]) {
+    assertNoHit('EXEC_BUNDLED_FILE', line, `点是文件名的一部分，不是动词：${line}`);
+  }
+});
+
+test('fix5-F1 端到端：清理清单不再送 high，真 source 照旧，被引用条目照旧进扫描面', async () => {
+  const ub = [
+    '#!/system/bin/sh',
+    'rm -rf \\',
+    '$MODPATH/system/placeholder $MODPATH/customize.sh \\',
+    '$MODPATH/README.md $MODPATH/.git* 2>/dev/null',
+    '[ -f $MODPATH/customize.sh ] && . $MODPATH/customize.sh',
+  ].join('\n') + '\n';
+  const zip = makeModuleZip({ id: 'eval.f5f1', files: [
+    ['module.prop', moduleProp('eval.f5f1')],
+    ['META-INF/com/google/android/update-binary', ub],
+    ['system/placeholder', 'setenforce 0\n'],
+  ] });
+  const r = await scanToReport(zip, { changeType: 'first' });
+  const eb = r.findings.filter((f) => f.ruleId === 'EXEC_BUNDLED_FILE');
+  assert.deepEqual(eb.map((f) => f.line), [5],
+    `清单那两行（3、4）不许报，真 source 那行（5）照报：${JSON.stringify(eb.map((f) => `${f.line}[${f.snippet}]`))}`);
+  assert.equal(eb[0].severity, 'high', '真 source 那行仍是 high');
+  // 豁免只作用于报不报：清单行引用的 system/placeholder 照样被拉进扫描面并逐行读过
+  assert.deepEqual(r.escalated.map((e) => e.resolvedEntry), ['system/placeholder'],
+    `扫描面不许因为这条豁免而缩小：${JSON.stringify(r.escalated)}`);
+  assert.ok(r.findings.some((f) => f.ruleId === 'SELINUX_DISABLE' && f.file === 'system/placeholder'),
+    `被引用的载荷必须真的被读过：${JSON.stringify(r.findings.map((f) => `${f.ruleId}@${f.file}:${f.line}`))}`);
+  assert.equal(r.riskLevel, 'high', '整包定级不因为这 FP 撤掉而变松');
+});
+
+// ===========================================================================
+// fix5（第五轮）—— F2：DEBUGGABLE_ENABLE 不看值，把「把属性刷回安全值」当成罪状
+// ===========================================================================
+// 简报实测（snake-4/Zygisk-Assistant 的 post-fs-data.sh，这个模块的全部工作就是刷回锁定值）：
+//   medium  resetprop_if_diff ro.secure 1        <- 加固，不是罪状
+//   medium  resetprop_if_diff ro.debuggable 0    <- 加固，不是罪状
+//   medium  resetprop ro.secure 0                <- 削弱，必须报
+//   medium  resetprop ro.debuggable 1            <- 削弱，必须报
+// 旧 pattern 的尾巴是 `[=\s]+[01]\b`：`0` 和 `1` 两个方向都收，于是它给这个包白送 2 条 medium，
+// 把整包 medium 从 7 顶到 9 —— 报的还是「作者在恢复安全」这件事本身。
+// 收窄必须和 .prop 那一侧一起收：fix3-P9 的 PROP_SECURITY_WEAKEN 认的是「具名键 + 削弱值」四对
+// （ro.debuggable=1 / ro.secure=0 / ro.adb.secure=0 / service.adb.root=1），脚本侧以前只认两个键
+// 且不看值。两边各写一份字面量就会各说各话 —— 所以键值对只许有一份，导出成常量，两条规则都从它生成。
+
+test('fix5-F2：DEBUGGABLE_ENABLE 认得值 —— 加固值 0 命中，削弱值照旧 medium', () => {
+  // 简报那四行的原样复现
+  const WEAKEN = [
+    'resetprop ro.secure 0',
+    'resetprop ro.debuggable 1',
+    'setprop ro.debuggable 1',
+    'resetprop -w ro.adb.secure 0',
+    'setprop service.adb.root 1',
+    'resetprop_if_diff ro.secure 0',
+    'su -c "resetprop -n ro.debuggable 1"',
+    'resetprop ro.secure=0',
+  ];
+  const HARDEN = [
+    'resetprop_if_diff ro.secure 1',
+    'resetprop_if_diff ro.debuggable 0',
+    'resetprop_if_diff ro.adb.secure 1',
+    'resetprop_if_diff service.adb.root 0',
+    'resetprop ro.secure 1',
+    'setprop ro.debuggable 0',
+    'resetprop -n ro.adb.secure 1',
+    'setprop service.adb.root=0',
+    'resetprop ro.secure 01',                   // 不是那个具名值
+    'resetprop ro.secure 10',
+    'resetprop ro.debuggable 12',
+  ];
+  for (const line of WEAKEN) {
+    const h = assertHit('DEBUGGABLE_ENABLE', line, line);
+    assert.equal(h[0].severity, 'medium', `削弱值仍是 medium：${line}`);
+  }
+  for (const line of HARDEN) assertNoHit('DEBUGGABLE_ENABLE', line, `这是安全值，不是 offence：${line}`);
+});
+
+test('fix5-F2：脚本侧与 .prop 侧共用同一份「键→削弱值」表，两个方向都不许各说各话', async () => {
+  const PAIRS = (await import('./risk-rules.mjs')).SECURITY_WEAKEN_PAIRS;
+  assert.ok(Array.isArray(PAIRS) && PAIRS.length >= 4,
+    `两条规则必须从同一份导出的键值表生成，实际 ${JSON.stringify(PAIRS)}`);
+  const OPPOSITE = { '0': '1', '1': '0' };
+  for (const pair of PAIRS) {
+    assert.ok(pair && pair.key && OPPOSITE[pair.weaken], `表里每一项都要是 { key, weaken }：${JSON.stringify(pair)}`);
+    const { key, weaken } = pair;
+    const safe = OPPOSITE[weaken];
+    // 同一对 (键, 削弱值) 在两侧都得说话，同一个 (键, 安全值) 在两侧都得沉默 —— 少一项就是各说各话
+    assertHit('DEBUGGABLE_ENABLE', `resetprop ${key} ${weaken}`, `脚本侧要认削弱值：${key} ${weaken}`);
+    assertHit('DEBUGGABLE_ENABLE', `setprop ${key}=${weaken}`, `脚本侧要认 = 写法：${key}=${weaken}`);
+    assertNoHit('DEBUGGABLE_ENABLE', `resetprop ${key} ${safe}`, `脚本侧不许把加固值当罪状：${key} ${safe}`);
+    assertHit('PROP_SECURITY_WEAKEN', `${key}=${weaken}`, `.prop 侧要认削弱值：${key}=${weaken}`);
+    assertNoHit('PROP_SECURITY_WEAKEN', `${key}=${safe}`, `.prop 侧不许把加固值当罪状：${key}=${safe}`);
+    // 一种输入形状只许由一条规则说话，同一件事不许双报
+    assertNoHit('PROP_SECURITY_WEAKEN', `resetprop ${key} ${weaken}`, '脚本那一行归脚本侧：' + key);
+    assertNoHit('DEBUGGABLE_ENABLE', `${key}=${weaken}`, '属性文件那一行归文件侧：' + key);
+  }
+  // 表的键集与两条规则的 pattern 字面量同源：表里每一对都要出现在两边的 pattern.source 里
+  for (const [id, rule] of [['DEBUGGABLE_ENABLE', RULES_BY_ID.DEBUGGABLE_ENABLE], ['PROP_SECURITY_WEAKEN', RULES_BY_ID.PROP_SECURITY_WEAKEN]]) {
+    for (const { key, weaken } of PAIRS) {
+      const esc = key.replace(/\./g, '\\.');
+      assert.ok(rule.pattern.source.includes(esc), `${id} 的 pattern 里没有表里的键 ${key} —— 那份键表是抄的，不是同源的`);
+      assert.ok(new RegExp(`${esc}[^|;&\\n]*?[=\\s]*${weaken}\\b`).test(rule.pattern.source)
+        || new RegExp(`${esc}\\s*=\\s*${weaken}`).test(rule.pattern.source),
+        `${id} 的 pattern 里 ${key} 没和削弱值 ${weaken} 配成一对：${rule.pattern.source}`);
+    }
+  }
+});
+
+test('fix5-F2 端到端：把属性刷回锁定值的模块不再白送 medium，真削弱那行照旧报', async () => {
+  const hardening = await scanToReport(makeModuleZip({ id: 'eval.f5f2a', files: [
+    ['module.prop', moduleProp('eval.f5f2a')],
+    ['post-fs-data.sh', ['#!/system/bin/sh',
+      'resetprop_if_diff ro.adb.secure 1',
+      'resetprop_if_diff ro.debuggable 0',
+      'resetprop_if_diff ro.secure 1',
+      'resetprop_if_diff service.adb.root 0'].join('\n') + '\n'],
+  ] }), { changeType: 'first' });
+  assert.deepEqual(hardening.findings.filter((f) => f.ruleId === 'DEBUGGABLE_ENABLE'), [],
+    `恢复安全值不是罪状：${JSON.stringify(hardening.findings.map((f) => `${f.ruleId}@${f.line}`))}`);
+  assert.equal(hardening.counts.medium, 0, `这四行不该顶高任何 medium：${JSON.stringify(hardening.counts)}`);
+
+  const weakening = await scanToReport(makeModuleZip({ id: 'eval.f5f2b', files: [
+    ['module.prop', moduleProp('eval.f5f2b')],
+    ['post-fs-data.sh', ['#!/system/bin/sh',
+      'resetprop_if_diff ro.adb.secure 1',
+      'resetprop ro.debuggable 1',
+      'resetprop_if_diff ro.secure 1',
+      'setprop ro.adb.secure 0'].join('\n') + '\n'],
+  ] }), { changeType: 'first' });
+  const dbg = weakening.findings.filter((f) => f.ruleId === 'DEBUGGABLE_ENABLE');
+  assert.deepEqual(dbg.map((f) => f.line), [2, 4],
+    `同一份文件里的两条削弱值都要报、三条加固值都不报：${JSON.stringify(dbg.map((f) => f.line))}`);
+  assert.ok(dbg.every((f) => f.severity === 'medium'), JSON.stringify(dbg));
+});
