@@ -752,7 +752,12 @@ export function applyBundledRefVerdicts(findings = [], refs = [], writeInfo = nu
     const escalated = recs.find((r) => r.entries && r.entries.length);
     const unpinned = recs.find((r) => r.unpinned);
     const unresolved = recs.find((r) => !r.resolved);
-    const cause = escalated || unpinned || unresolved;
+    // Task 2.7：扩面之后「被引用但撤销不成立」的条目不再产生升级记录（它本来就在 feed 里），
+    // 于是同一行里「已撤销的常规写法 + 没被撤销的真载荷」这一格 cause 会全空，
+    // snippet 退回规则自己的最左匹配 —— 报告就把已经作过证的 `install.sh` 写成风险本体。
+    // 这一格补的是**作证的指向**，不是等级：撤销不成立的包内引用，指的就是它。
+    const culprit = recs.find((r) => r.resolved && !r.covered && !r.external && r.resolvedEntry);
+    const cause = escalated || culprit || unpinned || unresolved;
     if (cause) copy.snippet = trimSnippet(cause.ref);
     if (overridden) copy.advice = EXEC_OVERRIDDEN_ADVICE;
     else if (unpinned) copy.advice = EXEC_UNPINNED_ADVICE;
