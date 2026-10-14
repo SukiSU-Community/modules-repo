@@ -507,11 +507,23 @@ export const MODDIR_RUNTIME_WRITE = makeLineRule({
  *   downloadSinks(text) -> Map<归一化路径, 首个落地行>
  *   executedPaths(text) -> [{ path, line, kind }]
  *   交集：路径相等且执行行 > 落地行 ⇒ 一条链，报在执行行上
+ *
+ * Task 3.1（第二版，只动写法面）：`dteOutCluster` 收融合短选项簇与带值连写（`-qO <路径>` / `-sLo <路径>` /
+ * `-o<路径>`），`dteDownloader` 多认「命令位解析后末段是 curl/wget」这一格，`DTE_STDOUT_PATH` 继续把
+ * 标准输出形态挡在外面。上面那三行组合方式一字未改 —— 判据还是「路径精确相等 且 执行行 > 落地行」。
+ * 这一轮之后**仍然看不见**的（计划 §0.18 与工单 §2 点名的已知限度）：`DOWNLOADER=$(command -v curl)`
+ * 那一族（命令替换钉不住）、`bounded 90 "$BB" wget`（命令位是包装器）、位置参数当 sink（`-O "$2"`）、
+ * 控制词站在命令位（`if wget -qO …` / `if "$MODPATH/x" -h` —— 后者挡住的是**执行**那一半，
+ * sensitive-props 那条真链今天仍然 0 命中，见任务报告「工单与现实的差」）、下载 zip 解出脚本再执行、跨文件链。
  */
 
 /** 每文件每规则的上限：与工厂的 maxPerFile 同值，但基数是**链**（不是行、也不是执行形态数）。 */
 const MAX_DTE_CHAINS_PER_FILE = 20;
-/** 下载工具：只认这两个动词本身（`busybox wget` 那种前导形态不在本规则能力内，见任务报告已知限度）。 */
+/**
+ * 下载工具的字面量动词表。**Task 3.1 §2(b) 之后命令位的识别不止这张表**：
+ * 见 `dteDownloader` —— 它只额外认「解析变量后按 `/` 取的末段字面量等于 curl/wget」这一格，
+ * `busybox wget` 那种前导形态（命令位是 `busybox`）与 `bounded 90 "$BB" wget` 仍然不在能力内。
+ */
 const DTE_TOOLS = new Set(['curl', 'wget']);
 /**
  * 执行动词表（工单 §2 逐字钉死）：只有这五个词会把「它的参数」拿去跑。
@@ -521,6 +533,8 @@ const DTE_TOOLS = new Set(['curl', 'wget']);
  *     （工单 §3.9 把「下载 + chmod、没有执行」那一格列为已知限度：今天 low，T3 之后仍是 low）；
  *   * exec / setsid / nohup / busybox / xargs / env —— 与 ARG_ONLY_VERB 那一族的方向相反，
  *     本规则不扩这张表；要扩得另开一轮并补夹具。
+ * 下面 `chmod` 记的 mode（Task 3.1 §3 加的字段）本规则**一个都不看** —— 它只把 chmod 行当同一条链的证据
+ * 带进 snippet；「加成可执行」这句话由另一条规则 DOWNLOAD_TO_MODULE_EXEC 单独说，两条规则的判据互不借用。
  */
 const DTE_EXEC_VERBS = new Set(['sh', 'bash', 'ash', 'source', '.']);
 /** 语句边界符：被它们复位之后的第一个词同样站在命令位上 —— 与 PIPE_TO_SHELL / EXEC_BUNDLED_FILE
@@ -547,6 +561,33 @@ const DTE_URL = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*(\/[^?#]*)?$/i;
 const DTE_OUT_FLAG = /^(?:-[oO]|--output)$/;
 /** 目录前缀选项（wget 专有）：落地路径 = 目录 + URL 的 basename。 */
 const DTE_DIR_FLAG = /^(?:-P|--directory-prefix)$/;
+/**
+ * Task 3.1 §2(a)：融合短选项簇与带值连写。**只动写法面**——收的是「同一个 `-o`/`-O` 的拼法」，
+ * 不是「更少的证据」：值仍然要么紧跟在簇位之后，要么就是下一个词，路径判据一字未动。
+ *
+ * 真包的写法（计划 §0.18 逐字表）：`wget -qO "$MODPATH/resetprop-rs" …`（sensitive-props:207）、
+ * `curl -sLo …`（208）、`wget … -qO "$TMPDIR/$FILENAME" …`（tailscaled:29）、`curl -sLo x.tar.gz`（beszel:56）。
+ * 按 shell 的短选项簇语义，**第一个** `o`/`O` 就吃掉余下的一切：
+ *   `-qO` / `-sLo` → 后面没有剩余 ⇒ 值在下一个词；
+ *   `-o<path>` / `-O<path>` / `-qO<path>` → 剩余就是值（带值连写）；
+ *   `-sLoo` → 第一个 `o` 才是簇位，剩余 `o` 是它的值（一个相对路径，钉不住 ⇒ 不立 sink）——
+ *     工单 §2(a) 点名的正是这一格：末位是 `o` 不等于这一位是 `o`。
+ * 长选项（`--output=<path>`）走既有的 `=` 分支，这里**不碰**：`-` 后面紧跟 `-` 一律不认，
+ * 否则 `--output` 里那个 `o` 会被当成簇位、把 `utput` 当成路径。
+ * @returns {string|null} null = 这个词不是落盘簇；'' = 簇位后没有剩余（值在下一个词）；其余 = 带值连写的值
+ */
+function dteOutCluster(w) {
+  if (!/^-[^-]/.test(w)) return null;
+  const m = /^-[A-Za-z]*?[oO](.*)$/.exec(w);
+  return m ? m[1] : null;
+}
+/**
+ * 标准输出与描述符的写法不立 sink（工单 §2(a) 点名要**继续排除**的那一族）。
+ * 既有实现靠 `dteNormalize('-')` 返回 null 来挡 `-O -` / `-o-`；`-o/dev/stdout` 这种**带值连写**
+ * 走到路径判据时是个合法的绝对路径，所以这一格必须显式挡 —— 真包活样本：Yuri:46 `-qO- "$1"`、
+ * tailscaled:17 `-qO- "https://api.github.com/…" |`。
+ */
+const DTE_STDOUT_PATH = /^\/dev\/(?:std(?:out|err|in)|fd\/\d+)$/;
 
 /** ①②：去外层引号 + 去词尾反斜杠（与工厂的 logicalFirstToken 对命令位做的事一致，同一份 UNQUOTE_EDGE）。 */
 function dteWord(t) {
@@ -618,6 +659,29 @@ function dteResolveVars(s, assign) {
 }
 
 /**
+ * Task 3.1 §2(b)：命令位那个词「算不算下载器」。**这一族的口子比 §2(a) 小，而且边界是主控拍的，没扩**：
+ * 字面量 `curl`/`wget` 之外只多收一种 —— 先过 `dteResolveVars`（钉不住就原样），按 `/` 取末段，
+ * 末段去掉 `$`/`${}` 之后**字面量等于 `curl` 或 `wget`** 才算下载段。于是：
+ *   认 —— `$curl`（microG:27，同文件 17 行 `curl=$MODPATH/tools/curl/arm64eabi-v7a/curl` 解析后末段也是 curl）、
+ *         `$MODPATH/addon/curl`（Pixelify:686 自带二进制）、`/system/bin/wget` 这类同一族的绝对写法；
+ *   不认 —— `bounded 90 "$BB" wget -O "$2"`（AlwaysStrong:83：命令位是 `bounded`，要认出 `wget` 就得知道
+ *         `$BB` 指向什么，那是运行期探测出来的路径、可伪造且常跨文件 —— 写进已知限度，没实现）、
+ *         `"$DOWNLOADER" … -o "$ZIP_PATH.tmp"`（Integrity-Box:56：末段是 `DOWNLOADER` 而不是 `curl`，
+ *         它的值来自 `DOWNLOADER=$(command -v curl)` 命令替换，`dteLiteralAssignments` 按既有口径钉不住 ——
+ *         **这是故意的**，放宽它等于承认「谁都能把自己伪装成 wget」）、
+ *         `if wget -qO …`（sensitive-props:207：命令位是 `if`，末段不是 curl/wget ⇒ 这一行的 sink
+ *         只能由 208 那半句 `curl -sLo` 立 —— 控制词穿透不在本轮授权面内，见任务报告「工单与现实的差」）。
+ * 长度守卫：`--`/`-` 开头的词是选项位，不是命令位（否则 `--curl` 这种词会被当成下载器）。
+ */
+function dteDownloader(word, assign) {
+  if (DTE_TOOLS.has(word)) return true;
+  if (!word || word.startsWith('-')) return false;
+  const last = String(dteResolveVars(word, assign)).split('/').pop() || '';
+  const bare = last.replace(/^\$\{?/, '').replace(/\}$/, '');
+  return bare === 'curl' || bare === 'wget';
+}
+
+/**
  * 归一化：①②③ + 变量替换，然后判「这到底是不是一个路径」。
  * @returns {string|null} null = 不是路径（URL、`-`（标准输出）、裸词、选项），因此不能当 sink 也不能当执行目标
  */
@@ -679,11 +743,11 @@ function dteGroups(lines, contexts) {
   return order;
 }
 
-/** 下载段里的落盘动作（-o/-O/--output、-P/--directory-prefix、> 与 >>），逐个写进 sinks。 */
+/** 下载段里的落盘动作（-o/-O/--output 与其短选项簇形态、-P/--directory-prefix、> 与 >>），逐个写进 sinks。 */
 function dteCollectSinks(segments, assign, sinks) {
   for (const seg of segments) {
     const head = dteWord(seg[0].tok);
-    if (!DTE_TOOLS.has(head)) continue;                       // 命令位不是下载工具 ⇒ 这一段的词全是参数
+    if (!dteDownloader(head, assign)) continue;               // 命令位不是下载工具 ⇒ 这一段的词全是参数
     for (let k = 1; k < seg.length; k++) {
       const w = dteWord(seg[k].tok);
       const eq = /=(.*)$/.exec(w);
@@ -704,7 +768,14 @@ function dteCollectSinks(segments, assign, sinks) {
         operand = w.replace(/^>{1,2}/, '');
         flag = '>';
       } else {
-        continue;
+        const cluster = dteOutCluster(w);                     // 融合短选项簇：`-qO <路径>` / `-o<路径>`
+        if (cluster === null) continue;
+        if (cluster) {
+          operand = cluster;                                  // 带值连写：值就粘在簇位后面（`-qO-` 也走这里 ⇒ 不立 sink）
+        } else {
+          operand = seg[k + 1] ? seg[k + 1].tok : null;
+          if (seg[k + 1]) { opLine = seg[k + 1].line; k++; }
+        }
       }
       if (!operand) continue;
       if (DTE_DIR_FLAG.test(flag)) {                          // sink 是**目录**：落地路径 = 目录 + URL basename
@@ -718,7 +789,7 @@ function dteCollectSinks(segments, assign, sinks) {
         continue;
       }
       const p = dteNormalize(operand, assign);                // `-o -` 在这里返回 null：标准输出不是落盘
-      if (p && !sinks.has(p)) sinks.set(p, opLine);
+      if (p && !DTE_STDOUT_PATH.test(p) && !sinks.has(p)) sinks.set(p, opLine);
     }
   }
 }
@@ -754,11 +825,13 @@ function dteCollectExecs(group, assign, execs, chmods) {
         continue;
       }
       if (word === 'chmod') {                                 // 只是证据，不是执行（见上面 DTE_EXEC_VERBS 那段）
+        let mode = null;                                      // Task 3.1 §3：顺手记下 mode，DOWNLOAD_THEN_EXEC 不看它
         for (let k = 1; k < seg.length; k++) {
           const w = dteWord(seg[k].tok);
           if (!w || w.startsWith('-')) continue;
+          if (mode === null && /^(?:[0-7]{3,4}|[ugoa]*[+-=][rwxXa]+)$/.test(w)) { mode = w; continue; }
           const p = dteNormalize(seg[k].tok, assign);
-          if (p) { add(chmods, p, { path: p, line: seg[k].line }); break; }
+          if (p) { add(chmods, p, { path: p, line: seg[k].line, mode }); break; }
         }
       }
     }
@@ -827,6 +900,122 @@ export const DOWNLOAD_THEN_EXEC = {
         snippet: trimSnippet(parts.join(' -> ')), // 「一条链」的证据本来就分布在几行上，snippet 要一起带过去
         message: DOWNLOAD_THEN_EXEC_TITLE,
         advice: DOWNLOAD_THEN_EXEC_ADVICE,
+      });
+    }
+    return findings;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Task 3.1 §3：DOWNLOAD_TO_MODULE_EXEC —— 「远程内容被写进会被覆盖进系统分区的位置，并加成可执行」
+// ---------------------------------------------------------------------------
+//
+// 洞（计划 §0.18 实测，不是推演）：`Magisk-Modules-Alt-Repo/tree` 整包 **low / auto-approve**：
+//   customize.sh:38  wget -qO "$MODPATH/system/bin/bash" "$url"
+//   customize.sh:41  if [ $? -eq 0 ] && [ -f "$MODPATH/system/bin/bash" ]; then
+//   customize.sh:43  chmod 0755 "$MODPATH/system/bin/bash"
+// 它从远程拉一个 bash 进模块的 `system/bin/`、加成可执行 —— 今天没有任何一条规则说这句话，
+// 而 low + 首次收录走的就是机器人自动合并通道。§3.9 那条「只 chmod 不执行」的已知限度
+// 今天在真包里落地了，而且落在自动通道上。
+//
+// 它与 DOWNLOAD_THEN_EXEC 是**两个不同的主张**，所以另立 ruleId、另写文案：
+//   DOWNLOAD_THEN_EXEC  —— 远程内容被拿去**执行**（必须有人跑它）；
+//   本规则              —— 远程内容被写进**安装时会被覆盖进系统分区**的位置并加了执行位
+//                          （没人执行它，Magisk 挂载模块时替它把这条路铺开）。
+// 两条同时命中时都出（与 EXEC_BUNDLED_FILE 那一格同一取舍：两个事实不许互相吞）。
+//
+// 判据窄，两个条件**都要**，缺一个都不报：
+//   ① sink 路径归一化后落在模块的安装可见位置（见 dtmeVisibleModulePath）；
+//   ② 同一篇文本里有 chmod 对**同一条路径**加执行位（见 dtmeGrantsExec），且晚于落地行。
+// 路径判据与 DOWNLOAD_THEN_EXEC 共用同一份 dteNormalize/dteCollectSinks —— 精确相等，
+// 一件宽松都没做（同目录就算 / 按 basename 算 / 去掉扩展名再比，§0.18 实测任取一种就有四个正经包变 high）。
+
+/** 每文件每规则的上限：与工厂的 maxPerFile 同值，基数是「落地 + 加执行位」的对数。 */
+const MAX_DTME_PAIRS_PER_FILE = 20;
+
+/**
+ * 条件①：落地路径归一化后落在模块的**安装可见位置**。
+ * 只认这三形（工单 §3 原话）：模块相对路径以 `system/` 开头；`$MODPATH`/`$MODDIR`/`${MODPATH}`/`${MODDIR}`
+ * 直接拼出的 `service.d/`；以及 `/data/adb/modules/<id>/system/…` 的绝对形态。
+ * 绝对形态那一条**不认 moduleId**（本文件的折算拿不到它，与 DOWNLOAD_THEN_EXEC 同一口径、同一代价）：
+ * 于是模块 id 拼错的路径会被折成「另一个模块的目录」，方向是 fail closed。
+ * 不认的形态（写进已知限度，别当成已覆盖）：模块根的裸文件（`$MODPATH/tool`）、`$MODPATH/system.prop`、
+ * 模块里别的自建目录、以及**全局** `/data/adb/service.d/`（那不是模块的 system/ 覆盖点，
+ * tailscaled:48 那种正经写法一旦收进来就是拿误伤换命中）。
+ */
+function dtmeVisibleModulePath(p) {
+  if (!p || p.charAt(0) !== DTE_MOD_REL) return false;
+  const rel = p.slice(DTE_MOD_REL.length);
+  return /^(?:system\/|service\.d\/)/.test(rel)
+    || /^data\/adb\/modules\/[^/]+\/system\//.test(rel);
+}
+
+/**
+ * 条件②：这一串 mode 有没有**加**执行位。
+ * 八进制：末三位里任何一位带 x（1/3/5/7）就算 —— `0755`/`755`/`0700`/`700`/`750` 算，`644`/`0644`/`600` 不算。
+ * 符号：只认 `+x` 这一族（`+x` / `u+x` / `a+x`），逗号分隔的多段子句逐个看。
+ * **不认的两族**（放宽等于往误伤方向走，工单 §3 的族里没有它们）：`u=rwx` 这类 `=` 赋值、
+ * 以及 `chmod --preserve-root` 之类把 mode 交给变量而钉不住的写法（`mode` 记成 null ⇒ 不报）。
+ */
+function dtmeGrantsExec(mode) {
+  if (!mode) return false;
+  if (/^[0-7]{3,4}$/.test(mode)) return /[1357]/.test(mode.slice(-3));
+  return String(mode).split(',').some((c) => /^[ugoa]*\+[rwxXa]*x/.test(c));
+}
+
+const DOWNLOAD_TO_MODULE_EXEC_TITLE = '远程内容被下载进模块的 system/ 或 service.d/ 并加成可执行';
+const DOWNLOAD_TO_MODULE_EXEC_ADVICE = 'curl/wget 把远程字节写进模块安装时会被覆盖进系统分区的位置（system/… 或 $MODPATH/service.d/…），'
+  + '同一篇文本里又被 chmod 加了执行位 —— 这一格不需要谁去执行它，挂载模块时这条路就铺好了。'
+  + '与「先下载再执行」是两件事，所以这条单独报。落盘的那份字节本次没有读过（它不在这个 zip 里），'
+  + '必须人工核对下载地址、校验和与该二进制声称的功能。';
+
+export const DOWNLOAD_TO_MODULE_EXEC = {
+  id: 'DOWNLOAD_TO_MODULE_EXEC',
+  category: 'execution',
+  severity: 'high',
+  title: DOWNLOAD_TO_MODULE_EXEC_TITLE,
+  // anchor 与 DOWNLOAD_THEN_EXEC 同一声明：载荷出现在一行里任何位置都算，命令位由逻辑行说话。
+  anchor: 'anywhere',
+  anchorSibling: null,
+  pattern: null, // 同族口径：跨行规则的匹配不住在单个正则上，null 是有意为之（redactText 走 !r.pattern 分支）
+  advice: DOWNLOAD_TO_MODULE_EXEC_ADVICE,
+  scan(file, text) {
+    const src = String(text == null ? '' : text);
+    const lines = src.split(/\r?\n/);
+    const contexts = buildLineContexts(lines); // 与 DOWNLOAD_THEN_EXEC 同一份命令位实现，不写第二套口径
+    const assign = dteLiteralAssignments(lines);
+    const groups = dteGroups(lines, contexts);
+    const sinks = new Map();   // 归一化路径 -> 首个落地行（下载段的识别与老规则共用同一份代码）
+    const chmods = new Map();  // 归一化路径 -> [{ path, line, mode }]
+    for (const g of groups) {
+      dteCollectSinks(g.segments, assign, sinks);
+      dteCollectExecs(g, assign, new Map(), chmods); // 执行形态这一半本规则用不上，chmod 证据才用
+    }
+    const pairs = [];
+    for (const [path, sinkLine] of sinks) {
+      if (!dtmeVisibleModulePath(path)) continue;                 // 条件①
+      const grants = (chmods.get(path) || [])
+        .filter((c) => c.line > sinkLine && dtmeGrantsExec(c.mode)) // 条件②（顺序与老规则同向：先落地后加位）
+        .sort((a, b) => a.line - b.line);
+      if (!grants.length) continue;                               // 缺任何一个条件都不报
+      pairs.push({ path, sinkLine, chmod: grants[0] });            // 一条落地只报一次：取最早那次加执行位
+    }
+    pairs.sort((a, b) => (a.chmod.line - b.chmod.line) || (a.sinkLine - b.sinkLine)
+      || (a.path < b.path ? -1 : (a.path > b.path ? 1 : 0)));
+    const findings = [];
+    for (const p of pairs.slice(0, MAX_DTME_PAIRS_PER_FILE)) {
+      findings.push({
+        ruleId: 'DOWNLOAD_TO_MODULE_EXEC',
+        category: 'execution',
+        severity: 'high',
+        file,
+        line: p.chmod.line, // 报在「加执行位」那一行：这条规则说的话是「落地 + 加成可执行」这一句
+        snippet: trimSnippet([
+          String(lines[p.sinkLine - 1] == null ? '' : lines[p.sinkLine - 1]).trim(),
+          String(lines[p.chmod.line - 1] == null ? '' : lines[p.chmod.line - 1]).trim(),
+        ].join(' -> ')),
+        message: DOWNLOAD_TO_MODULE_EXEC_TITLE,
+        advice: DOWNLOAD_TO_MODULE_EXEC_ADVICE,
       });
     }
     return findings;
@@ -1200,6 +1389,7 @@ export const CONTENT_RULES = [
   EXEC_INDIRECT,
   MODDIR_RUNTIME_WRITE,
   DOWNLOAD_THEN_EXEC,
+  DOWNLOAD_TO_MODULE_EXEC,
   DOWNLOAD_TO_STDOUT,
   OBFUSCATED_DECODE_EXEC,
   OBFUSCATED_DECODE_ONLY,
