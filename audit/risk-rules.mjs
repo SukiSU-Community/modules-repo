@@ -71,8 +71,11 @@ function endsWithContinuation(line) {
  *   customize.sh:216 '      if "$MODPATH/resetprop-rs" -h >/dev/null 2>&1; then'
  * T3.1 把 sink 的写法面做完之后这条链仍 0 命中，原因只有这一个（task-3.1-report.md §9 / 夹具 T3.1-A5）。
  *
- * **这张表只许有一份，且只住在下面 `logicalFirstToken` 里**（夹具 T3.2-D1 逐字钉着：声明一次、读一处）：
- * 规则里再写一份「跳过 if」的局部逻辑就是 fix6-F1 那条病的复发 —— 命令位有两套口径早晚会分叉。
+ * **这张表只许有一份，但从 Task 3.3 起它被两处读**（夹具 T3.2-D1 逐字钉着：声明一次、读两处）：
+ *   ① `logicalFirstToken` —— 逻辑行的命令位（T3.2）；
+ *   ② `PIPE_TO_SHELL_LEFT_EDGE` —— 下载器左边的语句起点（T3.3，见下面那段）。
+ * 规则里再写一份「跳过 if」的局部逻辑、或者把词表抄进 pattern，都是 fix6-F1 那条病的复发 ——
+ * 命令位与左边界有两套口径早晚会分叉（`elif` 补进这张表时，两处必须同时长出来，D1 会当场抓住没同时改的那一边）。
  *
  * 故意不收的（收错一格就等于把真命令从命令位上抹掉）：
  *   * `[` / `[[` / `test` —— 测试位里的路径算不算执行，本轮的答案是**不算**（夹具 T3.2-C3）：
@@ -80,10 +83,13 @@ function endsWithContinuation(line) {
  *   * `&&` `||` `|` `;` —— 段内的命令位由 `dteTokens` 的语句边界符口径说话，不归这里（夹具 T3.2-C2）。
  *   * `exec` / `setsid` / `nohup` / `busybox` / `eval` —— 它们**就是**命令（或会把参数拿去跑），
  *     收进表里等于让 `exec $MODPATH/x` 沉默；`DTE_EXEC_VERBS` / `ARG_ONLY_VERB` 那两张表一个字没动。
- *   * `esac` —— 真包里它单独成行，与 `fi`/`done` 同格，但工单给的表里没有，本轮不扩。
+ *   * `esac` / `in` —— 真包里 `esac` 单独成行，与 `fi`/`done` 同格，但工单给的表里没有，本轮不扩；
+ *     `in` 是 `case … in` 的另一半，把它收进来等于让 `in curl) …` 那种**case 标签行**站在语句起点上
+ *     （夹具 T3.3-B4 钉的就是这一格）。
  * `time` 收：POSIX 保留字，且 `time wget -qO …` 里真正在下载的确实是那个 wget。
+ * `elif` 收（Task 3.3 §2 补的那一格）：POSIX 保留字，`elif curl … | sh; then` 与 `if` 那一族是同一个写法。
  */
-const SHELL_CONTROL_WORDS = new Set(['if', 'while', 'until', 'then', 'else', 'do', 'for', 'case', 'select', 'time', '!', '{', '}', 'fi', 'done']);
+const SHELL_CONTROL_WORDS = new Set(['if', 'while', 'until', 'then', 'else', 'elif', 'do', 'for', 'case', 'select', 'time', '!', '{', '}', 'fi', 'done']);
 
 // 逻辑行的命令位词：跳过空白行与「整行只有反斜杠」那种纯续行行，取第一个**不是 shell 控制词**的分词，
 // 再去掉外层引号与词尾反斜杠。只取**第一个**真命令词 —— 判据要窄，多解析一个词就多一分猜测。
@@ -100,6 +106,31 @@ function logicalFirstToken(lines, head, end) {
   }
   return '';
 }
+
+/**
+ * Task 3.3：语句起点判据 —— 上面那张表的**第二处读**（第一处是 logicalFirstToken 的命令位）。
+ *
+ * `PIPE_TO_SHELL` 改前的左边界是 `(?:^|[|;&`(]\s*)`：认行首、认语句边界符，**不认「控制词 + 空格」**，
+ * 于是 `if curl -s https://x.dev/a | sh` 这种最像安装器的写法在 main 上是 low / auto-approve
+ *（复现表：计划 §0.19 与 task-3.2-report.md §4 —— 七形里四形走机器人自动合并通道）。
+ * 这里把左边界并上「一个或多个控制词 + 空白」，词表**只展开上面那一张**，一个字都不手写
+ *（夹具 T3.2-D1：一张表、两处读、pattern 里不许出现第二张表或手抄的控制词）。
+ *
+ * 三条形状约束各有反向夹具（工单 §3），它们不是注释：
+ *   ① 控制词必须整词站在语句起点上（前面只能是行首或边界符）⇒ `ui_print "if curl x | sh …"`
+ *      与 `# 说明：if curl … | sh …` 都不命中（引号与注释符都不是边界符）；
+ *   ② 控制词后面必须真的跟着空白 ⇒ `casey curl …` 这种词不算控制词；
+ *   ③ 控制词可以连着来（外层 `+`）⇒ 组合形 `if ! curl … | sh; then` 命中；
+ *   ④ `in` / 标签都不在表里 ⇒ `case "$TOOL" in curl) busybox wget … | sh ;; esac` 整行 0 命中
+ *      —— 「任意单词后都算」的过宽版会红在 T3.3-B4 与 B2 上（变异 M3）。
+ * `^\s*` 只加在控制词那一边：行首带缩进的**裸** `curl … | sh` 改前改后都是 0（收它会直接改变真包里
+ * 缩进写法的命中面，工单 §4.4 期望 −0/+0），本轮不动，钉成观察 T3.3-D2。
+ */
+const SHELL_CONTROL_ALT = [...SHELL_CONTROL_WORDS]
+  .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')) // 表里的 `{` `}` 必须按字面量进分支
+  .join('|');
+const SHELL_STATEMENT_START = `(?:^\\s*|[|;&\`(]\\s*)(?:(?:${SHELL_CONTROL_ALT})\\s+)+`;
+const PIPE_TO_SHELL_LEFT_EDGE = `(?:^|[|;&\`(]\\s*|${SHELL_STATEMENT_START})`;
 
 // 给 matcher（exclude / severityFor）的第三个可选参数：这一行在逻辑行里的位置。
 // 老规则一个都不用改签名 —— 它是**加参数**，不是改既有参数顺序。
@@ -280,7 +311,12 @@ export const PIPE_TO_SHELL = makeLineRule({
   severity: 'high',
   title: '下载内容直连 shell 执行（curl|sh / wget|sh）',
   advice: '禁止。远程内容可在 root 下任意执行且无法审计，必须先落盘、校验校验和，再执行。',
-  pattern: /(?:^|[|;&`(]\s*)(?:curl|wget|busybox\s+wget|busybox\s+curl)\b[^\n|]*\|[^\n]*\b(?:sh|bash|ash|ksh|zsh|python3?|perl|su)\b|\b(?:sh|bash|ash)\s*<\(\s*(?:curl|wget)\b/,
+  // Task 3.3：只有**左边界**换了（并上「控制词 + 空白」那一支，见 SHELL_STATEMENT_START 的说明）。
+  // 右半 `\|[^\n]*\b(?:sh|bash|…)\b`、下载器那四个写法、以及 `sh <(curl …)` 那一支逐字未动 ——
+  // 由夹具 T3.3-C1 按 pattern.source 逐段子串对账（severity/category/title/advice 同一条钉着）。
+  pattern: new RegExp(
+    `${PIPE_TO_SHELL_LEFT_EDGE}(?:curl|wget|busybox\\s+wget|busybox\\s+curl)\\b[^\\n|]*\\|[^\\n]*\\b(?:sh|bash|ash|ksh|zsh|python3?|perl|su)\\b`
+    + `|\\b(?:sh|bash|ash)\\s*<\\(\\s*(?:curl|wget)\\b`),
 });
 
 export const DOWNLOAD_TO_STDOUT = makeLineRule({
