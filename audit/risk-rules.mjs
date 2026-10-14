@@ -78,7 +78,10 @@ function logicalFirstToken(lines, head, end) {
 
 // 给 matcher（exclude / severityFor）的第三个可选参数：这一行在逻辑行里的位置。
 // 老规则一个都不用改签名 —— 它是**加参数**，不是改既有参数顺序。
-function buildLineContexts(lines) {
+// Task 3 起这个函数是导出的：DOWNLOAD_THEN_EXEC 的「执行形态」判据必须吃同一份命令位实现 ——
+// fix6-F1 那条「形状豁免不是免死金牌：命令位由**逻辑行**的命令位说话」的判据只有一份实现才守得住，
+// 跨行规则自己再数一遍「本行第一个词」就是第二套口径，两套口径早晚会分叉。
+export function buildLineContexts(lines) {
   const n = lines.length;
   const cont = new Array(n);
   for (let i = 0; i < n; i++) cont[i] = i > 0 && endsWithContinuation(lines[i - 1]);
@@ -480,6 +483,356 @@ export const MODDIR_RUNTIME_WRITE = makeLineRule({
     + '凡在此之后被执行的包内路径都必须人工核对写出来源（zip 在哪、从哪下载、校验什么）。',
 });
 
+/**
+ * Task 3：DOWNLOAD_THEN_EXEC —— 「先用 curl/wget 把远程内容下载到磁盘，再执行它」。
+ *
+ * 洞（工单 §1，2026-10-14 在 0f4ddbe 实测，本会话不重新推演）：
+ *   curl <url> -o /data/local/tmp/u → chmod 700 <同一路径> → /data/local/tmp/u &
+ *   整包 findings 只有 NETWORK_FETCH/low ⇒ low + 首次收录 = **auto-approve**，
+ *   这条链走的是机器人自动合并通道。管道写法（`curl … | sh`）一直由 PIPE_TO_SHELL 判 high/block，
+ *   于是「同一件事换个写法就换一个结论」。这一条把落盘写法拉到同一档：high / block（转人工，
+ *   不是任何自动拒绝 —— 判断权留给双签，与 PROP_BOOT_SPOOF 同一条取舍）。
+ *
+ * 为什么不用 makeLineRule：判据跨行（sink 在一行、执行在另一行），单行匹配看不见配对。
+ * 对外形状仍与工厂一致：{ id, category, severity, title, advice, anchor, anchorSibling, pattern, scan }，
+ * scan(file, text) -> Finding[]，Finding 字段与工厂逐一对齐（scan.test.mjs 的 T3 形状用例钉着）。
+ * 纯函数：只吃 (file, text)，不读外部状态、不看时间 —— 受规则表完整性那条「两次结果一致」断言约束。
+ *
+ * `pattern: null` 是**有意为之而不是漏了**：这条规则的匹配不住在单个正则上；
+ * redactText 遍历规则时对 `!r.pattern` 直接 continue（scan.mjs 里那一行），
+ * 而本规则 category 是 execution、压根不进 REDACT_RULES（那条 filter 只挑 privacy 类）——
+ * null 既不会让脱敏漏跑一步，也不会让它崩；写个假正则反而是谎言。
+ *
+ * 组合方式（计划原话，保留）：三个小函数，一个组合。
+ *   downloadSinks(text) -> Map<归一化路径, 首个落地行>
+ *   executedPaths(text) -> [{ path, line, kind }]
+ *   交集：路径相等且执行行 > 落地行 ⇒ 一条链，报在执行行上
+ */
+
+/** 每文件每规则的上限：与工厂的 maxPerFile 同值，但基数是**链**（不是行、也不是执行形态数）。 */
+const MAX_DTE_CHAINS_PER_FILE = 20;
+/** 下载工具：只认这两个动词本身（`busybox wget` 那种前导形态不在本规则能力内，见任务报告已知限度）。 */
+const DTE_TOOLS = new Set(['curl', 'wget']);
+/**
+ * 执行动词表（工单 §2 逐字钉死）：只有这五个词会把「它的参数」拿去跑。
+ * **故意不收的两族**（收进来就是拿合法形状换人工容量）：
+ *   * chmod / chown / chcon / restorecon —— `chmod 644` 一个下载来的配置文件是合法形状，
+ *     所以 chmod **只作为同一条链的证据进 snippet**，单独一条 chmod 永远不构成执行
+ *     （工单 §3.9 把「下载 + chmod、没有执行」那一格列为已知限度：今天 low，T3 之后仍是 low）；
+ *   * exec / setsid / nohup / busybox / xargs / env —— 与 ARG_ONLY_VERB 那一族的方向相反，
+ *     本规则不扩这张表；要扩得另开一轮并补夹具。
+ */
+const DTE_EXEC_VERBS = new Set(['sh', 'bash', 'ash', 'source', '.']);
+/** 语句边界符：被它们复位之后的第一个词同样站在命令位上 —— 与 PIPE_TO_SHELL / EXEC_BUNDLED_FILE
+ *  的左边界类 `(?:^|[\s"';&|`(])` 同一口径（`&&`、`||` 在词法层就是两个相邻的 & 与 |）。 */
+const DTE_SEP = /^[;|&()]$/;
+/**
+ * 路径归一化只做三件事（工单 §2.6，一件不多做）：
+ *   ① 去外层引号 —— 复用工厂的 UNQUOTE_EDGE，不写第二份；
+ *   ② 去词尾反斜杠 —— 续行形态里 `-o /data/local/tmp/u \` 的那个尾巴；
+ *   ③ 把模块目录前缀折成模块相对路径。
+ * 第③件的字面量本文件已经有一份（MOD_PATH_TOKEN / BARE_MOD_PATH_MATCH），scan.mjs 也有一份
+ * （REF_MODDIR_PREFIX / REF_ABS_PREFIX，那份还要求 moduleId 相等才肯剥）。这里**不搬第三份**：
+ * 跨行规则拿不到 moduleId，所以绝对形态只剥 `/data/adb/modules/` 本身，模块 id 留在键里 ——
+ * 于是 `/data/adb/modules/A/x` 与 `/data/adb/modules/B/x` 不会被算成同一条链（别的模块的目录不是
+ * 本包的东西，这个方向 fail closed 的理由与 scan.mjs pinLiteralValue「只有等于本次模块 id 时才剥」同一份）。
+ * 代价如实写进已知限度：同一篇文本里 `$MODPATH/x` 与 `/data/adb/modules/<id>/x` 两种拼法混用时不相等。
+ * 除此之外不许任何模糊匹配 —— 前缀/子串/相似度会把 `/data/local/tmp/u` 和 `/data/local/tmp/util` 算成一条链。
+ */
+const DTE_MOD_REL = '\u0000';                                  // 模块相对路径的内部标记（不可能出现在真实参数里）
+const DTE_MODDIR_PREFIX = /^\$\{?(?:MODPATH|MODDIR)\}?[\\/]/;  // 工单点名的四个写法：$MODDIR / $MODPATH / ${MODDIR} / ${MODPATH}
+const DTE_MODULES_ABS = /^\/data\/adb\/modules\//;             // 同一族绝对写法（来源见上面那段说明）
+const DTE_URL = /^[a-z][a-z0-9+.-]*:\/\/[^/?#]*(\/[^?#]*)?$/i;
+/** 输出选项：值在下一个词，或紧跟 `=`。`-o-` / `-O -` / `--output -` 是标准输出，不是落盘。 */
+const DTE_OUT_FLAG = /^(?:-[oO]|--output)$/;
+/** 目录前缀选项（wget 专有）：落地路径 = 目录 + URL 的 basename。 */
+const DTE_DIR_FLAG = /^(?:-P|--directory-prefix)$/;
+
+/** ①②：去外层引号 + 去词尾反斜杠（与工厂的 logicalFirstToken 对命令位做的事一致，同一份 UNQUOTE_EDGE）。 */
+function dteWord(t) {
+  return String(t == null ? '' : t).replace(UNQUOTE_EDGE, '').replace(/\\+$/, '');
+}
+
+/**
+ * 词法层：把一条物理行切成词，引号内的边界符不算边界，边界符单独成词。
+ * 只给本规则用 —— 它不是为了「解析 shell」，是为了让 `-o` 的下一个词、`>` 的下一个词
+ * 与「命令位上的那个词」有确定的所指。引号**留给词本身**（`"$D"`），交给 dteNormalize 去外层，
+ * 这样 `ui_print "/data/local/tmp/u"` 里的路径仍然是「ui_print 的参数」而不是一个独立命令。
+ */
+function dteTokens(line) {
+  const s = String(line == null ? '' : line);
+  const out = [];
+  let cur = '';
+  let q = null;
+  const flush = () => { if (cur !== '') { out.push(cur); cur = ''; } };
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { cur += c; if (c === q) q = null; continue; }
+    if (c === '"' || c === "'") { q = c; cur += c; continue; }
+    if (DTE_SEP.test(c)) { flush(); out.push(c); continue; }
+    if (/\s/.test(c)) { flush(); continue; }
+    cur += c;
+  }
+  flush();
+  return out;
+}
+
+/**
+ * 同文件内的字面量赋值表：`NAME=/绝对路径`（含 `NAME="${MODDIR}/x"` 这类外层引号）。
+ * 口径与 scan.mjs 的 collectVarValues 一致的两点：目录根变量（MODPATH/MODDIR/TMPMODDIR）不参与
+ * （那是前缀，不是值），以及「只认第一个赋值」（保守，且与 downloadSinks 的「首个落地行」同向）。
+ * 命令替换（`A=$(curl …)`）与反引号钉不住 —— 本规则只吃字面量，钉不住就不替换。
+ * **跨文件赋值不在能力内**（install.sh 里下载、service.sh 里执行）：这一条只有单篇文本。
+ */
+function dteLiteralAssignments(lines) {
+  const map = new Map();
+  for (const raw of lines) {
+    if (/^\s*#/.test(raw)) continue;
+    const re = /(?:^|[;&|(\s])(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(["']?)([^\s"'`;|&)<>]*)/g;
+    let m;
+    while ((m = re.exec(raw))) {
+      const name = m[1];
+      if (name === 'MODPATH' || name === 'MODDIR' || name === 'TMPMODDIR') continue;
+      const value = m[3];
+      if (!value || value.startsWith('$(') || value.startsWith('`')) continue;
+      if (!map.has(name)) map.set(name, value);
+    }
+  }
+  return map;
+}
+
+/** 把 `$NAME` / `${NAME}` 换成字面值。有界三轮：自指与互指的写法会停在「仍以 $ 开头」上，仍不模糊。 */
+function dteResolveVars(s, assign) {
+  if (!assign.size || s.indexOf('$') < 0) return s;
+  let cur = s;
+  for (let round = 0; round < 3 && cur.length < 4096; round++) {
+    const next = cur.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
+      (all, a, b) => {
+        const v = assign.get(a || b);
+        return v === undefined ? all : v;
+      });
+    if (next === cur) break;
+    cur = next;
+  }
+  return cur;
+}
+
+/**
+ * 归一化：①②③ + 变量替换，然后判「这到底是不是一个路径」。
+ * @returns {string|null} null = 不是路径（URL、`-`（标准输出）、裸词、选项），因此不能当 sink 也不能当执行目标
+ */
+function dteNormalize(tok, assign) {
+  const stripped = dteWord(tok);
+  if (!stripped || DTE_SEP.test(stripped)) return null;
+  const s = dteResolveVars(stripped, assign);
+  if (!s) return null;
+  if (DTE_MODDIR_PREFIX.test(s)) return DTE_MOD_REL + s.replace(DTE_MODDIR_PREFIX, '');
+  if (DTE_MODULES_ABS.test(s)) return DTE_MOD_REL + 'data/adb/modules/' + s.replace(DTE_MODULES_ABS, '');
+  // 绝对路径原样比较；钉不住的变量（`$FOO/u`）也原样比较 —— 两侧同一个拼法才算一条链，
+  // 这是「精确相等」，不是模糊匹配；钉不住时它永远不会与别的写法相等。
+  if (/^\//.test(s) || /^\$\{?[A-Za-z_]/.test(s)) return s;
+  return null;
+}
+
+/** URL 的 basename：末段为空（以 `/` 结尾）或只有 host 时返回 null —— 工单 §2.2「不要猜」。 */
+function dteUrlBasename(tok) {
+  const s = dteWord(tok);
+  const m = DTE_URL.exec(s);
+  if (!m) return null;
+  const segs = String(m[1] == null ? '' : m[1]).split('/').filter(Boolean);
+  return segs.length ? segs[segs.length - 1] : null;
+}
+
+/**
+ * 按 buildLineContexts 的**逻辑行**分组，再把每组按语句边界符切成命令段。
+ * 分组与「这一组站在命令位的那个词」都来自 buildLineContexts —— 本规则不自己数第一个词。
+ * 注释行（`^\s*#`）整行不参与：既不是 sink 也不是执行形态（与 HARDCODED_IP / EXEC_BUNDLED_FILE
+ * 等规则同一豁免口径）。
+ * @returns {Array<{headLine:number, command:string, toks:Array<{tok:string,line:number}>, segments:Array<Array<{tok:string,line:number}>>}>}
+ */
+function dteGroups(lines, contexts) {
+  const byHead = new Map();
+  const order = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^\s*#/.test(lines[i])) continue;
+    const ctx = contexts[i];
+    const key = ctx.logicalFirstLine;
+    let g = byHead.get(key);
+    if (!g) {
+      // ctx.firstToken 是**整条逻辑行**的命令位（奇数个反斜杠续行时它可能根本不在这个 i 行上）
+      g = { headLine: ctx.logicalFirstLine, command: ctx.firstToken, toks: [], segments: [] };
+      byHead.set(key, g);
+      order.push(g);
+    }
+    for (const t of dteTokens(lines[i])) g.toks.push({ tok: t, line: i + 1 });
+  }
+  for (const g of order) {
+    let cur = [];
+    for (const t of g.toks) {
+      if (DTE_SEP.test(t.tok)) { if (cur.length) { g.segments.push(cur); cur = []; } continue; }
+      const w = dteWord(t.tok);
+      if (!w) continue; // 纯反斜杠（续行符本身）不是词
+      cur.push({ tok: t.tok, line: t.line });
+    }
+    if (cur.length) g.segments.push(cur);
+  }
+  return order;
+}
+
+/** 下载段里的落盘动作（-o/-O/--output、-P/--directory-prefix、> 与 >>），逐个写进 sinks。 */
+function dteCollectSinks(segments, assign, sinks) {
+  for (const seg of segments) {
+    const head = dteWord(seg[0].tok);
+    if (!DTE_TOOLS.has(head)) continue;                       // 命令位不是下载工具 ⇒ 这一段的词全是参数
+    for (let k = 1; k < seg.length; k++) {
+      const w = dteWord(seg[k].tok);
+      const eq = /=(.*)$/.exec(w);
+      let flag = w;
+      let operand = null;
+      let opLine = seg[k].line;
+      if (DTE_OUT_FLAG.test(w) || DTE_DIR_FLAG.test(w)) {
+        operand = seg[k + 1] ? seg[k + 1].tok : null;
+        if (seg[k + 1]) { opLine = seg[k + 1].line; k++; }
+      } else if (eq && (DTE_OUT_FLAG.test(w.slice(0, eq.index)) || DTE_DIR_FLAG.test(w.slice(0, eq.index)))) {
+        flag = w.slice(0, eq.index);
+        operand = eq[1];
+      } else if (/^>{1,2}$/.test(w)) {                        // `> path` / `>> path`
+        operand = seg[k + 1] ? seg[k + 1].tok : null;
+        flag = '>';
+        if (seg[k + 1]) { opLine = seg[k + 1].line; k++; }
+      } else if (/^>{1,2}\S/.test(w)) {                       // `>path`（`2>` 之类带 fd 的不会走到这里）
+        operand = w.replace(/^>{1,2}/, '');
+        flag = '>';
+      } else {
+        continue;
+      }
+      if (!operand) continue;
+      if (DTE_DIR_FLAG.test(flag)) {                          // sink 是**目录**：落地路径 = 目录 + URL basename
+        const dir = dteNormalize(operand, assign);
+        if (!dir) continue;
+        const urlTok = seg.slice(1).find((t) => DTE_URL.test(dteWord(t.tok)));
+        const base = urlTok ? dteUrlBasename(urlTok.tok) : null;
+        if (!base) continue;                                  // 没有 basename 就不产生 sink，不猜
+        const p = `${dir.replace(/\/+$/, '')}/${base}`;
+        if (!sinks.has(p)) sinks.set(p, opLine);
+        continue;
+      }
+      const p = dteNormalize(operand, assign);                // `-o -` 在这里返回 null：标准输出不是落盘
+      if (p && !sinks.has(p)) sinks.set(p, opLine);
+    }
+  }
+}
+
+/** 执行形态与 chmod 证据。executedPaths 的形状按计划保留 kind，链的 snippet 靠它挑 chmod 那几行。 */
+function dteCollectExecs(group, assign, execs, chmods) {
+  const add = (map, key, rec) => {
+    const list = map.get(key) || [];
+    list.push(rec);
+    map.set(key, list);
+  };
+  for (let si = 0; si < group.segments.length; si++) {
+    const seg = group.segments[si];
+    // 命令位：逻辑行的第一个词由 buildLineContexts 说话（第一段），段内被 ; | & ( ) 复位后的
+    // 第一个词也算命令位（其余段）。两段的词首与 firstToken 只在「首行是注释」这类形状上分叉，
+    // 分叉时把两个候选都过一遍判据 —— 只往**报告**的方向放宽，不往沉默方向放宽（fail closed）。
+    const candidates = si === 0 ? [group.command, dteWord(seg[0].tok)] : [dteWord(seg[0].tok)];
+    const seenWord = new Set();
+    for (const raw of candidates) {
+      const word = dteWord(raw);
+      if (!word || seenWord.has(word)) continue;
+      seenWord.add(word);
+      const line = seg[0].line;
+      const asPath = dteNormalize(word, assign);
+      if (asPath) { add(execs, asPath, { path: asPath, line, kind: 'bare' }); continue; }
+      if (DTE_EXEC_VERBS.has(word)) {
+        for (let k = 1; k < seg.length; k++) {
+          const w = dteWord(seg[k].tok);
+          if (!w || w.startsWith('-')) continue;              // 选项位（`sh -x /p`）
+          const p = dteNormalize(seg[k].tok, assign);
+          if (p) { add(execs, p, { path: p, line: seg[k].line, kind: 'interp' }); break; }
+        }
+        continue;
+      }
+      if (word === 'chmod') {                                 // 只是证据，不是执行（见上面 DTE_EXEC_VERBS 那段）
+        for (let k = 1; k < seg.length; k++) {
+          const w = dteWord(seg[k].tok);
+          if (!w || w.startsWith('-')) continue;
+          const p = dteNormalize(seg[k].tok, assign);
+          if (p) { add(chmods, p, { path: p, line: seg[k].line }); break; }
+        }
+      }
+    }
+  }
+}
+
+const DOWNLOAD_THEN_EXEC_TITLE = '远程内容落盘后被执行（先下载再执行）';
+const DOWNLOAD_THEN_EXEC_ADVICE = 'curl/wget 把远程内容写到磁盘后再被拿去执行 —— 与 `curl | sh` 是同一件事的两种写法，'
+  + '之前的规则只认管道那一支，所以这条路落到 low 并被自动放行。'
+  + '落盘的那份字节本次没有读过（它不在这个 zip 里），必须先校验和或由作者把产物一并提交，再定处置。';
+
+export const DOWNLOAD_THEN_EXEC = {
+  id: 'DOWNLOAD_THEN_EXEC',
+  category: 'execution',
+  severity: 'high',
+  title: DOWNLOAD_THEN_EXEC_TITLE,
+  // anchor：载荷出现在一行里任何位置都算 —— 这里说的是「命令位由逻辑行说话」，
+  // 前缀形态（`x=1; curl … -o …`）照样成立，由 audit/scan.test.mjs 的锚点闭包表逐条验证。
+  anchor: 'anywhere',
+  anchorSibling: null,
+  pattern: null, // 见上面那段：跨行规则的匹配不住在单个正则上，null 是有意为之
+  advice: DOWNLOAD_THEN_EXEC_ADVICE,
+  scan(file, text) {
+    const src = String(text == null ? '' : text);
+    const lines = src.split(/\r?\n/);
+    const contexts = buildLineContexts(lines); // fix6-F1 那份命令位实现，本规则复用（导出的唯一理由）
+    const assign = dteLiteralAssignments(lines);
+    const groups = dteGroups(lines, contexts);
+    const sinks = new Map();   // downloadSinks：归一化路径 -> 首个落地行
+    const execs = new Map();   // executedPaths：归一化路径 -> [{ path, line, kind }]
+    const chmods = new Map();  // 同一条链的 chmod 证据：路径 -> [{ path, line }]
+    for (const g of groups) {
+      dteCollectSinks(g.segments, assign, sinks);
+      dteCollectExecs(g, assign, execs, chmods);
+    }
+    // 与 PIPE_TO_SHELL 的硬约束（工单 §2）：某条链的「执行行」同时是管道直连的命中行时，本规则在那一行不出。
+    // 两条规则的分工是「管道那一行归 PIPE_TO_SHELL」，所以这里让位而不是双报；
+    // 与 EXEC_BUNDLED_FILE 相反 —— 那一格两条都要出（包内引用被执行 / 远程内容落盘后执行是两个事实）。
+    const pipeLines = new Set();
+    for (const f of PIPE_TO_SHELL.scan(file, src)) pipeLines.add(f.line);
+    const chains = [];
+    for (const [path, sinkLine] of sinks) {
+      const list = (execs.get(path) || [])
+        .filter((e) => e.line > sinkLine && !pipeLines.has(e.line))
+        .sort((a, b) => a.line - b.line);
+      if (!list.length) continue;                 // 只下载不执行 / 执行早于落地：都不构成链
+      chains.push({ path, sinkLine, exec: list[0] }); // 一条链只报一次：同一个 sink 的多种执行形态取最早那行
+    }
+    chains.sort((a, b) => (a.exec.line - b.exec.line) || (a.sinkLine - b.sinkLine)
+      || (a.path < b.path ? -1 : (a.path > b.path ? 1 : 0)));
+    const findings = [];
+    for (const c of chains.slice(0, MAX_DTE_CHAINS_PER_FILE)) {
+      const parts = [String(lines[c.sinkLine - 1] == null ? '' : lines[c.sinkLine - 1]).trim()];
+      for (const ch of (chmods.get(c.path) || [])) {
+        if (ch.line > c.sinkLine && ch.line < c.exec.line) {
+          parts.push(String(lines[ch.line - 1] == null ? '' : lines[ch.line - 1]).trim());
+        }
+      }
+      parts.push(String(lines[c.exec.line - 1] == null ? '' : lines[c.exec.line - 1]).trim());
+      findings.push({
+        ruleId: 'DOWNLOAD_THEN_EXEC',
+        category: 'execution',
+        severity: 'high',
+        file,
+        line: c.exec.line,
+        snippet: trimSnippet(parts.join(' -> ')), // 「一条链」的证据本来就分布在几行上，snippet 要一起带过去
+        message: DOWNLOAD_THEN_EXEC_TITLE,
+        advice: DOWNLOAD_THEN_EXEC_ADVICE,
+      });
+    }
+    return findings;
+  },
+};
+
 // ---------------------------------------------------------------------------
 // ②-c root 提权语义（root）
 // ---------------------------------------------------------------------------
@@ -846,6 +1199,7 @@ export const CONTENT_RULES = [
   EXEC_BUNDLED_FILE,
   EXEC_INDIRECT,
   MODDIR_RUNTIME_WRITE,
+  DOWNLOAD_THEN_EXEC,
   DOWNLOAD_TO_STDOUT,
   OBFUSCATED_DECODE_EXEC,
   OBFUSCATED_DECODE_ONLY,

