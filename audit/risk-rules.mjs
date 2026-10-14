@@ -63,15 +63,40 @@ function endsWithContinuation(line) {
   return trailingBackslashes(line) % 2 === 1;
 }
 
-// 逻辑行的命令位词：跳过空白行与「整行只有反斜杠」那种纯续行行，取第一个空白分词，
-// 再去掉外层引号与词尾反斜杠。只取**第一个**词 —— 判据要窄，多解析一个词就多一分猜测。
+/**
+ * Task 3.2：shell 的**保留字**（控制词）。它们站在命令位上时本身不是命令，它后面那个词才是这条逻辑行的命令。
+ *
+ * 逐字依据（计划 §0.18）：真包 sensitive-props 挡住那条链的不是写法，是行首那个 `if` ——
+ *   customize.sh:207 '    if wget -qO "$MODPATH/resetprop-rs" "$URL" 2>/dev/null || \'
+ *   customize.sh:216 '      if "$MODPATH/resetprop-rs" -h >/dev/null 2>&1; then'
+ * T3.1 把 sink 的写法面做完之后这条链仍 0 命中，原因只有这一个（task-3.1-report.md §9 / 夹具 T3.1-A5）。
+ *
+ * **这张表只许有一份，且只住在下面 `logicalFirstToken` 里**（夹具 T3.2-D1 逐字钉着：声明一次、读一处）：
+ * 规则里再写一份「跳过 if」的局部逻辑就是 fix6-F1 那条病的复发 —— 命令位有两套口径早晚会分叉。
+ *
+ * 故意不收的（收错一格就等于把真命令从命令位上抹掉）：
+ *   * `[` / `[[` / `test` —— 测试位里的路径算不算执行，本轮的答案是**不算**（夹具 T3.2-C3）：
+ *     穿透 `if` 之后停在 `[` 上，`[` 既不是下载器也不是路径，sink 与执行形态都不成立。
+ *   * `&&` `||` `|` `;` —— 段内的命令位由 `dteTokens` 的语句边界符口径说话，不归这里（夹具 T3.2-C2）。
+ *   * `exec` / `setsid` / `nohup` / `busybox` / `eval` —— 它们**就是**命令（或会把参数拿去跑），
+ *     收进表里等于让 `exec $MODPATH/x` 沉默；`DTE_EXEC_VERBS` / `ARG_ONLY_VERB` 那两张表一个字没动。
+ *   * `esac` —— 真包里它单独成行，与 `fi`/`done` 同格，但工单给的表里没有，本轮不扩。
+ * `time` 收：POSIX 保留字，且 `time wget -qO …` 里真正在下载的确实是那个 wget。
+ */
+const SHELL_CONTROL_WORDS = new Set(['if', 'while', 'until', 'then', 'else', 'do', 'for', 'case', 'select', 'time', '!', '{', '}', 'fi', 'done']);
+
+// 逻辑行的命令位词：跳过空白行与「整行只有反斜杠」那种纯续行行，取第一个**不是 shell 控制词**的分词，
+// 再去掉外层引号与词尾反斜杠。只取**第一个**真命令词 —— 判据要窄，多解析一个词就多一分猜测。
+// 一串控制词走完仍然没有命令（`fi` / `done` / `} {`）⇒ 返回空串：命令位上没有任何东西（T3.2-C1）。
 function logicalFirstToken(lines, head, end) {
   for (let k = head; k <= end; k++) {
     const raw = String(lines[k]).trim();
     if (!raw) continue;
-    const t = raw.split(/\s+/)[0];
-    if (/^\\+$/.test(t)) continue;
-    return t.replace(UNQUOTE_EDGE, '').replace(/\\+$/, '');
+    for (const w of raw.split(/\s+/)) {
+      const t = w.replace(UNQUOTE_EDGE, '').replace(/\\+$/, '');
+      if (/^\\+$/.test(t) || SHELL_CONTROL_WORDS.has(t)) continue;
+      return t;
+    }
   }
   return '';
 }
