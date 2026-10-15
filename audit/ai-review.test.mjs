@@ -1524,6 +1524,7 @@ test('M1-6 换形不是变少：③ 的摘要与条目大小无关，而任何�
   const b = buildBrief({ report: R, entries: [file('module.prop', 'id=demo\n'), entryOf('a.so', small), entryOf('b.so', big)] });
   const d1 = sentBytes(b, 'a.so').bytes;
   const d2 = sentBytes(b, 'b.so').bytes;
+  assert.ok(d1 > 0 && d2 > 0, `两条都要在 ③ 有登记行（实测 a=${d1} B b=${d2} B，0 就是静默跳过）`);
   assert.ok(Math.abs(d1 - d2) < 16, `摘要行不随条目大小增长（1,400 B → ${d1}，300,000 B → ${d2}）`);
   // 可读性判据不由本模块发明：整块可读（无 NUL）的条目必然走 ②；
   // 含 NUL 的必然走 ③ —— 两侧都钉住，免得哪天「按后缀」把乱码又捞回全文。
@@ -1594,6 +1595,15 @@ test('M1-9 产物里能读到「AI 看到了什么」：shapes/sections 与实�
   assert.equal(sh.polyglotAsText, 0);
   assert.equal(sh.forensicsRowsSent, 0, '报告里没有取证行时不编造');
   assert.equal(r.payload.brief.corpusFiles, 2);
+  // shapes 不是自说自话：拿同一批条目与同一份报告再算一次 brief，③ 的行数必须等于登记的条数，
+  // 且每条的名字都要能在文本里找到 —— M-B（静默跳过不登记）在这里必红。
+  const direct = buildBrief({ report: R, entries, maxBytes: 240000 });
+  const rows3 = direct.text.split('\n').filter((l) => l.startsWith('- '));
+  assert.equal(rows3.length, sh.binaryDigestEntries,
+    `走了摘要的条目必须在 ③ 各有一行：登记 ${sh.binaryDigestEntries} 条，实际 ${rows3.length} 行`);
+  for (const n of ['z/arm64-v8a.so', 'assets/stage.dat']) {
+    assert.ok(rows3.some((l) => l.startsWith(`- ${n} |`)), `${n} 必须在 ③ 有一行登记`);
+  }
   const secs = r.payload.brief.sections;
   assert.equal(secs.length, 4, '四节各自的字节数要能读出来');
   assert.equal(secs.reduce((a, x) => a + x, 0) + 3, r.payload.brief.byteSize,
