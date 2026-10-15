@@ -581,9 +581,12 @@ const EXEC_BUNDLED_FILE_BASE = makeLineRule({
 
 /**
  * A1 的落点：包一层 scan，把「官方 update-binary + 模板逐字行」那一条 finding 的 severity 降成 info。
- * 只改三样：severity、advice、其余字段（ruleId/category/file/line/snippet/message）原样保留 ——
+ * 只改两样：severity 与 advice；其余字段（ruleId/category/file/line/snippet/message）原样保留 ——
  * 证据本体不许被这条豁免改写。
- * 先按路径短路（判据①），非那个条目时连文本都不碰，返回基线数组本身，不改对象、不复制。
+ * 判据**只有一处实现点**：三条全在 `isOfficialInstallerShape` 里（含路径那一条），这一层只做
+ * 「按 finding 的行号取回那一行，交给它判」。这里不写第二条路径比较 —— 写了就是两套口径，
+ * 变异「只留整行判据（去掉路径）」会在 predicate 里摘掉判据①、却被这一层的短路挡住而测不到洞
+ * （本轮第一版就是这么写的，实测 M2 因此假绿，见 task-a1-report.md）。
  * 纯函数：输出只由 (file, text) 决定，不看包、不看扫描面、不看时间。
  * 导出面保持与工厂一致（id/category/severity/title/advice/pattern/anchor/anchorSibling 全部由
  * 展开继承），所以 scan.mjs 的 resolveBundledRefs（吃 rule.pattern）与锚点闭包表都一字不动。
@@ -592,7 +595,6 @@ export const EXEC_BUNDLED_FILE = {
   ...EXEC_BUNDLED_FILE_BASE,
   scan(file, text) {
     const findings = EXEC_BUNDLED_FILE_BASE.scan(file, text);
-    if (String(file) !== OFFICIAL_UPDATER_BINARY_ENTRY) return findings;
     if (!findings.length) return findings;
     // 与工厂同一个 split ⇒ finding.line 与这里取的行号天然对齐
     const lines = String(text == null ? '' : text).split(/\r?\n/);
