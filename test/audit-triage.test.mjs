@@ -500,6 +500,31 @@ test('AI 步的形状：不挂 set -e、收口认全五态、if 仍挂 found（�
   assert.match(text, /CODE=\$\?/, '退出码先收进变量，不当场开火');
 });
 
+test('耦合钉子：AI 步与 分流决策 的步骤级 if 必须逐字相同（「零状态文件」那条绿分支全靠它撑着）', () => {
+  // 分流里有一条**故意写绿**的分支：audit-out 里一个 ai-*.status 都没有 ⇒ 等级不动、
+  // 文案「这一步没有产物」，low+first 照旧 auto-approve。它唯一的理由是
+  // **AI 步先红会把 triage 整步跳过**（两步挂同一个 if、都没有 always()）。
+  // 有人给 AI 步加开关（如 vars.AI_REVIEW_ENABLED）或给 triage 加 always() 之后，
+  // 「没过 AI 也能自动合」会继续绿着，只多一句诚实文案。这里不改判据
+  //（disabled 今天同样不抬级，那是用户认下的运维态），只把这个前提钉成事实。
+  const ifOf = (name) => {
+    const { region } = extractStep(name);
+    // 只认 YAML 键位（行首 8 空格），不认全文：这一步的**注释里就写着「没有 always()」**，
+    // 拿 /always\(\)/ 断言会被自己的注释打红（我第一发就是这么红的）。
+    assert.doesNotMatch(region, /^ {8}if:.*always\(\)/m,
+      `「${name}」的步骤级 if 不许挂 always()：那会把上一步的失败洗成继续跑`);
+    assert.doesNotMatch(region, /^ {8}continue-on-error:/m, `「${name}」不许 continue-on-error：同上`);
+    const hits = region.match(/^ {8}if: .*$/gm) || [];
+    assert.equal(hits.length, 1, `「${name}」应当恰好一条步骤级 if，实到 ${hits.length} 条：${hits.join(' / ')}`);
+    return hits[0];
+  };
+  const aiIf = ifOf(AI_STEP);
+  const triageIf = ifOf('分流决策');
+  assert.match(aiIf, /^ {8}if: steps\.locate\.outputs\.found == 'true'$/, `AI 步的 if 形状变了：${aiIf}`);
+  assert.equal(triageIf, aiIf, '两步的步骤级 if 必须逐字相同：AI 步先红时 triage 必须整个被跳过，'
+    + '否则「没有 AI 产物」这条路会在没人改判据的情况下自己活过来');
+});
+
 test('locate 探 ai-review.mjs 的候选与 scanner 同形状，并多输出一个 ai_review', () => {
   const wf = fs.readFileSync(WF, 'utf8').replace(/\r\n/g, '\n');
   const start = wf.indexOf('- name: 定位投稿元数据');
