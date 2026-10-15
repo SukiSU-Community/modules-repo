@@ -835,18 +835,21 @@ jobs:
               }));
             }
             const disabledPkgs=pkgs.filter((p)=>ai[p]==="disabled");
-            let llmNote;
+            // 键名 T6.2 去掉了旧的 llm 前缀，改成 ai_note（写出处与两处消费点一起改；
+            // 只改一半的那一发会让「复核方式」那一句永远拿到空串）。**文案本身一个字没动** ——
+            // 五态怎么开火是 6.1 的资产，改坏了要靠 6.1 那 31 条红来发现。
+            let aiNote;
             if (!statusFiles.length) {
-              llmNote="AI 安全员这一步没有产物（audit-out 里没有任何 ai-*.status）：本轮只有静态扫描，等级不由 AI 参与";
+              aiNote="AI 安全员这一步没有产物（audit-out 里没有任何 ai-*.status）：本轮只有静态扫描，等级不由 AI 参与";
             } else if (!okPkgs.length) {
-              llmNote="AI 安全员未启用（QCA 四件配置缺一：PAT / agent id / agent version / environment id）：本轮只有静态扫描，等级不由 AI 参与";
+              aiNote="AI 安全员未启用（QCA 四件配置缺一：PAT / agent id / agent version / environment id）：本轮只有静态扫描，等级不由 AI 参与";
             } else {
               const changed=okPkgs.some((p)=>order[aiLevel[p]]>order[riskOf(repByPkg[p])]);
-              llmNote=changed
+              aiNote=changed
                 ? `AI 安全员已复核（每条引用都逐字复验过送出去的那一份原文）：不同意静态结论，等级已按更严处理抬到 ${risk}`
                 : "AI 安全员已复核（每条引用都逐字复验过送出去的那一份原文）：同意静态结论，等级未抬；AI 只能加严、无权放行";
               // 混合形态不可能由脚本产生，但也不许被写成「AI 同意」—— 按「有 N 包没有 AI 意见」呈现。
-              if (disabledPkgs.length) llmNote+=`；另有 ${disabledPkgs.length} 包没有 AI 意见（未启用）`;
+              if (disabledPkgs.length) aiNote+=`；另有 ${disabledPkgs.length} 包没有 AI 意见（未启用）`;
             }
             const idOf=(r)=> (r.meta && r.meta.id) ? r.meta.id : "(缺失)";
             const verOf=(r)=> (r.meta && r.meta.version) ? r.meta.version : "";
@@ -856,7 +859,7 @@ jobs:
             w("module_id",[...new Set(reports.map((x)=>idOf(x.r)))].join(","));
             w("module_version",[...new Set(reports.map((x)=>verOf(x.r)))].join(","));
             w("package_count",String(reports.length));
-            w("llm_note",llmNote);
+            w("ai_note",aiNote);
             w("reasons",reasons.join("；"));
 
             // 决策矩阵：唯一可自动放行的是「每一份都低风险 + 首次收录」。
@@ -924,7 +927,7 @@ jobs:
           ACTION: ${{ steps.triage.outputs.action }}
           LABEL: ${{ steps.triage.outputs.label }}
           CHANGE_TYPE: ${{ steps.triage.outputs.change_type }}
-          LLM_NOTE: ${{ steps.triage.outputs.llm_note }}
+          AI_NOTE: ${{ steps.triage.outputs.ai_note }}
           MODULE_ID: ${{ steps.triage.outputs.module_id }}
           PACKAGE_COUNT: ${{ steps.triage.outputs.package_count }}
           REASONS: ${{ steps.triage.outputs.reasons }}
@@ -1083,7 +1086,7 @@ jobs:
               + `- 变更类型：**${ctLabel(process.env.CHANGE_TYPE)}**\n`
               + `- 处置：**\`${process.env.ACTION}\`** / 标签 \`${process.env.LABEL}\`\n`
               + `- 依据：${process.env.REASONS}\n`
-              + `- 复核方式：${process.env.LLM_NOTE || '（分流这一步没写出复核方式：AI 那一层没有可呈现的文案）'}\n`;
+              + `- 复核方式：${process.env.AI_NOTE || '（分流这一步没写出复核方式：AI 那一层没有可呈现的文案）'}\n`;
 
             if (process.env.ACTION === 'auto-approve') {
               intro += `\n✅ 静态扫描未发现风险且每份投稿都是首次收录，已自动合入索引。\n`;
