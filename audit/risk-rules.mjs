@@ -1384,20 +1384,113 @@ export const HARDCODED_IP = makeLineRule({
 const SUSPICIOUS_TLD = /\.(?:xyz|top|tk|ml|ga|cf|gq|pw|cc|icu|rest|cyou|buzz|click|link|monster|su|live|lol)\b/i;
 const SUSPICIOUS_KEYWORD = /(?:telemetry|tracker|tracking|analytics|adservice|ads?\.(?:com|net)|doubleclick|googlesyndication|googletagmanager|umeng|talkingdata|appsflyer|adjust\.com|branch\.io|sentry\.io|mixpanel|amplitude|bugly|jiagu|igexin)/i;
 
+// ---------------- P10：SUSPICIOUS_DOMAIN 的 severity 判据（唯一实现点在这里） ----------------
+// 改前的形状：host 命中 SUSPICIOUS_TLD 就发 medium，没有任何上下文判据。于是真包里两类东西一起响：
+//   DOM/CSS 属性访问 `t.style.top`、`window.innerHeight-e.top`（device_faker / Integrity-Box 共 19 条）
+//   反向 DNS 包名 `com.tencent.tmgp.cf`（device_faker config.toml:95）
+// 用户 2026-10-14 拍的修法（计划 §2.6「已拍定（第三批）」、§0.22 末段）：判据换成**贴着匹配点边界**的三个锚点，
+// 强锚点 ⇒ medium、反向 DNS 包名 ⇒ info、弱锚点 ⇒ medium、都没有 ⇒ info。
+// ⚠ 这是**放宽方向**（收窄拦截范围），不是补洞：投稿者可以把 C2 域名塞成「没有锚点」的形状换 info。
+//   实物税已经在真包里：`Yuri/clear_all_detection_traces.sh:51` 的 `aidepro.top` 本轮起降成 info，
+//   钉成夹具 T-P10-B5，不许写成误报修复。
+// 三条硬约束（工单 §2）：
+//   1. 判据只许有一份 —— 三条锚点是下面三个具名谓词，severity 的分派只在 severityFor 里；
+//      不许在 scan.mjs 后处理、不许新增第二条 `SUSPICIOUS_DOMAIN_*` 规则（fix6-F1 的病：两套口径早晚会分叉）。
+//   2. 降的是 severity，不是删证据 —— 返回 'info' 而不是 null，也不许写成 'low'：
+//      finding 仍留在 report.findings 里（人看得见「这里有个可疑 TLD 形状，我判它是属性/包名」），
+//      而 countsTowardRisk('info') === false，所以不抬等级。
+//   3. 不做 ±W 邻域窗口 —— 实测三条紧邻信号下 W 取 12/24/40 结果一字不变，而「窗口里出现过 ://、url、host」
+//      这类松信号在压缩产物上 W=24 只降 11/20、W=80 反而只剩 7/20（计划 §0.21 第 3 条、briefs/p10-measurement-note.md）。
+//      判别力来自「锚在匹配点边界」，不是「窗口宽度」。
+// 这段历史的两次自我推翻（必须留着，不然下一轮会在同一个坑里再摔一次）：
+//   · 计划 §0.9（原第 576 行那一版）提出「首个 label 是反向 DNS 保留字 ⇒ info」，当天被**作者自己**在
+//     §0.11 结论四否掉，理由是「豁免的是一个投稿者可造的形状」：谁都能注册 `evil.tk`，
+//     在包里写 `com.evil.tk/payload`，首段是 `com`、同行也没有取用上下文 ⇒ 真 C2 白拿包名豁免。
+//   · 本轮按 §2.6 用户重拍执行，但那条反对理由**仍然成立**，所以把它做成判据的边界而不是忽略它：
+//     强锚点（①scheme 一路连到匹配点 / ②后面紧跟 `/path`）**压过**包名豁免 ⇒ `com.evil.tk/payload`
+//     因为②必须仍是 medium（夹具 T-P10-A3）。反过来，包名豁免必须**优先于弱锚点③（引号）**，
+//     否则真包那条整体在引号里的 `com.tencent.tmgp.cf` 关不掉，device_faker 只到 5/6（夹具 T-P10-B3）。
+//     ⇒ 顺序写成 强锚点 → 包名 → 弱锚点 → info，不是三个并列 if。
+const REVERSE_DNS_RESERVED_LABEL = /^(?:com|org|net|cn|gov|edu|mil|int)$/i; // 就这八个，一个都不许多：见 severityFor 里的说明
+const QUOTE_AT_MATCH_BOUNDARY = /["'`]/;
+
+// ① 强锚点：匹配点**前面紧邻** `https?://`，且 scheme 一路连到它 —— 中间没有空白、没有引号。
+// 从匹配点向左走，一碰到空白或引号就否（那条 scheme 属于另一个 token），碰到 `://` 就检查它左边是不是 `http:`/`https:`。
+function anchorSchemeConnects(line, at) {
+  for (let q = at - 1; q >= 2; q--) {
+    const c = line[q];
+    if (c === '"' || c === "'" || c === '`' || c === ' ' || c === '\t' || c === '\f' || c === '\v') return false;
+    if (c === '/' && line[q - 1] === '/' && line[q - 2] === ':') {
+      return /https?:$/i.test(line.slice(Math.max(0, q - 8), q - 2));
+    }
+  }
+  return false;
+}
+
+// ② 强锚点：匹配点**后面紧邻** `/` + 路径字符。压成「取用上下文」的那条路：域名后面跟路径就是当 URL 用。
+// 代价（§0.21 未量的一面）：`x.top/2` 这种 CSS/JS 写法也算数 ⇒ 留在 medium，属可接受的偏严一侧。
+function anchorPathFollows(line, end) {
+  return line[end] === '/' && /[A-Za-z0-9._~%-]/.test(line[end + 1] || '');
+}
+
+// ③ 弱锚点：匹配点**整体被引号包住**（`["'`]host["'`/]`）。弱在「字符串字面量里放域名」很常见，
+// 所以它排在包名豁免之后 —— 这是叠加顺序的设计，不是并列。
+function anchorQuotedAround(line, at, end) {
+  const before = at > 0 ? line[at - 1] : '';
+  const after = end < line.length ? line[end] : '';
+  return QUOTE_AT_MATCH_BOUNDARY.test(before)
+    && (QUOTE_AT_MATCH_BOUNDARY.test(after) || after === '/');
+}
+
+/** P10 三条紧邻锚点的唯一入口：返回成立的那条（'scheme' | 'path' | 'quoted'），都不成立返回 null。
+ *  顺序即强度：强锚点先判，弱锚点（③）最后判。 */
+function suspiciousDomainAnchor(line, m) {
+  const at = m.index;
+  const end = at + m[0].length;
+  if (anchorSchemeConnects(line, at)) return 'scheme';
+  if (anchorPathFollows(line, end)) return 'path';
+  if (anchorQuotedAround(line, at, end)) return 'quoted';
+  return null;
+}
+
+/** 首个 label 是不是反向 DNS 保留字（整词、大小写不敏感）。
+ *  ⚠ 词表就八个：`io`/`dev`/`me`/`xyz` 看着也像包名前缀，但它们本身就是可疑 TLD，
+ *  收进来等于送出一条「投稿者改个包名前缀就能换 info」的豁免门。
+ *  已知残留 FP：`io.github.foo.ml` 因此**留在 medium**（夹具 T-P10-A6 / 计划 §3 B4）——
+ *  §0.9 那版谓词当年要求它「不再是 medium」，那是被 §0.11 结论四否掉的那版口径，本轮不照它做。 */
+function isReverseDnsPackageName(host) {
+  return REVERSE_DNS_RESERVED_LABEL.test(host.split('.')[0]);
+}
+
 export const SUSPICIOUS_DOMAIN = makeLineRule({
   anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'SUSPICIOUS_DOMAIN',
   category: 'network',
   severity: 'medium',
   title: '可疑域名（免费/匿名 TLD 或遥测广告特征）',
-  advice: '确认该域名用途。遥测/广告 SDK 域名在 root 模块中出现需作者明确说明。',
+  // message 由工厂固定成 title（同一条规则各档共用），所以「这一档为什么这么判」写在 advice 上，
+  // 报告表格里那一列就是它 —— 降级的两条理由必须让人看得见，不能只藏在代码里。
+  advice: '确认该域名用途。遥测/广告 SDK 域名在 root 模块中出现需作者明确说明。'
+    + '反向 DNS 包名形状（首段是 com/org/net/cn/gov/edu/mil/int）与没有任何取用上下文的属性访问按 info 记录：'
+    + '证据仍在报告里，但不抬等级。',
   pattern: /\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,24}\b/i,
   exclude: /^\s*#|localhost|android\.com|github\.com|githubusercontent\.com|magisk|kernelsu|kernelsu\.org|topjohnwu|google\.com|googleapis\.com|gstatic\.com|w3\.org|schema\.org|json\.org|example\.com/,
-  severityFor(m) {
+  severityFor(m, line) {
     const host = m[0].toLowerCase();
+    // 1) 遥测那一支本轮不碰（没有误报证据），且它排在锚点判据之前 —— 夹具 T-P10-A5 钉住它别被新顺序带歪。
     if (SUSPICIOUS_KEYWORD.test(host)) return 'medium';
-    if (SUSPICIOUS_TLD.test(host)) return 'medium';
-    return null; // 返回 null 表示不构成发现
+    // 2) 不命中可疑 TLD ⇒ 照旧不构成发现。
+    if (!SUSPICIOUS_TLD.test(host)) return null;
+    // 3) 强锚点优先：①scheme 一路连到匹配点 / ②后面紧跟 /path。没有它们，恶意域名伪装成
+    //    `com.evil.tk/payload` 就能白拿包名豁免（§0.11 结论四那条反对理由说的正是这个）。
+    const anchor = suspiciousDomainAnchor(line, m);
+    if (anchor === 'scheme' || anchor === 'path') return 'medium';
+    // 4) 反向 DNS 包名 ⇒ info。**必须优先于弱锚点③**，否则整体在引号里的真包名关不掉（§0.22 末段）。
+    if (isReverseDnsPackageName(host)) return 'info';
+    // 5) 弱锚点③：整体在引号里的字符串字面量 ⇒ medium。
+    if (anchor === 'quoted') return 'medium';
+    // 6) 三条锚点与包名都不成立 ⇒ 「无取用上下文」，info。本轮接受的代价（夹具 T-P10-B5 就是这一格的真包实物）。
+    return 'info';
   },
 });
 
