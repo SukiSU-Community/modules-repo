@@ -474,7 +474,61 @@ function isModulePathToken(t) {
   return MOD_PATH_TOKEN.test(String(t).replace(/\\/g, '/'));
 }
 
-export const EXEC_BUNDLED_FILE = makeLineRule({
+// ---------------- A1：官方安装器那一行的「限定路径 + 逐字相符」降级 ----------------
+// 拍板：用户（计划 §2.6 第三批，2026-10-14）；主控当时推荐的是**不豁免**，并在 2026-10-15 之前把
+// 这条记反成「不豁免」。工单 briefs/task-a1.md。
+//
+// 三条**同时**成立才降级，缺一即报（工单 §2）：
+//   ① 条目路径逐字等于 OFFICIAL_UPDATER_BINARY_ENTRY —— 不用 endsWith、不忽略大小写、
+//      不折叠斜杠、不剥 `./`：那些都是投稿者可以自己造的形（夹具 A1-N2 钉六种近似写法）。
+//   ② 整行逐字等于 OFFICIAL_INSTALLER_TEMPLATE_LINE。比对前只许做两件事：行尾单个 `\r` 归一 +
+//      整行 trim（A1-02 钉这两件 —— CRLF 是行尾差异、不是形状差异，不为此交人工税）。
+//      不许折叠内部空白、不许规范化变量名、不许脱外层 `[ ]`、不认 `test -f` / `$MODDIR` /
+//      `${MODPATH}` / 带引号 / `if … then … fi`（A1-N5 逐条钉住，这组是本轮收窄可伪造性的主证据）。
+//   ③ ② 比的是**整行**而不是那段匹配 ⇒ 同行还有别的命令必然不相等：`x=1; [ -f … ] && . …`
+//      照报（A1-N3）。锚点闭包表（fix4-P14）的 witness 载荷 `sh $MODDIR/payload.bin` 本来就不是
+//      这个形状，所以它「恰好 1 条命中」的不变量在本条前后一字不动 ⇒ **那张表对本轮不敏感、
+//      不是这一格的证据**；真正拦住「豁免落在匹配上」的是 A1-N3 那一发前缀用例。
+//
+// 语义：降 severity，不删证据（沿用 P10 那条契约）—— 命中留在 report.findings，severity 'info'，
+// advice 换成具名常量写明理由。不许 null（那是删证据），不许 low（low 参与定级口径）。
+//
+// **为什么动作不写在 `EXEC_BUNDLED_FILE.exclude` 里**（工单 §2 指的缝）：工厂那一段是
+// `if (skipped) continue;`，`exclude` 返回 true 的语义只有「这个匹配不产出发现」，全行匹配都可
+// 豁免就整行沉默 —— 它删得掉证据，给不出「finding 仍在 + severity 是 info」。而且工厂不把 `file`
+// 传进 matcher（`exclude(m, line, ctx)` / `severityFor(m, line, ctx)` 都拿不到条目路径，
+// `buildLineContexts` 的 ctx 只有行号/续行/命令位那几个字段），所以判据①在 matcher 里根本写不出来。
+// 本仓「拿得到 file、又能改工厂产出的 finding」的既有先例只有包一层 `scan(file, text)`
+// （SUSPICIOUS_DOMAIN_RULE 就是这么处理 severityFor 的 null 分档的）。路径是判据① ⇒ 只能走那层，
+// 这也是本轮唯一不动 makeLineRule 工厂、不动 scan.mjs 的写法。判据本身仍是**一份**：
+// `isOfficialInstallerShape`，包外层只做「按行号取回那一行，交给它判」。
+//
+// 记账语义一个字没动（本轮最容易被顺手改掉的一格）：引用解析（scan.mjs 的 resolveBundledRefs）
+// 拿的是 `EXEC_BUNDLED_FILE.pattern` 原始正则，既不看 `exclude` 也不看本包装器的 severity，
+// 所以被这一行 source 的 `customize.sh` 照常进扫描面。夹具 A1-N6 把这件事钉成可证伪的断言：
+// 其中 (b) 那一发的载荷伪装成 customize.sh，只能靠这条引用升级进面 ⇒ 变异 M5（把豁免套进引用
+// 解析）红在那里。结论只允许这么说：**豁免只影响这一行在报告里的呈现，不缩小扫描面。**
+
+export const OFFICIAL_UPDATER_BINARY_ENTRY = 'META-INF/com/google/android/update-binary';
+export const OFFICIAL_INSTALLER_TEMPLATE_LINE = '[ -f $MODPATH/customize.sh ] && . $MODPATH/customize.sh';
+export const EXEC_OFFICIAL_INSTALLER_ADVICE =
+  '条目路径与官方安装器模板行逐字相符 ⇒ 按标准安装流程形状记录（info，不参与定级）。'
+  + '免掉的只是这一行的呈现：它 source 的 customize.sh 照常进扫描面逐行读；'
+  + '条目路径或这一行的写法任一不相等，就回到 high。';
+
+/** 判据②的归一面：只允许行尾单个 `\r` 与整行 trim，多一件都不许做。 */
+function normalizeInstallerLine(line) {
+  const s = String(line == null ? '' : line);
+  return (s.endsWith('\r') ? s.slice(0, -1) : s).trim();
+}
+
+/** A1 的唯一判据点：路径逐字 ① 且整行逐字 ②③。两个参数都是字面比较，不做第三种归一。 */
+export function isOfficialInstallerShape(file, line) {
+  return String(file) === OFFICIAL_UPDATER_BINARY_ENTRY
+    && normalizeInstallerLine(line) === OFFICIAL_INSTALLER_TEMPLATE_LINE;
+}
+
+const EXEC_BUNDLED_FILE_BASE = makeLineRule({
   anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'EXEC_BUNDLED_FILE', category: 'execution', severity: 'high',
   title: '脚本执行模块自带的另一个文件',
@@ -524,6 +578,29 @@ export const EXEC_BUNDLED_FILE = makeLineRule({
   pattern: /(?:^|[\s;&|({["'])(?:(?:busybox\s+)?sh|bash|ash|source|\.(?=\s|\$\{?IFS)|exec|setsid|nohup)(?:\s*(?:\$\{?IFS\}?)?\s*)["']?(?:\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/]|\/data\/adb\/modules\/)[^\s"']+|(?:^[\s]*|(?:&&|\|\||[;|({])[\s]*)["']?(?:\$\{?(?:MODPATH|MODDIR|TMPMODDIR)\}?[\\/]|\/data\/adb\/modules\/)[^\s"']+/,
   advice: '脚本执行了模块自带的另一个文件。审核必须把那个文件也当作可执行文本读一遍 —— 只扫被执行的这一行等于什么都没扫。',
 });
+
+/**
+ * A1 的落点：包一层 scan，把「官方 update-binary + 模板逐字行」那一条 finding 的 severity 降成 info。
+ * 只改三样：severity、advice、其余字段（ruleId/category/file/line/snippet/message）原样保留 ——
+ * 证据本体不许被这条豁免改写。
+ * 先按路径短路（判据①），非那个条目时连文本都不碰，返回基线数组本身，不改对象、不复制。
+ * 纯函数：输出只由 (file, text) 决定，不看包、不看扫描面、不看时间。
+ * 导出面保持与工厂一致（id/category/severity/title/advice/pattern/anchor/anchorSibling 全部由
+ * 展开继承），所以 scan.mjs 的 resolveBundledRefs（吃 rule.pattern）与锚点闭包表都一字不动。
+ */
+export const EXEC_BUNDLED_FILE = {
+  ...EXEC_BUNDLED_FILE_BASE,
+  scan(file, text) {
+    const findings = EXEC_BUNDLED_FILE_BASE.scan(file, text);
+    if (String(file) !== OFFICIAL_UPDATER_BINARY_ENTRY) return findings;
+    if (!findings.length) return findings;
+    // 与工厂同一个 split ⇒ finding.line 与这里取的行号天然对齐
+    const lines = String(text == null ? '' : text).split(/\r?\n/);
+    return findings.map((f) => (isOfficialInstallerShape(file, lines[f.line - 1]) && f.severity !== 'info'
+      ? { ...f, severity: 'info', advice: EXEC_OFFICIAL_INSTALLER_ADVICE }
+      : f));
+  },
+};
 
 // fix2-P1/P2：变量间接执行 —— `sh $X` / `do $f` 这类「目标在变量里」的写法。
 // 这条规则只在**形状层**存在：它把「解释器动词 + 裸 $VAR」与「for-in 模块目录 glob + do $VAR」

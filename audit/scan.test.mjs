@@ -5642,7 +5642,7 @@ test('A1-C1 不变量：info 与 low 不等价、豁免只有一处实现点、�
   assert.equal(countsTowardRisk({ severity: 'info' }), false);
   assert.equal(countsTowardRisk({ severity: 'low' }), true);
   assert.equal(SEVERITY_ORDER.low > SEVERITY_ORDER.info, true, 'low 排在 info 之上，才会出现「记成 low 就抬等级」');
-  assert.equal(scoreRisk([{ severity: 'info' }]).counts, { high: 0, medium: 0, low: 0, info: 1 },
+  assert.deepEqual(scoreRisk([{ severity: 'info' }]).counts, { high: 0, medium: 0, low: 0, info: 1 },
     '一条 info 不参与定级：等级仍是 low 且 counts.low = 0');
   assert.equal(scoreRisk([{ severity: 'low' }]).counts.low, 1, '同一条写成 low 就进 counts.low');
 
