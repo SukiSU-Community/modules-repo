@@ -2788,17 +2788,32 @@ test('fix5-F1 端到端：清理清单不再送 high，真 source 照旧，被�
     '$MODPATH/README.md $MODPATH/.git* 2>/dev/null',
     '[ -f $MODPATH/customize.sh ] && . $MODPATH/customize.sh',
   ].join('\n') + '\n';
+  // A1 之后第 5 行正是「限定路径 + 逐字相符」被降级的那一行 ⇒ 它不能再充当 fix5-F1 的 high 证人。
+  // 但这条用例的两侧都要钉住，所以补第二份包：只把被 source 的文件名换掉（`customize.sh` → `setup.sh`，
+  // 其余一字不动）⇒ 判据②不相等 ⇒ 必须回到 high。「清单行沉默、真 source 照报」这件事从此由 ub2 说话。
+  const ub2 = ub.split('$MODPATH/customize.sh').join('$MODPATH/setup.sh');
   const zip = makeModuleZip({ id: 'eval.f5f1', files: [
     ['module.prop', moduleProp('eval.f5f1')],
     ['META-INF/com/google/android/update-binary', ub],
     ['system/placeholder', 'setenforce 0\n'],
   ] });
+  const zip2 = makeModuleZip({ id: 'eval.f5f1b', files: [
+    ['module.prop', moduleProp('eval.f5f1b')],
+    ['META-INF/com/google/android/update-binary', ub2],
+    ['system/placeholder', 'setenforce 0\n'],
+  ] });
   const r = await scanToReport(zip, { changeType: 'first' });
+  const r2 = await scanToReport(zip2, { changeType: 'first' });
   const eb = r.findings.filter((f) => f.ruleId === 'EXEC_BUNDLED_FILE');
   assert.deepEqual(eb.map((f) => f.line), [5],
     `清单那两行（3、4）不许报，真 source 那行（5）照报：${JSON.stringify(eb.map((f) => `${f.line}[${f.snippet}]`))}`);
-  assert.equal(eb[0].severity, 'high', '真 source 那行仍是 high');
-  // 豁免只作用于报不报：清单行引用的 system/placeholder 照样被读掉。
+  assert.equal(eb[0].severity, 'info',
+    'A1：模板逐字那一行按标准安装流程形状记录 —— 证据仍在（不是 null），档位在 info（不是 low）');
+  const eb2 = r2.findings.filter((f) => f.ruleId === 'EXEC_BUNDLED_FILE');
+  assert.deepEqual(eb2.map((f) => f.line), [5], '同一份清单形状，换文件名不许影响清单那两行的沉默');
+  assert.equal(eb2[0].severity, 'high', 'fix5-F1 的 high 证人搬家到这里：被 source 的名字不相等就必须回到 high');
+  // 两条豁免各管一件事，都只影响**呈现**：fix5-F1 让清单那两行沉默，A1 让模板那一行降档。
+  // 清单行引用的 system/placeholder 照样被读掉 —— 扫描面一条都不许缩。
   // Task 2.7（fix10-P11）：它是可读文本，本来就在 feed 上 → 没有升级证人，但内容确实逐行扫过。
   assert.ok(r.scripts.some((s) => s.name === 'system/placeholder'),
     `扫描面不许因为这条豁免而缩小：${JSON.stringify(r.scripts.map((s) => s.name))}`);
@@ -2806,7 +2821,10 @@ test('fix5-F1 端到端：清理清单不再送 high，真 source 照旧，被�
     'system/placeholder 已在 feed 上：escalated 只记「原本不在扫描面」的条目，不许为它作伪证');
   assert.ok(r.findings.some((f) => f.ruleId === 'SELINUX_DISABLE' && f.file === 'system/placeholder'),
     `被引用的载荷必须真的被读过：${JSON.stringify(r.findings.map((f) => `${f.ruleId}@${f.file}:${f.line}`))}`);
+  assert.ok(r2.findings.some((f) => f.ruleId === 'SELINUX_DISABLE' && f.file === 'system/placeholder'),
+    '第二份同理：载荷必须照样被读过，换文件名不许让扫描面变小');
   assert.equal(r.riskLevel, 'high', '整包定级不因为这 FP 撤掉而变松');
+  assert.equal(r2.riskLevel, 'high', '第二份整包照旧 high ⇒ 搬家后的 fix5-F1 证人仍能在定级层说话');
 });
 
 // ===========================================================================
