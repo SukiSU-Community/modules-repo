@@ -2122,10 +2122,15 @@ function binaryVerdict(b, found) {
   // 前缀**自己解析成功了也不算证完** —— 尾部没读到的东西能装下任何能力，
   // 所以这一格只能说「输入不完整」，永远不许念成「取证成功、0 危险族」。
   if (rec.inputCapped) {
+    // 两个数各说各的话：条目多大取**条目自己**（b.bytes），喂进去多少取**记录**（rawBytes）。
+    // 取错来源会写出「条目 8388608 B 超过上限 8388608 B」这种自相矛盾的句子 ——
+    // 实测漏掉这一格时就是那样的文案。
+    const entryBytes = Number(b && b.bytes) || Number(rec.bytes) || 0;
+    const fedBytes = Number(rec.rawBytes) || Number(rec.bytes) || 0;
     return {
       outcome: 'INPUT_CAPPED', severity: 'medium', families: [],
-      message: `${name}：ELF 条目 ${Number(rec.bytes) || 0} B 超过取证字节上限，本次只喂进 `
-        + `${Number(rec.rawBytes) || 0} B —— 输入不完整，后半段一个字都没读到`
+      message: `${name}：ELF 条目 ${entryBytes} B 超过取证字节上限，本次只喂进 `
+        + `${fedBytes} B —— 输入不完整，后半段一个字都没读到`
         + (rec.parseError ? `（已读到的那一段还报：${rec.parseError}）` : '')
         + '：按未审查的二进制登记。',
       extraAdvice: ` ${registerOnly}`,

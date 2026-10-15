@@ -6003,6 +6003,12 @@ test('T57-14 超过取证字节上限的真 ELF：raw 正好截在上限，且�
   assert.equal(row.entryBytes, cap + 1);
   assert.match(t57Struct(r)[0].message, /输入不完整/);
   assert.equal(t57Struct(r)[0].severity, 'medium');
+  // 两个数各说各的话：条目多大 == 条目自己（cap+1），喂进去多少 == cap。
+  // 取错来源的那一版会写成「条目 8388608 B 超过上限，只喂进 8388608 B」——自相矛盾的句子（本轮实测过）。
+  const capMsg = t57Struct(r)[0].message;
+  assert.ok(capMsg.includes(String(cap + 1)) && capMsg.includes(String(cap)),
+    `条目大小与实喂大小都要出现且不相等：${capMsg}`);
+  assert.notEqual(row.entryBytes, row.rawBytes, '登记里这两个数也必须不是同一个来源');
 });
 
 test('T57-15 产物里不许有 raw，也不许有 NUL（§5.3 那一格，撑着一段历史事故）', async () => {
