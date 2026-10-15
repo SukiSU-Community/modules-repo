@@ -521,13 +521,15 @@ test('五种状态不合并，且 disabled 只由 workflow 写：模块自己永
   assert.equal(MODULE_WRITABLE_STATUSES.includes('disabled'), false);
 });
 
-async function runMain({ report, entries, argvExtra, env, fetchImpl, name = 'pkg.zip' }) {
+async function runMain({ report, entries, argvExtra, env, fetchImpl, readZip: injectedReadZip, name = 'pkg.zip' }) {
   const { dir, zipPath } = tmpZip(name, entries);
   const reportPath = writeReport(dir, report);
   const outPath = join(dir, 'ai-pkg.json');
   const statusPath = join(dir, 'ai.status');
+  const deps = { env, fetchImpl };
+  if (injectedReadZip) deps.readZip = injectedReadZip;
   const code = await main(['run', '--report', reportPath, '--zip', zipPath, '--out', outPath, '--status', statusPath, ...argvExtra],
-    { env, fetchImpl });
+    deps);
   const payload = JSON.parse(readFileSync(outPath, 'utf8'));
   return { dir, code, payload, status: readFileSync(statusPath, 'utf8').trim(), reportPath, zipPath, outPath, statusPath };
 }
@@ -1619,6 +1621,36 @@ test('M1-10 真 ELF 接线（仓库常驻夹具，只读不执行）：T5.7 的�
   assert.equal(b.corpus.has('zygisk/arm64-v8a.so'), false, '机器码仍然不送字节流');
   // 「AI 看得比静态少」的那一格：静态只吃前 24,576 B，而这里给的摘要与条目大小无关
   assert.ok(line.length < 1300, `摘要与条目大小无关：983,624 B → ${line.length} 字符`);
+});
+
+test('M1-11 一次判定只读一次 zip：送出去的那一份 = 复验用的那一份（变异 M-A 的钉子）', async () => {
+  // 注入的 readZip：第一发返回真条目，第二发起返回「同一批名字、被改过的正文」。
+  // 只读一次时模型引用的原文照样复验得动；读第二次就换成另一套字节 ⇒ 复验必然打回。
+  const real = [
+    file('module.prop', 'id=demo\nname=Demo'),
+    file('service.sh', '#!/system/bin/sh\nrm -rf /data/foo\n'),
+  ];
+  let calls = 0;
+  const fakeReadZip = () => {
+    calls += 1;
+    if (calls === 1) return { files: real, unread: [] };
+    return { files: [real[0], file('service.sh', '#!/system/bin/sh\necho 被第二次读改写过的正文\n')], unread: [] };
+  };
+  const verdict = {
+    schemaVersion: 1, agree: false, risk: 'high',
+    findings: [{ file: 'service.sh', line: 2, quote: 'rm -rf /data/foo', severity: 'high', why: '破坏性操作' }],
+  };
+  const r = await runMain({ report: R, entries: real,
+    argvExtra: ['--backend', 'workers-ai'],
+    env: { AI_API_BASE: 'https://x/v1', AI_API_KEY: 'k', AI_MODEL: 'm' },
+    readZip: fakeReadZip,
+    fetchImpl: async () => ({
+      ok: true, status: 200,
+      json: async () => ({ choices: [{ message: { content: fenced(verdict) }, finish_reason: 'stop' }] }),
+    }) });
+  assert.equal(calls, 1, `zip 必须只读一次（实测读了 ${calls} 次）—— 第二次读就是第二套口径`);
+  assert.equal(r.status, 'ok', `引用的原文与送出去的那一份同源才该采信：status=${r.status} reason=${r.payload.reason || ''}`);
+  assert.equal(r.payload.findings.length, 1, '结论要落到加严的那一条上，而不是整份不采信');
 });
 
 

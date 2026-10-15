@@ -1375,8 +1375,14 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
 
   let entries = [];
   let unread = [];
+  // 一次判定只读一次 zip：`buildBrief` 交出的 corpus 既是送出去的那一份，也是复验用的那一份。
+  // 第二次 readZip / 第二次切行 = 两套口径（评审 F8 的病根，也正是变异 M-A 的形状）：
+  // 包内字节完全相同时它不报错，只在「zip 被换过 / 重名条目 / 上限截断」这类缝隙上静默分叉，
+  // 而复验一旦对着另一套字节，「quote 逐字对得上」这句承诺就变成空话。
+  // `deps.readZip` 只当测试注入点（默认仍是本模块 import 的那一份；CLI 路径拿不到 deps）。
+  const readZipImpl = typeof deps.readZip === 'function' ? deps.readZip : readZip;
   try {
-    const z = readZip(paths.zip);
+    const z = readZipImpl(paths.zip);
     entries = z.files;
     unread = z.unread;
   } catch (err) {
