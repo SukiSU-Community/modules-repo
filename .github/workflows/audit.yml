@@ -983,6 +983,17 @@ jobs:
             const boolOf = (v) => (typeof v === 'boolean' ? v : null);
             const strOf = (v) => (v === null || v === undefined || v === '' ? null : seal(v));
 
+            // 上面那把 seal 只管白名单里的串；**intro 那几行是原样插值的**，而 REASONS 与
+            // MODULE_ID 都不是我们自己造的串（trimSnippet 只压空白、不转义 `<`，module.prop 的
+            // id 由投稿者写）。不中和的话，一句 `</details>` 就能提前关掉别人的折叠块、
+            // 再开一个自己的 —— 而这条评论是渲染给人看的判据现场。
+            // 只做中和（& 先转，避免二次转义），**不删字**：删了没人知道投稿者写过什么。
+            const inert = (v) => String(v === null || v === undefined ? '' : v)
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;').replace(/>/g, '&gt;')
+              .replace(/`/g, '&#96;')
+              .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' ');
+
             // ---- 字段白名单（工单 §2 Step 1 点名的那一份；这是白名单，不是黑名单）。
             // 禁止 `JSON.stringify(artifact)` 整包贴：产物里的 reason / problem.raw /
             // problem.bad[].quote / findings[].message 都是「模型转述过的、投稿者能影响的文本」，
@@ -1081,12 +1092,12 @@ jobs:
 
             let intro = `## 模块投稿安全审核\n\n`
               + `- 本 PR 内投稿数：**${COUNT}**\n`
-              + `- 模块 id：\`${process.env.MODULE_ID}\`\n`
+              + `- 模块 id：\`${inert(process.env.MODULE_ID)}\`\n`
               + `- 风险等级：**${String(process.env.RISK).toUpperCase()}**（取本 PR 全部报告里最严的一份）\n`
               + `- 变更类型：**${ctLabel(process.env.CHANGE_TYPE)}**\n`
               + `- 处置：**\`${process.env.ACTION}\`** / 标签 \`${process.env.LABEL}\`\n`
-              + `- 依据：${process.env.REASONS}\n`
-              + `- 复核方式：${process.env.AI_NOTE || '（分流这一步没写出复核方式：AI 那一层没有可呈现的文案）'}\n`;
+              + `- 依据：${inert(process.env.REASONS)}\n`
+              + `- 复核方式：${inert(process.env.AI_NOTE || '（分流这一步没写出复核方式：AI 那一层没有可呈现的文案）')}\n`;
 
             if (process.env.ACTION === 'auto-approve') {
               intro += `\n✅ 静态扫描未发现风险且每份投稿都是首次收录，已自动合入索引。\n`;

@@ -1180,3 +1180,32 @@ test('T6.2·接缝：分流写出的那句复核方式真的出现在正文里�
   assert.ok(r.body.includes(r.kv.ai_note), '正文里那句必须与 output 逐字相同（截断也算不上，两句要能对上）');
 });
 
+
+test('T6.2·折叠边界：依据与模块 id 里的 `</details>`、反引号、控制序列都不许把评论的结构拆掉', () => {
+  // 复验 6.2 时发现的一格：白名单管住了 AI 产物里的自由文本，但 intro 那七行是**原样插值**的。
+  // REASONS 与 MODULE_ID 都不是我们自己造的串 ——
+  //   REASONS 里有 risk-rules 的 `trimSnippet`（实测只压空白、不转义 `<`，risk-rules.mjs:40-43），
+  //   MODULE_ID 是 `module.prop` 里的 `id=`（投稿者写的）。
+  // 于是「一行折叠正文 + 一句 `</details>`」就能在评论里提前关掉别人的块、再开一个自己的块，
+  // 或者用反引号把 `- 模块 id：\`…\`` 那段内联代码提前闭合。
+  // 判据不新发明封口：与本步 `seal()` 同一套思路（洗控制序列 + 把 `<`、`>`、反引号变成实体），
+  // 只作用在评论自己的插值上，**不动**静态报告正文（那是 renderMarkdown 那一层的事，另账）。
+  const reason = 'rm 清理 </details><img src=q onerror=alert(1)> ``` 伪造围栏 \u0001 结尾';
+  const r = runCommentFrom({
+    reports: { 'demo.zip': rep('medium', 'first', { reasons: [reason], id: 'a`</details>伪造' }) },
+    ai: { 'demo.zip': { status: 'ok', artifact: {
+      status: 'ok', agree: true, findings: [], brief: { byteSize: 10, shapes: {}, sections: [] },
+    } } },
+  });
+  assert.equal(r.err, null, `评论步本身不许抛：${r.stderr}`);
+  // 一块静态 + 一块 AI ⇒ 恰好两个 </details>。注入的那两句各自多带一个，红在这里。
+  assert.equal((r.body.match(/<\/details>/g) || []).length, 2,
+    `折叠标签数量必须恰好等于块数（多出来的就是投稿者写的）：\n${r.body}`);
+  assert.equal((r.body.match(/<details>/g) || []).length, 2, '开标签同样只许来自我们自己');
+  assert.ok(!/<img\b/.test(r.body), '注入的 <img> 不许原样出现在正文（渲染态就是可执行的标签）');
+  assert.ok(!r.body.includes('\u0001'), '控制序列不许原样进评论');
+  // 三处合法的 ```（AI 块一开一合）之外不许再多出围栏
+  assert.equal((r.body.match(/```/g) || []).length, 2,
+    '反引号围栏只许来自我们的 AI 块；依据/模块 id 里的反引号必须先变成实体');
+  assert.match(r.body, /&lt;|&#96;/, '被中和之后仍然要看得见原文内容，不许直接删掉（删了就没人知道投稿者写了什么）');
+});
