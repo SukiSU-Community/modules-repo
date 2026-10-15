@@ -308,3 +308,72 @@ export function extractStrings(buf, min = 6, cap = Infinity) {
   if (cur.length >= min) { total++; if (res.length < cap) res.push({ off: start, s: cur }); }
   return { total, samples: res };
 }
+
+// ---------------------------------------------------------------------------
+// T5.7 §2：危险能力族。
+//
+// 这张表**只住在这一个文件里**：risk-rules 与 scan 只许消费，不许抄第二份成员表
+// （audit/scan.test.mjs 的 T57-07 按源码钉这一格）。族名与成员是工单 §2 那五行，
+// 按前缀归族，成员全部来自上面 SENSITIVE 那份名单已经认出来的名字。
+//
+// 为什么这里只有「链接期事实」：`.dynsym` 里出现过的名字是动态链接器必须满足的集合，
+// 出现过就一定用得到 —— 这是静态层唯一能拿到的硬证据。它不等于「会被调用」，更不等于
+// 「安全」，所以这张表只用来把 STRUCT_BINARY 往严写，永远不用来放宽任何东西。
+//
+// 刻意**不算危险族**的：mmap / mprotect / read / write / close / ioctl / syscall
+// （以及 open / opendir / readdir / writev / readlink 这些读侧与目录遍历形）。
+// §0.8 那条边界是双向的 —— 「导入表干净」不等于安全，反过来「有 mmap」也不等于能执行；
+// 把这些收进危险集会把我自己那条论证说反，而且会让每一个正经 .so 都亮灯（那种判据没有信息量）。
+//
+// 纯函数、确定性：输入是字符串数组，输出按族名排序、族内符号排序、族内代表符号封顶
+// REPRESENTATIVE_CAP 个（总数另放在 symbolTotal 里，静默截断是不许的）。
+// 空数组、非数组、未知名、大小写混写都必须有确定输出 —— 匹配时统一转小写，
+// 所以 `FORK` / `fork` / `Fork` 归到同一族且去重成一条。
+// ---------------------------------------------------------------------------
+
+/** 族内代表符号的上限（工单 §2 第四、五行：「每族至多 5 个」）。 */
+const REPRESENTATIVE_CAP = 5;
+
+/** [族名, 人读标签, 前缀成员表]。前缀按 §2 那一行逐字落地，别用「差不多是」的正则。 */
+const CAPABILITY_FAMILIES = [
+  ['EXEC', '起新程序/运行时加载',
+    ['exec', 'system', 'popen', 'fork', 'vfork', 'clone', 'posix_spawn', 'dlopen', 'dlsym']],
+  ['NET', '网络收发',
+    ['socket', 'connect', 'bind', 'listen', 'accept', 'send', 'recv', 'getaddrinfo']],
+  ['NS', '命名空间与进程逃逸',
+    ['setns', 'unshare', 'chroot', 'mount', 'pivot_root', 'ptrace', 'kill', 'sigaction', 'prctl']],
+  ['PROP', '系统属性读写',
+    ['__system_property_', 'android_', 'property_']],
+  ['FILEWRITE', '文件写出与改名',
+    ['unlink', 'rename', 'truncate', 'ftruncate', 'mkdir', 'rmdir', 'chdir']],
+];
+
+/**
+ * 逐族展开：返回 [{family, label, symbols(≤5，已排序), symbolTotal}]，按族名排序。
+ * @param {string[]} sensitiveImports forensics() 的 sensitiveImports（也可以喂任意名字数组）
+ */
+export function capabilitySymbols(sensitiveImports) {
+  const names = Array.isArray(sensitiveImports)
+    ? sensitiveImports.filter((x) => typeof x === 'string' && x.length > 0)
+    : [];
+  const out = [];
+  for (const [family, label, prefixes] of CAPABILITY_FAMILIES) {
+    const uniq = [...new Set(names.filter((s) => {
+      const low = s.toLowerCase();
+      return prefixes.some((p) => low.startsWith(p));
+    }))].sort();
+    if (uniq.length > 0) {
+      out.push({ family, label, symbols: uniq.slice(0, REPRESENTATIVE_CAP), symbolTotal: uniq.length });
+    }
+  }
+  return out.sort((a, b) => (a.family < b.family ? -1 : a.family > b.family ? 1 : 0));
+}
+
+/**
+ * 族名集合（去重 + 排序）。危险族**数量**是唯一的升档依据：≥2 类才升 high。
+ * @param {string[]} sensitiveImports
+ * @returns {string[]} 例如 ['EXEC','FILEWRITE','NET','NS']；什么都落不到时 []
+ */
+export function capabilityFamilies(sensitiveImports) {
+  return capabilitySymbols(sensitiveImports).map((x) => x.family);
+}

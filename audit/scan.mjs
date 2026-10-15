@@ -28,9 +28,30 @@ import {
   CONTENT_RULES, scanContent, checkMetadata, parseModuleProp,
   scoreRisk, decide, countsTowardRisk, CATEGORY_LABEL, SEVERITY_ORDER,
   inspectStructure, checkCoverage, checkUnread, checkBinaries, detectBinary,
-  printableRatio, POLYGLOT_MIN_PRINTABLE,
+  binaryForensicsRows, printableRatio, POLYGLOT_MIN_PRINTABLE,
   MAX_TEXT, MAX_ENTRY_UNCOMPRESSED, EXEC_BUNDLED_FILE, EXEC_INDIRECT, MODDIR_RUNTIME_WRITE, trimSnippet,
 } from './risk-rules.mjs';
+import { forensics, STRING_SCAN_LIMIT } from './elf-forensics.mjs';
+
+/**
+ * Task 5.7：二进制条目原始字节的保留上限（工单 §5 第 2 条那个「专门的字节上限」）。
+ *
+ * 为什么取这个数（= STRING_SCAN_LIMIT = 8 MiB，不是随手挑的）：
+ *   1) 取证模块自己就只看到 8 MiB —— `elf-forensics.analyze()` 的 strings 那一步扫的是
+ *      `min(buf.length, STRING_SCAN_LIMIT)`。留得比这更多，多出来的那些字节一个都不会被读到，
+ *      所以这个上限永远不是「少读了」的原因，只可能是「少留了」的原因，而那正是我们要它做的。
+ *   2) 它是 MAX_ENTRY_UNCOMPRESSED（64 MiB）的 1/8。拿 64 MiB 当这个闸等于没有闸：
+ *      投稿者塞一枚 64 MiB 的「ELF」就能把 CI 的解析时间与内存端走（工单 §5 明令禁止复用那个上限）。
+ *   3) 上限存在的真正理由是**可证性**：超过它的条目必须留下一句「只读了前 N 字节」，
+ *      否则一枚 20 MiB 的 .so 会在前缀上解析成功，被念成「读到 N 个导入，无一落在危险族」——
+ *      那是把「我们只看了 8 MiB」说成「它什么都不干」（§5 末段那一格，T57-09 / T57-14 压着）。
+ *
+ * 实现口径（照实写，别让注释比代码乐观）：`raw` 是已解压 Buffer 的 subarray **视图**，
+ * 与既有的 `head` 同一个 ArrayBuffer ⇒ 它本身不多占字节；`raw` 只在 detectBinary 命中处保留，
+ * 文本条目一律 `raw: null`（§5.1 那条「不许把文本条目的内存翻倍」）。
+ * 实测参照：本轮常驻的真 ELF 最大 983,624 B（device_faker 的 arm64-v8a.so），离上限一个数量级。
+ */
+export const MAX_FORENSICS_BYTES = STRING_SCAN_LIMIT;
 // ---------------------------------------------------------------------------
 // ZIP 解析（自带简易实现，失败时回退系统 unzip）
 // ---------------------------------------------------------------------------
@@ -279,6 +300,15 @@ function toFileEntry(name, buf) {
   // 机器码）本来就不逐行扫，给它们记截断只是噪声。
   const scanBytes = scanFeedBytes(bytes);
   const scanCapped = scanBytes < bytes.length;
+  // Task 5.7（工单 §5）：`content` 是 utf8 串，原始字节在解码那一刻就已经被毁掉了
+  // ——实测一枚真 .so 从 13,480 B 解成 13,430 个字符、往返不相等，`forensics()` 第一行
+  // 就按这个理由拒收字符串。所以要看二进制内部必须有原始字节，而它**只**在 detectBinary
+  // 命中时留下（§5.1：不许所有条目都留 Buffer），并受 MAX_FORENSICS_BYTES 管住（§5.2）。
+  // 超限那一条留 rawCapped=true，这是「看得见的记录」，不许静默变成「读不出」。
+  // 这一格与 report 的产物面无关：raw 永远不进报告（§5.3，T57-15 按 JSON.stringify 钉）。
+  const head = bytes.subarray(0, 512);
+  const isBinary = Boolean(detectBinary(head));
+  const rawCapped = isBinary && bytes.length > MAX_FORENSICS_BYTES;
   return {
     name,
     size: bytes.length,
@@ -286,7 +316,9 @@ function toFileEntry(name, buf) {
     // 不能把产物里的正文也剪了 —— AUDIT_COVERAGE_TRUNCATED 的「其余见产物」靠它。
     // 注意 content 是全文，而 scanText 才是行级规则真正吃进去的那一段。
     content: bytes.toString('utf8'),
-    head: bytes.subarray(0, 512),
+    head,
+    raw: isBinary ? bytes.subarray(0, Math.min(bytes.length, MAX_FORENSICS_BYTES)) : null,
+    rawCapped,
     truncated,
     scanBytes,
     scanCapped,
@@ -937,7 +969,27 @@ export function scanZip(zipPath, opts = {}) {
   // 第三个参数只用来把阈值写进文案；「哪个条目被砍了多少」在 files[].scanBytes 上。
   const coverFindings = checkCoverage(files, MAX_TEXT, MAX_SCAN_BYTES_PER_ENTRY);
   const unreadFindings = checkUnread(unread);
-  const binFindings = checkBinaries(binaries.map((b) => ({ name: b.name, id: b.binary.id, why: b.binary.why, bytes: b.size })));
+  // Task 5.7 接线（工单 §2 末段）：对 classify() 的 binaries 逐条跑 forensics(raw)，
+  // 按**条目名**建 map 再交给 checkBinaries。两份名字必须出自同一个表达式 ——
+  // map 的 key 只要漂一个口径（归一化成 basename、把反斜杠折成正斜杠、拿原始 zip 条目名
+  // 对工作区标签），整套新分支就一声不响地死掉：报告照旧是「medium / 我读不了」，
+  // 而测试还能全绿。INV-A 与变异 M4（名字口径）、M6（字节口径）就是为这一格存在的。
+  // 重名条目在 map 上必然共用一份记录（STRUCT_DUPLICATE_NAME 已经把那种包判 high 并拦住
+  // 自动放行）；登记里 entryBytes 取条目自己、forensicsBytes 取记录，两者不一致时人看得见。
+  const binList = binaries.map((b) => ({ name: b.name, id: b.binary.id, why: b.binary.why, bytes: b.size }));
+  const forensicsByName = new Map();
+  for (let i = 0; i < binaries.length; i++) {
+    const b = binaries[i];
+    // 没留住原始字节就**不登记**（不拿 content 去凑：utf8 串喂进 forensics 只会得到
+    // 一条「字节已经毁了」的 parseError，看着像「这个二进制读不出名堂」，
+    // 而那正是 §1 硬边界最怕的静默失效 —— 工单 §5 数过这一格）。
+    if (!Buffer.isBuffer(b.raw) || b.raw.length === 0) continue;
+    const rec = forensics(b.raw, binList[i].name);
+    forensicsByName.set(binList[i].name,
+      rec && b.rawCapped ? { ...rec, inputCapped: true, rawBytes: b.raw.length } : rec);
+  }
+  const binFindings = checkBinaries(binList, forensicsByName);
+  const binaryForensics = binaryForensicsRows(binList, forensicsByName);
   const metadataFindings = source === 'unzip' ? [{
     ruleId: 'AUDIT_COVERAGE_METADATA',
     category: 'structure',
@@ -986,6 +1038,11 @@ export function scanZip(zipPath, opts = {}) {
     structure: struct.stats,
     unread,
     binaries: binaries.map((b) => ({ name: b.name, kind: b.binary.id, bytes: b.size })),
+    // Task 5.7：取证数据单独一格，逐条目一条，key 与 report.binaries 的 name 同一套。
+    // 为什么不放进 finding 的 snippet：renderJSON 对所有**不参与定级**的 finding 无条件
+    // `snippet: mask(...)`，实测把证据打成 `AArc************语义`（§0 记过的那次），
+    // 而这一格不受定级口径牵连。这里只有事实与一句话结论，**没有字节面**（§5.3，T57-15 钉）。
+    binaryForensics,
     // 被引用而升级进扫描面的条目：谁在第几行、用什么写法引用了它，解析到了哪个条目。
     // 人工复核与 T5 的 brief 都靠这个字段复现「引用 → 载荷」这条链。
     escalated,

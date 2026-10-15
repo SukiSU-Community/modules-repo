@@ -6115,7 +6115,11 @@ test('INV-C 档位只增不减：同批包 counts.medium + counts.high 在改动
     afterHigh += r.counts.high;
   }
   assert.equal(afterTotal, beforeTotal, '全批守恒');
-  assert.equal(beforeHigh, 0, '改前全批 0 条 high（本轮实测）');
-  assert.equal(afterHigh, 3, '改后全批 3 条 high（本轮实测）');
+  // 这两个数是本轮实测的**整包** counts（含别的规则自带的 high），不是 STRUCT_BINARY 单独数：
+  // polyglotReal 那一只包本来就带 3 条 high，所以基线不是 0。
+  // STRUCT_BINARY 自己的那一本账在 INV-A：手动那一份 0 条 high，接线那一份 3 条。
+  assert.equal(beforeHigh, 3, '改前全批 3 条 high（本轮实测）');
+  assert.equal(afterHigh, 6, '改后全批 6 条 high（本轮实测）');
+  assert.equal(afterHigh - beforeHigh, 3, '净增的 3 条就是被取证升档的那三条 STRUCT_BINARY，一条不许更多');
   assert.equal(t57BatchCount(await t57Run('df2')), 2, 'df2 两枚真 ELF 必须都升 high');
 });

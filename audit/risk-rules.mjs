@@ -17,6 +17,11 @@
 // 约定：
 //   * 所有函数都是纯函数，不读文件、不读环境变量、不产生副作用。
 //   * severity === 'info' 的发现只提示、不参与风险定级（投稿者隐私属此类）。
+//
+// Task 5.7 起本文件 import 了 ./elf-forensics.mjs 里的 capabilitySymbols —— 那是同一套纯函数
+// （零 I/O、零依赖），引它只为「能力族表全仓只许有一份」（工单 §2）。
+
+import { capabilitySymbols } from './elf-forensics.mjs';
 
 export const SEVERITY_ORDER = { info: 0, low: 1, medium: 2, high: 3 };
 
@@ -2052,19 +2057,177 @@ export function checkUnread(unread = []) {
   }));
 }
 
+// ---------------------------------------------------------------------------
+// Task 5.7：把 STRUCT_BINARY 从「我读不了」写成「它一定能做什么」
+//
+// 三条硬边界（工单 §1）落在这两个函数里，改之前先读它们：
+//   1) 每个二进制条目**恰好一条**参与定级的发现，档位只许 ∈ {medium, high}。
+//      没有一条分支写成 low / info，也没有一条分支少发或多发发现 ⇒ 这个改动不可能让任何包
+//      从 block 变成 auto-approve（decide 对非 low 一律 block）。INV-B 与变异 M2 压着这一格。
+//   2) 档位只增不减：取证能说的最多是「medium → high」，方向永远朝严。INV-C 压着条数守恒。
+//   3) 「读不出」与「没有危险」是两本账：parseError / 超限输入永远不许被念成「0 危险族」，
+//      而「0 危险族」那一行自己必须写着「这不等于安全」（§0.8 那条双向边界）。
+//
+// 能力族表住在 audit/elf-forensics.mjs（只此一份，T57-07 按源码钉），这里只消费。
+// ---------------------------------------------------------------------------
+
+/**
+ * 查这份条目名对应的取证记录。三种口径分开：
+ *   没查中（hit=false）⇒ 走今天的行为；查中且值为 null ⇒ 「跑过取证，它不是 ELF」；
+ *   查中且有对象 ⇒ 按那份事实分派。
+ * 用 has/hasOwnProperty 而不是 `map[key]` 直接取：条目名是投稿者起的，
+ * `__proto__` / `constructor` 这种 key 在朴素对象上会取到一个真值对象，把分派带进错误的分支。
+ * @param {Map|object|null} forensicsByName
+ * @param {string} key
+ */
+function lookupForensics(forensicsByName, key) {
+  if (!forensicsByName || typeof forensicsByName !== 'object') return { hit: false, rec: undefined };
+  if (typeof forensicsByName.has === 'function' && typeof forensicsByName.get === 'function') {
+    return forensicsByName.has(key) ? { hit: true, rec: forensicsByName.get(key) } : { hit: false, rec: undefined };
+  }
+  return Object.prototype.hasOwnProperty.call(forensicsByName, key)
+    ? { hit: true, rec: forensicsByName[key] }
+    : { hit: false, rec: undefined };
+}
+
+/**
+ * 一个二进制条目的取证分派（工单 §2 那张五行表 + §5 那一格超限）。纯函数，不碰 zip、不读常量表。
+ * @param {{name?:string,id?:string,why?:string,bytes?:number}} b checkBinaries 收到的那条
+ * @param {{hit:boolean,rec?:object|null}} found lookupForensics 的结果
+ * @returns {{outcome:string,severity:string,message:string,families:string[],extraAdvice?:string}}
+ */
+function binaryVerdict(b, found) {
+  const name = String(b && b.name ? b.name : '');
+  const why = (b && (b.why || b.id)) || '未知类型';
+  const baseMessage = `${name} 是二进制负载（${why}），静态行级规则无法审查`;
+  const registerOnly = '按未审查的二进制登记：来源与校验和必须在 module.prop/描述里说明。';
+
+  // 第一行之前那一格：没接线 / 查不中 == 今天，逐字节相同（T57-01 的向后兼容钉子）。
+  if (!found.hit) return { outcome: 'NO_RECORD', severity: 'medium', message: baseMessage, families: [] };
+
+  // 表①：非 ELF（forensics 返回 null —— dex / apk / ttf / png…）。
+  // 口径纪律（§2.7）：这不是「读不了」，是「不归静态取证管」。写成读不动就把
+  // 「看不见」与「看不清」并成了一格，而这两本的账完全不同。
+  if (found.rec === null || found.rec === undefined) {
+    return {
+      outcome: 'NOT_ELF', severity: 'medium', families: [],
+      message: `${name} 是二进制负载（${why}），不是 ELF，静态取证不适用：`
+        + '行级规则读不懂它，只能按机器码交人工。',
+      extraAdvice: ` ${registerOnly}`,
+    };
+  }
+
+  const rec = found.rec;
+  // 表⑤（§5 那一格，排在最前）：超过取证字节上限的条目只留下了前缀。
+  // 前缀**自己解析成功了也不算证完** —— 尾部没读到的东西能装下任何能力，
+  // 所以这一格只能说「输入不完整」，永远不许念成「取证成功、0 危险族」。
+  if (rec.inputCapped) {
+    return {
+      outcome: 'INPUT_CAPPED', severity: 'medium', families: [],
+      message: `${name}：ELF 条目 ${Number(rec.bytes) || 0} B 超过取证字节上限，本次只喂进 `
+        + `${Number(rec.rawBytes) || 0} B —— 输入不完整，后半段一个字都没读到`
+        + (rec.parseError ? `（已读到的那一段还报：${rec.parseError}）` : '')
+        + '：按未审查的二进制登记。',
+      extraAdvice: ` ${registerOnly}`,
+    };
+  }
+
+  // 表②：ELF 但 parseError（畸形头、大端、越界的表项，或字节面在解码时就已经坏了）。
+  const unparsed = !Number.isInteger(rec.importCount) || !Array.isArray(rec.sensitiveImports);
+  if (rec.parseError || unparsed) {
+    return {
+      outcome: 'PARSE_ERROR', severity: 'medium', families: [],
+      message: `${name}：头部有 ELF 魔数，但读不出符号表（${rec.parseError || '没有可读的 .dynsym 计数'}）`
+        + '：按未审查的二进制登记，读不出不等于没有。',
+      extraAdvice: ` ${registerOnly}`,
+    };
+  }
+
+  // 表③④⑤：读出来了，按危险族数量分档。
+  const fams = capabilitySymbols(rec.sensitiveImports);
+  const read = `${name}：ELF（${rec.machineName || '未知架构'}，${rec.importCount} 个导入`
+    + `${rec.stripped ? '，已 strip' : ''}）`;
+  const families = fams.map((x) => x.family);
+  if (fams.length === 0) {
+    return {
+      outcome: 'ELF_NO_FAMILY', severity: 'medium', families,
+      message: `${read} —— 读到 ${rec.importCount} 个导入，无一落在危险族；这不等于安全`
+        + '（mmap + mprotect 即可在进程内跑机器码，open / write / unlink 即可改文件）。',
+    };
+  }
+  const listing = fams.map((x) => `${x.family} ${x.label}（${x.symbols.join(', ')}`
+    + `${x.symbolTotal > x.symbols.length ? `…共 ${x.symbolTotal} 个` : ''}）`).join('；');
+  return {
+    outcome: fams.length >= 2 ? 'ELF_FAMILIES' : 'ELF_FAMILY',
+    severity: fams.length >= 2 ? 'high' : 'medium',
+    families,
+    message: `${read} —— 链接期一定会用到 ${fams.length} 类危险能力：${listing}`
+      + (fams.length >= 2 ? '；升级理由：≥2 类链接期能力。' : '。'),
+    extraAdvice: ' 导入表是动态链接器必须满足的集合：名字出现过就一定用得到。'
+      + '核对这些能力是否都在它自称的功能里。',
+  };
+}
+
 /** 二进制条目：行级规则对它无效，只能靠人/专门通道看 */
-export function checkBinaries(binaries = []) {
-  return (Array.isArray(binaries) ? binaries : []).map((b) => ({
-    ruleId: 'STRUCT_BINARY',
-    category: 'structure',
-    severity: 'medium',
-    file: String(b && b.name ? b.name : ''),
-    line: 0,
-    snippet: `${b.id} / ${b.bytes} B`,
-    message: `${b.name} 是二进制负载（${b.why || b.id}），静态行级规则无法审查`,
-    advice: '模块可以带二进制（busybox、update-binary 等），但它必须在 module.prop/描述里说明来源，'
-      + '并给出可核对的上游或校验和；匿名可执行文件在 root 下运行等于把判断权交给机器码。',
-  }));
+export function checkBinaries(binaries = [], forensicsByName = null) {
+  const list = Array.isArray(binaries) ? binaries : [];
+  return list.map((b) => {
+    const base = {
+      ruleId: 'STRUCT_BINARY',
+      category: 'structure',
+      severity: 'medium',
+      file: String(b && b.name ? b.name : ''),
+      line: 0,
+      snippet: `${b.id} / ${b.bytes} B`,
+      message: `${b.name} 是二进制负载（${b.why || b.id}），静态行级规则无法审查`,
+      advice: '模块可以带二进制（busybox、update-binary 等），但它必须在 module.prop/描述里说明来源，'
+        + '并给出可核对的上游或校验和；匿名可执行文件在 root 下运行等于把判断权交给机器码。',
+    };
+    // Task 5.7：取证结论只改 severity / message / advice 三个字段。
+    // ruleId 沿用 STRUCT_BINARY（不新增 id，否则与它在同一个文件上重复计数 —— §0.7 那个病）、
+    // file 与 line 一字不动（INV-B 按条目名逐条对账）、snippet 不放取证摘要
+    // （renderJSON 会把不参与定级的 snippet 打成 `AArc************语义`，见 §2）。
+    const v = binaryVerdict(b, lookupForensics(forensicsByName, base.file));
+    const out = { ...base, severity: v.severity, message: v.message };
+    if (v.extraAdvice) out.advice = `${base.advice}${v.extraAdvice}`;
+    return out;
+  });
+}
+
+/**
+ * Task 5.7 的取证登记（新的顶层报告字段用得到它）。
+ * 与 checkBinaries 同一次分派、同一个来源，所以「报告说它读到 86 个导入」与「这条发现为什么是 high」
+ * 不可能各说一套。逐条目一条，条目名就是 key —— 与 report.binaries 那份清单一一对得上。
+ */
+export function binaryForensicsRows(binaries = [], forensicsByName = null) {
+  const list = Array.isArray(binaries) ? binaries : [];
+  return list.map((b) => {
+    const found = lookupForensics(forensicsByName, String(b && b.name ? b.name : ''));
+    const v = binaryVerdict(b, found);
+    const row = {
+      name: String(b && b.name ? b.name : ''),
+      kind: b && b.id ? b.id : null,
+      entryBytes: b && Number.isInteger(b.bytes) ? b.bytes : null,
+      outcome: v.outcome,
+      families: v.families,
+      summary: v.message,
+    };
+    const rec = found.hit && found.rec ? found.rec : null;
+    if (rec) {
+      if (rec.kind) row.forensicsKind = rec.kind;
+      if (Number.isInteger(rec.bytes)) row.forensicsBytes = rec.bytes;
+      if (rec.machineName) row.machineName = rec.machineName;
+      if (rec.type) row.type = rec.type;
+      if (typeof rec.stripped === 'boolean') row.stripped = rec.stripped;
+      if (Number.isInteger(rec.importCount)) row.importCount = rec.importCount;
+      if (Array.isArray(rec.sensitiveImports)) row.sensitiveImports = rec.sensitiveImports;
+      if (Array.isArray(rec.needed)) row.needed = rec.needed;
+      if (rec.parseError) row.parseError = rec.parseError;
+      if (rec.inputCapped) row.inputCapped = true;
+      if (Number.isInteger(rec.rawBytes)) row.rawBytes = rec.rawBytes;
+    }
+    return row;
+  });
 }
 
 // ---------------------------------------------------------------------------
