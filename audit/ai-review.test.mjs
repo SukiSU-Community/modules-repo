@@ -602,6 +602,39 @@ test('CLI：装不下 → over-budget 并且**不发这一发**（fetch 一次�
   assert.ok(r.payload.brief.omitted.length > 0 && r.payload.brief.overBudget === true, 'omitted 与 overBudget 要进最终报告');
 });
 
+// M1 报告 §二 记的那笔账：上面那发在 M-C 变异（把预算闸挪到调用之后）下确实红了，但红的是
+// `status` 变成 failed —— 桩是**故意抛**的，`assert.equal(called, 0)` 那句压根没机会执行。
+// 于是「装不下就不发这一发」今天只钉在状态值上，没钉在调用次数上。这一发把桩换成
+// **完全合法**的返回（schema 对、quote 逐字对得上送出去的那一份原文），红只能红在 called 上。
+test('CLI：桩返回**完全合法**的结论时，装不下仍然是 over-budget 且 called === 0（M1 留账）', async () => {
+  let called = 0;
+  // 不抛、不返回垃圾：HTTP 200 + 单条整围栏 + GOOD_VERDICT（quote 逐字来自 service.sh 第 2 行）。
+  // 这一发如果真发出去了，schema 校验与 quote 复验都会通过 → 会是一个看起来可用的 ok + agree:false。
+  const fakeFetch = async () => {
+    called += 1;
+    return {
+      ok: true, status: 200,
+      json: async () => ({ choices: [{ message: { content: fenced(GOOD_VERDICT) }, finish_reason: 'stop' }], usage: { neurons: 9 } }),
+    };
+  };
+  const entries = [
+    file('service.sh', '#!/system/bin/sh\nrm -rf /data/foo\n'),
+    file('payload.json', 'z'.repeat(4000) + '\n'),
+  ];
+  const r = await runMain({ report: R, entries, argvExtra: ['--backend', 'workers-ai', '--max-bytes', '2000'],
+    env: { AI_API_BASE: 'https://x/v1', AI_API_KEY: 'k', AI_MODEL: 'm' }, fetchImpl: fakeFetch });
+  assert.equal(called, 0, '这一发**压根不该发出去**：预算闸在调用之前，与返回内容合不合法无关');
+  assert.equal(r.status, 'over-budget', '合法返回也改变不了「没看全」：读残缺输入再盖章比不审更糟');
+  assert.equal(r.code, 1);
+  assert.equal(r.payload.reasonCode, 'over-budget');
+  assert.equal(r.payload.brief.overBudget, true);
+  assert.ok(r.payload.brief.neededBytes > 2000, '文案要报「需要多少」，不是「装下了多少」');
+  // 一份 over-budget 的产物里不许有看起来可用的结论（与「不采信的消息不写 agree」同一条理由）。
+  for (const k of ['agree', 'risk', 'findings', 'levelAfterAi']) {
+    assert.equal(r.payload[k], undefined, `over-budget 的产物里不许出现结论字段 ${k}`);
+  }
+});
+
 test('CLI：模型调用失败（非 2xx）→ failed 且不重试成 agree', async () => {
   let called = 0;
   const fakeFetch = async () => { called += 1; return { ok: false, status: 503, json: async () => ({}) }; };
