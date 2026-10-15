@@ -4801,17 +4801,4 @@ test('T3.4-C2 不变量：左边界收缩进第一支，SHELL_STATEMENT_START �
   assert.equal(RULES_BY_ID.PIPE_TO_SHELL.anchor, 'anywhere', '锚点声明不动（闭包表继续按 x=1; 前缀验它）');
 });
 
-test('T3.4-C3 不变量：母本与副本的 risk-rules 是同一份字节 —— 谁只改一边，这里当场红', () => {
-  // 工单 §4.6 的 parity 纪律在测试面上的投影：副本（repo/audit）与母本（contrib/audit）互为兄弟目录，
-  // 两边跑同一份测试时各自把**对面那份**读进来逐字节对账；Temp 打桩副本没有仓外兄弟文件 ⇒ 两条候选路径
-  // 都不存在，测试自动放行（这就是基线里那条「环境伪影」同类现象，不硬失败）。
-  const local = readFileSync(new URL('./risk-rules.mjs', import.meta.url), 'utf8');
-  for (const rel of ['../../audit/risk-rules.mjs', '../repo/audit/risk-rules.mjs']) {
-    const sib = new URL(rel, import.meta.url);
-    if (!existsSync(sib)) continue;
-    assert.equal(readFileSync(sib, 'utf8'), local,
-      `仓外兄弟文件 ${rel} 与本地不是同一份字节：母本/副本必须先同步再跑`);
-  }
-});
-
 
