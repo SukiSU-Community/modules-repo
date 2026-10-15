@@ -245,7 +245,11 @@ function runAiStep(opts = {}) {
   const calls = fs.existsSync(callsPath)
     ? fs.readFileSync(callsPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
     : [];
-  return { code: err ? (err.status ?? 1) : 0, stdout, stderr, dir, files, status, calls };
+  // ::error:: 那几行才是这一步的「说法」。本步按 workflow 的既有惯例写 stdout（scan 的覆盖度闸同形），
+  // 所以断言从合并输出里挑出 error 行，而不是赌它落在哪条流上。
+  const out = `${stdout}\n${stderr}`;
+  const errors = out.split('\n').filter((l) => l.includes('::error::')).join('\n');
+  return { code: err ? (err.status ?? 1) : 0, stdout, stderr, out, errors, dir, files, status, calls };
 }
 
 /** 从调用 argv 里取某个 flag 的值。 */
@@ -467,17 +471,17 @@ test('AI 步：脚本 exit 2 且没写状态文件 → 这一步自己红，文�
   const r = runAiStep({ plan: { 'demo.zip': { noWrite: true, exit: 2 }, 'evil.zip': { status: 'ok' } } });
   // 「运行了但状态不好」与「这一层根本没运行」不是一回事：后者只能由本步自己红。
   assert.notEqual(r.code, 0, '没写出状态文件时必须本步红，否则下游拿到的是没有 AI 意见的判据');
-  assert.match(r.stderr, /demo\.zip/, '要点名是哪一包');
-  assert.match(r.stderr, /分叉|配置错误/, 'prompt 分叉是运维错，不是模型跑败：混成一句就把人指去查供应商');
-  assert.doesNotMatch(r.stderr, /没跑成/, '「没跑成」是 failed 那句串，AI 步不许提前用掉它');
+  assert.match(r.errors, /demo\.zip/, '要点名是哪一包');
+  assert.match(r.errors, /分叉|配置错误/, 'prompt 分叉是运维错，不是模型跑败：混成一句就把人指去查供应商');
+  assert.doesNotMatch(r.errors, /没跑成/, '「没跑成」是分流里 failed 那句串，AI 步不许提前用掉它');
 });
 
 test('AI 步：脚本崩溃（非 0 也非 2、没写状态）→ 同一条收口红，但不许说成 prompt 分叉', () => {
   const r = runAiStep({ plan: { 'demo.zip': { noWrite: true, exit: 1 }, 'evil.zip': { status: 'ok' } } });
   assert.notEqual(r.code, 0);
-  assert.match(r.stderr, /demo\.zip/);
-  assert.match(r.stderr, /状态文件/);
-  assert.doesNotMatch(r.stderr, /分叉/, '退出码 1 不是配置错误那条路；把两种病写成一句，运维就只能猜');
+  assert.match(r.errors, /demo\.zip/);
+  assert.match(r.errors, /状态文件/);
+  assert.doesNotMatch(r.errors, /分叉/, '退出码 1 不是配置错误那条路；把两种病写成一句，运维就只能猜');
 });
 
 test('AI 步的形状：不挂 set -e、收口认全五态、if 仍挂 found（不许 always()）', () => {
@@ -489,7 +493,8 @@ test('AI 步的形状：不挂 set -e、收口认全五态、if 仍挂 found（�
     '收口的 case 必须含 over-budget：M1 之后脚本会真写它，漏了就是把合法状态判成非法（§0.2-1）');
   assert.match(region, /^ {8}if: steps\.locate\.outputs\.found == 'true'$/m,
     'found=false 时既没有 zip 也没有报告，放宽这条会让每个维护类 PR 都红');
-  assert.doesNotMatch(region, /always\(\)/, '这一步不需要 always()：红由 triage 开火，不靠兜底跑完');
+  assert.doesNotMatch(region, /^ {8}if:.*always\(\)/m,
+    '这一步不靠 always() 兜底跑完：红由 分流决策 开火，不靠把失败洗成继续跑');
   assert.doesNotMatch(region, /continue-on-error/);
   assert.doesNotMatch(text, /\|\|\s*true/, '|| true 会把收口一起吞掉：这是变异②的形状');
   assert.match(text, /CODE=\$\?/, '退出码先收进变量，不当场开火');
