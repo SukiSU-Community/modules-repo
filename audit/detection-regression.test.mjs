@@ -655,21 +655,30 @@ const NARROWING_WITNESSES = [
   },
   {
     id: 'NW-3',
-    name: 'P10 包名/无锚点降 info ⇒ 证据仍在 report.findings，不写 null',
-    closesWhen: 'severityFor 的第 4/6 步返回 null（删证据 = A1 的 M3 同款方向），或 info 被改成 low（改档）',
+    name: 'P10 两条 info 分支（包名 / 无锚点）⇒ 证据仍在 report.findings，不写 null',
+    closesWhen: 'severityFor 的第 4 或第 6 步返回 null（删证据 = A1 的 M3 同款方向），或 info 被改成 low（改档）',
+    // 两个 info 分支各占一行：V5 变异实测过一支单独摘掉时另一支照样绿 ⇒ 这一格必须两行都在，
+    // 否则「P10 降 severity 不删证据」只有一半证人（本轮第一次跑 V5 就是这么暴露的，照实记）。
     build: () => ({ id: 'eval.t7nw3', files: [
-      ['service.sh', body('package = "com.tencent.tmgp.cf"')],
+      ['service.sh', body(
+        'package = "com.tencent.tmgp.cf"',
+        '    remove_path "/storage/emulated/0/Android/data/aidepro.top"')],
     ]}),
     check: (r) => {
       const hits = r.findings.filter((f) => f.ruleId === 'SUSPICIOUS_DOMAIN');
-      assert.equal(hits.length, 1, `info 那一支必须留在报告面上：${JSON.stringify(spots(r))}`);
-      assert.equal(hits[0].severity, 'info', `降级档位漂了：${JSON.stringify(hits[0])}`);
-      assert.equal(countsTowardRisk(hits[0]), false, 'info 不计入定级是 P10 的两条契约之一');
+      assert.equal(hits.length, 2,
+        `两条 info 分支都必须留在报告面上（少一条就是那一支被写成了 null）：${JSON.stringify(spots(r))}`);
+      assert.deepEqual(hits.map((f) => `${f.severity}@${f.line}`).sort(), ['info@2', 'info@3'],
+        `降级档位漂了：${JSON.stringify(hits.map((f) => `${f.severity}@${f.line}`))}`);
+      for (const f of hits) {
+        assert.equal(countsTowardRisk(f), false, 'info 不计入定级是 P10 的两条契约之一');
+      }
       assert.equal(countsTowardRisk({ severity: 'low' }), true,
         'info 与 low 不是一档：把降级写成 low 就是给这条证据抬了一档（A1-C1 的同一句话，这里再钉一次）');
-      assert.equal(r.riskLevel, 'low', `整包等级不该被这条抬起：${JSON.stringify(r.counts)}`);
+      assert.equal(r.counts.info, 2, `counts.info 该吃这两笔（证据变少也是红）：${JSON.stringify(r.counts)}`);
+      assert.equal(r.riskLevel, 'low', `整包等级不该被这两条抬起：${JSON.stringify(r.counts)}`);
     },
-    measured: 'low / auto-approve，SUSPICIOUS_DOMAIN/info 仍在 findings',
+    measured: 'low / auto-approve，SUSPICIOUS_DOMAIN/info 两笔都在 findings，counts.info=2',
   },
   {
     id: 'NW-4',
