@@ -6041,6 +6041,13 @@ test('T57-16 raw 只在 detectBinary 命中处保留：文本条目 raw===null�
   const big = Object.fromEntries(readZip(t57Zip('overCap')).files.map((f) => [f.name, f]));
   assert.equal(big['assets/big.elf'].raw.length, cap, '超限那条只许留到上限');
   assert.equal(big['assets/big.elf'].rawCapped, true, '超限那一格要产生看得见的记录，不许静默变成「读不出」');
+  // §5.2 的**真实目的**是管住「留住的字节数」，不只是「解析多少」。
+  // `Buffer.prototype.subarray` 返回的是**视图**（与父 ArrayBuffer 共享存储），
+  // 所以 `raw.length === cap` 完全可能仍然钉着一整块 64 MiB —— 上限就成了装饰。
+  // 实测一枚 40 MiB 缓冲取 8 MiB 视图：`view.buffer.byteLength` 仍是 40 MiB。
+  assert.equal(big['assets/big.elf'].raw.buffer.byteLength, cap,
+    `超限那条必须把前缀**拷出来**：视图会把整块父缓冲钉住，`
+    + `实得 raw=${big['assets/big.elf'].raw.length} 而底层 buffer=${big['assets/big.elf'].raw.buffer.byteLength}`);
 });
 
 // ---------------------------------------------------------------------------
