@@ -1661,6 +1661,43 @@ export function detectBinary(head) {
 }
 
 /**
+ * 「魔数或 NUL 开头、但后面整块是明文脚本」的 polyglot 条目要不要追加进内容扫描面（feed）的阈值。
+ * 判据是**严格大于**：0.851 进面，恰好 0.850 与 0.849 都不进 —— 夹具 T4-A3 钉的就是这一格。
+ *
+ * 这个数不是拍出来的：18 包（13 真包 + 5 老包）的 `binaries` 桶 228 条里，过线的恰好 2 条
+ * （Pixelify 的 `dnd.descriptor` 0.875000 与 `music_detector.descriptor` 0.861524），
+ * 把这 2 条逐字节喂进 `scanContent` 出 **0 条发现**；反面锚是真字体条目前 3000 B 的 0.340333
+ * 与 `classes.dex` 最高 0.5232 —— 真机器码离这条线有 0.3 的余量。
+ * ⇒ 阈值在真包侧不是空样本，它确实放两条进来，代价实测为 0 条新发现、0 个包翻转。
+ */
+export const POLYGLOT_MIN_PRINTABLE = 0.85;
+
+/**
+ * 整块可打印比例。量法写死在这儿，别人复现必须同法（工单 §0）：
+ * 可打印 = `0x20–0x7E` ∪ `0x09 0x0A 0x0D`，**对整条目字节取比例**。
+ *
+ * 全仓只许有这一份实现：`detectBinary` 只看头 16 字节，判的是「这是不是机器码」；
+ * 这里判的是「那串字节里有多少是人读得懂的正文」，两件事共用一份字符类早晚会分叉 ——
+ * 夹具 T4-C1 数着 `scan.mjs` 里不许出现第二个字符类。
+ * @param {Uint8Array|Buffer|string} bytes 条目字节；传字符串时按 UTF-8 取字节
+ *   （就是 `readZip` 给的那份 `content` 转字节，与 18 包那次重量同法）
+ * @returns {number} 0–1；空条目 0
+ */
+export function printableRatio(bytes) {
+  const b = Buffer.isBuffer(bytes) ? bytes
+    : bytes instanceof Uint8Array ? bytes
+      : typeof bytes === 'string' ? Buffer.from(bytes, 'utf8')
+        : null;
+  if (!b || !b.length) return 0;
+  let ok = 0;
+  for (let i = 0; i < b.length; i++) {
+    const v = b[i];
+    if ((v >= 0x20 && v <= 0x7e) || v === 0x09 || v === 0x0a || v === 0x0d) ok++;
+  }
+  return ok / b.length;
+}
+
+/**
  * zip 元数据层面的结构检查（纯函数）。
  * @param {Array<{name:string, method?:number, compSize?:number, origSize?:number,
  *               encrypted?:boolean, isSymlink?:boolean, isDir?:boolean}>} entries

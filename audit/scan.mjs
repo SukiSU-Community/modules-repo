@@ -28,6 +28,7 @@ import {
   CONTENT_RULES, scanContent, checkMetadata, parseModuleProp,
   scoreRisk, decide, countsTowardRisk, CATEGORY_LABEL, SEVERITY_ORDER,
   inspectStructure, checkCoverage, checkUnread, checkBinaries, detectBinary,
+  printableRatio, POLYGLOT_MIN_PRINTABLE,
   MAX_TEXT, MAX_ENTRY_UNCOMPRESSED, EXEC_BUNDLED_FILE, EXEC_INDIRECT, MODDIR_RUNTIME_WRITE, trimSnippet,
 } from './risk-rules.mjs';
 // ---------------------------------------------------------------------------
@@ -811,6 +812,8 @@ export function scanZip(zipPath, opts = {}) {
   // 策略/初始化文件（sepolicy.rule / .rc / .te —— 内容本身就是可执行语义，T2 补的盲）。
   // 二进制只登记不逐行扫（见 checkBinaries 的理由）—— 改名成数据文件的 ELF 由魔数落进
   // `binaries`，不在这里被捞回文本，那一格的证据是 STRUCT_BINARY 与 T5.5 取证。
+  // Task 4 补的那一格在下面的 polyglot 那一步：分桶不动、文本桶不许捞它，但「整块可读」的
+  // 那份字节要在**内容扫描**里被逐行读一遍（进 feed，不进可撤销面）。
   // fix2-P5：桶清单从 classify() 的返回键里显式点名（SCAN_TARGET_BUCKETS）——
   // 以前这里是手写的展开，新增桶忘接线时不会报错，只会让那个桶的文件「安静地不进扫描面」
   // （P5 复现过的正是这种静默）。守卫测试对两边做双向比对，忘一条就红。
@@ -825,6 +828,19 @@ export function scanZip(zipPath, opts = {}) {
   // 撤销判据继续只认 coveredSurface —— 「会在扫描面上」不等于「读过且无罪」。
   const coveredSurface = SCAN_TARGET_BUCKETS.flatMap((b) => cls[b] || []);
   const scanTargets = coveredSurface.concat(cls.others || []);
+
+  // Task 4：把「魔数/NUL 开头 + 后面整块是明文脚本」的 polyglot 条目**追加进 feed**。
+  // `classify()` 的魔数闸让它落 `binaries` 并 `continue`，于是那种「整块可读」的条目在改前
+  // 一行都没喂给内容规则 —— 报告只能说「有个二进制我读不了」，不能说「里面逐字写着
+  // `curl | sh` / `setenforce 0`，第几行」。方向是加严，动的只有组扫描面这一步。
+  // 先只算「哪些条目过线」（纯读 cls.binaries，不碰任何集合），真正 push 留到升级之后：
+  // 这样 `coveredSurface` 继续是那五个桶，而「把 polyglot 并进可撤销面」是一处可指名的改法
+  //（变异 M3 就改下面 `resolveBundledRefs` 的那一个实参）。
+  const polyglotEligible = (cls.binaries || []).filter((b) => {
+    const text = String(b.content == null ? '' : b.content);
+    // 内容非空 + 整块可打印比例**严格大于**阈值（量法只有共享层那一份实现，见 risk-rules）
+    return text.length > 0 && printableRatio(text) > POLYGLOT_MIN_PRINTABLE;
+  });
 
   // 载荷间接执行：被脚本 sh/source/变量间接引用的包内条目必须进扫描面，而且必须发生在下面那个
   // 内容扫描循环之前 —— 追加在循环之后的话，那些条目一行都不会被扫，测试却照样能
@@ -847,6 +863,29 @@ export function scanZip(zipPath, opts = {}) {
     escalatedEntries.push(e);
     escalated.push({ fromFile: e.__from, fromLine: e.__line, ref: e.__ref, resolvedEntry: e.name });
   }
+
+  // Task 4 的那一步真正落地：把过线的条目追加进 feed。三件事各管各的，一条都不许并（工单 §2）：
+  //   * `coveredSurface` 一字未动 ⇒ 撤销照旧只认扩面之前那五个桶。这一格是 §0.13 的续命判据：
+  //     「`sh $MODPATH/assets/payload.bin` 可以撤销」必须仍然不成立（夹具 T4-B3 / 变异 M3）。
+  //   * push 排在 `resolveBundledRefs` **之后**：升级记账（`report.escalated`）说的还是
+  //     「原本不在扫描面、因引用被拉进来」那件事，不许被本轮顶掉；已在 feed 上的条目
+  //     （含被升级进来的那份拷贝，按 rowKey 比）不重复推第二遍 —— 同一个条目推两遍就是
+  //     §0.16 那张表里「③ 跟着 ②」的同一个病：同一条 finding 出现两次、`counts.high` 变胖，
+  //     而 `counts` 是直接写进公开评论「命中统计」的那一行。
+  //   * push 排在本行的截断记账**之前**：polyglot 走的还是 Task 2.9 那条 24 KB 有界通道
+  //     （`lineRuleInput`），超限照旧记 `AUDIT_COVERAGE_TRUNCATED`，不为它另开一条无上限的喂法。
+  const polyglotFed = [];
+  {
+    const onFeed = new Set(scanTargets.map((f) => rowKey(f)));
+    for (const b of polyglotEligible) {
+      if (onFeed.has(rowKey(b))) continue;              // 已在 feed：不记第二份身份
+      scanTargets.push(b);
+      onFeed.add(rowKey(b));
+      polyglotFed.push(b);
+    }
+  }
+  // 渲染面按对象身份排除这一批（`escalated` 那些拷贝不在集合里，它们的清单行照旧在）。
+  const polyglotSet = new Set(polyglotFed);
 
   // Task 2.9：扫描面到这儿才算齐（升级条目也在里面），所以「谁被喂进过行级规则、
   // 谁被上限砍过」只能在这里记账。escalated 那些是 `{...文件条目}` 的拷贝，
@@ -979,7 +1018,20 @@ export function scanZip(zipPath, opts = {}) {
     // 但扫描面与渲染面要分开：升级条目照常进 scanContent，非文本条目在这里只给有界预览
     // （评审 fix1-③：1 MiB ELF 改名 .conf 实测把 Markdown 灌成 1.03 MB / 52 万个 NUL，
     //   8 MiB 把 JSON 灌成 50 MB —— 这些产物会作为公开 PR 评论发出去）。
-    scripts: scanTargets.map((f) => scriptRow(f)),
+    // Task 4：本轮追加进 feed 的 polyglot 也不进这一节 —— 同一个条目在报告清单里只有
+    // 一份身份（`binaries` 那一行），它读到了什么由 findings 自己指名道姓（工单 §2.4）。
+    scripts: scanTargets.filter((f) => !polyglotSet.has(f)).map((f) => scriptRow(f)),
+    // 本轮的记账面：哪些 binaries 条目因为「整块可读」被追加进了内容扫描，读了多少字节。
+    // 它不是 finding（不改等级、不加噪声），但「进过 feed」这件事必须人看得见、测得着 ——
+    // 否则 B1「两条 descriptor 进面但 0 发现」与 B2「机器码不许进面」两侧都没有观测点。
+    polyglotFed: polyglotFed.map((f) => ({
+      name: f.name,
+      kind: f.binary ? f.binary.id : null,
+      bytes: f.size,
+      printable: Number(printableRatio(f.content).toFixed(4)),
+      scanBytes: f.scanBytes,
+      scanCapped: Boolean(f.scanCapped),
+    })),
     findings: all,
     counts,
     riskLevel: level,
@@ -1127,7 +1179,14 @@ export function renderMarkdown(report) {
     && !(inv.policyFiles || []).length) {
     L.push('| — | （无脚本类文件） | — | — |');
   }
-  for (const b of report.binaries || []) L.push(`| 二进制（不逐行扫） | \`${escapeCell(b.name)}\` | ${b.bytes} B | ${b.kind} |`);
+  for (const b of report.binaries || []) {
+    // Task 4：进过内容扫描的那几条不许继续顶着「不逐行扫」这句话 —— 报告说的和做过的不许两样。
+    // 措辞只说读过（逐行读到了什么由 findings 那一节自己指名），不说「审过了、没问题」。
+    const label = (report.polyglotFed || []).some((x) => x.name === b.name)
+      ? '二进制（已按内容规则逐行扫过）'
+      : '二进制（不逐行扫）';
+    L.push(`| ${label} | \`${escapeCell(b.name)}\` | ${b.bytes} B | ${b.kind} |`);
+  }
   if (inv.otherFiles.length) {
     L.push('');
     L.push(`未纳入行级扫描的数据文件（${inv.otherFiles.length} 个，仅列前 30 个）：` +
@@ -1171,6 +1230,16 @@ export function renderMarkdown(report) {
     + '并逐条记 `AUDIT_COVERAGE_TRUNCATED`：哪个条目、原文多少字节、实扫多少字节）');
   L.push(`- 报告内嵌全文的上限：${st.limits ? (st.limits.MAX_TEXT / 1024).toFixed(0) : '512'} KB/文件`
     + `（Markdown 只贴前缀，全文在 JSON 产物里；上限之外的字节连规则也没读过，见上一条）`);
+  // Task 4：这一行是「进 feed 这件事可观测」那一格（工单 §3 B1）。没有这类条目时一行都不许多，
+  // 所以既有包的这一节逐字不变；有条目时要说清读的是哪几条、比例多少、读了多少字节。
+  if ((report.polyglotFed || []).length) {
+    L.push(`- 魔数/NUL 开头但整块可读、已追加进内容扫描面的条目（${report.polyglotFed.length} 个，`
+      + '它们仍只登记在上面的二进制清单里，报告不为它们另立第二份身份）：');
+    for (const x of report.polyglotFed) {
+      L.push(`    - \`${escapeCell(x.name)}\`：${x.kind} / ${x.bytes} B，整块可打印 ${x.printable}`
+        + `，行级规则读了 ${x.scanBytes} B${x.scanCapped ? `（超过单条目上限，已记 \`AUDIT_COVERAGE_TRUNCATED\`）` : ''}`);
+    }
+  }
   L.push('');
 
   L.push('## 风险发现');
