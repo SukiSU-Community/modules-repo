@@ -931,39 +931,190 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const files = fs.existsSync('audit-out')
-              ? fs.readdirSync('audit-out').filter(f => f.endsWith('.audit.md'))
-              : [];
+            const dir = 'audit-out';
+            const FENCE = '`'.repeat(3);
+            const namesOf = (suffix) => (fs.existsSync(dir)
+              ? fs.readdirSync(dir).filter((f) => f.endsWith(suffix)).sort()
+              : []);
+            const stem = (f, suffix) => f.slice(0, f.length - suffix.length);
+
+            // 逐包（Task 6.2）：这一步原本只贴排序后的第一份 .audit.md，多包 PR 里另外几份
+            // 只在文案里被承认「存在于 artifact」。工单 §0 那条验收要的是：陌生人只读这条评论
+            // 就能回答「AI 这一层跑没跑 / 它对哪几包说了什么 / 它实际被喂进去多少东西」——
+            // 少贴一包，第二问就答不上。包清单 = 静态报告与 AI 产物的并集，两份都要有块。
+            const mdPkgs = namesOf('.audit.md').map((f) => stem(f, '.audit.md'));
+            // 产物名 = ai-<zip basename>.json（AI 步写死的口径，含 .zip）。剥壳要用「去尾缀 + 去前缀」，
+            // 不能拿 stem(f,'ai-') 那种「砍最后三个字符」的写法顶替：它把 'ai-demo.zip' 切成 'ai-demo.'，
+            // 于是凭空多出一包、真正的包反而没块 —— 与 6.1 那两条 basename 钉子是同一个病。
+            const aiPkgs = namesOf('.json')
+              .filter((f) => /^ai-.*\.json$/.test(f))
+              .map((f) => stem(f, '.json').slice('ai-'.length));
+            const pkgs = [...new Set(mdPkgs.concat(aiPkgs))].sort();
+
             // 变更类型现在是「本 PR 内所有报告的并集」（会出现 first+update 这种值），
             // 所以标签要做映射：把判据的内部拼法原样贴给投稿者看，等于让他读我们的变量名。
             const CT = { first: '首次收录', update: '版本更新', unknown: '未知' };
             const ctLabel = (s) => String(s || '').split('+').map((x) => CT[x] || x).join('＋') || '未知';
             const COUNT = Number(process.env.PACKAGE_COUNT || 1);
-            let body = `## 模块投稿安全审核\n\n`
+
+            // ---- 三件封顶（§2 Step 1）：每块一个上限，整条正文一个总上限。
+            // GitHub 评论的硬上限是 65536 字符，超了 createComment 直接被 API 拒 —— 那是
+            // 「整条 PR 上一片沉默」，比贴不全更糟。60000 是留了 5536 余量的读数。
+            const MD_MAX = 12000;
+            // AI 块的上限要**大于「装满白名单」的那一发**（10 条 findings × 200 + 10 条 omitted × 200
+            // 实测约 9.5K），否则正常的大产物也会被切成半截 JSON —— 那一刀该落在超长自由文本上，
+            // 不该落在可核验的读数上。
+            const AI_MAX = 12000;
+            const BODY_MAX = 60000;
+            const RESERVE = 700; // 给「这些包没贴出来」那一句留位置，别让那句自己把上限顶穿
+            const TRUNC = '…（本节已截断，完整报告见 workflow artifact：module-audit-report）';
+
+            // ---- 封口：条数 ≤10、单条 ≤200。抄 分流决策 里那句 slice(0,10) + slice(0,200)，
+            // 不在这里发明第二份口径 —— 那是「模型产出的、投稿者能影响的文本进 PR 评论前的
+            // 最后一道」的评论层另一半。控制序列一并洗掉：白名单里的串也可能是投稿者起的条目名。
+            const CAP_ITEMS = 10;
+            const CAP_TEXT = 200;
+            const seal = (v) => (v === null || v === undefined ? ''
+              : String(v).replace(/[\u0000-\u001f\u007f]/g, ' ')).slice(0, CAP_TEXT);
+            const numOf = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+            const boolOf = (v) => (typeof v === 'boolean' ? v : null);
+            const strOf = (v) => (v === null || v === undefined || v === '' ? null : seal(v));
+
+            // ---- 字段白名单（工单 §2 Step 1 点名的那一份；这是白名单，不是黑名单）。
+            // 禁止 `JSON.stringify(artifact)` 整包贴：产物里的 reason / problem.raw /
+            // problem.bad[].quote / findings[].message 都是「模型转述过的、投稿者能影响的文本」，
+            // 原样进 PR 评论 = 二次注入。上游 ai-review 侧 sanitize 过这件事，评论层不许依赖它 ——
+            // 判据只许有一份，但**封口**不许只有一层。
+            const pickFinding = (x) => ({
+              ruleId: seal(x && x.ruleId),
+              severity: seal(x && x.severity),
+              file: seal(x && x.file),
+              line: numOf(x && x.line),
+            });
+            const SHAPE_KEYS = ['textEntries', 'binaryDigestEntries', 'polyglotAsText',
+              'nonTextRerouted', 'forensicsRowsSent'];
+            const pickBrief = (b) => (b && typeof b === 'object' ? {
+              byteSize: numOf(b.byteSize),
+              neededBytes: numOf(b.neededBytes),
+              corpusFiles: numOf(b.corpusFiles),
+              fileCount: numOf(b.fileCount),
+              overBudget: boolOf(b.overBudget),
+              budgetBasis: strOf(b.budgetBasis),
+              omitted: (Array.isArray(b.omitted) ? b.omitted : []).slice(0, CAP_ITEMS)
+                .map((o) => ({ name: seal(o && o.name), bytes: numOf(o && o.bytes), reason: seal(o && o.reason) })),
+              shapes: SHAPE_KEYS.reduce((acc, k) => { acc[k] = numOf(b.shapes && b.shapes[k]); return acc; }, {}),
+              sections: (Array.isArray(b.sections) ? b.sections : []).slice(0, CAP_ITEMS).map(numOf),
+            } : null);
+            const pickMeta = (m) => {
+              // 「有什么记什么」的那一格：只留标量，串一样过封口（sessionId/eventId 是服务端给的）。
+              if (!m || typeof m !== 'object' || Array.isArray(m)) return null;
+              const out = {};
+              for (const [k, v] of Object.entries(m)) {
+                if (typeof v === 'number' || typeof v === 'boolean' || v === null) out[seal(k)] = v;
+                else if (typeof v === 'string') out[seal(k)] = seal(v);
+              }
+              return out;
+            };
+            const pickAi = (a) => ({
+              status: seal(a.status),
+              reasonCode: strOf(a.reasonCode),
+              staticRiskLevel: strOf(a.staticRiskLevel),
+              levelAfterAi: strOf(a.levelAfterAi),
+              agree: boolOf(a.agree),
+              risk: strOf(a.risk),
+              backend: strOf(a.backend),
+              model: strOf(a.model),
+              promptSha256: strOf(a.promptSha256),
+              budgetBasis: strOf(a.budgetBasis),
+              findings: (Array.isArray(a.findings) ? a.findings : []).slice(0, CAP_ITEMS).map(pickFinding),
+              brief: pickBrief(a.brief),
+              meta: pickMeta(a.meta),
+            });
+
+            const FIVE = ['disabled', 'ok', 'failed', 'untrusted', 'over-budget'];
+            const statusOf = (p) => {
+              const f = `${dir}/ai-${p}.status`;
+              if (!fs.existsSync(f)) return null;
+              const v = seal(fs.readFileSync(f, 'utf8').trim());
+              return FIVE.includes(v) ? v : '未知状态值（原文不贴）';
+            };
+
+            function mdBlock(p) {
+              const head = `<details><summary>静态报告 · ${p}</summary>\n\n`;
+              const f = `${p}.audit.md`;
+              if (!fs.existsSync(`${dir}/${f}`)) {
+                return `${head}（这一包没有 ${f}：只有 AI 产物，静态报告读不到）\n\n</details>\n`;
+              }
+              const md = fs.readFileSync(`${dir}/${f}`, 'utf8');
+              const over = md.length > MD_MAX;
+              return `${head}${over ? md.slice(0, MD_MAX) : md}\n${over ? `\n${TRUNC}\n` : ''}</details>\n`;
+            }
+
+            function aiBlock(p) {
+              const head = `<details><summary>AI 安全员 · ${p}</summary>\n\n`;
+              const artFile = `ai-${p}.json`;
+              const st = statusOf(p);
+              if (!fs.existsSync(`${dir}/${artFile}`)) {
+                // 没有产物也要有一句话说清「为什么没有」—— 留白会被读成「AI 看了但没意见」。
+                const why = st === null ? '没有 ai-*.status：AI 安全员这一步没有产物'
+                  : st === 'disabled' ? '状态 disabled（QCA 四件配置缺一，未启用）'
+                    : `状态 ${st}：这一发没有写出产物 JSON`;
+                return `${head}本轮没有 AI 产物 —— ${why}。\n\n</details>\n`;
+              }
+              let a = null;
+              try {
+                const raw = JSON.parse(fs.readFileSync(`${dir}/${artFile}`, 'utf8'));
+                if (raw && typeof raw === 'object' && !Array.isArray(raw)) a = raw;
+              } catch { a = null; }
+              if (!a) {
+                // 解析错误的原文不回显：那里面就是投稿者可控的字节。
+                return `${head}本轮没有 AI 产物 —— ${artFile} 读不出来（JSON 解析失败，原文不贴）。\n\n</details>\n`;
+              }
+              const json = JSON.stringify(pickAi(a), null, 2);
+              const over = json.length > AI_MAX;
+              return `${head}${FENCE}json\n${over ? json.slice(0, AI_MAX) : json}\n${FENCE}\n`
+                + `${over ? `\n${TRUNC}\n` : ''}</details>\n`;
+            }
+
+            let intro = `## 模块投稿安全审核\n\n`
               + `- 本 PR 内投稿数：**${COUNT}**\n`
               + `- 模块 id：\`${process.env.MODULE_ID}\`\n`
               + `- 风险等级：**${String(process.env.RISK).toUpperCase()}**（取本 PR 全部报告里最严的一份）\n`
               + `- 变更类型：**${ctLabel(process.env.CHANGE_TYPE)}**\n`
               + `- 处置：**\`${process.env.ACTION}\`** / 标签 \`${process.env.LABEL}\`\n`
               + `- 依据：${process.env.REASONS}\n`
-              + `- 复核方式：${process.env.LLM_NOTE}\n`;
+              + `- 复核方式：${process.env.LLM_NOTE || '（分流这一步没写出复核方式：AI 那一层没有可呈现的文案）'}\n`;
 
             if (process.env.ACTION === 'auto-approve') {
-              body += `\n✅ 静态扫描未发现风险且每份投稿都是首次收录，已自动合入索引。\n`;
+              intro += `\n✅ 静态扫描未发现风险且每份投稿都是首次收录，已自动合入索引。\n`;
             } else if (process.env.RISK === 'low') {
               // 走到这一支只有两种可能：含已收录模块的更新，或多份投稿里不全是首次收录。
               // 两种都不是「中/高风险」——把它写成中/高风险就是把我们的判据说反。
-              body += `\n⚠️ 风险虽低，但按规则不自动合入（含已收录模块的版本更新，或本 PR 内并非每份投稿都是首次收录）：转人工审核。\n`;
+              intro += `\n⚠️ 风险虽低，但按规则不自动合入（含已收录模块的版本更新，或本 PR 内并非每份投稿都是首次收录）：转人工审核。\n`;
             } else {
-              body += `\n⛔ 中/高风险，需人工审核后才可进入正式索引；本 PR 不会自动合入。\n`;
+              intro += `\n⛔ 中/高风险，需人工审核后才可进入正式索引；本 PR 不会自动合入。\n`;
             }
 
-            if (files.length) {
-              const md = fs.readFileSync(`audit-out/${files[0]}`, 'utf8');
-              const MAX = 60000;
-              body += `\n<details><summary>完整报告（${files[0]}${COUNT > 1 ? ` —— 共 ${COUNT} 份投稿里的这 1 份，其余见 workflow artifact` : ''}）</summary>\n\n`
-                + (md.length > MAX ? md.slice(0, MAX) + '\n\n…（报告过长已截断，完整版见 workflow artifact）' : md)
-                + `\n</details>\n`;
+            let body;
+            if (!pkgs.length) {
+              body = `${intro}\n⚠️ audit-out 里没有任何 .audit.md 与 ai-*.json：本轮没有可贴出的报告。\n`;
+            } else {
+              const lead = `\n### 逐包呈现（${pkgs.length} 包：每包一块静态报告 + 一块 AI 安全员产物）\n\n`;
+              const fitted = [];
+              let used = intro.length + lead.length;
+              const hidden = [];
+              for (const p of pkgs) {
+                const text = `${mdBlock(p)}${aiBlock(p)}\n`;
+                // 装不下就整块撤下并点名：半截的 <details> 会把后面的渲染一起带歪，
+                // 而静默变短等于让人以为「静态与 AI 对这一包没话说」。
+                if (used + text.length <= BODY_MAX - RESERVE) { fitted.push(text); used += text.length; } else hidden.push(p);
+              }
+              body = intro + lead + fitted.join('');
+              if (hidden.length) {
+                body += `\n⚠️ 评论总长上限 ${BODY_MAX} 字符（GitHub 是 65536）已满：未贴出的投稿 ${hidden.join('、')}`
+                  + ' —— 整块撤下而不是切一半，完整报告见 workflow artifact：module-audit-report。\n';
+                body = body.slice(0, BODY_MAX); // 点名那一句自己也受总上限管（包名极多时的兜底）
+              }
             }
             await github.rest.issues.createComment({
               issue_number: context.issue.number,

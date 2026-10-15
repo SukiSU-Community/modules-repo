@@ -944,6 +944,8 @@ test('T6.2·逐包：三份 .audit.md 都出现在正文里、各占一块，旧
     assert.ok(r.body.includes(`<summary>静态报告 · ${p}`), `${p} 没有自己那一块 <details>`);
   }
   assert.equal(r.kv.package_count, '3');
+  assert.match(r.body, /逐包呈现（3 包/, '包清单 = 报告数：产物名与取块口径漂了就多出一包幽灵');
+  assert.doesNotMatch(r.body, /这一包没有/, '一致的目录形状里不许出现「这一包没有 .audit.md」那种幽灵块');
   assert.ok((r.body.match(/<details>/g) || []).length >= 6, '逐包 = 每包一块静态 + 一块 AI，三包至少六块');
   assert.doesNotMatch(r.body, /份投稿里的这 1 份|其余见 workflow artifact/,
     '这句旧文案承认「另外几份只存在于 artifact」；本轮补成逐包之后它必须消失');
@@ -951,11 +953,15 @@ test('T6.2·逐包：三份 .audit.md 都出现在正文里、各占一块，旧
 });
 
 test('T6.2·逐包·混合：一包有产物、一包 disabled 时两块各说各的，不许把 disabled 洗成「也复验过了」', () => {
+  // disabled 在 CI 里的真实形状是**只有 status、没有产物 JSON**（AI 步的凭据闸直接 continue），
+  // 所以夹具也得写成 artifact:null —— 否则测的是「产物与状态并存」那一种，幽灵包那一发就漏过去了。
   const r = runCommentFrom({
     reports: { 'a.zip': rep('low', 'first'), 'b.zip': rep('low', 'first') },
-    ai: { 'a.zip': { status: 'ok', artifact: fullArt('a.zip') }, 'b.zip': 'disabled' },
+    ai: { 'a.zip': { status: 'ok', artifact: fullArt('a.zip') }, 'b.zip': { status: 'disabled', artifact: null } },
   });
   assert.equal(r.triageErr, null, r.triageStderr);
+  assert.match(r.body, /逐包呈现（2 包/, '包清单要与报告同源：幽灵包 = 把同一包拆成两块');
+  assert.doesNotMatch(r.body, /这一包没有/, '一致的目录形状里不许出现「这一包没有 .audit.md」那种幽灵块');
   assert.equal(JSON.parse(aiBlockOf(r.body, 'a.zip')).status, 'ok');
   const bBlock = aiBlockRegion(r.body, 'b.zip');
   assert.match(bBlock, /本轮没有 AI 产物/, 'disabled 那一包要写明没有产物，不许留空');
@@ -990,7 +996,8 @@ test('T6.2·AI 块：有 ai-<zip>.json 时正文出现该包的围栏，可核�
 
 test('T6.2·没有 AI 产物（disabled 与压根没状态两种）都必须写明「本轮没有 AI 产物」，不许留空', () => {
   const off = runCommentFrom({
-    reports: { 'demo.zip': rep('low', 'first') }, ai: { 'demo.zip': 'disabled' },
+    reports: { 'demo.zip': rep('low', 'first') },
+    ai: { 'demo.zip': { status: 'disabled', artifact: null } },
   });
   assert.equal(off.triageErr, null, off.triageStderr);
   assert.match(off.body, /本轮没有 AI 产物/);
