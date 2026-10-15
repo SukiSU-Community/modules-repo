@@ -869,6 +869,9 @@ function runCommentFrom({ reports, ai, md, rawStatus, env = {}, moduleAt } = {})
   return { ...c, kv: t.kv, triageErr: t.err, triageStderr: t.stderr };
 }
 
+/** 正文里那行「逐包呈现（N 包 …）」；取块口径一漂，包数先在这里露出来（比数块数好读）。 */
+const leadOf = (body) => (body.match(/逐包呈现（[^）]*）/u) || ['（正文里没有「逐包呈现」那行）'])[0];
+
 /** 渲染契约：每包的静态块以 `<summary>静态报告 · <pkg>` 开头，取到下一个 `<summary>` 为止。 */
 function mdBlockRegion(body, pkg) {
   const at = body.indexOf(`<summary>静态报告 · ${pkg}`);
@@ -979,6 +982,9 @@ test('T6.2·AI 块：有 ai-<zip>.json 时正文出现该包的围栏，可核�
     ai: { 'demo.zip': { status: 'ok', artifact: fullArt('demo.zip') } },
   });
   assert.equal(r.err, null, `评论步本身不许抛：${r.stderr}`);
+  // 取块口径钉子（§5 那一问）：包数必须等于报告数。产物名与评论步的取块漂一个「.zip」时，
+  // 同一包会被拆成两块（一块真有围栏、一块写「本轮没有 AI 产物」）—— 包数先涨，这一发先红。
+  assert.match(leadOf(r.body), /^逐包呈现（1 包/, leadOf(r.body));
   const block = JSON.parse(aiBlockOf(r.body, 'demo.zip'));
   // 工单 §2.1-2 点名的这几项：少了任何一项，「它实际被喂进去多少东西」就答不上来。
   for (const k of ['status', 'levelAfterAi', 'promptSha256', 'brief']) {
@@ -1036,6 +1042,7 @@ test('T6.2·白名单：围栏里的键集恰好等于白名单，四类自由�
     env: { REASONS: '静态原因（白名单用例）' },
   });
   assert.equal(r.err, null, `评论步本身不许抛：${r.stderr}`);
+  assert.match(leadOf(r.body), /^逐包呈现（1 包/, leadOf(r.body));
   for (const [k, v] of Object.entries(MARK)) {
     assert.ok(!r.body.includes(v), `白名单外的 ${k} 进了正文：${v} —— 那是投稿者可控文本经模型转述后的二次注入`);
   }
