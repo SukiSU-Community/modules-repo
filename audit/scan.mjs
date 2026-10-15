@@ -306,6 +306,9 @@ function toFileEntry(name, buf) {
   // 命中时留下（§5.1：不许所有条目都留 Buffer），并受 MAX_FORENSICS_BYTES 管住（§5.2）。
   // 超限那一条留 rawCapped=true，这是「看得见的记录」，不许静默变成「读不出」。
   // 这一格与 report 的产物面无关：raw 永远不进报告（§5.3，T57-15 按 JSON.stringify 钉）。
+  // ⚠ 超限那一格必须**拷贝**而不是取视图：`subarray` 与父 ArrayBuffer 共享存储，
+  // 取视图的话 `raw.length` 到了上限、被钉住的却还是整块 64 MiB —— 上限就成了只作用在「解析多少」，
+  // 而这条闸要管的是「留多少」。不超限那一格反过来：整块本来就要留，留 `bytes` 本身是零拷贝、零浪费。
   const head = bytes.subarray(0, 512);
   const isBinary = Boolean(detectBinary(head));
   const rawCapped = isBinary && bytes.length > MAX_FORENSICS_BYTES;
@@ -317,7 +320,7 @@ function toFileEntry(name, buf) {
     // 注意 content 是全文，而 scanText 才是行级规则真正吃进去的那一段。
     content: bytes.toString('utf8'),
     head,
-    raw: isBinary ? bytes.subarray(0, Math.min(bytes.length, MAX_FORENSICS_BYTES)) : null,
+    raw: isBinary ? (rawCapped ? Buffer.from(bytes.subarray(0, MAX_FORENSICS_BYTES)) : bytes) : null,
     rawCapped,
     truncated,
     scanBytes,
