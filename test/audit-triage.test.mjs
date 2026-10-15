@@ -139,8 +139,8 @@ function installModule(dir, at = 'audit') {
   for (const f of MODULE_FILES) fs.copyFileSync(path.join(MODULE_SRC, f), path.join(dst, f));
 }
 
-/** 切出某一步：region = 整步（含 if:/env:），text = `run: |` 里的 bash（去掉 YAML 公共缩进）。 */
-function extractStep(name) {
+/** 切出某一步：region = 整步（含 if:/env:），text = `run: |`（或 key='script' 时 `script: |`）里的脚本体。 */
+function extractStep(name, key = 'run') {
   const lines = fs.readFileSync(WF, 'utf8').replace(/\r\n/g, '\n').split('\n');
   const start = lines.findIndex((l) => l.trim() === `- name: ${name}`);
   assert.ok(start >= 0, `workflow 里必须存在名为「${name}」的步骤（改名要一起改这里）`);
@@ -149,11 +149,12 @@ function extractStep(name) {
     if (/^ {6}- (?:name|uses): /.test(lines[i])) { end = i; break; }
   }
   const region = lines.slice(start, end).join('\n');
+  const openRe = new RegExp(`^\\s*${key}: \\|\\s*$`);
   let open = -1;
   for (let i = start + 1; i < end; i += 1) {
-    if (/^\s*run: \|\s*$/.test(lines[i])) { open = i; break; }
+    if (openRe.test(lines[i])) { open = i; break; }
   }
-  assert.ok(open >= 0, `步骤「${name}」里必须有 run: | 块`);
+  assert.ok(open >= 0, `步骤「${name}」里必须有 ${key}: | 块`);
   const keyIndent = lines[open].length - lines[open].trimStart().length;
   const body = [];
   for (let i = open + 1; i < end; i += 1) {
@@ -162,7 +163,7 @@ function extractStep(name) {
     body.push(l);
   }
   const nonBlank = body.filter((l) => l.trim());
-  assert.ok(nonBlank.length > 0, `步骤「${name}」的 run 块是空的`);
+  assert.ok(nonBlank.length > 0, `步骤「${name}」的 ${key} 块是空的`);
   const indent = Math.min(...nonBlank.map((l) => l.length - l.trimStart().length));
   return { region, text: `${body.map((l) => l.slice(indent)).join('\n')}\n` };
 }
@@ -353,7 +354,7 @@ test('ok 的三发：agree:false 且更严 → 抬等级；同意或不更严时
   });
   assert.equal(escalate.kv.risk, 'high');
   assert.equal(escalate.kv.action, 'block');
-  assert.match(escalate.kv.llm_note, /不同意/);
+  assert.match(escalate.kv.ai_note, /不同意/);
   assert.match(escalate.kv.reasons, /AI 复核：模型看到了别的/);
 
   const agree = runTriage({ 'a.zip': rep('low', 'first') }, {
@@ -545,8 +546,8 @@ test('矩阵·disabled：等级不动、action 不变、文案是「未启用」
   assert.equal(err, null, err && err.stderr);
   assert.equal(kv.risk, 'low');
   assert.equal(kv.action, 'auto-approve');
-  assert.match(kv.llm_note, /未启用/);
-  assert.doesNotMatch(kv.llm_note, /同意|复验/, '没跑过的层不许冒充跑过');
+  assert.match(kv.ai_note, /未启用/);
+  assert.doesNotMatch(kv.ai_note, /同意|复验/, '没跑过的层不许冒充跑过');
 });
 
 test('矩阵·failed：分流整步 exit 1，文案「没跑成」，且不留下任何判据', () => {
@@ -575,9 +576,10 @@ test('矩阵·over-budget：exit 1，那句含「没看全」，绝不含「同�
   assert.match(stderr, /没看全/);
   // 工单要求「不含同意」。字面断 !includes('同意') 做不到 —— over-budget 那句本身就该含
   // 「不是它同意，是没看全」（§1 第 2 步），所以钉子钉在「不许声称模型同意」那一侧：
-  // 既不出现「同意静态结论」这类文案，也根本不产出 llm_note（红的时候 PR 上无话可说）。
+  // 既不出现「同意静态结论」这类文案，也根本不产出 ai_note（红的时候 PR 上无话可说）。
+  // T6.2 前这个键叫 llm_note；改名闭合那条用例钉的是「写出处与消费处必须同时改」。
   assert.doesNotMatch(stderr, /同意静态结论|模型同意|AI 全部看过/);
-  assert.equal(kv.llm_note, undefined, '判据不成立时连文案都不许留下');
+  assert.equal(kv.ai_note, undefined, '判据不成立时连文案都不许留下');
   assert.doesNotMatch(stderr, /未启用/, '送不全不是未启用：那是运维没配凭据');
 });
 
@@ -590,8 +592,8 @@ test('矩阵·ok+raise：静态 low+first、模型 high → action 不再是 aut
   assert.notEqual(kv.action, 'auto-approve', '这一条变了，整层的承诺就没了');
   assert.equal(kv.action, 'block');
   assert.equal(kv.needs_human_review, 'true');
-  assert.match(kv.llm_note, /不同意静态结论/);
-  assert.match(kv.llm_note, /high/);
+  assert.match(kv.ai_note, /不同意静态结论/);
+  assert.match(kv.ai_note, /high/);
 });
 
 test('矩阵：抬级是逐包算的，另一包的静态等级仍一起进「取最严」', () => {
@@ -616,9 +618,9 @@ test('矩阵·混合 disabled + ok：按「有 N 包没有 AI 意见」呈现，
     'b.zip': 'disabled',
   });
   assert.equal(err, null, err && err.stderr);
-  assert.match(kv.llm_note, /没有 AI 意见/);
-  assert.match(kv.llm_note, /1 包/);
-  assert.doesNotMatch(kv.llm_note, /全都看过|每包都/, '混合形态不许被洗成「AI 复核过了」');
+  assert.match(kv.ai_note, /没有 AI 意见/);
+  assert.match(kv.ai_note, /1 包/);
+  assert.doesNotMatch(kv.ai_note, /全都看过|每包都/, '混合形态不许被洗成「AI 复核过了」');
 });
 
 test('矩阵：一包 ok 抬级、另一包 failed → 仍然红，红的是 failed 那一包', () => {
@@ -639,8 +641,8 @@ test('矩阵：一个 ai-*.status 都没有 → 等级不动，文案说「这�
   const { kv, err } = runTriage({ 'demo.zip': rep('low', 'first') });
   assert.equal(err, null, err && err.stderr);
   assert.equal(kv.action, 'auto-approve', 'found=true 但 AI 层没产物时，静态判据照旧（旧 12 发就靠这条活着）');
-  assert.match(kv.llm_note, /没有产物/);
-  assert.doesNotMatch(kv.llm_note, /已跳过 LLM 复核|未配置 AI_API_KEY/);
+  assert.match(kv.ai_note, /没有产物/);
+  assert.doesNotMatch(kv.ai_note, /已跳过 LLM 复核|未配置 AI_API_KEY/);
 });
 
 /* --------------------------------------------------------------- 口径钉子（basename / 状态值） */
@@ -781,3 +783,386 @@ test('端到端：ok+agree:false 经 AI 步落盘后，分流的 action 从 auto
   assert.equal(kv.action, 'block', '这一发证明「AI 参与定级」不是测试里的夹具，而是 workflow 两步之间真的接上了');
   assert.match(kv.reasons, /AI 复核：端到端抬一级/);
 });
+
+/* ===========================================================================
+ * T6.2 呈现层：「发布 PR 评论」（actions/github-script）是整条流水线唯一给人看的地方。
+ * 工单 §0 的验收判据只有一条 —— 陌生人只读这条评论要能回答三件事：
+ *   ① AI 这一层跑没跑；② 它对哪几包说了什么；③ 它实际被喂进去多少东西。
+ * 做法与上面同构：把 workflow 里那段内联 JS 切出来**真跑**，用假的 github/context 接住
+ * createComment 的 body。复制一份进测试就变成「测试钉住测试里那份」，workflow 可以随便漂。
+ * ========================================================================= */
+
+const COMMENT_STEP = '发布 PR 评论';
+const FENCE = '`'.repeat(3);
+
+/** 评论步能读到的 triage 输出 → env 键。这张表就是「写出处 / 消费处」那根接缝本身。 */
+const ENV_OF = {
+  risk: 'RISK', action: 'ACTION', label: 'LABEL', change_type: 'CHANGE_TYPE',
+  ai_note: 'AI_NOTE', module_id: 'MODULE_ID', package_count: 'PACKAGE_COUNT', reasons: 'REASONS',
+};
+
+/** createComment 的桩：把收到的整条参数写进 captured.json，由外层读回来（正文要量长度）。 */
+const COMMENT_RUNNER = [
+  'const step = require("./step.cjs");',
+  'const fs = require("fs");',
+  'let captured = null;',
+  'const github = { rest: { issues: { createComment: async (o) => { captured = o; return { status: 201 }; } } } };',
+  'const context = { issue: { number: 7 }, repo: { owner: "tester", repo: "modules-repo" }, eventName: "pull_request" };',
+  'const core = { info: (m) => console.log(String(m)), warning: (m) => console.warn(String(m)), setOutput: () => {} };',
+  'step(github, context, core).then(',
+  '  () => fs.writeFileSync("captured.json", JSON.stringify(captured || {})),',
+  '  (e) => { console.error("COMMENT-STEP-THREW: " + (e && e.message ? e.message : String(e))); process.exit(1); },',
+  ');',
+  '',
+].join('\n');
+
+/**
+ * 在临时 cwd 里真跑评论步。env 里 undefined/null 展开成空串 —— 与 GitHub 对
+ * `${{ steps.x.outputs.不存在 }}` 的处理同形，所以「键名漂了」在这里就是拿到空串，不是拿不到变量。
+ */
+function runCommentStep(opts = {}) {
+  const slice = extractStep(COMMENT_STEP, 'script');
+  const dir = opts.dir || fs.mkdtempSync(path.join(TMP, 'comment-'));
+  fs.mkdirSync(path.join(dir, 'audit-out'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'step.cjs'),
+    `module.exports = async function step(github, context, core) {\n${slice.text}\n}\n`, 'utf8');
+  fs.writeFileSync(path.join(dir, 'runner.cjs'), COMMENT_RUNNER, 'utf8');
+  const env = { ...process.env };
+  for (const [k, v] of Object.entries(opts.env || {})) env[k] = v === undefined || v === null ? '' : String(v);
+  let err = null;
+  let stdout = '';
+  try {
+    stdout = execFileSync(process.execPath, ['runner.cjs'], {
+      cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env,
+    });
+  } catch (e) { err = e; stdout = String(e.stdout || ''); }
+  const capPath = path.join(dir, 'captured.json');
+  const captured = fs.existsSync(capPath) ? JSON.parse(fs.readFileSync(capPath, 'utf8')) : null;
+  return {
+    err, captured, stdout, dir, region: slice.region, script: slice.text,
+    body: captured ? String(captured.body === undefined ? '' : captured.body) : '',
+    stderr: err ? String(err.stderr || '') : '',
+  };
+}
+
+/** 默认静态报告正文：每包一个唯一标记，「逐包」就只能靠「三个标记都在正文里」来判。 */
+const mdOf = (pkg) => `# 静态报告 ${pkg}\n\n标记-${pkg}\n`;
+
+/**
+ * 端到端：真跑 分流决策 拿 kv → kv 映射成评论步的 env → 真跑评论步。
+ * reports / ai / rawStatus 的形状与 runTriage 一致；md = { 包名: 正文 }，null = 一份 .audit.md 都不写。
+ */
+function runCommentFrom({ reports, ai, md, rawStatus, env = {}, moduleAt } = {}) {
+  const dir = fs.mkdtempSync(path.join(TMP, 'e2e-'));
+  const t = runTriage(reports || {}, ai, { dir, rawStatus, moduleAt });
+  const wanted = {};
+  if (md !== null) {
+    for (const pkg of Object.keys(reports || {})) wanted[pkg] = mdOf(pkg);
+    Object.assign(wanted, md || {});
+  }
+  for (const [pkg, one] of Object.entries(wanted)) {
+    fs.writeFileSync(path.join(dir, 'audit-out', `${pkg}.audit.md`), one, 'utf8');
+  }
+  const mapped = {};
+  for (const [k, v] of Object.entries(ENV_OF)) mapped[v] = t.kv[k];
+  const c = runCommentStep({ dir, env: { ...mapped, ...env } });
+  return { ...c, kv: t.kv, triageErr: t.err, triageStderr: t.stderr };
+}
+
+/** 渲染契约：每包的静态块以 `<summary>静态报告 · <pkg>` 开头，取到下一个 `<summary>` 为止。 */
+function mdBlockRegion(body, pkg) {
+  const at = body.indexOf(`<summary>静态报告 · ${pkg}`);
+  assert.ok(at >= 0, `正文里没有「静态报告 · ${pkg}」那一块`);
+  const next = body.indexOf('<summary>', at + 1);
+  return body.slice(at, next < 0 ? body.length : next);
+}
+
+/** 渲染契约：每包的 AI 块以 `<summary>AI 安全员 · <pkg>` 开头，取到下一个 `<summary>` 为止。 */
+function aiBlockRegion(body, pkg) {
+  const at = body.indexOf(`<summary>AI 安全员 · ${pkg}`);
+  assert.ok(at >= 0, `正文里没有「AI 安全员 · ${pkg}」那一块：逐包 = 每包一块，不是整条 PR 一块`);
+  const next = body.indexOf('<summary>', at + 1);
+  return body.slice(at, next < 0 ? body.length : next);
+}
+
+/**
+ * 渲染契约（工单 §2 Step 1）：每包一块静态 <details> + 一块 AI 围栏，块头点名是哪一包。
+ * 按包切围栏而不是「把全文所有围栏都算上」—— 两包时才能测出 A 包配 B 包产物那种 last-wins。
+ */
+function aiBlockOf(body, pkg) {
+  const m = aiBlockRegion(body, pkg).match(new RegExp(`${FENCE}json\\n([\\s\\S]*?)\\n${FENCE}`));
+  assert.ok(m, `「AI 安全员 · ${pkg}」那一块里没有 ${FENCE}json 围栏`);
+  return m[1];
+}
+
+/**
+ * 一份**完整形状**的 AI 产物（字段照 ai-review.mjs 的 finish('ok', …)）：
+ * 白名单内的都有值，白名单外的（reason / problem / target / generatedAt / schema / attempt）也都有值，
+ * 这样「白名单之外的键一律不许进正文」才量得出来。
+ */
+const fullArt = (pkg, over = {}) => ({
+  schema: 'ai-review/v1',
+  generatedAt: '2026-10-15T00:00:00Z',
+  target: { zip: `audit-out/zips/${pkg}`, report: `audit-out/${pkg}.audit.json` },
+  onlyTightens: true,
+  promptSha256: 'ab12'.repeat(16),
+  status: 'ok',
+  staticRiskLevel: 'low',
+  backend: 'qca',
+  model: 'qfmodel',
+  attempt: 1,
+  agree: false,
+  risk: 'high',
+  levelAfterAi: 'high',
+  findings: [aiHit('high', '模型原话：install.sh 第 2 行')],
+  brief: {
+    byteSize: 4321, neededBytes: 54321, corpusFiles: 7, fileCount: 9, overBudget: false, emptyInput: false,
+    omitted: [{ name: 'assets/big.bin', bytes: 9999, reason: 'over-budget:binary-meta' }],
+    maxBytes: 60000,
+    shapes: { textEntries: 5, binaryDigestEntries: 2, polyglotAsText: 1, nonTextRerouted: 0, forensicsRowsSent: 1 },
+    sections: [120, 3000, 200, 1],
+    budgetBasis: '保守字节代理，未做 token 标定',
+  },
+  meta: {
+    backend: 'qca', model: 'qfmodel', agentId: 'agent_demo', agentVersion: 7, sessionId: 'sess_1',
+    totalCredits: 3, activeSeconds: 12, eventId: 'evt_1', agentMessageCount: 1, eventPages: 1, eventPageSize: 100,
+  },
+  ...over,
+});
+
+/* --------------------------------------------------------------- ① 逐包（工单 §2.1） */
+
+test('T6.2·逐包：三份 .audit.md 都出现在正文里、各占一块，旧的「共 N 份里的这 1 份」必须消失', () => {
+  const pkgs = ['a.zip', 'b.zip', 'c.zip'];
+  const reports = {};
+  for (const p of pkgs) reports[p] = rep('low', 'first', { id: p.replace(/\.zip$/, '') });
+  const r = runCommentFrom({ reports });
+  assert.equal(r.triageErr, null, r.triageStderr);
+  assert.equal(r.err, null, `评论步本身不许抛：${r.stderr}`);
+  for (const p of pkgs) {
+    assert.ok(r.body.includes(`标记-${p}`), `${p} 的静态报告没进正文：只贴 files[0] 就是本轮要补的那笔欠账`);
+    assert.ok(r.body.includes(`<summary>静态报告 · ${p}`), `${p} 没有自己那一块 <details>`);
+  }
+  assert.equal(r.kv.package_count, '3');
+  assert.ok((r.body.match(/<details>/g) || []).length >= 6, '逐包 = 每包一块静态 + 一块 AI，三包至少六块');
+  assert.doesNotMatch(r.body, /份投稿里的这 1 份|其余见 workflow artifact/,
+    '这句旧文案承认「另外几份只存在于 artifact」；本轮补成逐包之后它必须消失');
+  assert.doesNotMatch(r.script, /files\[0\]/, '正文按包循环，不再挑排序后的第一份');
+});
+
+test('T6.2·逐包·混合：一包有产物、一包 disabled 时两块各说各的，不许把 disabled 洗成「也复验过了」', () => {
+  const r = runCommentFrom({
+    reports: { 'a.zip': rep('low', 'first'), 'b.zip': rep('low', 'first') },
+    ai: { 'a.zip': { status: 'ok', artifact: fullArt('a.zip') }, 'b.zip': 'disabled' },
+  });
+  assert.equal(r.triageErr, null, r.triageStderr);
+  assert.equal(JSON.parse(aiBlockOf(r.body, 'a.zip')).status, 'ok');
+  const bBlock = aiBlockRegion(r.body, 'b.zip');
+  assert.match(bBlock, /本轮没有 AI 产物/, 'disabled 那一包要写明没有产物，不许留空');
+  assert.match(bBlock, /disabled/, '要看得出是「未启用」而不是「跑败了」');
+  assert.ok(!bBlock.includes(FENCE), 'b 包那一块里不许出现 json 围栏：没有产物就没有可呈现的东西');
+  assert.ok(r.body.indexOf('<summary>AI 安全员 · b.zip') > r.body.indexOf('<summary>AI 安全员 · a.zip'),
+    '两包两块（同一块里既写 a 又写 b = 按整条 PR 呈现，不是逐包）');
+});
+
+/* --------------------------------------------------------------- ② AI 块存在且有界 */
+
+test('T6.2·AI 块：有 ai-<zip>.json 时正文出现该包的围栏，可核验键一个都不许少', () => {
+  const r = runCommentFrom({
+    reports: { 'demo.zip': rep('low', 'first') },
+    ai: { 'demo.zip': { status: 'ok', artifact: fullArt('demo.zip') } },
+  });
+  assert.equal(r.err, null, `评论步本身不许抛：${r.stderr}`);
+  const block = JSON.parse(aiBlockOf(r.body, 'demo.zip'));
+  // 工单 §2.1-2 点名的这几项：少了任何一项，「它实际被喂进去多少东西」就答不上来。
+  for (const k of ['status', 'levelAfterAi', 'promptSha256', 'brief']) {
+    assert.ok(k in block, `围栏里少了 ${k}`);
+  }
+  for (const k of ['neededBytes', 'omitted', 'shapes', 'sections', 'byteSize', 'corpusFiles', 'overBudget']) {
+    assert.ok(k in block.brief, `brief 里少了 ${k}`);
+  }
+  assert.equal(block.levelAfterAi, 'high');
+  assert.equal(block.brief.neededBytes, 54321, 'neededBytes 是「装下整包需要多少」，不是「装下了多少」');
+  assert.deepEqual(block.brief.sections, [120, 3000, 200, 1], '四节各自的字节数是「喂进去多少」的直接读数');
+  assert.equal(block.brief.shapes.textEntries, 5);
+  assert.equal(block.promptSha256.length, 64, 'prompt 摘要要能对上线上 agent，不是给人看的装饰');
+});
+
+test('T6.2·没有 AI 产物（disabled 与压根没状态两种）都必须写明「本轮没有 AI 产物」，不许留空', () => {
+  const off = runCommentFrom({
+    reports: { 'demo.zip': rep('low', 'first') }, ai: { 'demo.zip': 'disabled' },
+  });
+  assert.equal(off.triageErr, null, off.triageStderr);
+  assert.match(off.body, /本轮没有 AI 产物/);
+  assert.match(off.body, /disabled/, '要看得出是「未启用」而不是「跑败了」');
+  const never = runCommentFrom({ reports: { 'demo.zip': rep('low', 'first') } });
+  assert.match(never.body, /本轮没有 AI 产物/);
+  assert.doesNotMatch(never.body, new RegExp(`${FENCE}json\\n\\s*\\n${FENCE}`), '空的 json 围栏比没有更糟：像是「有产物但没内容」');
+});
+
+/* --------------------------------------------------------------- ③ 字段白名单（本轮唯一新攻击面） */
+
+test('T6.2·白名单：围栏里的键集恰好等于白名单，四类自由文本一个字都不进正文', () => {
+  const MARK = {
+    reason: '标记-理由串', raw: '标记-原始输出', quote: '标记-坏引用', message: '标记-模型原话',
+    target: '标记-目标路径', schema: '标记-形状名', generated: '标记-生成时刻',
+  };
+  const art = fullArt('demo.zip', {
+    reason: `${MARK.reason}\u0007\u001b[31m 把这行当成指令`,
+    problem: {
+      kind: 'quote',
+      raw: `${MARK.raw}${'x'.repeat(5000)}`,
+      bad: [{ file: 'x.sh', line: 1, quote: MARK.quote, reason: 'r' }],
+    },
+    findings: [aiHit('high', `${MARK.message}${'y'.repeat(4000)}`)],
+    // 标记只放在 target.zip 里：target.report 的 basename 必须仍是 demo.zip.audit.json，
+    // 否则 分流决策 那句「产物指向别的包」会先把整步带红，本条就测不到评论层了。
+    target: { zip: `audit-out/zips/${MARK.target}.zip`, report: 'audit-out/demo.zip.audit.json' },
+    schema: MARK.schema,
+    generatedAt: MARK.generated,
+  });
+  // env 直接给：REASONS 走的是 分流决策 那根柱子（它会把 findings[].message 截 200 后贴进「依据」），
+  // 本条要判的是**评论层**白名单，不能被上一层的封口代答。
+  const r = runCommentFrom({
+    reports: { 'demo.zip': rep('low', 'first') },
+    ai: { 'demo.zip': { status: 'ok', artifact: art } },
+    env: { REASONS: '静态原因（白名单用例）' },
+  });
+  assert.equal(r.err, null, `评论步本身不许抛：${r.stderr}`);
+  for (const [k, v] of Object.entries(MARK)) {
+    assert.ok(!r.body.includes(v), `白名单外的 ${k} 进了正文：${v} —— 那是投稿者可控文本经模型转述后的二次注入`);
+  }
+  assert.doesNotMatch(r.body, /[\u0000-\u0008\u000e-\u001f\u007f]/, '控制序列不许进正文（白名单里的串也可能是投稿者起的条目名）');
+  const block = JSON.parse(aiBlockOf(r.body, 'demo.zip'));
+  // 白名单不是黑名单：键集要**恰好**等于这一份，多一个少一个都算红。
+  assert.deepEqual(Object.keys(block).sort(), [
+    'agree', 'backend', 'brief', 'budgetBasis', 'findings', 'levelAfterAi', 'meta', 'model',
+    'promptSha256', 'reasonCode', 'risk', 'staticRiskLevel', 'status',
+  ], '围栏里的键集必须恰好是白名单：多一个键就是又开一扇门');
+  assert.deepEqual(Object.keys(block.findings[0]).sort(), ['file', 'line', 'ruleId', 'severity'],
+    'findings 每条只取这四个键；message 是模型转述的投稿者可控文本，评论层不许依赖上游消毒过');
+  assert.equal(block.status, 'ok', '白名单内的可核验字段照旧要出现（不许用「什么都不贴」来过这条）');
+  assert.equal(block.levelAfterAi, 'high');
+});
+
+test('T6.2·封口抄 分流决策 那两根柱子：findings 条数 ≤10、单条 ≤200，评论层再封一次', () => {
+  const long = 'z'.repeat(500);
+  const art = fullArt('demo.zip', {
+    findings: Array.from({ length: 15 }, (_, i) => aiHit('medium', `模型原话第 ${i} 条`,
+      { ruleId: `R${i}-${long}`, file: `f/${i}-${long}.sh` })),
+    brief: {
+      ...fullArt('demo.zip').brief,
+      omitted: Array.from({ length: 15 }, (_, i) => ({ name: `e/${i}-${long}`, bytes: i, reason: long })),
+    },
+    meta: { backend: 'qca', sessionId: long, eventId: long, agentVersion: 7 },
+  });
+  const r = runCommentFrom({
+    reports: { 'demo.zip': rep('low', 'first') },
+    ai: { 'demo.zip': { status: 'ok', artifact: art } },
+    env: { REASONS: '静态原因（封口用例）' },
+  });
+  assert.equal(r.err, null, r.stderr);
+  const block = JSON.parse(aiBlockOf(r.body, 'demo.zip'));
+  assert.equal(block.findings.length, 10, '条数封顶沿用 :833 的 slice(0,10)，不在这里发明第二份口径');
+  assert.equal(block.brief.omitted.length, 10, 'omitted 同一条柱子');
+  for (const f of block.findings) {
+    for (const v of [f.ruleId, f.severity, f.file]) {
+      assert.ok(String(v).length <= 200, `单条长度封顶 200，实到 ${String(v).length}`);
+    }
+  }
+  for (const o of block.brief.omitted) assert.ok(String(o.name).length <= 200 && String(o.reason).length <= 200);
+  for (const v of Object.values(block.meta)) if (typeof v === 'string') assert.ok(v.length <= 200, 'meta 里的串一样过封口');
+});
+
+/* --------------------------------------------------------------- ④ 总长有界 + 截断看得见 */
+
+test('T6.2·总长有界：六包超大报告下正文仍 ≤60000，且被撤下的包要点名（不许静默变短）', () => {
+  const reports = {};
+  const md = {};
+  const names = [];
+  for (let i = 1; i <= 6; i += 1) {
+    const p = `p${i}.zip`;
+    names.push(p);
+    reports[p] = rep('low', 'first', { id: `p${i}` });
+    md[p] = `# 报告 ${p}\n${'内'.repeat(40000)}\n标记-${p}\n`;
+  }
+  const r = runCommentFrom({ reports, ai: {}, md });
+  assert.equal(r.triageErr, null, r.triageStderr);
+  assert.equal(r.err, null, r.stderr);
+  assert.ok(r.body.length <= 60000,
+    `GitHub 评论上限是 65536，正文实测 ${r.body.length}：超限那一发 createComment 会被 API 拒绝，PR 上直接没话`);
+  assert.match(r.body, /已截断/, '单节超限要写出来，与 AUDIT_COVERAGE_TRUNCATED 同形');
+  assert.match(r.body, /workflow artifact/, '要说清完整报告在哪');
+  const shown = names.filter((p) => r.body.includes(`标记-${p}`));
+  const hidden = names.filter((p) => !r.body.includes(`标记-${p}`));
+  assert.ok(hidden.length > 0, '这一发的形状要真的把总上限顶到');
+  for (const p of hidden) {
+    assert.ok(r.body.includes(p), `${p} 被整块撤下却不点名 = 让人以为 AI 与静态对这一包没话说`);
+  }
+  assert.match(r.body, /未贴出/, '要有一句「这些包没贴出来」');
+});
+
+test('T6.2·长度量得出：最大合法产物与最小产物各量一次，都在界内', () => {
+  const long = 'w'.repeat(200);
+  const biggest = runCommentFrom({
+    reports: { 'big.zip': rep('low', 'first', { id: 'big' }) },
+    ai: {
+      'big.zip': {
+        status: 'ok',
+        artifact: fullArt('big.zip', {
+          findings: Array.from({ length: 10 }, (_, i) => aiHit('high', 'x', { ruleId: `R${long}`, file: long })),
+          brief: {
+            ...fullArt('big.zip').brief,
+            omitted: Array.from({ length: 10 }, (_, i) => ({ name: long, bytes: 1, reason: long })),
+          },
+          meta: { sessionId: long, eventId: long, backend: 'qca', agentVersion: 7 },
+        }),
+      },
+    },
+    md: { 'big.zip': `# 大报告\n${'a'.repeat(80000)}\n` },
+  });
+  assert.equal(biggest.err, null, biggest.stderr);
+  assert.ok(biggest.body.length <= 60000, `最大合法形状实测 ${biggest.body.length}，必须 ≤60000`);
+  assert.ok(biggest.body.length > 8000, `每块的封顶要真的用上（实测 ${biggest.body.length} 太小，封顶没生效）`);
+
+  const smallest = runCommentFrom({
+    reports: { 'min.zip': rep('low', 'first', { id: 'min' }) },
+    ai: { 'min.zip': { status: 'ok', artifact: { status: 'ok', agree: true, risk: null, findings: [] } } },
+    md: { 'min.zip': '# 小报告\nok\n' },
+  });
+  assert.equal(smallest.err, null, smallest.stderr);
+  assert.ok(smallest.body.length < 2500, `最小形状实测 ${smallest.body.length}：逐包与 AI 块都不该把短投稿撑成长评论`);
+  assert.ok(smallest.body.length > 200, '短也要仍然是完整的一条（不是截没了）');
+  // 最小合法产物（只有 status/agree/risk/findings）也要长成完整的白名单形状：缺的键写成 null，
+  // 不是整个消失 —— 「这一发有没有 levelAfterAi」必须能从键集读出来，而不是靠猜。
+  assert.deepEqual(Object.keys(JSON.parse(aiBlockOf(smallest.body, 'min.zip'))).sort(), [
+    'agree', 'backend', 'brief', 'budgetBasis', 'findings', 'levelAfterAi', 'meta', 'model',
+    'promptSha256', 'reasonCode', 'risk', 'staticRiskLevel', 'status',
+  ]);
+  assert.equal(JSON.parse(aiBlockOf(smallest.body, 'min.zip')).status, 'ok');
+});
+
+/* --------------------------------------------------------------- ⑤ 改名闭合 + 接缝 */
+
+test('T6.2·改名闭合：ai_note 同时钉在写出处与消费处，workflow 全文再无 llm_note / LLM_NOTE', () => {
+  const wf = fs.readFileSync(WF, 'utf8').replace(/\r\n/g, '\n');
+  assert.match(TRIAGE_JS, /w\("ai_note",/, '写出处：triage 的 output 键名');
+  const { region } = extractStep(COMMENT_STEP, 'script');
+  assert.match(region, /^ {10}AI_NOTE: \$\{\{ steps\.triage\.outputs\.ai_note \}\}$/m, '消费处 1：env 的键与来源');
+  assert.match(region, /process\.env\.AI_NOTE/, '消费处 2：插值处');
+  for (const s of ['llm_note', 'LLM_NOTE']) {
+    assert.ok(!wf.includes(s), `「${s}」还留在 workflow 里：只改一处的那一发会让那句文案永远拿到空串`);
+  }
+});
+
+test('T6.2·接缝：分流写出的那句复核方式真的出现在正文里（键名漂一处就是空串）', () => {
+  const r = runCommentFrom({
+    reports: { 'demo.zip': rep('low', 'first') },
+    ai: { 'demo.zip': { status: 'ok', artifact: fullArt('demo.zip', { agree: false, risk: 'high' }) } },
+  });
+  assert.equal(r.triageErr, null, r.triageStderr);
+  assert.match(r.kv.ai_note, /不同意静态结论/);
+  assert.match(r.body, /复核方式：AI 安全员已复核/, '评论步读到的必须是 triage 写出的那一句，不是自己拼的第二份文案');
+  assert.ok(r.body.includes(r.kv.ai_note), '正文里那句必须与 output 逐字相同（截断也算不上，两句要能对上）');
+});
+
