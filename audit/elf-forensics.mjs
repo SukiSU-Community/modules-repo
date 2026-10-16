@@ -352,7 +352,7 @@ export function extractStrings(buf, min = 6, cap = Infinity) {
 const REPRESENTATIVE_CAP = 5;
 
 /** [族名, 人读标签, 前缀成员表]。前缀按 §2 那一行逐字落地，别用「差不多是」的正则。 */
-const CAPABILITY_FAMILIES = [
+export const CAPABILITY_FAMILIES = [
   ['EXEC', '起新程序/运行时加载',
     ['exec', 'system', 'popen', 'fork', 'vfork', 'clone', 'posix_spawn', 'dlopen', 'dlsym']],
   ['NET', '网络收发',
