@@ -1187,7 +1187,10 @@ export function renderMarkdown(report) {
   const m = report.meta;
   L.push('# 模块投稿安全审核报告');
   L.push('');
-  L.push(`- 目标文件：\`${report.target.zipName}\``);
+  // T6.3：下面凡是从包里读出来、或从投稿表单读出来的字符串，落进 markdown 之前一律过
+  // inertMarkdown。我们自己造的词（标题、级别、规则号、建议文案）一个都不过 ——
+  // 人还得读得懂这份报告，而围栏里那份脚本原文是人工复核要看的东西。
+  L.push(`- 目标文件：\`${inertMarkdown(report.target.zipName)}\``);
   L.push(`- zip 读取方式：${report.reader === 'builtin' ? '内置解析器' : '系统 unzip（回退）'}`);
   L.push(`- 生成时间：${report.generatedAt}`);
   L.push(`- 规则版本：静态规则表 \`risk-rules.mjs\`，共 ${CONTENT_RULES.length} 条内容规则`);
@@ -1199,7 +1202,9 @@ export function renderMarkdown(report) {
   L.push('');
   L.push(`- 变更类型：**${changeTypeLabel(report.changeType)}**`);
   L.push(`- 处置：**\`${report.decision.action}\`** / 标签 \`${report.decision.label}\``);
-  L.push(`- 依据：${report.decision.reason}`);
+  // reason 里可能带着条目路径（decide() 撤销自动放行那一支把 ${shown} 写进句子，
+  // shown 来自 zip 的条目名 == 投稿者可控），所以这一行也要过中和。
+  L.push(`- 依据：${inertMarkdown(report.decision.reason)}`);
   L.push(`- 命中统计：high ${report.counts.high} / medium ${report.counts.medium} / low ${report.counts.low} / info ${report.counts.info}`);
   L.push('');
 
@@ -1209,13 +1214,14 @@ export function renderMarkdown(report) {
   L.push('|---|---|---|---|');
   const idOk = !report.declared.id || !m.id ? '未声明' : (report.declared.id === m.id ? '✅ 一致' : '❌ 不一致');
   const verOk = !report.declared.version || !m.version ? '未声明' : (report.declared.version === m.version ? '✅ 一致' : '❌ 不一致');
-  L.push(`| id | \`${m.id ?? '(缺失)'}\` | \`${report.declared.id ?? '(未提供)'}\` | ${idOk} |`);
-  L.push(`| version | \`${m.version ?? '(缺失)'}\` | \`${report.declared.version ?? '(未提供)'}\` | ${verOk} |`);
+  // module.prop 整份是投稿者写的，表单声明也是他填的 —— 这一格的四面都要过中和。
+  L.push(`| id | \`${inertMarkdown(m.id ?? '(缺失)')}\` | \`${inertMarkdown(report.declared.id ?? '(未提供)')}\` | ${idOk} |`);
+  L.push(`| version | \`${inertMarkdown(m.version ?? '(缺失)')}\` | \`${inertMarkdown(report.declared.version ?? '(未提供)')}\` | ${verOk} |`);
   if (m.name) L.push('');
-  if (m.name) L.push(`- name：${m.name}`);
-  if (m.author) L.push(`- author：${m.author}`);
-  if (m.description) L.push(`- description：${m.description}`);
-  L.push(`- module.prop 路径：\`${m.propPath ?? '(缺失)'}\``);
+  if (m.name) L.push(`- name：${inertMarkdown(m.name)}`);
+  if (m.author) L.push(`- author：${inertMarkdown(m.author)}`);
+  if (m.description) L.push(`- description：${inertMarkdown(m.description)}`);
+  L.push(`- module.prop 路径：\`${inertMarkdown(m.propPath ?? '(缺失)')}\``);
   L.push('');
 
   L.push('## 文件清单');
@@ -1273,9 +1279,11 @@ export function renderMarkdown(report) {
   L.push('## 包结构与审核覆盖度');
   L.push('');
   const st = report.structure || {};
-  const list = (a) => (a && a.length ? a.map((x) => `\`${x}\``).join('、') : '无');
+  // 这一列出来的每一条都是条目名（符号链接/越界路径/重名/加密/不支持的压缩方式/反斜杠/解压失败），
+  // 条目名是投稿者起的 —— 过同一把中和，别在这里再写第二份口径。
+  const list = (a) => (a && a.length ? a.map((x) => `\`${inertMarkdown(x)}\``).join('、') : '无');
   L.push(`- 条目总数：${st.entries ?? '—'}（文件 ${st.fileEntries ?? '—'} / 目录 ${st.dirEntries ?? '—'}），阈值 ${st.limits ? st.limits.MAX_ENTRIES : '—'}`);
-  L.push(`- 最高声明压缩比：${st.maxRatio ?? 0}:1${st.maxRatioEntry ? `（\`${st.maxRatioEntry}\`）` : ''}，阈值 ${st.limits ? st.limits.MAX_RATIO : '—'}:1`);
+  L.push(`- 最高声明压缩比：${st.maxRatio ?? 0}:1${st.maxRatioEntry ? `（\`${inertMarkdown(st.maxRatioEntry)}\`）` : ''}，阈值 ${st.limits ? st.limits.MAX_RATIO : '—'}:1`);
   L.push(`- 符号链接条目：${list(st.symlinks)}`);
   L.push(`- 越界/绝对路径条目：${list(st.unsafePaths)}`);
   L.push(`- 重名条目：${list(st.duplicateNames)}`);
@@ -1320,7 +1328,8 @@ export function renderMarkdown(report) {
       L.push('| 级别 | 规则 | 文件:行 | 原文片段 | 建议 |');
       L.push('|---|---|---|---|---|');
       for (const f of items) {
-        L.push(`| ${SEV_MARK[f.severity]} | \`${f.ruleId}\` | \`${f.file}:${f.line}\` | \`${escapeCell(f.snippet)}\` | ${f.advice} |`);
+        // file 是条目名、snippet 是原文匹配片段：两面都是投稿者来源，同一把中和。
+        L.push(`| ${SEV_MARK[f.severity]} | \`${f.ruleId}\` | \`${inertMarkdown(f.file)}:${f.line}\` | \`${escapeCell(f.snippet)}\` | ${f.advice} |`);
       }
       L.push('');
     }
@@ -1338,7 +1347,7 @@ export function renderMarkdown(report) {
     L.push('| 规则 | 文件:行 | 原文片段（已脱敏） | 建议 |');
     L.push('|---|---|---|---|');
     for (const f of priv) {
-      L.push(`| \`${f.ruleId}\` | \`${f.file}:${f.line}\` | \`${escapeCell(mask(f.snippet))}\` | ${f.advice} |`);
+      L.push(`| \`${f.ruleId}\` | \`${inertMarkdown(f.file)}:${f.line}\` | \`${escapeCell(mask(f.snippet))}\` | ${f.advice} |`);
     }
     L.push('');
   }
@@ -1346,7 +1355,7 @@ export function renderMarkdown(report) {
   if (report.warnings.length) {
     L.push('## 解析告警');
     L.push('');
-    for (const w of report.warnings) L.push(`- ${w}`);
+    for (const w of report.warnings) L.push(`- ${inertMarkdown(w)}`);
     L.push('');
   }
 
@@ -1402,8 +1411,32 @@ function groupBy(arr, fn) {
   return m;
 }
 
+/**
+ * T6.3：投稿者来源的字符串落进 markdown 之前先中和 markup —— **只中和不删字**。
+ *
+ * 与 6.2 给评论 intro 用的那把 `inert()`（`.github/workflows/audit.yml`）同形：
+ * `&` 先转（避免二次转义），`<` `>` 反引号转实体，控制序列换空格。两层各管各的面，
+ * 不许合并：那一把管「评论自己那几行原样插值」，这一把管「被插进评论正文的那份报告」。
+ *
+ * 三条不许越界：
+ *  1) 判据只许有一份 —— 它住在 scan.mjs，workflow 里不许再抄第二份；
+ *  2) **只作用于给人看的那一面**：不许顺着接到 renderJSON 上。AI 那一层吃的是 JSON
+ *     （readZip 原文 + 报告 JSON），实体化会改变喂给模型的字节，把 6.1/6.2 的复验链打乱；
+ *  3) 不许波及我们自己写的结构（标题、内联代码、代码围栏）—— 全文那一节留着真围栏，
+ *     因为人工复核要看的是原文，而 fenceFor 保证投稿者关不掉它。
+ */
+export function inertMarkdown(v) {
+  return String(v == null ? '' : v)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/`/g, '&#96;')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' ');
+}
+
 function escapeCell(s) {
-  return String(s).replace(/\|/g, '\\|').replace(/`/g, "'");
+  // 表格单元格与「### 条目名」这类标题都过这一把：条目名是投稿者起的，
+  // `|` 要反斜杠、反引号与 `<` `>` 要实体（T6.3 之前只有前两件，所以一句 `</details>` 能漏进正文）。
+  return inertMarkdown(s).replace(/\|/g, '\\|');
 }
 
 /**
