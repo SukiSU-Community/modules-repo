@@ -814,6 +814,91 @@ test('S3A-06 三个新键的两条边界：parseError 一支不许带（读不�
 });
 
 //----------------------------------------------------------------------------
+// P5-B（2026-10-16 用户拍「只摘 NET:send，其余四条不落」）：这是一发**放宽**。
+//
+// 放宽必须把代价钉成看得见的形状，不许只在注释里口头承认，所以这四条的期望值全部写成
+// **摘掉 send 之后**的真值 —— 在 NET 仍含 send 的表上跑，这一组必须全红（那一步的现场红数
+// 记在交付报告里）。四条各咬一个不同的形状：
+//   N1 正名：sendfile 是内核内两个 fd 之间的搬运，念成「网络收发」不是链接期事实 ⇒ 0 族。
+//   N2 代价：sendto 单独存在（没有其他 NET 成员）时不再落 NET；sendto+fork 从 2 族/high 变 1 族/medium。
+//   N3 包级防线：常驻真夹具 detach-arm32 摘后仍 3 族 ⇒ 仍 ELF_FAMILIES/high，不会落进自动通道。
+//   N4 解耦复验：sendfile 仍出现在给人看的那份 sensitiveImports 里，而它不再落任何族（两份东西）。
+// 档位公式（0/1 → medium、≥2 → high）、decide()、SENSITIVE 那份名单，本组只消费、不修改。
+//----------------------------------------------------------------------------
+
+test('B-N1 sendfile 不再落任何族：纯函数层 []，真管线读到 0 族那一格仍含「无一落在危险族」与「这不等于安全」', () => {
+  assert.deepEqual(S3A.capabilityFamilies(['sendfile']), [], 'sendfile 是 fd→fd 的内核内搬运，不证明往外发东西');
+  assert.deepEqual(S3A.capabilityFamilies(['sendfile', 'socket']), ['NET'], '摘的是 send 那一条前缀，不是整个 NET 族');
+
+  const out = forensics(s3aElf(['sendfile']), 'sendfile-only.so');
+  assert.equal(out.parseError, undefined, out.parseError);
+  assert.equal(out.importCount, 1);
+  assert.deepEqual(out.sensitiveImports, ['sendfile'], '给人看的那份名单不许因为族表变了就少一个字');
+  assert.deepEqual(out.capabilityImports, [], '族进料里它不再落任何族');
+  assert.equal(out.capabilityImportsTotal, 0);
+  assert.equal(out.capabilityImportsCapped, false);
+
+  const g = s3aVerdict('sendfile-only.so', out);
+  assert.equal(g.severity, 'medium', '0 族 ⇒ medium：档位公式一字未改');
+  assert.match(g.message, /读到 1 个导入/);
+  assert.match(g.message, /无一落在危险族/);
+  assert.match(g.message, /不等于安全/, '0 族那一格的口径不变：这一发读成 0 族之后，这句更是分界线');
+});
+
+test('B-N2 代价钉住：sendto 单独 ⇒ 0 族/medium（改前 NET 1 族），sendto+fork ⇒ 1 族/medium（改前 EXEC+NET 2 族/high）', () => {
+  // 2026-10-16 用户拍的代价：「sendto 单独存在且没有其他 NET 成员」的模块从此读到 1 族而不是 2 族。
+  // 真用 socket 发送的模块几乎必然同框导入 socket/connect，所以这一格在语料里今天还没出现过 ——
+  // 它是接受的代价，不是发现的收益，钉在这里是为了让下一次有人说「顺手再放宽一条」时看得见形状。
+  const one = forensics(s3aElf(['sendto']), 'sendto-only.so');
+  assert.equal(one.parseError, undefined, one.parseError);
+  assert.deepEqual(one.sensitiveImports, ['sendto'], '展示筛仍认 sendto，那一份一个字没动');
+  assert.deepEqual(one.capabilityImports, [], '代价的形状①：sendto 单独存在时不再落 NET');
+  const g1 = s3aVerdict('sendto-only.so', one);
+  assert.equal(g1.severity, 'medium', '这一发改前改后都是 medium：变的只是理由（NET 一族 → 0 族）');
+  assert.match(g1.message, /无一落在危险族/);
+
+  const two = forensics(s3aElf(['sendto', 'fork']), 'sendto-fork.so');
+  assert.deepEqual(two.capabilityImports, ['fork'], '代价的形状②：sendto 退出族进料，fork 照旧在');
+  const g2 = s3aVerdict('sendto-fork.so', two);
+  assert.equal(g2.severity, 'medium', '改前 2 族 ⇒ high，改后 1 族 ⇒ medium：这就是 B 唯一真正会放宽的那一格');
+  assert.match(g2.message, /1 类危险能力/);
+  assert.doesNotMatch(g2.message, /≥2 类链接期能力/, '升级理由不许再被念出来 —— 族数不够了');
+});
+
+test('B-N3 包级防线：真夹具 detach-arm32 摘后族集 EXEC+FILEWRITE+NS、outcome 仍 ELF_FAMILIES、severity 仍 high', () => {
+  const rec = forensics(fix('detach-arm32'), 'detach-arm32');
+  assert.equal(rec.parseError, undefined, rec.parseError);
+  assert.ok(rec.sensitiveImports.includes('sendfile'), '给人看的那份名单里 sendfile 还在（常驻夹具的真字节）');
+  assert.equal(rec.capabilityImports.includes('sendfile'), false, '族进料里它已经不再落 NET：这一格就是 B 落地的形状');
+  assert.deepEqual(S3A.capabilityFamilies(rec.capabilityImports), ['EXEC', 'FILEWRITE', 'NS'], '改前是 4 族，NET 靠 sendfile 撑着');
+
+  const g = s3aVerdict('detach-arm32', rec);
+  assert.equal(g.severity, 'high', '3 族 ≥2 ⇒ 仍是 high：这一枚不会因为摘了 send 就掉档');
+  assert.match(g.message, /3 类危险能力/);
+  assert.match(g.message, /≥2 类链接期能力/);
+
+  const row = S3A_RR.binaryForensicsRows(
+    [{ name: 'detach-arm32', id: 'ELF', why: 'ELF 可执行文件/共享库', bytes: rec.bytes }],
+    new Map([['detach-arm32', rec]]))[0];
+  assert.equal(row.outcome, 'ELF_FAMILIES', '登记口径也必须是多族，不许被念成单族');
+  assert.deepEqual(row.families, ['EXEC', 'FILEWRITE', 'NS']);
+  assert.equal(S3A_RR.decide(S3A_RR.scoreRisk([g]).level, 'first').action, 'block',
+    '这一枚所在的包不因 B 落进自动通道');
+});
+
+test('B-N4 解耦复验：sendfile 在给人看的那份名单里，同时它不落任何族（两份东西不许复合）', () => {
+  // SENSITIVE 那份名单与它的两条既有证人（本文件 ELF64 锚点那一条、scan.test.mjs 的 T57-07）一字不动，
+  // 这里只补「同一枚里两栏同时成立」这一对：展示筛里有它、族集里没有它。
+  const out = forensics(s3aElf(['sendfile', 'recv']), 'pair.so');
+  assert.equal(out.parseError, undefined, out.parseError);
+  assert.deepEqual(out.sensitiveImports, ['recv', 'sendfile'], 'SENSITIVE 那份名单一字未动');
+  assert.deepEqual(out.capabilityImports, ['recv'], '族进料只剩 recv');
+  assert.deepEqual(S3A.capabilitySymbols(out.capabilityImports).map((x) => [x.family, x.symbols]),
+    [['NET', ['recv']]], 'NET 仍在，但撑它的是 recv 而不是 sendfile');
+  assert.deepEqual(S3A.capabilityFamilies(['sendfile']), [], '这一对的另一半：给人看的名单里有它，族集里没有它');
+});
+
+//----------------------------------------------------------------------------
 // I. 输出形状
 //----------------------------------------------------------------------------
 
