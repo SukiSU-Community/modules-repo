@@ -1055,15 +1055,17 @@ test('prompt 必须把「怎么引那一行」说到位：连续一段、不许�
   assert.match(SYSTEM_PROMPT, /只有 ② 节里真出现过的标签才能原样抄进 file/);
 });
 
-test('真接口实测：DEFAULT_TIMEOUT_MS 必须盖过 QCA 的排程冷启动，否则每一发都是 failed', () => {
-  // 两发实测（同一枚包、同一份 brief ≈21.5 KB、medium effort）：
-  //   第一发 active_seconds=311.98（rescheduling 约 300s）；
-  //   第二发整发墙上时间约 790s，其中到 635s 还在 rescheduling、没进 running。
-  // 慢在**排程**不在模型。180000 掐断过第一发，600000 掐断过第二发 —— 掐断后会话照样跑完并计费 10.72 credits，
-  // 我们只是把已经付过钱的结论丢成 failed。方向上偏短只会更严（不会误放行），但每包都 failed 等于这一层没接上。
-  // 尾巴没量过：n=2 只能保证盖住这两发，不许当成「上限」。
-  assert.ok(DEFAULT_TIMEOUT_MS >= 900000,
-    `默认超时 ${DEFAULT_TIMEOUT_MS}ms 盖不住实测第二发的 790s（rescheduling 635s 仍在排程）`);
+test('真接口实测：DEFAULT_TIMEOUT_MS 要盖过 QCA 的排程尾部（三发全掐断过，形状由用户 2026-10-16 拍：更大余量）', () => {
+  // 同一枚真包（≈21.5 KB brief、medium effort）三发的会话实况：
+  //   第一发 active_seconds=311.98（rescheduling 约 300s）、计费 10.72；
+  //   第二发到 635s 还在 rescheduling、active_seconds=768.00、计费 12.58；
+  //   第三发到 926s 仍在 rescheduling、0 credits、没答。
+  // 180000 / 600000 / 900000 三个余量都被掐断过 ⇒ 「按实测 N 倍取」这个算法本身会被下一个样本证伪。
+  // 慢在**排程**不在模型；偏短的方向是更严（不会误放行），但每包都 failed 等于这一层没接上。
+  // 取 1800000 是**赌排程够用**这个形状（用户拍的），不是标定：n=3，尾部没有上限。
+  // 顺带两条实现事实：每次 attempt 各自起 deadline；超时直接 `failed`，不重试成 agree。
+  assert.ok(DEFAULT_TIMEOUT_MS >= 1800000,
+    `默认超时 ${DEFAULT_TIMEOUT_MS}ms 盖不住今天见过的最差一发（第三发到 926s 仍在 rescheduling、没答）`);
 });
 
 test('F4a：预算依据如实写明是未标定的保守字节代理，没有发明 token 系数', () => {

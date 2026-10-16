@@ -146,14 +146,14 @@ export const BUDGET_BASIS = 'uncalibrated-conservative-byte-proxy：DEFAULT_MAX_
 export const MIN_MAX_TOKENS = 2000;
 
 /**
- * 一发判定的墙上时间上限。两发实测（同一枚包、≈21.5 KB brief、medium effort）：
- * 第一发 active_seconds=311.98（rescheduling 约 300s），第二发到 635s 还在 rescheduling、整发约 790s。
- * 180000 掐断过第一发、600000 掐断过第二发，而**掐断后会话照样跑完并计费 10.72 credits** ——
- * 我们只是把已经付过钱的结论丢成 failed。偏短的方向是「更严」（不会误放行），
- * 但每一包都 failed 等于这一层没接上，所以按两发实测的最大值再留一档。
- * 尾巴没有量过：n=2，900000 不是上限，是「目前见过的最差那一发的余量」。
+ * 一发判定的墙上时间上限。同一枚真包三发的会话实况（2026-10-16）：`active_seconds` 311.98、768.00，
+ * 第三发到 926s 还在 `rescheduling`、0 credits、没答 —— 180000 / 600000 / 900000 三个余量全被掐断过。
+ * 慢在**排程**不在模型，而跑完的那几发即使被我们掐断也照计费（10.72 / 12.58 credits），没跑起来的不计费。
+ * 偏短的方向是「更严」（不会误放行），但每包都 failed 等于这一层没接上。
+ * **1800000 是用户 2026-10-16 拍的形状：赌排程够用**，不是标定 —— n=3，这段尾部没有上限。
+ * 另两条实现事实：每次 attempt 各自起 deadline；超时直接判 `failed`，不重试成 agree。
  */
-export const DEFAULT_TIMEOUT_MS = 900000;
+export const DEFAULT_TIMEOUT_MS = 1800000;
 
 /**
  * QCA 事件分页（评审 F8：limit=100 不翻页时，消息多于 100 条的会话永远读不到结论）。
