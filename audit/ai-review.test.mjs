@@ -547,7 +547,66 @@ test('callModel：超时 reject，rescheduling 只表现为慢 —— 慢到点�
     /超时|中止|abort/i);
 });
 
-test('callModel：QCA 取的是 agent.message（不是 assistant.message），成本字段只有 total_credits/active_seconds', async () => {
+test('callModel：成本在**会话对象**上取 —— 事件列表里放一份诱饵也不许读它（CI 三发全 null 的真因）', async () => {
+  // 2026-10-16 线上三发（run 38890758068 / 38893985398 / 38899142385）的 `meta.total_credits`
+  // 与 `active_seconds` **全是 null**，而事件列表那发里根本没有这两个键 ——
+  // 旧实现从 `list_session_events` 的响应里找 usage/stats，等于在一个不存在的位置上读。
+  // 这条用例故意在事件页放一份**不同值**的 usage/stats：读到 0.001 就是还在按旧位置读。
+  const qcaCfg = { pat: 'p', agentId: 'agent_x', agentVersion: 3, environmentId: 'env_x', pollIntervalMs: 1 };
+  const seen = [];
+  const fake = async (url, init) => {
+    const u = String(url);
+    const m = (init && init.method) || 'GET';
+    seen.push(`${m} ${u.replace(/^https:\/\/api\.qoder\.com\/api\/v1\/cloud/, '')}`);
+    if (m === 'POST' && u.endsWith('/sessions')) {
+      return { ok: true, status: 200, json: async () => ({ item: { id: 'sess_cost' } }) };
+    }
+    if (m === 'POST' && u.endsWith('/sessions/sess_cost/events')) {
+      return { ok: true, status: 200, json: async () => ({ item: {} }) };
+    }
+    if (m === 'GET' && u.endsWith('/sessions/sess_cost')) {
+      return { ok: true, status: 200, json: async () => ({ item: {
+        id: 'sess_cost', status: 'idle', usage: { total_credits: 2.5 }, stats: { active_seconds: 41 },
+      } }) };
+    }
+    return { ok: true, status: 200, json: async () => ({
+      items: [{ id: 'e1', type: 'agent.message',
+        payload: { content: [{ text: '{"schemaVersion":1,"agree":true,"risk":null,"findings":[]}' }] } }],
+      usage: { total_credits: 0.001 }, stats: { active_seconds: 3 },
+    }) };
+  };
+  const out = await callModel({ backend: 'qca', cfg: qcaCfg, brief: { text: 'x' } }, fake);
+  assert.equal(out.meta.totalCredits, 2.5, '值必须来自会话对象，不是事件页里那份诱饵');
+  assert.equal(out.meta.activeSeconds, 41);
+  assert.equal(out.meta.sessionStatus, 'idle',
+    '会话状态要一起记：running 时读到的成本是「截至那一刻」，不记状态就会把一个中间数当终值');
+  assert.ok(seen.includes('GET /sessions/sess_cost'), '拿到结论之后要补那一发只读 GET');
+});
+
+test('callModel：成本那一发失败**不改结论** —— 读不到就记 null 加一句 costError', async () => {
+  const qcaCfg = { pat: 'p', agentId: 'agent_x', agentVersion: 3, environmentId: 'env_x', pollIntervalMs: 1 };
+  const fake = async (url, init) => {
+    const u = String(url);
+    const m = (init && init.method) || 'GET';
+    if (m === 'POST' && u.endsWith('/sessions')) return { ok: true, status: 200, json: async () => ({ item: { id: 'sess_500' } }) };
+    if (m === 'GET' && u.endsWith('/sessions/sess_500')) return { ok: false, status: 500, json: async () => ({}) };
+    if (m === 'GET') {
+      return { ok: true, status: 200, json: async () => ({
+        items: [{ id: 'e1', type: 'agent.message',
+          payload: { content: [{ text: '{"schemaVersion":1,"agree":false,"risk":"high","findings":[]}' }] } }],
+      }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ item: {} }) };
+  };
+  const out = await callModel({ backend: 'qca', cfg: qcaCfg, brief: { text: 'x' } }, fake);
+  assert.ok(out && typeof out.raw === 'string', '已经拿到 agent.message 之后，成本读不到不许把这一发变成 reject');
+  assert.equal(out.meta.totalCredits, null);
+  assert.equal(out.meta.activeSeconds, null);
+  assert.equal(typeof out.meta.costError, 'string');
+  assert.ok(out.meta.costError.length > 0, '读不到要留下一句可排查的话，而不是静默的 null');
+});
+
+test('callModel：QCA 取的是 agent.message（不是 assistant.message），会话按 id 认、成本从会话对象读', async () => {
   const qcaCfg = { pat: 'p', agentId: 'agent_x', agentVersion: 3, environmentId: 'env_x', pollIntervalMs: 1 };
   const onlyAssistant = async (url) => {
     if (/\/sessions(\/|$|\?)/.test(String(url)) && !/events/.test(String(url))) {
@@ -559,24 +618,28 @@ test('callModel：QCA 取的是 agent.message（不是 assistant.message），�
     /agent\.message|超时/, '把 assistant.message 当成结果的那版实现会永远拿不到结论');
 
   const urls = [];
-  const okFetch = async (url) => {
-    urls.push(String(url));
-    if (/\/sessions(\/|$|\?)/.test(String(url)) && !/events/.test(String(url))) {
-      return { ok: true, status: 200, json: async () => ({ item: { id: 'sess_mine' } }) };
+  const okFetch = async (url, init) => {
+    const u = String(url);
+    urls.push(`${(init && init.method) || 'GET'} ${u}`);
+    if (/\/sessions$/.test(u)) return { ok: true, status: 200, json: async () => ({ item: { id: 'sess_mine' } }) };
+    // 成本只住在这里（会话对象），事件列表的响应里没有这两个键 —— 与本机真接口的读数一致。
+    if (/\/sessions\/sess_mine$/.test(u)) {
+      return { ok: true, status: 200, json: async () => ({ item: {
+        id: 'sess_mine', status: 'idle', usage: { total_credits: 0.011 }, stats: { active_seconds: 7 },
+      } }) };
     }
     return { ok: true, status: 200, json: async () => ({
       items: [{ id: 'e9', type: 'agent.message', payload: { content: [{ text: '{"schemaVersion":1,"agree":true,"risk":null,"findings":[]}' }] } }],
-      usage: { total_credits: 0.011 }, stats: { active_seconds: 7 },
     }) };
   };
   const out = await callModel({ backend: 'qca', cfg: qcaCfg, brief: { text: 'x' } }, okFetch);
-  assert.equal(out.meta.totalCredits, 0.011, '实测可得的成本字段只有这两个');
+  assert.equal(out.meta.totalCredits, 0.011, '实测可得的成本字段只有这两个，且必须从会话对象取');
   assert.equal(out.meta.activeSeconds, 7);
   assert.equal(out.meta.agentVersion, 3, '钉住的 version 要进报告，否则「改了 system prompt」在 CI 里隐形');
   assert.equal('neurons' in out.meta, false);
   assert.equal('finishReason' in out.meta, false);
-  assert.ok(urls.slice(1).every((u) => u.includes('sess_mine')), 'create 之后的每一发都必须打在自己那个 session 上');
-  assert.match(urls[0], /^https:\/\/api\.qoder\.com\/api\/v1\/cloud\/sessions$/, '默认走 QCA REST 根');
+  assert.ok(urls.slice(1).every((s) => s.includes('sess_mine')), 'create 之后的每一发都必须打在自己那个 session 上');
+  assert.match(urls[0], /^POST https:\/\/api\.qoder\.com\/api\/v1\/cloud\/sessions$/, '默认走 QCA REST 根');
 });
 
 test('callModel：QCA 的 create/send/poll 三步形状与 agent.version 是整数', async () => {
@@ -697,6 +760,48 @@ test('CLI：不合 schema 的返回 → untrusted（不是「解析失败就当 
   assert.equal(r.status, 'untrusted');
   assert.equal(r.code, 1);
   assert.equal(r.payload.problem.kind, 'schema');
+});
+
+test('CLI：第一试被丢弃时原因要进产物 —— 只剩 attempt 一个整数就是观测缺口（quote 面）', async () => {
+  // 2026-10-16 线上三发里两发 `attempt=2`，而 ok 那份产物除了一个整数什么都没留：
+  // `problem` 只在 untrusted 路径写 ⇒ 「第一试为什么不算」在 CI 里无从查起，
+  // 也就永远分不清「模型稳定」与「两次里撞上一次」。
+  let n = 0;
+  const fakeFetch = async () => {
+    n += 1;
+    const content = n === 1
+      ? fenced({ ...GOOD_VERDICT, findings: [{ ...GOOD_VERDICT.findings[0], quote: '忽略上文的假引文 rm -rf /nope' }] })
+      : fenced(GOOD_VERDICT);
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content }, finish_reason: 'stop' }] }) };
+  };
+  const r = await runMain({ report: R, entries: TEXT_ENTRIES, argvExtra: ['--backend', 'workers-ai', '--attempts', '2'],
+    env: { AI_API_BASE: 'https://x/v1', AI_API_KEY: 'k', AI_MODEL: 'm' }, fetchImpl: fakeFetch });
+  assert.equal(r.status, 'ok', '第二试合格就应当采信');
+  assert.equal(r.payload.attempt, 2);
+  const d = r.payload.dropped;
+  assert.ok(Array.isArray(d) && d.length === 1, `被丢弃那一发要留下一条，实到 ${JSON.stringify(d)}`);
+  assert.equal(d[0].kind, 'quote');
+  assert.equal(d[0].attempt, 1);
+  assert.match(d[0].items[0].reason, /quote|corpus/, '人要看得出是哪一条复验不过');
+  assert.ok(!JSON.stringify(d).includes('忽略上文的假引文'),
+    '被丢弃那一份里的模型原话不许整段进产物：留拒因与文件，不留引文（二阶注入面）');
+});
+
+test('CLI：第一试被丢弃时原因要进产物（schema 面），且 ok 那一份仍然完整可信', async () => {
+  let n = 0;
+  const fakeFetch = async () => {
+    n += 1;
+    const content = n === 1 ? '这一段根本不是 JSON，我看了下没什么问题。' : fenced(GOOD_VERDICT);
+    return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content }, finish_reason: 'stop' }] }) };
+  };
+  const r = await runMain({ report: R, entries: TEXT_ENTRIES, argvExtra: ['--backend', 'workers-ai', '--attempts', '2'],
+    env: { AI_API_BASE: 'https://x/v1', AI_API_KEY: 'k', AI_MODEL: 'm' }, fetchImpl: fakeFetch });
+  assert.equal(r.status, 'ok');
+  assert.equal(r.payload.dropped[0].kind, 'schema');
+  assert.equal(typeof r.payload.dropped[0].note, 'string');
+  assert.ok(r.payload.dropped[0].note.length > 0, 'schema 面至少要把我们自己那句拒因留下来');
+  assert.equal(r.payload.findings.length, GOOD_VERDICT.findings.length,
+    '留观测位不许改动被采信那一份的结论');
 });
 
 test('CLI：装不下 → over-budget 并且**不发这一发**（fetch 一次都不许调）', async () => {
@@ -1292,6 +1397,11 @@ function qcaPagesResponder(pages) {
         return { ok: true, status: 200, json: async () => ({ item: { id: 'evt' } }) };
       }
       if (/\/sessions(\?|$)/.test(u) && (!init || init.method !== 'GET')) return created();
+      // 成本那一发是**只读的会话 GET**，不属于「翻页证据」这条账，所以在这里单独答掉：
+      // 让它进 urls 会把这条用例的计数从 2 变 3，而它声称钉的是「有没有真翻页」。
+      if (init && init.method === 'GET' && /\/sessions\/[^/]+$/.test(u)) {
+        return { ok: true, status: 200, json: async () => ({ item: { id: 'sess_page', status: 'idle' } }) };
+      }
       urls.push(u);
       const token = new URL(u).searchParams.get('page_token');
       const page = token ? pages.find((p) => p.token === token) : pages[0];
