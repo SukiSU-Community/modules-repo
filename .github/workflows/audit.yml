@@ -606,10 +606,15 @@ jobs:
           QCA_ENVIRONMENT_ID: ${{ vars.QCA_ENVIRONMENT_ID }}
           QCA_PROMPT_SHA: ${{ vars.QCA_PROMPT_SHA }}
         run: |
-          # 这里**故意没有 -e**（工单 §0.2-2）：ai-review.mjs 对任何非 ok（failed / untrusted /
-          # over-budget 都算）一律 exit 1，而下面 分流决策 的 if 是 found=='true'、没有 always()。
-          # 本步先红会把 triage 整步跳过：五态文案永远出不来、判据 output 全空、PR 上一片沉默，
-          # 而「沉默 + 前一步红」比「判据红」更难查。所以退出码先收进变量、不当场开火。
+          # 本步的规矩是「非 ok 不在这里开火」（工单 §0.2-2）：ai-review.mjs 对任何非 ok（failed /
+          # untrusted / over-budget 都算）一律 exit 1，而下面 分流决策 的 if 是 found=='true'、没有
+          # always()。本步先红会把 triage 整步跳过：五态文案永远出不来、判据 output 全空、PR 上一片
+          # 沉默，而「沉默 + 前一步红」比「判据红」更难查。
+          # ⚠️ 但这条规矩**不能靠省略 -e 来兑现**（2026-10-16 run 38904316355 实测）：GitHub 把
+          # `shell: bash` 展开成 `bash --noprofile --norc -e -o pipefail`，那个 `-e` 是 runner 给的，
+          # 这里写 `set -uo pipefail` 撤不掉它。旧写法（`node …` 接 `CODE=$?`）在线上等于
+          # 「第一个非 0 退出码当场把整步打断」——CODE 永远来不及收，收口与 triage 一起没了。
+          # 所以规矩落在调用点上：**每个预期会非 0 的调用都必须自带 `|| CODE=$?`**。
           # 本步只有一种情况自己红：这一层**根本没运行**（模块缺失 / 状态文件没写出来 / 配置错误）。
           set -uo pipefail
           mkdir -p audit-out
@@ -667,8 +672,10 @@ jobs:
             if [ -n "${QCA_PROMPT_SHA:-}" ]; then
               ARGS+=(--expected-prompt-sha "$QCA_PROMPT_SHA")
             fi
-            node "$AI" "${ARGS[@]}"
-            CODE=$?
+            CODE=0
+            # 归零是必须的：`|| CODE=$?` 只在失败那发赋值，不归零会把上一包的退出码当成这一包的。
+            # 带 `||` 也是必须的：runner 给的 -e 会在裸 `node` 非 0 时当场打断整步（见本步开头）。
+            node "$AI" "${ARGS[@]}" || CODE=$?
             printf '%s %s\n' "$BASE" "$CODE" >> audit-out/ai.codes
             echo "AI 安全员：$BASE → 退出码 $CODE（状态：$( [ -f "$STATUS" ] && tr -d '\r\n' < "$STATUS" || echo '<没写出>' )）"
           done < zips.txt
