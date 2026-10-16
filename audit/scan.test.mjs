@@ -5892,7 +5892,10 @@ test('T57-07 能力族纯函数：arm64-v8a.so 的真名单逐字断族，外加
   assert.deepEqual(T57_ELF.capabilitySymbols(arm.sensitiveImports).map((x) => [x.family, x.symbols]), [
     ['EXEC', ['dlsym', 'fork']],
     ['FILEWRITE', ['chdir', 'unlink']],
-    ['NET', ['recv', 'send']],
+    // NET 的代表符号只剩 ['recv']：`send` 这条前缀被摘掉了（2026-10-16 拍的那一发），而同一发里
+    // 那条 sensitiveImports 的逐字断言一字未动 —— `send` 还在给人看的那份名单里。
+    // 展示筛与族进料是两份东西：这一格改的是后者，前者不许跟着动。
+    ['NET', ['recv']],
     ['NS', ['chroot', 'kill', 'prctl', 'sigaction']],
   ]);
   assert.equal(T57_ELF.capabilitySymbols(arm.sensitiveImports).length, 4, '4 族 ⇒ 这一枚是 high');
@@ -6255,8 +6258,13 @@ test('INV-D 只增不减：常驻六枚逐枚对两套进料，新族集 ⊇ 旧
       `${f}：档位降了（旧 ${oldSet.join('+')||'0族'} → 新 ${newSet.join('+')||'0族'}，实测 ${sev}）`);
     table.push(`${f}: ${oldSet.length}族(${oldNames.length}名) → ${newSet.length}族(${rec.capabilityImportsTotal}名) ${sev}`);
   }
-  // 逐枚对照表本轮实测（写进 briefs/task-s3a-report.md，红的时候这一句就是现场）：
-  assert.equal(table.filter((x) => x.includes(' 4族')).length, 3, '三枚 ≥2 族的必须仍是 4 族 high：' + table.join(' | '));
+  // 逐枚对照表本轮实测（写进交付报告，红的时候这一句就是现场）。
+  // 摘掉 NET 的 `send` 前缀之后 detach-arm32 从 4 族变 3 族（NET 本来只靠 sendfile 撑着），
+  // 所以「 4族」的行数由 3 变 2、多出一行「 3族」。①②③ 三段判据本身一字未改：
+  // 它比的是两套进料在**同一张表**下的包含关系，换表不改变方向；档位那一断在 detach-arm32 上
+  // 仍成立（3 族 ≥2 ⇒ 仍是 high）。
+  assert.equal(table.filter((x) => x.includes(' 4族')).length, 2, '两枚 ≥2 族的必须仍是 4 族 high：' + table.join(' | '));
+  assert.equal(table.filter((x) => x.includes(' 3族')).length, 1, 'detach-arm32 摘后是 3 族（NET 靠 sendfile 的那一格没了）：' + table.join(' | '));
   assert.equal(table.filter((x) => x.includes(' 0族')).length, 3, '三枚 HMA 必须仍是 0 族（证出来的可靠缺席）：' + table.join(' | '));
 });
 

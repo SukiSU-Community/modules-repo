@@ -355,8 +355,26 @@ const REPRESENTATIVE_CAP = 5;
 export const CAPABILITY_FAMILIES = [
   ['EXEC', '起新程序/运行时加载',
     ['exec', 'system', 'popen', 'fork', 'vfork', 'clone', 'posix_spawn', 'dlopen', 'dlsym']],
+  // NET 这一行为什么**没有** `send` 那一条前缀（2026-10-16 拍的一次放宽，只摘这一条，其余四条没拍）：
+  //   ① 为什么摘：`sendfile` 的口径是「在一个文件描述符与另一个文件描述符之间复制数据」——
+  //      Linux ≥2.6.33 上 out_fd 可以是任意普通文件，它是内核内两个 fd 之间的搬运，
+  //      **本身不证明往外发东西**。把它念成「网络收发」不是链接期事实，而只有链接期事实能当族表依据。
+  //      实测：钉 tag 的五个公开 release、41 枚二进制里，摘掉这一条前缀让 **8** 枚的族集发生变化，
+  //      其中跨 high→medium 的是 **4** 枚（包级取最严：0 个包的档位会变），而那 8 枚涉及的名字
+  //      **只有 `sendfile`**。别把这句读反：整份语料里 `send*` 另外还命中了 `send` / `sendto` /
+  //      `sendmsg`（21 枚），只是其中 13 枚的 NET 另有 `socket` / `connect` 一类撑着，摘了前缀族集不动。
+  //      样本边界同样如实写着：那 8 枚全部来自 `zygisk-detach` 一个包（每种 ABI 各两枚），
+  //      另外四个包在摘前摘后一个字都不动。
+  //   ② 接受的代价：`send` / `sendto` / `sendmsg` 从此不再**单独**构成 NET。真用 socket 发送的模块
+  //      几乎必然同框导入 `socket` / `connect`（上面那 13 枚就是这么来的），所以这份代价还没在这份
+  //      语料里现出形；它的形状由 audit/elf-forensics.test.mjs 的 B-N2 那两枚合成 ELF 钉死 ——
+  //      `sendto` 单独存在 ⇒ 0 族/medium，`sendto` + `fork` ⇒ 1 族/medium（而改前是 2 族/high）。
+  //      代价必须由用例钉住，不许只在这段注释里口头承认。
+  //   ③ 这不等于安全：摘完之后能读到 0 族的二进制变多了，而 0 族那一格的文案口径一字未动
+  //      （下游 risk-rules 里那句「无一落在危险族……这不等于安全」），这张表从来只用来往严写，
+  //      永远不用来放宽别的判据。
   ['NET', '网络收发',
-    ['socket', 'connect', 'bind', 'listen', 'accept', 'send', 'recv', 'getaddrinfo']],
+    ['socket', 'connect', 'bind', 'listen', 'accept', 'recv', 'getaddrinfo']],
   ['NS', '命名空间与进程逃逸',
     ['setns', 'unshare', 'chroot', 'mount', 'pivot_root', 'ptrace', 'kill', 'sigaction', 'prctl']],
   ['PROP', '系统属性读写',

@@ -362,9 +362,11 @@ test('Step 2 dump 字段口径一律从报告取：riskLevel/counts/decision/bin
     assert.deepEqual(b.families, capabilityFamilies(b.capabilityImports));
   }
   // 条目名是 zip 里的**全名**（带 lib/ 前缀），不是 basename —— 与 report.binaries[].name 同一套口径。
+  // detach-arm32 这一栏是 3 不是 4：NET 那一族本来只靠 `sendfile` 撑着，2026-10-16 摘掉 `send`
+  // 这条前缀之后它落不到 NET 了。改的是这张表的成员，不是这里的计数口径。
   const byName = Object.fromEntries(row.binaries.map((b) => [b.name, b.families.length]));
   assert.deepEqual(byName, {
-    'lib/device_faker_cli': 4, 'lib/arm64-v8a.so': 4, 'lib/detach-arm32': 4,
+    'lib/device_faker_cli': 4, 'lib/arm64-v8a.so': 4, 'lib/detach-arm32': 3,
     'lib/hma-arm64.so': 0, 'lib/hma-armeabi-v7a.so': 0, 'lib/hma-x86.so': 0,
   });
   // 跨枚取并集是「包级最严」那一栏的族集口径，排序去重。
@@ -376,8 +378,14 @@ test('Step 2 dump 字段口径一律从报告取：riskLevel/counts/decision/bin
 // Step 3 —— diff 的收窄闸，以及一张**不依赖下载**的前后表
 // ---------------------------------------------------------------------------
 
-/** Step 4 那一发的候选表：摘掉这五枚成员（族名 + 前缀，逐词对过现表）。 */
-const STEP4_REMOVALS = [['NET', 'send'], ['FILEWRITE', 'chdir'], ['NS', 'kill'], ['NS', 'sigaction'], ['NS', 'prctl']];
+/**
+ * 未拍的候选表：还剩这四枚成员（族名 + 前缀，逐词对过现表）。
+ * `['NET','send']` 那一元**已经不在**这张表里 —— 它不是候选，2026-10-16 拍了并落了地，
+ * 现表 NET 里再也没有 `send` 这条前缀，所以留着它会让下面 narrow() 那条前提断言当场红
+ * （那是它该有的行为，红过一次记在交付报告里）。落地之后的真值改由紧邻 B 的那条特征化断言钉，
+ * 不再混在这张「还没拍」的候选表里；其余四条仍然是候选，谁顺手落一条都会红。
+ */
+const STEP4_REMOVALS = [['FILEWRITE', 'chdir'], ['NS', 'kill'], ['NS', 'sigaction'], ['NS', 'prctl']];
 
 /** 从现表里按 [族,前缀] 摘成员。摘之前先确认它真在现表里 —— 表改了这发要响，而不是偷偷测了个空集。 */
 function narrow(pairs) {
@@ -387,6 +395,20 @@ function narrow(pairs) {
   }
   return CAPABILITY_FAMILIES.map(([f, l, ps]) => [f, l, ps.filter((p) => !pairs.some(([pf, pp]) => pf === f && pp === p))]);
 }
+
+test('B 已落地那一格：现表 NET 里没有 send，而 arm64-v8a.so 那份筛后名单里 send 仍在（两份东西不许复合）', () => {
+  const net = CAPABILITY_FAMILIES.find(([f]) => f === 'NET');
+  assert.ok(net, 'NET 那一行还在：摘的是一条前缀，不是整个族');
+  assert.equal(net[2].includes('send'), false, '现表 NET 里没有 `send` —— 这一发已经落地，不再是候选');
+  assert.deepEqual(net[2], ['socket', 'connect', 'bind', 'listen', 'accept', 'recv', 'getaddrinfo'],
+    '其余成员一字未动（EXEC / NS / PROP / FILEWRITE 四行由上面那张候选表继续管着）');
+
+  const arm = forensics(readFileSync(join(FIXTURES, 'arm64-v8a.so')), 'arm64-v8a.so');
+  assert.ok(arm.sensitiveImports.includes('send'), '给人看的那份名单里 send 还在：展示筛不为族表让路');
+  assert.equal(arm.capabilityImports.includes('send'), false, '族进料里它不再出现 —— 这一对就是那面解耦墙');
+  assert.deepEqual(capabilityFamilies(arm.capabilityImports), ['EXEC', 'FILEWRITE', 'NET', 'NS'],
+    'NET 仍靠 recv 撑着：这一枚还是 4 族，摘一条前缀不等于摘一个族');
+});
 
 /** 离线造一份 dump：六枚常驻真 ELF 进合成 zip ⇒ 生产入口扫 ⇒ buildDumpRow。 */
 async function offlineDump() {
@@ -431,7 +453,7 @@ test('Step 3 收窄闸：候选表里有新增前缀或新增族 ⇒ 非零退�
   }
 });
 
-test('Step 3 离线前后表：六枚常驻夹具 + Step 4 候选表 ⇒ 4→3 / 4→3 / 4→4 / 0→0×3，跨 ≥2 边界的枚数 = 0', async () => {
+test('Step 3 离线前后表：六枚常驻夹具 + Step 4 候选表 ⇒ 4→3 / 3→3 / 4→4 / 0→0×3，跨 ≥2 边界的枚数 = 0', async () => {
   const dump = await offlineDump();
   const result = diffDump(dump, narrow(STEP4_REMOVALS));
   assert.deepEqual(result.problems, [], `报告里的 families 与现表重算不一致：${result.problems.join(' | ')}`);
@@ -441,7 +463,9 @@ test('Step 3 离线前后表：六枚常驻夹具 + Step 4 候选表 ⇒ 4→3 /
 
   assert.deepEqual(Object.keys(byName).sort(), [...SIX].sort());
   assert.deepEqual([byName.device_faker_cli.beforeCount, byName.device_faker_cli.afterCount], [4, 3]);
-  assert.deepEqual([byName['detach-arm32'].beforeCount, byName['detach-arm32'].afterCount], [4, 3]);
+  // detach-arm32 的前栏由 4 改 3、后栏 3 不改：NET 本来只靠 `sendfile` 撑着，那条前缀摘掉之后
+  // 现表重算出来就是 EXEC+FILEWRITE+NS 三族（这一栏是从生产报告的 families 现算来的，不是手写的）。
+  assert.deepEqual([byName['detach-arm32'].beforeCount, byName['detach-arm32'].afterCount], [3, 3]);
   assert.deepEqual([byName['arm64-v8a.so'].beforeCount, byName['arm64-v8a.so'].afterCount], [4, 4]);
   for (const n of ['hma-arm64.so', 'hma-armeabi-v7a.so', 'hma-x86.so']) {
     assert.deepEqual([byName[n].beforeCount, byName[n].afterCount], [0, 0], `${n} 两栏都该是 0`);
