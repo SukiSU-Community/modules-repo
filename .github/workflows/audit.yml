@@ -851,9 +851,16 @@ jobs:
               aiNote="AI 安全员未启用（QCA 四件配置缺一：PAT / agent id / agent version / environment id）：本轮只有静态扫描，等级不由 AI 参与";
             } else {
               const changed=okPkgs.some((p)=>order[aiLevel[p]]>order[riskOf(repByPkg[p])]);
+              // 立场与效果是两件事，不能共用一个分支（2026-10-16 CI run 38890758068 实测）：
+              // 那一条 canary 的产物是 agree:false + 5 条 high findings，而静态本来就是 high，
+              // raiseLevel 抬不动 ⇒ 旧写法落到「同意静态结论」那一句 —— 把模型明确说过的「不同意」
+              // 抹成了「同意」。等级未抬是**无从再抬**，不是同意。
+              const disagreed=okPkgs.filter((p)=>art[p].agree === false);
               aiNote=changed
                 ? `AI 安全员已复核（每条引用都逐字复验过送出去的那一份原文）：不同意静态结论，等级已按更严处理抬到 ${risk}`
-                : "AI 安全员已复核（每条引用都逐字复验过送出去的那一份原文）：同意静态结论，等级未抬；AI 只能加严、无权放行";
+                : disagreed.length
+                  ? "AI 安全员已复核（每条引用都逐字复验过送出去的那一份原文）：不同意静态结论，但没有提出比静态更严的等级，等级未抬；AI 只能加严、无权放行"
+                  : "AI 安全员已复核（每条引用都逐字复验过送出去的那一份原文）：同意静态结论，等级未抬；AI 只能加严、无权放行";
               // 混合形态不可能由脚本产生，但也不许被写成「AI 同意」—— 按「有 N 包没有 AI 意见」呈现。
               if (disabledPkgs.length) aiNote+=`；另有 ${disabledPkgs.length} 包没有 AI 意见（未启用）`;
             }
@@ -925,8 +932,11 @@ jobs:
           path: pending-changed/pending/
           if-no-files-found: warn
 
+      # 只有 PR 事件有 PR 可评论：手动触发那一条路上 context.issue.number 解析成 0，
+      # createComment 直接 404（2026-10-16 run 38890758068 实测），整条作业因通道而红，
+      # 读不出「这批包过没过检」。不跑，而不是跑了再炸。
       - name: 发布 PR 评论
-        if: steps.locate.outputs.found == 'true'
+        if: github.event_name == 'pull_request' && steps.locate.outputs.found == 'true'
         uses: actions/github-script@v7
         env:
           RISK: ${{ steps.triage.outputs.risk }}
@@ -1146,8 +1156,9 @@ jobs:
       # ---------------------------------------------------------------
       # 6. 打标签
       # ---------------------------------------------------------------
+      # 与上面那一步同一条理由：addLabels 用的也是 PR/issue 编号，dispatch 上没有对象。
       - name: 打标签
-        if: steps.locate.outputs.found == 'true'
+        if: github.event_name == 'pull_request' && steps.locate.outputs.found == 'true'
         uses: actions/github-script@v7
         env:
           LABEL: ${{ steps.triage.outputs.label }}
