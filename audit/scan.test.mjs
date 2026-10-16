@@ -6272,3 +6272,40 @@ test('T6.3·JSON 面一字不变：markdown 的中和绝不许顺着改到 rende
   assert.ok(json.includes('rm -rf /data'), 'JSON 面：脚本原文仍是原文');
   assert.equal(t63Count(json, /&lt;|&gt;|&#96;/g), 0, '实体形式一个都不许出现在 JSON 产物里');
 });
+
+// 工单 §5 的自问自答：「将来有人在 renderMarkdown 里新加一段投稿者来源的输出却忘了走这把中和，
+// 今天有哪一条用例会红？」—— 逐字段的四条答不了这个问题（新字段没有对应的旧用例）。
+// 所以这一条**不看字段，看记号**：把同一枚记号喂进真管线里能喂的每一个投稿者槽位，
+// 再从 report 自己列出「带着记号的字符串叶子」清单（跨步骤前提必须自己是一条断言，
+// 否则记号根本没进报告时这一格会假绿），然后要求这些原文一个都不许原样出现在围栏外。
+// 于是新落点只要打印的是报告里**任何一处**投稿者字节，就红在这一格。
+const T63_MARK = '</details><zz9>';
+
+function t63Leaves(node, acc = []) {
+  if (typeof node === 'string') { if (node.includes(T63_MARK)) acc.push(node); return acc; }
+  if (node == null || typeof node !== 'object' || Buffer.isBuffer(node)) return acc;
+  for (const v of Object.values(node)) t63Leaves(v, acc);
+  return acc;
+}
+
+test('T6.3·新落点漏走中和也必须红：报告里带注入记号的原文，一个都不许原样出现在围栏外', async () => {
+  const zip = makeModuleZip({
+    id: 't63mark',
+    files: [
+      ['module.prop', `id=a${T63_MARK}b\nname=n${T63_MARK}\ndescription=d${T63_MARK}\n`
+        + `version=v${T63_MARK}\nversionCode=1\nauthor=${T63_MARK}\n`],
+      [`s${T63_MARK}.sh`, '#!/system/bin/sh\necho hi\n'],
+    ],
+  });
+  const r = await scanToReport(zip, { changeType: 'first' });
+  const leaves = t63Leaves(r);
+  assert.ok(leaves.length >= 6, `前提：记号必须真的散在报告里（实测 ${leaves.length} 处字符串叶子），不然这一格是空闸`);
+  assert.ok(new Set(leaves).size >= 5, `前提：至少要有 5 个不同字段带着它（实测 ${new Set(leaves).size}）`);
+  const body = t63OutsideFences(renderMarkdown(r));
+  assert.ok(!body.includes(T63_MARK),
+    `凡是打印报告里投稿者字节的新落点，只要没过 inertMarkdown 就红在这里：\n${body}`);
+  assert.equal(t63Count(body, /<\/details>/g), T63_STRUCT_CLOSE, '闭合标签的总数仍然只许来自我们自己的结构');
+  // 反向闸：上面那条不许因为「什么都没打印」而假绿 —— 已中和的落点必须真的在场。
+  assert.ok(body.includes('&lt;/details&gt;&lt;zz9&gt;'), '中和过的落点必须还在正文里看得见');
+  assert.ok(renderJSON(r).includes(T63_MARK), 'JSON 面仍然必须是原文（这一格也不许把中和漏过去）');
+});
