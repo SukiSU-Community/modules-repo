@@ -13,7 +13,7 @@ import { join, resolve, dirname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
-  buildBrief, callModel, parseVerdict, verifyQuotes, toFindings, raiseLevel, main,
+  buildBrief, callModel, parseVerdict, verifyQuotes, foldQuote, toFindings, raiseLevel, main,
   SYSTEM_PROMPT, STATUS_VALUES, MODULE_WRITABLE_STATUSES, MIN_MAX_TOKENS, QCA_BASE,
   sanitizeUntrusted, BUDGET_BASIS, QFMODEL_MAX_INPUT_TOKENS, DEFAULT_MAX_BRIEF_BYTES,
   EVENT_PAGE_SIZE, MAX_EVENT_PAGES, MAX_RAW_EXCERPT, UNTRUSTED_MARK, OVER_BUDGET_REASON_CODES,
@@ -25,6 +25,7 @@ import { scanZip, isCliEntry, isNonTextContent, readZip } from './scan.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const FIXDIR = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
+const ELF8 = [0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00];   // 顶部声明：M1 那节与新用例共用同一份魔数
 
 // ---------------------------------------------------------------------------
 // 夹具
@@ -266,7 +267,7 @@ test('D5c 补：放不下的是「一整条」，半条文件既读不出语义�
   assert.match(b.omitted[0].reason, /over-budget/);
 });
 
-test('③ 二进制条目：只送 name+size+magic+头 64 字节 hex+熵，不送字节流、不进 corpus', () => {
+test('③ 二进制条目：送 name+size+magic+头 64 字节 hex+熵+取证摘要，不送字节流，但那一行本身可引用', () => {
   const elf = Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01]), Buffer.alloc(64, 0x90)]);
   const entries = [
     file('module.prop', 'id=demo\nname=Demo'),
@@ -276,8 +277,80 @@ test('③ 二进制条目：只送 name+size+magic+头 64 字节 hex+熵，不�
   assert.ok(b.text.includes('stage.dat'), '存在本身就是信号，必须列出来');
   assert.match(b.text, /ELF/, 'magic 要写清楚');
   assert.ok(b.text.includes('7f454c46'), '头 64 字节的 hex 预览');
-  assert.equal(b.corpus.has('stage.dat'), false, '二进制不进 corpus —— 模型引用它就该被判不可采信');
   assert.equal(b.fileCount, entries.length, '计数仍按 entries 全集');
+  // ㉒ 那一发真应答改掉的口径：③ 那一行是**我们发出去的原文**，模型逐字引它不该被判造假。
+  assert.equal(b.corpus.has('stage.dat'), true, '③ 那一行要进 corpus —— 否则模型引用它就必然整份作废');
+  assert.equal(b.corpus.get('stage.dat').length, 1, '③ 每个条目只有一行：line 只能是 1');
+});
+
+test('真应答那一发的形状：逐字引用 ③ 的取证行复验得过，捏造的词仍复验不过', () => {
+  const entries = [
+    file('module.prop', 'id=demo\nname=Demo'),
+    { name: 'bin/x86/detach', size: 193436, content: '', head: Buffer.from(ELF8) },
+  ];
+  const report = { ...R, binaryForensics: [{ name: 'bin/x86/detach', outcome: 'ELF_FAMILIES', kind: 'ELF',
+    machineName: 'x86', type: 'DYN', stripped: true, importCount: 65,
+    capabilityImports: ['execvp', 'fork'], capabilityImportsTotal: 2, families: ['EXEC', 'NS'],
+    summary: 'ELF（x86，65 个导入，已 strip） —— 链接期一定会用到 2 类危险能力' }] };
+  const b = buildBrief({ report, entries, maxBytes: 240000 });
+  const row = b.corpus.get('bin/x86/detach')[0];
+  assert.ok(/链接期取证/.test(row), '取证摘要要在这一行里');
+  const verbatim = { findings: [{ file: 'bin/x86/detach', line: 1,
+    quote: row.slice(row.indexOf('结论'), row.indexOf('结论') + 30), severity: 'high', why: 'w' }] };
+  assert.equal(verifyQuotes(verbatim, b.corpus).ok, true, '逐字抄自己看到的那一行不该整份作废');
+  // 牙还在的两格：换了词、换了条目，都不是「我们送出去的原文」。
+  const invented = { findings: [{ file: 'bin/x86/detach', line: 1,
+    quote: row.slice(row.indexOf('结论'), row.indexOf('结论') + 20).replace('ELF_FAMILIES', 'ELF_BENIGN'),
+    severity: 'high', why: 'w' }] };
+  assert.equal(verifyQuotes(invented, b.corpus).ok, false, '改一个词仍然是造假');
+  const otherFile = { findings: [{ file: 'module.prop', line: 1,
+    quote: '结论 ELF_FAMILIES', severity: 'high', why: 'w' }] };
+  assert.equal(verifyQuotes(otherFile, b.corpus).ok, false, '张冠李戴（别的条目名配这一行的内容）仍然判红');
+});
+
+test('verifyQuotes 的折叠只折「全角标点↔半角」与空白：字母数字与词序不许动', () => {
+  // 实测：模型把 `ELF（x86，65 个导入，已 strip）` 重打成 `ELF(x86,65个导入,已strip)`，
+  // 原样 `includes` 判 false ⇒ 整份 untrusted。折叠是**有界**的：只认这张标点表与空白。
+  const corpus = new Map([['a.sh', ['rm -rf（/data，/foo）']]]);
+  const q = (quote) => ({ findings: [{ file: 'a.sh', line: 1, quote, severity: 'high', why: 'w' }] });
+  assert.equal(verifyQuotes(q('rm -rf(/data,/foo)'), corpus).ok, true, '全角↔半角 + 空格之差要认');
+  assert.equal(verifyQuotes(q('rm-rf(/data,/foo)'), corpus).ok, true, '空白差不算造假');
+  assert.equal(verifyQuotes(q('rm -rf（/data；/foo）'), corpus).ok, false, '标点表里没有的字符不许凭空折出来');
+  assert.equal(verifyQuotes(q('rm -rf（/data,/foo'), corpus).ok, true, '半句仍然要在那一行里');
+  assert.equal(verifyQuotes(q('   '), corpus).ok, false, '纯空白折叠后为空，不算引用');
+  assert.equal(foldQuote('结论（ELF_FAMILIES）'), '结论(ELF_FAMILIES)', '折叠表：只动标点与空白，不动字母数字');
+  assert.equal(foldQuote('导入 65 个'), '导入65个');
+});
+
+test('prompt 第 3 条把「可引用的两面」写死：② 逐行原文 + ③ 那一行登记（line 只能 1）', () => {
+  // ㉒ 的 A 半边：进料面变了，prompt 就必须自己说清楚能引哪一列 —— 靠模型猜节标题是猜不住的。
+  assert.match(SYSTEM_PROMPT, /可引用的原文只有两处面/);
+  assert.match(SYSTEM_PROMPT, /③ 节每个二进制条目的那一行登记（它只有一行，line 只能填 1）/);
+  assert.match(SYSTEM_PROMPT, /二进制的字节流没有送出，不得引用其内容/);
+  assert.match(SYSTEM_PROMPT, /复验只容忍全角\/半角标点与空格之差/);
+  assert.doesNotMatch(SYSTEM_PROMPT, /不得作为 quote 来源/, '旧口径（③ 整节不可引）不许回来');
+});
+
+test('被预算略掉的 ③ 条目不许进 corpus：略掉的东西模型根本没看到，引用它必须是造假', () => {
+  // 900 B 这一档实测：② 的那篇放得下、③ 那一行放不下（needed=1143 B）⇒ omitted 里只有 big.so。
+  const elf = Buffer.concat([Buffer.from(ELF8), Buffer.alloc(4096, 0x90)]);
+  const b = buildBrief({ report: R, maxBytes: 900,
+    entries: [file('a.sh', 'echo hi\n'), { name: 'big.so', size: 900000, content: elf.toString('utf8'), head: elf }] });
+  assert.deepEqual(b.omitted.map((o) => o.name), ['big.so'], `这一档要略掉的正是那枚 ③ 条目（实测 omitted=${b.omitted.map((o) => o.name)}）`);
+  assert.equal(b.corpus.has('big.so'), false, 'corpus.set 必须在预算判断之后：先登记再判预算 = 让模型引用没送出的东西');
+  assert.equal(b.corpus.has('a.sh'), true);
+});
+
+test('corpus 多了「可引用」这个用途之后，emptyInput 仍只认 ② 有没有逐行原文（同源两面）', () => {
+  const elf = Buffer.concat([Buffer.from(ELF8), Buffer.alloc(64, 0x90)]);
+  const onlyBin = buildBrief({ report: R, entries: [{ name: 'stage.dat', size: 1228800,
+    content: elf.toString('utf8'), head: elf }] });
+  assert.equal(onlyBin.corpus.size, 1, '③ 那一行现在确实在 corpus 里');
+  assert.equal(onlyBin.emptyInput, true, '但「没有任何逐行原文」这个读数不许因为 ③ 而翻转 —— F5 那一格咬的是它');
+  const withText = buildBrief({ report: R, entries: [file('a.sh', 'echo hi\n'),
+    { name: 'stage.dat', size: 1228800, content: elf.toString('utf8'), head: elf }] });
+  assert.equal(withText.emptyInput, false, '有一篇可读原文就不是空输入');
+  assert.equal(withText.corpus.size, 2, '② 与 ③ 各占一键');
 });
 
 test('二进制判定复用 detectBinary，不在此处再写一份魔数表', () => {
@@ -288,11 +361,20 @@ test('二进制判定复用 detectBinary，不在此处再写一份魔数表', (
     { name: 'd.txt', head: Buffer.from('plain text\n') },
     { name: 'e.json', head: Buffer.from('{"a":1}\n') },
   ];
-  const b = buildBrief({ report: R, entries: heads.map((h) => ({ ...h, size: h.head.length, content: '' })) });
+  const b = buildBrief({ report: R, entries: heads.map((h) => ({ ...h, size: h.head.length, content: `TOKEN-${h.name}\n` })) });
   for (const h of heads) {
+    // ㉒ 之后两侧都「可引用」，所以同结论的observable 从「在不在 corpus 里」换成「corpus 里那一面是什么形状」：
+    // 走 ③ 的只有一行摘要（不许带正文），走 ② 的必须是逐行原文。两份魔数表一旦对不上，这里必红。
     const isBin = Boolean(detectBinary(h.head));
-    assert.equal(b.corpus.has(h.name), !isBin,
-      `${h.name} 的分类必须与 risk-rules.detectBinary 同结论（两份实现迟早对不上）`);
+    const lines = b.corpus.get(h.name);
+    assert.ok(Array.isArray(lines), `${h.name} 必须在 corpus 里可引用（② 送原文、③ 送那一行摘要）`);
+    if (isBin) {
+      assert.equal(lines.length, 1, `${h.name} 走 ③：只有一行摘要，line 只能是 1`);
+      assert.match(lines[0], /^- /, `${h.name} 的 corpus 内容必须是那一行元信息`);
+      assert.equal(lines[0].includes(`TOKEN-${h.name}`), false, '③ 不许把正文带进去');
+    } else {
+      assert.equal(lines[0], `TOKEN-${h.name}`, `${h.name} 走 ②：送的是逐行原文`);
+    }
   }
 });
 
@@ -1038,12 +1120,14 @@ test('F5：entries 为空 → 判 over-budget（reasonCode=empty-corpus），且
   assert.ok(OVER_BUDGET_REASON_CODES.includes('empty-corpus'));
 });
 
-test('F5b：整包只有二进制条目（corpus 为空）同样不许 ok', async () => {
+test('F5b：整包只有二进制条目（没有任何逐行原文）同样不许 ok', async () => {
   const elf = Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01]), Buffer.alloc(64, 0x90)]);
   const entries = [{ name: 'stage.dat', size: 1228800, content: elf.toString('utf8'), head: elf, truncated: false }];
   const b = buildBrief({ report: R, entries });
-  assert.equal(b.corpus.size, 0);
-  assert.equal(b.emptyInput, true);
+  // ㉒ 之后 ③ 那一行进了 corpus，所以这一格的牙**不能**再是「corpus 为空」：
+  // emptyInput 必须仍然只认「② 有没有逐行原文」，否则「整包只有机器码 ⇒ 模型只能盖章」那条洞就回来了。
+  assert.equal(b.corpus.size, 1, '③ 的摘要行现在可引用，但它是元信息不是原文');
+  assert.equal(b.emptyInput, true, '这一读数不许因为 ③ 而翻转');
   const r = await runMain({ report: R, entries, argvExtra: ['--backend', 'workers-ai'],
     env: { AI_API_BASE: 'https://x/v1', AI_API_KEY: 'k', AI_MODEL: 'm' },
     fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content: fenced(CLEAN_VERDICT) }, finish_reason: 'stop' }] }) }) });
@@ -1431,7 +1515,6 @@ test('D4：expectedPromptSha 不符 = 配置错误 exit 2，且不许发这一�
 //       是默认预算 240,000 B 的 9.8 倍。
 // ---------------------------------------------------------------------------
 
-const ELF8 = [0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00];
 const B = (s) => Buffer.byteLength(String(s == null ? '' : s), 'utf8');
 
 function xorshift(seed) {
@@ -1486,7 +1569,8 @@ test('M1-1 进料判据只看条目自己（魔数表 + 正文含 NUL），不�
   ];
   const b = buildBrief({ report: R, entries, maxBytes: DEFAULT_MAX_BRIEF_BYTES });
   for (const n of ['arm64.so', 'arm64.txt', 'arm64.json', 'assets/inner']) {
-    assert.equal(b.corpus.has(n), false, `${n} 是机器码/含 NUL，不许按全文送`);
+    assert.equal(b.corpus.get(n).length, 1, `${n} 是机器码/含 NUL：corpus 里只许那一行摘要，不许按全文送`);
+    assert.equal(b.corpus.get(n)[0].startsWith(`- ${n} |`), true, '那一行就是 ③ 的登记行本身（可引用≠可送正文）');
     assert.equal(sentBytes(b, n).route, '③', `${n} 必须在 ③ 有一条登记`);
     assert.ok(b.text.includes(n), `${n} 的名字要在 brief 里出现（存在本身就是信号）`);
   }
@@ -1503,7 +1587,8 @@ test('M1-2 detectBinary 只看头 512 字节：头里没 NUL、往后才有 NUL 
   const b = buildBrief({ report, entries: [file('module.prop', 'id=demo\n'), e] });
   assert.equal(detectBinary(e.head), null, '前提：这一格 detectBinary 是漏的（只看头 512 B）');
   assert.equal(isNonTextContent(e), true, '而静态自己的「非文本」判据认得它');
-  assert.equal(b.corpus.has('assets/stage.dat'), false, '乱码不许进 corpus（进了就是让它抢报价格）');
+  assert.equal(b.corpus.get('assets/stage.dat').length, 1, '乱码只带那一行摘要进 corpus —— 抢预算的是全文，不是这一行');
+  assert.equal(b.corpus.get('assets/stage.dat')[0].includes('\u0000'), false, 'NUL 之后的正文一个字都不许进来');
   const s = sentBytes(b, 'assets/stage.dat');
   assert.equal(s.route, '③');
   assert.ok(s.bytes < 600, `③ 那一行是定长摘要，实测=${s.bytes} B`);
@@ -1683,7 +1768,9 @@ test('M1-6 换形不是变少：③ 的摘要与条目大小无关，而任何�
   const r2 = buildBrief({ report: { ...R, polyglotFed: [{ name: 'p.bin', kind: 'ELF' }] }, entries: [entryOf('p.bin', readable)] });
   assert.equal(r2.corpus.has('p.bin'), true);
   const r3 = buildBrief({ report: R, entries: [entryOf('n.dat', Buffer.concat([Buffer.from('echo hi\n\0'), Buffer.from('x\n')]))] });
-  assert.equal(r3.corpus.has('n.dat'), false, '正文含 NUL 就不许按全文送（与静态 scriptRow 同一判据）');
+  // ㉒ 之后「在不在 corpus 里」不再是可读性的读数（③ 那一行也可引用）；判据换成「带了几行、带的是什么」。
+  assert.equal(r3.corpus.get('n.dat').length, 1, '正文含 NUL 就不许按全文送（与静态 scriptRow 同一判据）');
+  assert.equal(r3.corpus.get('n.dat')[0].includes('echo hi'), false, '那一行登记里不许有正文');
 });
 
 test('M1-7 取证行里的字符串是投稿者可控的：逐条消毒，不许伪造节标题或表格结构', () => {
@@ -1745,7 +1832,7 @@ test('M1-9 产物里能读到「AI 看到了什么」：shapes/sections 与实�
   assert.equal(sh.nonTextRerouted, 1, '其中一条是「detectBinary 漏下、被静态的非文本判据接住」的乱码');
   assert.equal(sh.polyglotAsText, 0);
   assert.equal(sh.forensicsRowsSent, 0, '报告里没有取证行时不编造');
-  assert.equal(r.payload.brief.corpusFiles, 2);
+  assert.equal(r.payload.brief.corpusFiles, 4, '㉒ 之后 corpus = ② 的 2 篇原文 + ③ 的 2 行登记（都可引用）');
   // shapes 不是自说自话：拿同一批条目与同一份报告再算一次 brief，③ 的行数必须等于登记的条数，
   // 且每条的名字都要能在文本里找到 —— M-B（静默跳过不登记）在这里必红。
   const direct = buildBrief({ report: R, entries, maxBytes: 240000 });
@@ -1779,7 +1866,9 @@ test('M1-10 真 ELF 接线（仓库常驻夹具，只读不执行）：T5.7 的�
   assert.ok(line.includes(`导入 ${row.importCount} 个`), `导入数要原样送出（实测 ${row.importCount}）`);
   assert.ok(/能力族 /.test(line), '危险能力族要送出（这条真 ELF 是 EXEC/FILEWRITE/NET/NS）');
   assert.ok(/NET/.test(line) && /EXEC/.test(line));
-  assert.equal(b.corpus.has('zygisk/arm64-v8a.so'), false, '机器码仍然不送字节流');
+  assert.equal(b.corpus.get('zygisk/arm64-v8a.so').length, 1, '机器码仍然不送字节流：corpus 里只有那一行摘要');
+  // 同源那一半：可引用的那一行**必须就是发出去的那一行**，否则「引用得到却复验不了」又会回来。
+  assert.equal(b.corpus.get('zygisk/arm64-v8a.so')[0], line, '③ 送出去的那一行 = 复验用的那一行（同一份字节）');
   // 「AI 看得比静态少」的那一格：静态只吃前 24,576 B，而这里给的摘要与条目大小无关
   assert.ok(line.length < 1300, `摘要与条目大小无关：983,624 B → ${line.length} 字符`);
 });
