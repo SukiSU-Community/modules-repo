@@ -1055,7 +1055,10 @@ jobs:
               backend: strOf(a.backend),
               model: strOf(a.model),
               promptSha256: strOf(a.promptSha256),
-              budgetBasis: strOf(a.budgetBasis),
+              // 顶层这一格的**真位置在 `brief.budgetBasis`**（`ai-review.mjs` 只把它写进 briefMeta），
+              // 旧写法 `strOf(a.budgetBasis)` 永远拿到 null —— 键集用例只钉「键在不在」，钉不出「键有没有值」。
+              // 顶层优先、缺则回落到 brief：**键一个不增减**（「缺的写成 null 而不是消失」这条契约留着）。
+              budgetBasis: strOf(a.budgetBasis == null ? (a.brief || {}).budgetBasis : a.budgetBasis),
               findings: (Array.isArray(a.findings) ? a.findings : []).slice(0, CAP_ITEMS).map(pickFinding),
               brief: pickBrief(a.brief),
               meta: pickMeta(a.meta),

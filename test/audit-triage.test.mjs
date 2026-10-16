@@ -999,6 +999,23 @@ test('T6.2·逐包·混合：一包有产物、一包 disabled 时两块各说�
 
 /* --------------------------------------------------------------- ② AI 块存在且有界 */
 
+test('T6.2·budgetBasis 的真位置：产物只在 brief 里写它，评论顶层不许写 null', () => {
+  // 2026-10-16 拿 run 38890758068 的 artifact 重放评论步时量出来的：顶层 `"budgetBasis": null`，
+  // 而真字符串就在同一条 JSON 的 `brief.budgetBasis` 里。`ai-review.mjs` 从来只在 brief 里写它
+  // （`BUDGET_BASIS` 进 `briefMeta`），所以顶层那一句 `strOf(a.budgetBasis)` 永远是空 ——
+  // 而键集用例只钉「这个键在不在」，钉不出「这个键有没有值」。
+  const r = runCommentFrom({
+    reports: { 'demo.zip': rep('low', 'first') },
+    ai: { 'demo.zip': { status: 'ok', artifact: fullArt('demo.zip') } },
+  });
+  assert.equal(r.err, null, `评论步本身不许抛：${r.stderr}`);
+  const block = JSON.parse(aiBlockOf(r.body, 'demo.zip'));
+  assert.equal(block.budgetBasis, '保守字节代理，未做 token 标定',
+    '顶层那一格必须带上真值：读者先看顶层，写 null 等于说「这条闸没有依据」，而依据一直都在');
+  assert.equal(block.budgetBasis, block.brief.budgetBasis,
+    '同一个值两个面必须同源 —— 不许顶层一个空串、brief 里一个真值');
+});
+
 test('T6.2·AI 块：有 ai-<zip>.json 时正文出现该包的围栏，可核验键一个都不许少', () => {
   const r = runCommentFrom({
     reports: { 'demo.zip': rep('low', 'first') },
