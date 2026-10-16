@@ -5715,6 +5715,7 @@ const T57_FIX_SHA = {
   'device_faker_cli': 'e3dfd27a5cff36946af5d782d259ee397b959276',
   'hma-arm64.so': 'efa5d78192d6904ea46972b41e8be89bf16c88ad',
   'hma-x86.so': '48467904a36a6d4cac9dc72af540e8dd21959306',
+  'hma-armeabi-v7a.so': '282512626b079edaafc0b8c032fb9e8860f95295',   // S3-A INV-D 要逐枚对六枚，这一枚的字节面此前没钉过
   'detach-arm32': '54a7ec1728dc4c4aabec637bb8c10c4ac90c54fb',
 };
 function t57Fix(f) {
@@ -6186,6 +6187,45 @@ test('INV-C 档位只增不减：同批包 counts.medium + counts.high 在改动
   assert.equal(afterHigh, 6, '改后全批 6 条 high（本轮实测）');
   assert.equal(afterHigh - beforeHigh, 3, '净增的 3 条就是被取证升档的那三条 STRUCT_BINARY，一条不许更多');
   assert.equal(t57BatchCount(await t57Run('df2')), 2, 'df2 两枚真 ELF 必须都升 high');
+});
+
+// ---------------------------------------------------------------------------
+// S3-A 工单 §3 Step 4：本轮「方向为加严」的机器证明。
+// 「测试全绿」不等于方向为加严 —— 这一条逐枚把新旧两套进料摆在一起对：
+//   旧 = capabilitySymbols(sensitiveImports)（改前的进料），新 = capabilitySymbols(capabilityImports)（改后的进料）。
+// 判据两格：**新族集 ⊇ 旧族集**，且**枚枚档位不降**。
+// 名字层也一起对（族内的 symbols 只呈现前 REPRESENTATIVE_CAP 个，光比族集会漏掉成员增减）。
+// ---------------------------------------------------------------------------
+
+test('INV-D 只增不减：常驻六枚逐枚对两套进料，新族集 ⊇ 旧族集、旧名字一个不丢、枚枚档位不降', () => {
+  const SIX = ['arm64-v8a.so', 'detach-arm32', 'device_faker_cli', 'hma-arm64.so', 'hma-armeabi-v7a.so', 'hma-x86.so'];
+  assert.equal(SIX.length, 6, '常驻夹具就是六枚（三枚 HMA 的三种 ABI 都在）');
+  const table = [];
+  for (const f of SIX) {
+    const b = t57Fix(f);
+    const rec = T57_ELF.forensics(b, f);
+    assert.equal(rec.parseError, undefined, `${f}：${rec.parseError}`);
+    const oldFams = T57_ELF.capabilitySymbols(rec.sensitiveImports);
+    const newFams = T57_ELF.capabilitySymbols(rec.capabilityImports);
+    const oldSet = oldFams.map((x) => x.family);
+    const newSet = newFams.map((x) => x.family);
+    // ① 族集合：只增不减
+    for (const fam of oldSet) assert.ok(newSet.includes(fam), `${f}：旧族 ${fam} 在新进料里丢了`);
+    assert.ok(newSet.length >= oldSet.length, `${f}：族数不许变少（旧 ${oldSet.length} → 新 ${newSet.length}）`);
+    // ② 名字集合：旧进料里那些**命中了族**的名字必须还在新进料里（族集相等不代表成员没少）
+    const oldNames = rec.sensitiveImports.filter((n) => T57_ELF.capabilitySymbols([n]).length > 0);
+    for (const n of oldNames) assert.ok(rec.capabilityImports.includes(n), `${f}：成员 ${n} 被从族进料里丢了`);
+    assert.ok(rec.capabilityImportsTotal >= oldNames.length, `${f}：命中名字总数只增不减`);
+    // ③ 档位：真走定级层，不在这儿自己重算公式
+    const sev = checkBinaries([{ name: f, id: 'ELF', why: 'ELF 可执行文件/共享库', bytes: b.length }],
+      new Map([[f, rec]]))[0].severity;
+    assert.ok(SEVERITY_ORDER[sev] >= SEVERITY_ORDER[oldSet.length >= 2 ? 'high' : 'medium'],
+      `${f}：档位降了（旧 ${oldSet.join('+')||'0族'} → 新 ${newSet.join('+')||'0族'}，实测 ${sev}）`);
+    table.push(`${f}: ${oldSet.length}族(${oldNames.length}名) → ${newSet.length}族(${rec.capabilityImportsTotal}名) ${sev}`);
+  }
+  // 逐枚对照表本轮实测（写进 briefs/task-s3a-report.md，红的时候这一句就是现场）：
+  assert.equal(table.filter((x) => x.includes(' 4族')).length, 3, '三枚 ≥2 族的必须仍是 4 族 high：' + table.join(' | '));
+  assert.equal(table.filter((x) => x.includes(' 0族')).length, 3, '三枚 HMA 必须仍是 0 族（证出来的可靠缺席）：' + table.join(' | '));
 });
 
 // ---------------------------------------------------------------------------
