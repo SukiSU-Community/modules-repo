@@ -168,6 +168,8 @@ export const MAX_EVENT_PAGES = 20;
  * （scan.mjs escapeCell 的 `|`→\\| 与反引号→'；那边没导出，所以这里同一份口径实现一次）。
  */
 export const MAX_UNTRUSTED_ENUM_TEXT = 60;
+/** 被丢弃那一试最多留几条「复验不过的位置」：这是条数上限，不是文本长度上限（两者混用过一次）。 */
+export const MAX_DROPPED_ITEMS = 10;
 export const MAX_UNTRUSTED_QUOTE_TEXT = 200;
 export const MAX_UNTRUSTED_WHY_TEXT = 300;
 export const MAX_RAW_EXCERPT = 2000;
@@ -863,6 +865,28 @@ function eventText(item) {
 }
 
 /**
+ * 拿会话对象上的成本读数（`usage.total_credits` / `stats.active_seconds` / `status`）。
+ * 与 `send_session_events` 那条不同，这一发是**信息位**：读不到就把 `totalCredits`/`activeSeconds`
+ * 记成 null 并留一句 `error`，绝不把已经成立的结论改成 failed（那等于让运维读数的缺失变成安全判定）。
+ * 壳的几种写法都试（`item` / 裸对象 / `session`），因为本模块的离线测试钉的是字段名而不是信封。
+ */
+async function qcaSessionCost({ fetchImpl, base, headers, signal, sessionId }) {
+  const none = { totalCredits: null, activeSeconds: null, status: null };
+  try {
+    const json = await qcaFetchJson(fetchImpl, joinUrl(base, `/sessions/${sessionId}`),
+      { method: 'GET', headers, signal }, 'qca get_session');
+    const s = (json && (json.item || json.session)) || json || {};
+    return {
+      totalCredits: (s.usage && s.usage.total_credits) ?? null,
+      activeSeconds: (s.stats && s.stats.active_seconds) ?? null,
+      status: typeof s.status === 'string' ? s.status : null,
+    };
+  } catch (err) {
+    return { ...none, error: `get_session：${err.message}`.slice(0, 200) };
+  }
+}
+
+/**
  * QCA：create_session → send_session_events → 轮询 list_session_events。
  * 结果**只按 session_id 取**：按「最近创建的会话」找，等于多包 PR 里拿到别人的结论。
  */
@@ -910,7 +934,11 @@ async function callQca({ cfg, prompt, signal, deadline, timeoutMs, fetchImpl }) 
     if (messages.length) {
       const last = messages[messages.length - 1];
       const raw = eventText(last);
-      const owner = page.lastJson || {};
+      // 成本住在**会话对象**上，不在事件列表里。CI 三发（38890758068 / 38893985398 / 38899142385）
+      // 的 `meta.total_credits` 与 `active_seconds` 全是 null 的真因就是旧写法在 `list_session_events`
+      // 的响应里找 usage/stats —— 那个位置从来没有过这两个键。
+      // 这一发**只读**，且失败不改结论：已经拿到的 agent.message 不该因为读不到成本而被扔成 failed。
+      const cost = await qcaSessionCost({ fetchImpl, base, headers, signal, sessionId });
       const meta = {
         backend: 'qca',
         model: cfg.model || null,
@@ -918,8 +946,11 @@ async function callQca({ cfg, prompt, signal, deadline, timeoutMs, fetchImpl }) 
         agentVersion,
         sessionId,
         // 有什么记什么：QCA 的可用成本字段只有这两个（没有 finish_reason、没有 neurons）。
-        totalCredits: (owner.usage && owner.usage.total_credits) ?? (last.usage && last.usage.total_credits) ?? null,
-        activeSeconds: (owner.stats && owner.stats.active_seconds) ?? (last.stats && last.stats.active_seconds) ?? null,
+        totalCredits: cost.totalCredits,
+        activeSeconds: cost.activeSeconds,
+        // 会话状态必须一起记：running 时读到的数是「截至那一刻」，不记状态就会把中间值当终值。
+        sessionStatus: cost.status,
+        ...(cost.error ? { costError: cost.error } : {}),
         eventId: last.id || null,
         agentMessageCount: messages.length,
         // 分页可审计：人复核时要知道这是翻了几页取到的最后一条，还是第一页的第一条。
@@ -1500,6 +1531,11 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   const attempts = Number.isInteger(rawAttempts) && rawAttempts >= 1 && rawAttempts <= 3 ? rawAttempts : 2;
 
   let problem = null;
+  // 被丢弃的那几试各自留下**一句拒因 + 是哪个位置**，但不留模型原话：
+  // `attempt: 2` 单独一个整数只能说明「有一次没算」，说明不了为什么 —— 线上三发里两发是这样，
+  // 于是「模型稳定」与「两次里撞上一次」在今天这条链路上是读不出来的同一件事。
+  // 注入面照旧：留 `kind` / 我们的 reason / sanitize 过的 file，**不留 quote**。
+  const dropped = [];
   for (let attempt = 1; attempt <= attempts; attempt++) {
     let raw; let meta;
     try {
@@ -1512,6 +1548,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
         reason: `模型调用失败：${err.message}`,
         staticRiskLevel: report.riskLevel ?? null,
         brief: briefMeta, attempt, attempts,
+        ...(dropped.length ? { dropped } : {}),
       });
     }
     const p = parseVerdict(raw);
@@ -1519,6 +1556,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       // 不可信文本先 sanitize（截断 + 标记 + 转义）再进产物（评审 F7；旧写法 slice(0,4000)
       // 把 4000 字符原样灌进 error 与报告，那是二阶注入 + PR 评论膨胀的入口）
       problem = { kind: 'schema', error: p.error, raw: sanitizeUntrusted(raw, MAX_RAW_EXCERPT) };
+      dropped.push({ attempt, kind: 'schema', note: sanitizeUntrusted(p.error, MAX_UNTRUSTED_WHY_TEXT) });
       continue;
     }
     const q = verifyQuotes(p.verdict, brief.corpus);
@@ -1534,6 +1572,16 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
           reason: b.reason,
         })),
       };
+      dropped.push({
+        attempt, kind: 'quote',
+        // 封顶用的是「留几条」，不是某个文本长度常量 —— 拿 MAX_UNTRUSTED_ENUM_TEXT(=60，字符数) 当条数上限
+        // 是错用常量，它会把一整份产物撑开而不会拦住任何一条。
+        items: q.bad.slice(0, MAX_DROPPED_ITEMS).map((b) => ({
+          file: sanitizeUntrusted(b.file, MAX_UNTRUSTED_ENUM_TEXT),
+          line: Number.isInteger(b.line) ? b.line : null,
+          reason: sanitizeUntrusted(b.reason, MAX_UNTRUSTED_WHY_TEXT),
+        })),
+      });
       continue;
     }
     const findings = toFindings(p.verdict);
@@ -1542,6 +1590,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       backend,
       model: cfg.model || null,
       attempt,
+      ...(dropped.length ? { dropped } : {}),
       agree: p.verdict.agree,
       risk: p.verdict.risk,
       // 只往严调；这一字段不是放行结论，下游 triage 只能拿它抬等级。
