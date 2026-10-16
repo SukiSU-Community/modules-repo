@@ -596,6 +596,29 @@ test('矩阵·ok+raise：静态 low+first、模型 high → action 不再是 aut
   assert.match(kv.ai_note, /high/);
 });
 
+test('矩阵·ok + agree:false 但抬不动：静态已是 high，文案不许声称「同意静态结论」', () => {
+  // 2026-10-16 CI run 38890758068 实测到的假陈述：产物里 agree:false、5 条 findings 全 high，
+  // 而静态本来就是 high ⇒ raiseLevel 抬不动 ⇒ changed=false ⇒ 落到「同意静态结论，等级未抬」那一句。
+  // 「没抬」是效果，「同意」是立场，两件事不能共用一个分支。
+  const { kv, err } = runTriage({ 'demo.zip': rep('high', 'first') }, {
+    'demo.zip': { status: 'ok', ...aiArt('demo.zip', { agree: false, risk: 'high', findings: [aiHit('high', '下载后执行')] }) },
+  });
+  assert.equal(err, null, err && err.stderr);
+  assert.equal(kv.risk, 'high');
+  assert.equal(kv.action, 'block');
+  assert.match(kv.ai_note, /^AI 安全员已复核（每条引用都逐字复验过送出去的那一份原文）：不同意静态结论/,
+    'agree:false 就是不同意；抬不动不等于同意');
+});
+
+test('矩阵·ok + agree:true 且未抬级：那一句仍然照旧写「同意静态结论」（加上一格时必须留着这一句）', () => {
+  const { kv, err } = runTriage({ 'demo.zip': rep('high', 'first') }, {
+    'demo.zip': { status: 'ok', ...aiArt('demo.zip', { agree: true, risk: 'high', findings: [aiHit('medium', '只是提示')] }) },
+  });
+  assert.equal(err, null, err && err.stderr);
+  assert.match(kv.ai_note, /：同意静态结论，等级未抬/,
+    '模型真的同意时这句是准确的，不许被上一格一起改掉');
+});
+
 test('矩阵：抬级是逐包算的，另一包的静态等级仍一起进「取最严」', () => {
   const { kv } = runTriage({
     'a.zip': rep('low', 'first'),
