@@ -922,8 +922,15 @@ jobs:
       # ---------------------------------------------------------------
       # 5. 把报告贴到 PR
       # ---------------------------------------------------------------
+      # 这一步是**唯一**在判据红之后还要跑的一步：`!cancelled()`。
+      # 动机是 run 38908245528 实测到的形状：分流决策按设计判红之后，`上传报告` 与后面三步全 `skipped`，
+      # 于是最该留证据的那一发（整份 `audit-out/`：扫描报告 + AI 五态产物）只活在会过期的 runner 日志里。
+      # 这里放宽的只是**证据位**：artifact 是原样落盘的字节，不解释、不参与批准，也不进任何判据。
+      # 评论与标签两步**不许**跟着加 —— 分流里写 output 那一段在整个脚本末尾，三条 fail-closed 都在它之前
+      # `exit 1`，所以判据红的那一发 `steps.triage.outputs.*` 全空；拿空值渲染一句给人看的话，
+      # 要么是一条假陈述，要么是通道自己坏。真要把「没跑成」写到 PR 上，改法是分流先写完判据再红。
       - name: 上传报告
-        if: steps.locate.outputs.found == 'true'
+        if: ${{ !cancelled() && steps.locate.outputs.found == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: module-audit-report

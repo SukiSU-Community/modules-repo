@@ -562,6 +562,49 @@ test('写回 PR 的那两步只挂 pull_request —— dispatch 里没有 PR 可
   }
 });
 
+test('判据红的那一发也要把报告留下 —— 只有 上传报告 允许 !cancelled()，其余四步不许跟着加', () => {
+  // 2026-10-16 run 38908245528（坏配置的失败面 canary，修完 -e 那一发）实测：
+  // `AI 安全员复核 => success`、`分流决策 => failure` 都对，但后面 `处置台账核对 / 上传报告 /
+  // 上传待合并 pending / 发布 PR 评论 / 打标签` 全 `skipped` —— GitHub 对「前一步红」的默认处理
+  // 就是跳过后续步骤，而那两步挂的 `if` 里没有 `always()` 家族的任何东西。
+  // 后果是**最该留证据的那一发什么都没留**：整份 `audit-out/`（扫描报告 + AI 五态产物）只活在
+  // runner 日志里，日志会过期，而投稿者那边只剩一个红叉 —— 与本文件上面那条「不跑而不是跑了再炸」
+  // 是同一类病，只是这次缺的不是通道而是证据。
+  // 只放宽 artifact 那一格：它是**原样落盘的字节**，不解释、不参与批准，放宽它零风险。
+  const wf = fs.readFileSync(WF, 'utf8');
+  // 只认**步骤级 `if:` 那一行**，不在整块里扫 `!cancelled` / `always()`：块尾会把下一步前面的
+  // 那段注释一起吃进来（本文件那条「耦合钉子」用例就是被自己的注释打红的，同一个坑不踩第二次）。
+  const ifLineOf = (name) => {
+    const m = stepBlock(wf, `- name: ${name}`).match(/^ {8}if: .*$/m);
+    assert.ok(m, `步骤「${name}」必须有步骤级 if`);
+    return m[0];
+  };
+  const FOUND = "        if: steps.locate.outputs.found == 'true'";
+  const PR_FOUND = "        if: github.event_name == 'pull_request' && steps.locate.outputs.found == 'true'";
+
+  assert.equal(ifLineOf('上传报告'),
+    "        if: ${{ !cancelled() && steps.locate.outputs.found == 'true' }}",
+    '报告 artifact 必须在判据红之后仍然上传（写成 `${{ }}` 形式是不让值以 `!` 开头 —— YAML 里那是标签起始符；这条是规范级说法，裸写法我没实测过）');
+  const rep = stepBlock(wf, '- name: 上传报告');
+  assert.match(rep, /name: module-audit-report/);
+  assert.match(rep, /path: audit-out\//);
+
+  // 另外四步**不许**跟着加上同一把：
+  // - 发布 PR 评论 / 打标签：分流里写 output 的那一段（`w("risk",…)` 那批）在整个脚本**末尾**，
+  //   而 `failed` / `untrusted` / `over-budget` 三条 fail-closed 都在它之前 `process.exit(1)`
+  //   ⇒ 判据红的那一发 `steps.triage.outputs.*` 是**全空**的。加了 `!cancelled()` 就是拿空值渲染
+  //   一句给人看的话：要么是一条假陈述（§0.42 那条「把效果当立场」的同族），要么是通道自己坏。
+  // - 处置台账核对：它自己就是判据，跑在红之后只会把「谁挡的」变成两条互相覆盖的红。
+  // - 上传待合并 pending：唯一的消费者是 publish 作业，而它只认 `action == 'auto-approve'`
+  //   ⇒ 红的那一发没有消费者，放宽它只是多传一份没人读的东西。
+  //   真要把「没跑成」那句写到 PR 上，正确的改法是**先写完判据 output 再红**，那是分流自己的事，
+  //   属于「红的时候对外说什么」，不在这一格里顺手做。
+  assert.equal(ifLineOf('处置台账核对（下架 / 黑名单）'), FOUND, '判据位不放宽：它在红之后再跑只会把「谁挡的」念成两条互相覆盖的红');
+  assert.equal(ifLineOf('上传待合并 pending'), FOUND, '这份 artifact 的唯一消费者是 publish，而它只认 auto-approve');
+  assert.equal(ifLineOf('发布 PR 评论'), PR_FOUND, '判据红的那一发 triage 的 output 全空，拿空值渲染 = 假陈述');
+  assert.equal(ifLineOf('打标签'), PR_FOUND, '同上：标签读的也是那批空 output');
+});
+
 /* --------------------------------------------------------- 与母本 / Worker 的对齐 */
 const TEMPLATE = path.resolve(import.meta.dirname, '../../audit/workflows/audit.yml');
 
