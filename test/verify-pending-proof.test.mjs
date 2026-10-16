@@ -512,8 +512,35 @@ test('proof 步不再挂在 locate 的 found 上，并把「查哪些文件」�
     '范围要比的 pending 目录必须与 locate 的 PENDING_DIR 同源（都由 PREFIX 推导），否则两边比的不是同一棵树');
 });
 
-/* --------------------------------------------------------- 与母本 / Worker 的对齐 */
+/** 取出某个步骤整块（从它的 `id: <name>` 到下一个同级步骤之前）。 */
+function stepBlock(wf, idLine) {
+  const start = wf.indexOf(idLine);
+  assert.ok(start >= 0, `workflow 里找不到 ${idLine}`);
+  const rest = wf.slice(start);
+  const end = rest.search(/\n {6}- (?:name|uses):/);
+  return rest.slice(0, end === -1 ? rest.length : end);
+}
 
+test('pin 只挂在 pull_request 上：dispatch 用自己这一份扫描器，而 PR 那三道闸一道都没少', () => {
+  // 手动触发是给维护者做线上验证的那条路（`workflow_dispatch` 需要 write 权限，投稿者拿不到）。
+  // 它天然没有 base_ref，所以「钉回 base」这一步在 dispatch 上没有对象 —— 但不能因此把整步删掉：
+  // PR 那条路上「base 必须是 main」「钉回 base」「钉完再 diff 复核」三道闸都得原样在场。
+  const wf = fs.readFileSync(WF, 'utf8');
+  const block = stepBlock(wf, 'id: pin');
+  assert.match(block, /^ {8}if: github\.event_name == 'pull_request'$/m,
+    'pin 必须只在 PR 事件上跑；否则 dispatch 会撞在闸门一（base_ref 为空）上，这条路今天就是这样死的');
+  assert.match(block, /闸门一/);
+  assert.match(block, /git fetch --no-tags --depth=200 origin "\$BASE_REF"/);
+  assert.match(block, /git diff --quiet "\$BASE_SHA" -- audit scripts json/);
+  // 开了这条路不等于顺手开了合并：publish 仍然只认 audit 自己产出的 auto-approve。
+  const pub = wf.slice(wf.indexOf('  publish:'));
+  assert.match(pub, /if: needs\.audit\.outputs\.found == 'true' && needs\.audit\.outputs\.action == 'auto-approve'/,
+    'dispatch 没有 PR 上下文；合并那一步的准入条件不许因为这条路被松动');
+  // proof 早就只挂 PR（那条上面已钉）⇒ dispatch 不会去查凭据，也不会假绿：它连 pending 都不读。
+  assert.match(stepBlock(wf, 'id: proof'), /^ {8}if: github\.event_name == 'pull_request'$/m);
+});
+
+/* --------------------------------------------------------- 与母本 / Worker 的对齐 */
 const TEMPLATE = path.resolve(import.meta.dirname, '../../audit/workflows/audit.yml');
 
 test('生效副本与 contrib/audit/workflows/audit.yml 母本只差开头 4 行标题（两边必须一起改）', (t) => {

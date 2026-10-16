@@ -125,6 +125,12 @@ jobs:
       # ---------------------------------------------------------------
       - name: 把扫描器、合并逻辑与索引钉回 base 版本
         id: pin
+        # 只在 PR 上钉 base：这一步要防的是「投稿自带一份扫描器」，而它需要 base_ref 才有对象。
+        # workflow_dispatch 是维护者做线上验证的那条路（触发它要 write 权限，投稿者拿不到）：
+        # 跑的就是被触发那个 ref 自己那份扫描器，「自带扫描器」这个问题在它身上不存在；
+        # zip 由 inputs.zip 直接给，凭据复核那一步同样只挂 PR，所以 dispatch 既不查凭据、
+        # 也不读 pending，不会假绿。合并那一步的准入（action == 'auto-approve'）一概不动。
+        if: github.event_name == 'pull_request'
         shell: bash
         env:
           BASE_REF: ${{ github.base_ref }}
