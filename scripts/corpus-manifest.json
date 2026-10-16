@@ -1,0 +1,43 @@
+{
+  "schema": "audit-corpus-manifest/v1",
+  "about": "真包语料清单。fetch 子命令按 tag 现问 GitHub 的 Releases API 取下载直链，再落盘并记 sha256。这里只存 repo / tag / asset 名与期望字节数，**不存任何下载直链**：直链带签名与有效期，写死在这里等于把「下次拿到的还是不是同一个东西」这件事交给时间，而且上游发新包时 latest 会把下载物悄悄换掉。",
+  "whyTheseFive": "这五枚是**含原生码的公开模块**样本，用途只有一个：量「把危险族成员表收窄之后，公开包的族集与档位会不会跟着翻」。它们不是历史上那批样本的全部 —— 那批包只记录了包名、没有记录 owner/repo，因此不可恢复。不要把这份清单当成那批包本身，也不要把它当成覆盖率：它是量尺，不是结论。",
+  "pinning": "钉的是 tag，不是 latest。每条的 bytes 是身份绑定的一半：下载后字节数与 sha256 只要有一个对不上，fetch 就停下来报错而不覆盖，让「旧包的字节盖到新包上」这件事当场可见。",
+  "entries": [
+    {
+      "name": "ReZygisk",
+      "repo": "PerformanC/ReZygisk",
+      "tag": "v1.0.0",
+      "asset": "ReZygisk-v1.0.0-release.zip",
+      "bytes": 506334
+    },
+    {
+      "name": "HMA-OSS",
+      "repo": "frknkrc44/HMA-OSS",
+      "tag": "oss-173",
+      "asset": "HMA-OSS-ZYGISK-oss-173-release.zip",
+      "bytes": 2743824
+    },
+    {
+      "name": "zygisk-detach",
+      "repo": "j-hc/zygisk-detach",
+      "tag": "v1.24.0",
+      "asset": "zygisk-detach-v1.24.0.zip",
+      "bytes": 371409
+    },
+    {
+      "name": "Zygisk-Assistant",
+      "repo": "snake-4/Zygisk-Assistant",
+      "tag": "v2.1.4",
+      "asset": "Zygisk-Assistant-v2.1.4-1013f8a-release.zip",
+      "bytes": 392961
+    },
+    {
+      "name": "device_faker",
+      "repo": "Seyud/device_faker_release",
+      "tag": "v1.6.0",
+      "asset": "device_faker_v1.6.0.zip",
+      "bytes": 969705
+    }
+  ]
+}
