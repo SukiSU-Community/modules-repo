@@ -11,13 +11,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { CAPABILITY_FAMILIES, forensics, capabilityFamilies } from '../audit/elf-forensics.mjs';
-import { familiesUnder, validateManifest, findGitWorktreeRoot } from '../scripts/audit-corpus.mjs';
+import { scanZip } from '../audit/scan.mjs';
+import { makeModuleZip } from '../audit/fixtures.mjs';
+import {
+  familiesUnder, validateManifest, findGitWorktreeRoot, sha256Of,
+  placeZip, pickAsset, fetchOne, mergeLock, buildDumpRow, runScan, familiesOfDumpRow,
+} from '../scripts/audit-corpus.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(HERE, '..');
@@ -193,3 +198,175 @@ test('Step 0.4 子命令缺失与 --out 缺失：非零退出，且**不许**是
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Step 2 —— fetch 的身份绑定 + scan 的字段口径（全部离线，零网络）
+// ---------------------------------------------------------------------------
+
+/** 六枚常驻真 ELF 打成一个合成 zip，只用来量 scan 的字段口径，不当真包用。 */
+function syntheticZip() {
+  return makeModuleZip({ id: 'corpus-fixture-bundle', files: SIX.map((n) => [`lib/${n}`, readFileSync(join(FIXTURES, n))]) });
+}
+
+const SILENT = { log: () => {}, error: () => {}, warn: () => {} };
+
+test('Step 2 身份绑定：同名不同字节就停下来报，绝不覆盖已有 zip', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'corpus-bind-'));
+  try {
+    const target = join(dir, 'ReZygisk.zip');
+    const oldBytes = Buffer.from('上一轮那个包的字节，谁也不许盖掉它'.repeat(3), 'utf8');
+    writeFileSync(target, oldBytes);
+    const fresh = Buffer.from('这一轮下载到的另一份字节'.repeat(4), 'utf8');
+    const r = placeZip(target, fresh, { name: 'ReZygisk', bytes: fresh.length });
+    assert.equal(r.ok, false, '同名不同字节必须判不成功');
+    assert.equal(r.stopped, 'name-collision');
+    assert.notEqual(r.existingSha, r.incomingSha);
+    assert.deepEqual(readFileSync(target), oldBytes, '停下来之后盘上必须还是旧字节（覆盖=换芯）');
+    // 同一个文件重放：字节一致才算 reused，不写第二遍。
+    const same = placeZip(target, oldBytes, { name: 'ReZygisk', bytes: oldBytes.length });
+    assert.equal(same.ok, true);
+    assert.equal(same.reused, true);
+    assert.equal(same.sha256, sha256Of(oldBytes));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Step 2 身份绑定：字节数与清单记的对不上就停（不落地、不进 lock）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'corpus-bytes-'));
+  try {
+    const target = join(dir, 'HMA-OSS.zip');
+    const fresh = Buffer.alloc(128, 7);
+    const r = placeZip(target, fresh, { name: 'HMA-OSS', bytes: 2743824 });
+    assert.equal(r.ok, false);
+    assert.equal(r.stopped, 'bytes-mismatch');
+    assert.equal(r.actual, 128);
+    assert.equal(existsSync(target), false, '字节对不上的东西不许落盘');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Step 2 pickAsset：附件名要逐字相符，近似名与 latest 换货都算没找到', () => {
+  const entry = EXPECTED[0];
+  const release = (names, size = entry.bytes, tag = entry.tag) => ({
+    tag_name: tag,
+    assets: names.map((n) => ({ name: n, size, browser_download_url: `//example/${n}` })),
+  });
+  const exact = pickAsset(release([entry.asset]), entry);
+  assert.equal(exact.ok, true);
+  assert.equal(pickAsset(release(['ReZygisk-v1.0.0.zip']), entry).ok, false, '少一个 -release 的近似名不许当命中');
+  assert.equal(pickAsset(release([entry.asset.toUpperCase()]), entry).ok, false, '大小写不同不许当命中');
+  assert.equal(pickAsset(release([entry.asset, entry.asset]), entry).ok, false, '同名两枚不许随便挑一个');
+  assert.equal(pickAsset(release([entry.asset], entry.bytes + 1), entry).ok, false, 'API 报的字节与清单不符要报出来');
+  assert.equal(pickAsset(release([entry.asset], entry.bytes, 'v9.9.9'), entry).ok, false, 'tag 被换过要报出来');
+});
+
+test('Step 2 fetchOne 全程离线重放：第二轮换了字节 ⇒ 停 + 盘上一个字节没动', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'corpus-fetch-'));
+  try {
+    const zipsDir = join(dir, 'zips');
+    mkdirSync(zipsDir, { recursive: true });
+    const entry = { ...EXPECTED[3], bytes: 64 };
+    const v1 = Buffer.alloc(64, 1);
+    const v2 = Buffer.alloc(64, 2);
+    let payload = v1;
+    const apiGet = async () => ({ tag_name: entry.tag, assets: [{ name: entry.asset, size: 64, browser_download_url: 'https://example.invalid/a.zip' }] });
+    const download = () => payload;
+    const r1 = await fetchOne(entry, { zipsDir, log: SILENT, apiGet, download });
+    assert.equal(r1.ok, true, r1.why || '第一轮该成');
+    assert.equal(r1.row.sha256, sha256Of(v1));
+    assert.equal(r1.row.bytes, 64);
+    // 同一个 name 换了字节（上游重发、或旧包盖新包）—— 这一发就是 MC1 的靶子。
+    payload = v2;
+    const r2 = await fetchOne(entry, { zipsDir, log: SILENT, apiGet, download });
+    assert.equal(r2.ok, false, '同名不同字节必须判失败');
+    assert.equal(r2.stopped, 'name-collision');
+    assert.deepEqual(readFileSync(join(zipsDir, `${entry.name}.zip`)), v1, '停下来之后盘上必须还是第一轮那份字节');
+    // lock 合并：--only 跑半截不许把别的包证人清空。
+    const merged = mergeLock({ entries: [{ name: 'Other', sha256: 'x' }] }, [r1.row]);
+    assert.deepEqual(merged.entries.map((e) => e.name).sort(), ['Other', entry.name]);
+    const replaced = mergeLock({ entries: [r1.row] }, [{ ...r1.row, sha256: 'y' }]);
+    assert.equal(replaced.entries.length, 1);
+    assert.equal(replaced.entries[0].sha256, 'y');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Step 2 scan 拒绝没有 lock 的目录，lock 的 sha 对不上时停下来不扫', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'corpus-scan-'));
+  try {
+    const zipsDir = join(dir, 'zips');
+    mkdirSync(zipsDir, { recursive: true });
+    const zipPath = join(zipsDir, 'synthetic.zip');
+    const made = syntheticZip();
+    writeFileSync(zipPath, readFileSync(made));
+    rmSync(dirname(made), { recursive: true, force: true });
+    const manifest = { entries: [{ name: 'synthetic', repo: 'o/r', tag: 't', asset: 'a.zip', bytes: statOf(zipPath) }] };
+    const noLock = await runScan({ log: SILENT, out: dir, manifest });
+    assert.equal(noLock.code, 2, '没有 lock 就该拒绝跑');
+    assert.match(noLock.problems.join(' '), /corpus-lock/, '拒绝理由要指名缺 lock');
+    assert.equal(existsSync(join(dir, 'corpus-dump.json')), false, '拒绝跑的时候不许留产物');
+
+    writeFileSync(join(dir, 'corpus-lock.json'), JSON.stringify({
+      schema: 'audit-corpus-lock/v1',
+      entries: [{ name: 'synthetic', url: 'https://example.invalid/a.zip', bytes: statOf(zipPath), sha256: '0'.repeat(64), fetched_at: 'x' }],
+    }));
+    const badLock = await runScan({ log: SILENT, out: dir, manifest });
+    assert.notEqual(badLock.code, 0, '盘上 sha 与 lock 不符时不许扫成');
+    assert.match(badLock.problems.join(' '), /sha256/);
+    assert.equal(existsSync(join(dir, 'corpus-dump.json')), false, '字节对不上更不许写 dump');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function statOf(p) {
+  return readFileSync(p).length;
+}
+
+test('Step 2 dump 字段口径一律从报告取：riskLevel/counts/decision/binaryForensics，ruleHistogram 是本工具衍生的', async () => {
+  const zipPath = syntheticZip();
+  const report = await scanZip(zipPath, { changeType: 'first' });
+  assert.equal('level' in report, false, '报告里没有 level 这个键');
+  assert.ok(['low', 'medium', 'high'].includes(report.riskLevel));
+  assert.ok(['auto-approve', 'request-review', 'block'].includes(report.decision.action), 'decision 是对象，取 .action');
+  assert.equal(report.binaries.length, 6);
+  assert.equal(report.binaryForensics.length, 6);
+
+  const row = buildDumpRow({ name: 'synthetic', zipPath, zipBytes: statOf(zipPath), zipSha256: sha256Of(zipPath) }, report);
+  assert.equal(row.riskLevel, report.riskLevel);
+  assert.deepEqual(row.counts, report.counts);
+  assert.equal(row.decision, report.decision.action);
+  assert.equal(row.zipSha256, sha256Of(zipPath));
+  // ruleHistogram 是本工具数出来的，报告里没有这一格。
+  const total = Object.values(row.ruleHistogram).reduce((a, b) => a + b, 0);
+  assert.equal(total, report.findings.length);
+  assert.equal('ruleHistogram' in report, false, '报告里本来没有 ruleHistogram —— 有就说明这格不是衍生的');
+
+  assert.equal(row.binaries.length, 6);
+  for (let i = 0; i < row.binaries.length; i++) {
+    const src = report.binaryForensics[i];
+    const b = row.binaries[i];
+    assert.equal(b.name, src.name, '条目名与 report.binaries 同一套口径');
+    assert.deepEqual(b.capabilityImports, src.capabilityImports || []);
+    assert.deepEqual(b.sensitiveImports, src.sensitiveImports || []);
+    assert.equal(b.capabilityImportsTotal, src.capabilityImportsTotal);
+    // 那一格只在被截时才写：读它要 === true，键不存在时也不该冒出来。
+    assert.equal(b.capabilityImportsCapped, src.capabilityImportsCapped === true ? true : undefined);
+    // families 用报告的现算值，与 familiesUnder(同一份进料, 现表) 一字不差。
+    assert.deepEqual(b.families, familiesUnder(b.capabilityImports, CAPABILITY_FAMILIES));
+    assert.deepEqual(b.families, capabilityFamilies(b.capabilityImports));
+  }
+  // 条目名是 zip 里的**全名**（带 lib/ 前缀），不是 basename —— 与 report.binaries[].name 同一套口径。
+  const byName = Object.fromEntries(row.binaries.map((b) => [b.name, b.families.length]));
+  assert.deepEqual(byName, {
+    'lib/device_faker_cli': 4, 'lib/arm64-v8a.so': 4, 'lib/detach-arm32': 4,
+    'lib/hma-arm64.so': 0, 'lib/hma-armeabi-v7a.so': 0, 'lib/hma-x86.so': 0,
+  });
+  // 跨枚取并集是「包级最严」那一栏的族集口径，排序去重。
+  assert.deepEqual(familiesOfDumpRow(row), ['EXEC', 'FILEWRITE', 'NET', 'NS', 'PROP']);
+  rmSync(dirname(zipPath), { recursive: true, force: true });
+});
+
