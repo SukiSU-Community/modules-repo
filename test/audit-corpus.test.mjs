@@ -23,6 +23,7 @@ import {
   familiesUnder, validateManifest, findGitWorktreeRoot, sha256Of,
   placeZip, pickAsset, fetchOne, mergeLock, buildDumpRow, runScan, familiesOfDumpRow,
   candidateNarrowingProblems, diffDump, runDiff, familyTier, mergeDump,
+  tableDriftProblems,
 } from '../scripts/audit-corpus.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -496,6 +497,56 @@ test('Step 2 --only 重扫一个包不许把整份 dump 缩成一行（那会让
     // 纯函数那一层：同名行以本次为准，排序稳定。
     const merged = mergeDump({ rows: [{ name: 'b', zipSha256: 'old' }, { name: 'a', zipSha256: 'old' }] }, [{ name: 'a', zipSha256: 'new' }]);
     assert.deepEqual(merged.rows.map((r) => [r.name, r.zipSha256]), [['a', 'new'], ['b', 'old']]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 主控复验补的那一格：dump 里 currentTable 那格原来**只写不读** —— 写了就等于没写。
+// ---------------------------------------------------------------------------
+
+test('表来源闸：dump 的 currentTable 与现表漂了 ⇒ 不出前后表、退出码 2、理由点名漂在哪个前缀', async () => {
+  // 漂移挑 `property_`：它在六枚常驻夹具里**一次都不命中**，所以「逐枚 families 与现表重算比对」
+  // 那道旧闸在这种漂移下照样绿 —— 这条用例的牙必须属于新闸，不能是搭旧闸的便车。
+  for (const n of SIX) {
+    for (const x of feedOf(n).capabilityImports) {
+      assert.ok(!x.toLowerCase().startsWith('property_'), `${n} 命中了 property_，这条用例的前提没了`);
+    }
+  }
+
+  const dump = await offlineDump();
+  dump.currentTable = CAPABILITY_FAMILIES.map(([f, , ps]) => [f, ps]);
+  const same = diffDump(dump, narrow(STEP4_REMOVALS));
+  assert.deepEqual(same.tableDrift, [], '表没漂就不许多嘴');
+  assert.deepEqual(same.problems, [], '这份 dump 的逐枚比对本来就一致，新闸不许把它判红');
+  assert.equal(same.packages.length, 1);
+
+  const drifted = JSON.parse(JSON.stringify(dump));
+  drifted.currentTable = drifted.currentTable.map(([f, ps]) => [f, f === 'PROP' ? ps.filter((p) => p !== 'property_') : ps]);
+  const r = diffDump(drifted, narrow(STEP4_REMOVALS));
+  assert.equal(r.tableDrift.length, 1, `表漂了一处必须报出来，实测 ${JSON.stringify(r.tableDrift)}`);
+  assert.match(r.tableDrift[0], /PROP/);
+  assert.match(r.tableDrift[0], /property_/);
+  assert.match(r.tableDrift[0], /先重跑 scan/);
+  assert.deepEqual(r.packages, [], '表漂了就不许再打印前后表 —— 那是一张来源不明的表');
+  assert.equal(r.summary.packages, 0);
+
+  // 纯函数那一层：同表给空、少一族与少一个前缀都要点名（族整族不见 ⇒ 也是一条）。
+  assert.deepEqual(tableDriftProblems(CAPABILITY_FAMILIES.map(([f, , ps]) => [f, ps]), CAPABILITY_FAMILIES), []);
+  assert.equal(tableDriftProblems([['EXEC', ['exec']]], CAPABILITY_FAMILIES).length, 1, '少掉其余四族要报，不许当成「没漂」');
+  const widened = CAPABILITY_FAMILIES.map(([f, , ps]) => [f, f === 'EXEC' ? [...ps, 'bogus_'] : ps]);
+  assert.equal(tableDriftProblems(widened, CAPABILITY_FAMILIES).length, 1, 'dump 里的表比现表宽 ⇒ 同样是漂');
+
+  // CLI 那一层真跑一发：这是前置条件不成立（不是「算完发现没变」），所以退出码 2。
+  const dir = mkdtempSync(join(tmpdir(), 'corpus-drift-'));
+  try {
+    writeFileSync(join(dir, 'corpus-dump.json'), JSON.stringify(drifted));
+    const cand = join(dir, 'cand.json');
+    writeFileSync(cand, JSON.stringify(narrow(STEP4_REMOVALS)));
+    const out = runCli(['diff', '--out', dir, '--candidate', cand]);
+    assert.equal(out.status, 2, `dump 的表与现表漂了必须以 2 退出，实测 ${out.status}：${out.output}`);
+    assert.match(out.output, /property_|先重跑 scan/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
