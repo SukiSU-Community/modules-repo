@@ -6136,3 +6136,139 @@ test('INV-C 档位只增不减：同批包 counts.medium + counts.high 在改动
   assert.equal(afterHigh - beforeHigh, 3, '净增的 3 条就是被取证升档的那三条 STRUCT_BINARY，一条不许更多');
   assert.equal(t57BatchCount(await t57Run('df2')), 2, 'df2 两枚真 ELF 必须都升 high');
 });
+
+// ---------------------------------------------------------------------------
+// T6.3（工单 2026-10-16）：报告正文里**投稿者来源**的字符串，落进 markdown 之前先中和 markup
+//
+// 实测的洞（工单 §0）：author 写一句 `</details>` 就能提前关掉别人的折叠块、在报告正文里
+// 造一个看起来像「审核结论」的块。GitHub 的 sanitizer 会剥掉 onerror，所以拿到的不是 XSS，
+// 是「这条评论的结构由投稿者控制」——危害说准，别夸大。
+//
+// 三条边界，都在下面的断言里，不在注释里：
+//   1) 只作用于给人看的那一面：renderJSON 的字节一个都不许变（AI 那一层吃 JSON + readZip 原文）。
+//   2) 只中和不删字（& 先转避免二次转义；< > 反引号转实体；控制序列换空格）。
+//   3) 判据只许有一份：这把中和是 scan.mjs 里的具名函数；6.2 给评论 intro 用的 inert()
+//      在 workflow 里，两层各管各的面，本单不许把它们合成一层（合成后 6.2 那条必须红）。
+// ---------------------------------------------------------------------------
+
+// 干净包实测：renderMarkdown 自己的结构不产生任何 <details>/</details>（全文那一节是围栏，不是标签）。
+// 钉成常量，不许写 <=：多出来的每一个闭合标签都是投稿者写的。
+const T63_STRUCT_CLOSE = 0;
+
+/**
+ * 「围栏外的那一份 markdown」——投稿者字节仍然原样留在我们自己的 code fence 里，
+ * 那是给人复核原文用的，而且 GitHub 在围栏内不解释 HTML，围栏长度由 fenceFor 保证关不掉。
+ * 所以「markup 漏进正文」的判据只看围栏之外：这个视图把成对的合法围栏连同其内容一起剔掉。
+ */
+function t63OutsideFences(md) {
+  const keep = [];
+  let fence = null;
+  for (const line of String(md).split('\n')) {
+    const m = line.match(/^\s*(`{3,})/);
+    if (m) {
+      if (fence === null) { fence = m[1].length; continue; }
+      if (m[1].length >= fence) { fence = null; continue; }
+      if (fence === null) keep.push(line);
+      continue;
+    }
+    if (fence === null) keep.push(line);
+  }
+  return keep.join('\n');
+}
+
+const t63Count = (s, re) => (String(s).match(re) || []).length;
+
+test('T6.3·渲染的折叠边界：module.prop 的 author/description 里的 markup 不许拆掉报告结构', async () => {
+  // 真管线：makeModuleZip -> scanZip -> renderMarkdown（不手写报告形状）。
+  const zip = makeModuleZip({
+    id: 't63fold',
+    files: [
+      ['module.prop', 'id=t63fold\nname=t63fold\n'
+        + 'description=x <img src=q onerror=alert(1)> y ``` z\n'
+        + 'version=v1.0\u0001\nversionCode=1\n'
+        + 'author=a</details>b<details><summary>伪造</summary>\n'],
+      ['service.sh', '#!/system/bin/sh\necho ok\n'],
+    ],
+  });
+  const md = renderMarkdown(await scanToReport(zip, { changeType: 'first' }));
+  const body = t63OutsideFences(md);
+  assert.equal(t63Count(body, /<\/details>/g), T63_STRUCT_CLOSE,
+    `闭合标签必须恰好等于我们自己结构产生的数量（${T63_STRUCT_CLOSE}），多出来的都是投稿者写的：\n${body}`);
+  assert.equal(t63Count(body, /<details>/g), T63_STRUCT_CLOSE, '开标签同样只许来自我们自己');
+  assert.equal(t63Count(body, /<summary>/g), 0, '<summary> 不许原样在场');
+  assert.equal(t63Count(body, /```/g), 0, 'description 里的 ``` 不许在正文里造围栏（围栏只许是我们自己的）');
+  assert.ok(!/<img\b/.test(body), '注入的 <img> 不许原样出现在正文');
+  assert.ok(!body.includes('\u0001'), '控制序列不许原样进正文');
+  // 只中和不删字：内容还得看得见，否则没人知道投稿者写过什么。
+  assert.ok(body.includes('&lt;/details&gt;'), '闭合标签要变成实体形式，不许直接删掉');
+  assert.ok(body.includes('&lt;summary&gt;'), '开标签同样只中和不删字');
+  assert.ok(/&#96;/.test(body), '反引号要变成实体（与 6.2 的 inert 同形）');
+  assert.ok(body.includes('伪造'), '中和之后「伪造」两个字还在（删字就是掩盖证据）');
+  // 人还读得懂：我们自己的结构一个字都不许被这把中和波及。
+  assert.ok(md.includes('\n## 结论\n'), '我们自己的标题不许被中和');
+  assert.ok(md.includes('- 处置：**`'), '我们自己写的内联代码围栏必须还是真反引号');
+  assert.ok(/```(sh|text)\n/.test(md), '全文那一节的围栏必须还是真反引号（人工复核要看原文）');
+});
+
+test('T6.3·条目名也走同一把中和：zip 里合法的 `</details>` 条目名不许拆结构', async () => {
+  // 这一条不许省：第一发很容易只修 meta 就交差。条目名同样是投稿者起的。
+  const evil = 'x</details>`y.sh';
+  const zip = makeModuleZip({
+    id: 't63entry',
+    files: [[evil, '#!/system/bin/sh\necho hi\n']],
+  });
+  const md = renderMarkdown(await scanToReport(zip, { changeType: 'first' }));
+  const body = t63OutsideFences(md);
+  assert.equal(t63Count(body, /<\/details>/g), T63_STRUCT_CLOSE,
+    `条目名里的 </details> 不许漏进正文（清单行与「### 条目名」标题都是落点）：\n${body}`);
+  assert.equal(t63Count(body, /<details>/g), T63_STRUCT_CLOSE);
+  assert.equal(t63Count(body, /```/g), 0, '条目名里的反引号不许造出正文围栏');
+  assert.ok(body.includes('x&lt;/details&gt;&#96;y.sh'), '条目名中和后仍要逐字看得见');
+});
+
+test('T6.3·片段与文件名走同一把中和：finding 的 file 与 snippet 落进 markdown 后不产生新标签', async () => {
+  // snippet 就是脚本原文/属性原文的匹配片段（trimSnippet 实测只压空白、不转义 `<`）。
+  const zip = makeModuleZip({
+    id: 't63frag',
+    files: [
+      ['module.prop', 'id=a<img src=q onerror=alert(1)>`b\nname=t63frag\ndescription=ok\n'
+        + 'version=v1.0\nversionCode=1\nauthor=fixture\n'],
+      ['rm</details>.sh', '#!/system/bin/sh\nrm -rf /data\n'],
+    ],
+  });
+  const r = await scanToReport(zip, { changeType: 'first' });
+  const md = renderMarkdown(r);
+  const body = t63OutsideFences(md);
+  assert.ok(r.findings.some((f) => f.file === 'rm</details>.sh'), '前提：文件名那一列必须真的带着 markup');
+  assert.ok(r.findings.some((f) => f.snippet.includes('<img')), '前提：片段那一列必须真的带着 markup');
+  assert.equal(t63Count(body, /<\/details>/g), T63_STRUCT_CLOSE, `file 列不许造出闭合标签：\n${body}`);
+  assert.ok(!/<img\b/.test(body), 'snippet 里的 <img> 不许原样进表格');
+  assert.ok(!/<summary>/i.test(body), '片段里的标签不许变成真标签');
+  assert.ok(body.includes('rm&lt;/details&gt;.sh'), '文件名中和后仍要逐字看得见');
+  assert.ok(body.includes('&lt;img src=q onerror=alert(1)&gt;'), '片段中和后仍要逐字看得见（只中和不删字）');
+});
+
+test('T6.3·JSON 面一字不变：markdown 的中和绝不许顺着改到 renderJSON（AI 那一层吃的是 JSON）', async () => {
+  const zip = makeModuleZip({
+    id: 't63json',
+    files: [
+      ['module.prop', 'id=t63json\nname=t63json\n'
+        + 'description=x <img src=q onerror=alert(1)> y ``` z\n'
+        + 'version=v1.0\nversionCode=1\nauthor=a</details>b<details><summary>伪造</summary>\n'],
+      ['service.sh', '#!/system/bin/sh\nrm -rf /data\n'],
+    ],
+  });
+  const r = await scanToReport(zip, { changeType: 'first' });
+  const before = JSON.stringify(r);
+  const md = renderMarkdown(r);
+  // 渲染不许顺手改报告对象（改了就是拿 markdown 的口径去动 AI 的进料）。
+  assert.equal(JSON.stringify(r), before, 'renderMarkdown 必须不改 report 一个字节');
+  const json = renderJSON(r);
+  assert.equal(renderJSON(r), json, 'renderJSON 幂等：两次产出逐字节相同');
+  // 同一份报告：markdown 那面是中和过的，JSON 那面必须还是原文。
+  assert.ok(md.includes('&lt;/details&gt;'), 'markdown 面：已中和');
+  assert.ok(json.includes('a</details>b<details><summary>伪造</summary>'), 'JSON 面：author 仍是原文');
+  assert.ok(json.includes('<img src=q onerror=alert(1)>'), 'JSON 面：description 仍是原文');
+  assert.ok(json.includes('rm -rf /data'), 'JSON 面：脚本原文仍是原文');
+  assert.equal(t63Count(json, /&lt;|&gt;|&#96;/g), 0, '实体形式一个都不许出现在 JSON 产物里');
+});
