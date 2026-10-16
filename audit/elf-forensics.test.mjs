@@ -657,6 +657,130 @@ test('stringsPartial：超过扫描上限时如实声明只看了前 8 MiB', () 
 });
 
 //----------------------------------------------------------------------------
+// S3-A（工单 briefs/task-s3a.md，2026-10-16 用户拍「只落 A」）：危险族能力的进料解耦
+//
+// 病（工单 §1，数是从 briefs/task-s3-pre-report.md 量来的，不是推的）：
+//   forensics() 用 SENSITIVE 把导入表筛成 sensitiveImports，而 risk-rules 拿这份**筛后的**名单定危险族
+//   ⇒ 族表里 execvp/mkdir/rename/truncate/ftruncate/mkdir/rmdir/pivot_root 这批成员在真管线上
+//   永远进不到族函数面前，于是 `['execvp']` 这一发导入今天读成「无一落在危险族」。
+// 修法只有一条：族的进料与给人看的那份筛后名单解耦 —— 族函数改吃**全量 UND**。
+//
+// 这一组用例全用**合成 ELF**（复用本文件 :141 那台 buildElf32，不引 readelf/nm、不新造第二台机器），
+// 只有 S3A-05 那一发落在常驻真夹具上（钉住「A 不是把所有包都抬起来」）。
+// checkBinaries 那一层也放在这里（而不是 scan.test.mjs）：那台 ELF 机器是本文件的局部函数，
+// 跨文件复用要么复制它、要么让测试文件互相 import（用例会被注册两遍），两条都更坏。
+//
+// 新符号一律走动态取：静态具名 import 在实现落地前会让整个文件在 link 阶段炸掉，
+// 红的应当是本轮新用例，不是上面那三十条既有证人（同一条纪律见 scan.test.mjs:5703）。
+//----------------------------------------------------------------------------
+
+const S3A = await import('./elf-forensics.mjs');
+const S3A_RR = await import('./risk-rules.mjs');
+
+/**  UND 名单 = 一组 st_shndx==0 的符号；NEEDED 用现成的 LIBS，与族结论无关。 */
+const s3aElf = (names) => buildElf32({
+  syms: names.map((n) => ({ name: n, shndx: 0 })),
+  dyns: LIBS.map((n) => ({ tag: 1, name: n })),
+});
+/** 真管线形状：forensics() 的记录原样交给 checkBinaries，测试不在中间补任何字段。 */
+const s3aVerdict = (name, rec) => S3A_RR.checkBinaries(
+  [{ name, id: 'ELF', why: 'ELF 可执行文件/共享库', bytes: rec.bytes }],
+  new Map([[name, rec]]))[0];
+
+test('S3A-01 只导入 execvp 的合成 ELF ⇒ capabilityImports=[execvp]、族 [EXEC]、ELF_FAMILY/medium（今天这一发是 0 族：本轮的正面见证）', () => {
+  const out = forensics(s3aElf(['execvp']), 'execvp-only.so');
+  assert.equal(out.parseError, undefined, out.parseError);
+  assert.equal(out.importCount, 1);
+  assert.deepEqual(out.sensitiveImports, [], '预筛本来就不认 execvp —— 这一格一个字不动（工单 §2.1）');
+  assert.deepEqual(out.capabilityImports, ['execvp']);
+  assert.equal(out.capabilityImportsTotal, 1);
+  assert.equal(out.capabilityImportsCapped, false);
+  assert.deepEqual(S3A.capabilityFamilies(out.capabilityImports), ['EXEC']);
+  assert.equal(S3A.CAPABILITY_IMPORT_CAP, 64, '上限必须是这个具名常量、就是这个值');
+
+  const g = s3aVerdict('execvp-only.so', out);
+  assert.equal(g.severity, 'medium', '一族 ⇒ medium：档位公式一字未改');
+  assert.match(g.message, /EXEC/);
+  assert.doesNotMatch(g.message, /无一落在危险族/, '这一发上「0 族」那句话不许再出现：它读的是筛子的形状');
+});
+
+test('S3A-02 execvp+mkdir+unlink ⇒ EXEC 与 FILEWRITE 两族 ⇒ high（今天只剩 FILEWRITE ⇒ medium）', () => {
+  const out = forensics(s3aElf(['execvp', 'mkdir', 'unlink']), 'three.so');
+  assert.equal(out.importCount, 3);
+  assert.deepEqual(out.capabilityImports, ['execvp', 'mkdir', 'unlink'], '已去重排序');
+  assert.equal(out.capabilityImportsTotal, 3);
+  assert.deepEqual(S3A.capabilitySymbols(out.capabilityImports).map((x) => [x.family, x.symbols]), [
+    ['EXEC', ['execvp']],
+    ['FILEWRITE', ['mkdir', 'unlink']],
+  ]);
+  assert.deepEqual(S3A.capabilitySymbols(out.sensitiveImports).map((x) => x.family), ['FILEWRITE'],
+    '旧进料的形状也钉住：改的就是这一格');
+
+  const g = s3aVerdict('three.so', out);
+  assert.equal(g.severity, 'high');
+  assert.match(g.message, /2 类危险能力/);
+  assert.match(g.message, /≥2 类链接期能力/);
+});
+
+test('S3A-03 六个死词活了：pivot_root 落 NS 且 symbols 含它；rename/truncate/ftruncate/mkdir/rmdir 五员全落 FILEWRITE', () => {
+  const ns = forensics(s3aElf(['pivot_root', 'setns']), 'ns.so');
+  assert.deepEqual(ns.capabilityImports, ['pivot_root', 'setns']);
+  assert.deepEqual(ns.sensitiveImports, ['setns'], 'NS 的进料今天只有 setns 到得了：pivot_root 是被预筛吃掉的那个');
+  const nsF = S3A.capabilitySymbols(ns.capabilityImports);
+  assert.deepEqual(nsF.map((x) => x.family), ['NS']);
+  assert.ok(nsF[0].symbols.includes('pivot_root'), '工单 §3 Step 0.3：钉「六个死词里至少 NS 那个词活了」');
+
+  const fw = forensics(s3aElf(['rename', 'truncate', 'ftruncate', 'mkdir', 'rmdir']), 'fw.so');
+  assert.deepEqual(fw.sensitiveImports, [], '五个词全是死词：预筛一个都不放进来');
+  assert.deepEqual(fw.capabilityImports, ['ftruncate', 'mkdir', 'rename', 'rmdir', 'truncate']);
+  assert.deepEqual(S3A.capabilitySymbols(fw.capabilityImports), [
+    { family: 'FILEWRITE', label: '文件写出与改名', symbols: ['ftruncate', 'mkdir', 'rename', 'rmdir', 'truncate'], symbolTotal: 5 },
+  ], '一族五个成员全在场（正好等于 REPRESENTATIVE_CAP，不许静默截断）');
+  assert.equal(S3A.capabilityFamilies(fw.sensitiveImports).length, 0, '旧进料下这一发今天读成 0 族');
+
+  const g = s3aVerdict('fw.so', fw);
+  assert.equal(g.severity, 'medium', '一族 ⇒ medium：只加严、不动档位公式');
+  assert.match(g.message, /FILEWRITE/);
+});
+
+test('S3A-04 截断只限制呈现、绝不限制计数：CAP+1 个命中名字 ⇒ total 是真数、capped=true、message 末尾写「族集合是下限」', () => {
+  const cap = S3A.CAPABILITY_IMPORT_CAP;
+  assert.equal(cap, 64);
+  const names = Array.from({ length: cap + 1 }, (_, i) => `unlink_s${String(i).padStart(2, '0')}`);
+  const sorted = names.slice().sort();
+  const out = forensics(s3aElf(names), 'capped.so');
+  assert.equal(out.importCount, cap + 1);
+  assert.deepEqual(out.capabilityImports, sorted.slice(0, cap), '呈现的是排序后的前 CAP 条');
+  assert.equal(out.capabilityImports.length, cap, '上限只管呈现条数');
+  assert.equal(out.capabilityImportsTotal, cap + 1, '真实计数不许被上限污染');
+  assert.equal(out.capabilityImportsCapped, true);
+
+  const g = s3aVerdict('capped.so', out);
+  assert.match(g.message, /危险族名单在 64 条处截过，族集合是下限/);
+  assert.ok(g.message.endsWith('；危险族名单在 64 条处截过，族集合是下限'), `这条呈现纪律落在 message 末尾：${g.message}`);
+  assert.equal(g.severity, 'medium', '呈现纪律不许新开档位（工单 §2.2）');
+});
+
+test('S3A-05 真夹具：device_faker_cli 的 capabilityImports 含 execvp 与 mkdir，而 hma-arm64.so 仍是 0 族', () => {
+  const cli = forensics(fix('device_faker_cli'), 'device_faker_cli');
+  assert.equal(cli.parseError, undefined, cli.parseError);
+  assert.equal(cli.importCount, 70, 'task-s3-pre-und-all.mjs 量过的那一发 UND 数');
+  assert.ok(cli.capabilityImports.includes('execvp'), `execvp 是真 UND 链接期导入，必须到得了族函数：${cli.capabilityImports}`);
+  assert.ok(cli.capabilityImports.includes('mkdir'), `mkdir 同上：${cli.capabilityImports}`);
+  assert.equal(cli.sensitiveImports.includes('execvp'), false, '它确实是被预筛吃掉的那一个，不是新出现的名字');
+
+  const hma = forensics(fix('hma-arm64.so'), 'hma-arm64.so');
+  assert.equal(hma.importCount, 24);
+  assert.deepEqual(hma.capabilityImports, [], '它的 UND 里没有任何名字命中族表 ⇒ 这个 0 族是证出来的可靠缺席');
+  assert.equal(hma.capabilityImportsTotal, 0);
+  assert.equal(hma.capabilityImportsCapped, false);
+  const g = s3aVerdict('hma-arm64.so', hma);
+  assert.equal(g.severity, 'medium', 'A 不是把所有包都抬起来：这一枚改前改后都是 medium');
+  assert.match(g.message, /无一落在危险族/);
+  assert.match(g.message, /不等于安全/);
+});
+
+//----------------------------------------------------------------------------
 // I. 输出形状
 //----------------------------------------------------------------------------
 
