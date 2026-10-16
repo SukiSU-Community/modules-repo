@@ -489,6 +489,32 @@ function safeReadJson(p) {
 }
 
 /**
+ * 把本次扫到的行合进已有 dump（按包名覆盖同名行，其余保留）。
+ * 为什么必须有这一格：--only 只想重扫一个包时，直接把 dump 写成「只剩这一行」，
+ * 下一步 diff 读到的就是一张只有一枚包的表，而它打印出来的汇总看着完全自洽 ——
+ * 于是「整个语料都不变」这个结论其实是「只有一个包」。
+ * @param {object|null} existing
+ * @param {object[]} fresh
+ * @param {{ current?: Array<[string, string, string[]]> }} [opts]
+ */
+export function mergeDump(existing, fresh, opts = {}) {
+  const current = opts.current || CAPABILITY_FAMILIES;
+  const byName = new Map();
+  for (const r of (Array.isArray(existing && existing.rows) ? existing.rows : [])) {
+    if (r && typeof r.name === 'string') byName.set(r.name, r);
+  }
+  for (const r of (Array.isArray(fresh) ? fresh : [])) byName.set(r.name, r);
+  return {
+    schema: 'audit-corpus-dump/v1',
+    generatedAt: new Date().toISOString(),
+    tool: 'scripts/audit-corpus.mjs scan',
+    // 这份 dump 是用哪一张表扫出来的，diff 那一步要靠它判断报告里的 families 还作不作数。
+    currentTable: current.map(([f, , ps]) => [f, ps]),
+    rows: [...byName.values()].sort((a, b) => (a.name < b.name ? -1 : 1)),
+  };
+}
+
+/**
  * scan：读 <out>/zips/*.zip（按 lock 逐条核字节与 sha256）⇒ 每个包跑生产入口
  * scanZip(路径, { changeType: 'first' }) ⇒ 写 <out>/corpus-dump.json ⇒ 打人读表。
  * 只读，不执行包里任何东西。
@@ -539,9 +565,12 @@ export async function runScan(deps = {}) {
     }, report));
   }
   if (problems.length) return { code: 1, problems, rows };
-  const dump = { schema: 'audit-corpus-dump/v1', generatedAt: new Date().toISOString(), tool: 'scripts/audit-corpus.mjs scan', currentTable: CAPABILITY_FAMILIES.map(([f, , ps]) => [f, ps]), rows };
-  writeFileSync(join(out, DUMP_NAME), `${JSON.stringify(dump, null, 2)}\n`);
-  log.log(`扫了 ${rows.length} 个包 ⇒ ${join(out, DUMP_NAME)}`);
+  const dumpPath = join(out, DUMP_NAME);
+  const existing = existsSync(dumpPath) ? safeReadJson(dumpPath) : null;
+  const dump = mergeDump(existing, rows);
+  writeFileSync(dumpPath, `${JSON.stringify(dump, null, 2)}\n`);
+  const carried = dump.rows.length - rows.length;
+  log.log(`扫了 ${rows.length} 个包，dump 里累计 ${dump.rows.length} 个${carried > 0 ? `（${carried} 行是上一轮留下的，本轮没重扫）` : ''} ⇒ ${dumpPath}`);
   for (const line of renderScanTable(rows)) log.log(line);
   const capped = rows.flatMap((r) => (r.binaries || []).filter((b) => b.capabilityImportsCapped === true).map((b) => `${r.name}/${b.name}`));
   if (capped.length) log.log(`注意：这些枚的族名单被截过（族数偏低的那一格）：${capped.join(', ')}`);

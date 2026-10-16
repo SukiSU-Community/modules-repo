@@ -22,7 +22,7 @@ import { makeModuleZip } from '../audit/fixtures.mjs';
 import {
   familiesUnder, validateManifest, findGitWorktreeRoot, sha256Of,
   placeZip, pickAsset, fetchOne, mergeLock, buildDumpRow, runScan, familiesOfDumpRow,
-  candidateNarrowingProblems, diffDump, runDiff, familyTier,
+  candidateNarrowingProblems, diffDump, runDiff, familyTier, mergeDump,
 } from '../scripts/audit-corpus.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -467,6 +467,38 @@ test('Step 3 离线前后表：六枚常驻夹具 + Step 4 候选表 ⇒ 4→3 /
   // 族数档位那条公式本身也钉一下（0/1 → medium，≥2 → high），跨边界的计数才有出处。
   assert.equal(familyTier(['EXEC']), 'medium');
   assert.equal(familyTier(['EXEC', 'NET']), 'high');
+});
+
+test('Step 2 --only 重扫一个包不许把整份 dump 缩成一行（那会让下一张前后表说假话）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'corpus-dumpmerge-'));
+  try {
+    const zipsDir = join(dir, 'zips');
+    mkdirSync(zipsDir, { recursive: true });
+    const made = syntheticZip();
+    const body = readFileSync(made);
+    rmSync(dirname(made), { recursive: true, force: true });
+    for (const n of ['a', 'b']) writeFileSync(join(zipsDir, `${n}.zip`), body);
+    const sha = sha256Of(body);
+    writeFileSync(join(dir, 'corpus-lock.json'), JSON.stringify({
+      schema: 'audit-corpus-lock/v1',
+      entries: ['a', 'b'].map((n) => ({ name: n, url: `https://example.invalid/${n}.zip`, bytes: body.length, sha256: sha, fetched_at: 'x' })),
+    }));
+    const manifest = { entries: ['a', 'b'].map((n) => ({ name: n, repo: 'o/r', tag: 't', asset: 'a.zip', bytes: body.length })) };
+
+    await runScan({ log: SILENT, out: dir, manifest, only: 'a' });
+    await runScan({ log: SILENT, out: dir, manifest, only: 'b' });
+    const dump = JSON.parse(readFileSync(join(dir, 'corpus-dump.json'), 'utf8'));
+    assert.deepEqual(dump.rows.map((r) => r.name), ['a', 'b'], '两轮各扫一个包，dump 里应当是两个包');
+    await runScan({ log: SILENT, out: dir, manifest, only: 'a' });
+    const after = JSON.parse(readFileSync(join(dir, 'corpus-dump.json'), 'utf8'));
+    assert.deepEqual(after.rows.map((r) => r.name), ['a', 'b'], '重扫 a 之后 b 那一行不许被抹掉');
+
+    // 纯函数那一层：同名行以本次为准，排序稳定。
+    const merged = mergeDump({ rows: [{ name: 'b', zipSha256: 'old' }, { name: 'a', zipSha256: 'old' }] }, [{ name: 'a', zipSha256: 'new' }]);
+    assert.deepEqual(merged.rows.map((r) => [r.name, r.zipSha256]), [['a', 'new'], ['b', 'old']]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 
