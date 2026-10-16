@@ -780,12 +780,48 @@ test('S3A-05 真夹具：device_faker_cli 的 capabilityImports 含 execvp 与 m
   assert.match(g.message, /不等于安全/);
 });
 
+test('S3A-06 三个新键的两条边界：parseError 一支不许带（读不出≠像 0），读成功但没有 .dynsym 时必须是初始化好的值', () => {
+  const NEW = ['capabilityImports', 'capabilityImportsTotal', 'capabilityImportsCapped'];
+
+  // ① parseError：与 importCount 同规则 —— 读不出来就不许给一个看起来像 0 的数。
+  const be = Buffer.from(fix('hma-arm64.so'));
+  be[5] = 2;                                                 // ELFDATA2MSB
+  for (const [k, buf] of [
+    ['truncated', fix('arm64-v8a.so').subarray(0, 4096)],
+    ['big-endian', be],
+    ['string-input', 'not a buffer at all'],
+  ]) {
+    const out = forensics(buf, `bad-${k}`);
+    assert.ok(out && out.parseError, `${k} 必须 parseError：${JSON.stringify(out).slice(0, 120)}`);
+    for (const key of NEW) assert.ok(!(key in out), `${k} 的 parseError 输出里不许出现 ${key}`);
+  }
+
+  // ② 读成功但节表里指不出 .dynsym：三个键必须是字面量里初始化好的 [] / 0 / false，不许留 undefined。
+  //    留 undefined 会被工单 §2.2 那道新闸误判成 PARSE_ERROR —— 那是改变一类真形状的行为，不是加严。
+  const b = Buffer.from(s3aElf(['execvp', 'unlink']));
+  const at = b.indexOf(Buffer.from('.dynsym\0', 'latin1'));
+  assert.ok(at > 0, '夹具里 .dynsym 那个节名要能定位到（找不到就是机器变了）');
+  b[at] = 0x78;                                              // '.' -> 'x'：节名变成 xdynsym，find('.dynsym') 失败
+  const out = forensics(b, 'no-dynsym.so');
+  assert.equal(out.parseError, undefined, `改了节名不该影响可解析性：${out.parseError}`);
+  assert.equal(out.sections.includes('.dynsym'), false, '这条形状证人：确实没有 .dynsym');
+  assert.equal(out.importCount, 0, '读成功、真的没读到名字 —— 这个 0 是证出来的');
+  for (const key of NEW) assert.ok(key in out, `${key} 必须在（初始化过就不该 undefined，也不该整键缺失）`);
+  assert.deepEqual(out.capabilityImports, []);
+  assert.equal(out.capabilityImportsTotal, 0);
+  assert.equal(out.capabilityImportsCapped, false);
+  assert.deepEqual(out.sensitiveImports, [], 'sensitiveImports 同一条规则，这一格一字未动');
+});
+
 //----------------------------------------------------------------------------
 // I. 输出形状
 //----------------------------------------------------------------------------
 
 test('输出键集合固定，且本模块不给严重性、不判危险', () => {
-  const wantKeys = ['bytes', 'importCount', 'ioc', 'kind', 'machineName', 'name', 'needed', 'sections',
+  // S3-A 工单 §2.1 加了三个键（capabilityImports / Total / Capped）⇒ 这一组键集合跟着变，
+  // 但 sensitiveImports 那份筛后名单与它上面的每一个期望值都一字未动（Step 5 那一条钉这一格）。
+  const wantKeys = ['bytes', 'capabilityImports', 'capabilityImportsCapped', 'capabilityImportsTotal',
+    'importCount', 'ioc', 'kind', 'machineName', 'name', 'needed', 'sections',
     'sensitiveImports', 'stringSamples', 'stringTotal', 'stringsPartial', 'stringsScannedBytes', 'stripped', 'type'];
   for (const f of ['arm64-v8a.so', 'hma-armeabi-v7a.so']) {
     const out = forensics(fix(f), f);

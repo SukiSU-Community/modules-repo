@@ -62,6 +62,13 @@ const DT_NEEDED = 1n;
 export const STRING_SCAN_LIMIT = 8 * 1024 * 1024;
 const SAMPLE_CAP = 4096;    // 样本**条数**上限。只限制样本，绝不限制 total。
 const IOC_SAMPLE_CAP = 8;   // 每个桶最多 8 条 `offset: 串`
+/**
+ * 危险族命中名单的**呈现**上限（S3-A 工单 §2.1）：与 SAMPLE_CAP / IOC_SAMPLE_CAP 同一族规矩 ——
+ * 上限只限制呈现的条数，绝不限制被上报的总数（总数在 capabilityImportsTotal）。
+ * 截过的那一发必须在 message 里念出来（risk-rules 的「族集合是下限」），因为被截短的名单会让
+ * 族数偏低，而偏低正是 S3-A 要消灭的那种「被念成干净」。
+ */
+export const CAPABILITY_IMPORT_CAP = 64;
 
 class Refuse extends Error {}
 const refuse = (msg) => { throw new Refuse(msg); };
@@ -201,6 +208,9 @@ function analyze(buf, name) {
     stripped: !secs.some((s) => s.name === '.symtab'),      // .symtab 没了 == 作者 strip 过
     importCount: 0,
     sensitiveImports: [],
+    capabilityImports: [],
+    capabilityImportsTotal: 0,
+    capabilityImportsCapped: false,
     needed: [],
   };
 
@@ -233,6 +243,13 @@ function analyze(buf, name) {
     }
     out.importCount = imports.length;                       // 全集 = 分母，不按敏感名单筛
     out.sensitiveImports = [...new Set(imports.filter((x) => SENSITIVE.test(x)))].sort();
+    // S3-A 工单 §2.1：危险族的进料与上面那份**给人看的筛后名单**解耦。
+    // 判据只有 `capabilitySymbols([n]).length > 0` 这一条 —— 不复用 SENSITIVE、不加第二个选择条件、
+    // 也不在这里返回族名（硬约束 3：这里只报"读到了什么"，判档是下游 risk-rules 的事）。
+    const filtered = [...new Set(imports.filter((n) => capabilitySymbols([n]).length > 0))].sort();
+    out.capabilityImportsTotal = filtered.length;           // 真实计数，不受上限管
+    out.capabilityImports = filtered.slice(0, CAPABILITY_IMPORT_CAP);
+    out.capabilityImportsCapped = filtered.length > CAPABILITY_IMPORT_CAP;
   }
 
   // ---- NEEDED：.dynamic 里的 DT_NEEDED，到 DT_NULL 收口 ----
