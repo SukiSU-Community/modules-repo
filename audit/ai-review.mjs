@@ -447,10 +447,16 @@ function forensicsDigest(name, forensicsByName) {
   // 上面那段（敏感导入）是呈现面，留着不动；这里复用同一对上限与同一把消毒。
   const famHits = Array.isArray(row.capabilityImports) ? row.capabilityImports : [];
   if (famHits.length) {
+    // 计数一律用 total：上面那份数组是被 CAPABILITY_IMPORT_CAP 截过的，拿它的长度当总数念
+    // 就是把「偏低」念成「就这么多了」—— 本轮要消灭的正是这一形状，只是它搬到了 AI 这一层。
+    const total = Number.isInteger(row.capabilityImportsTotal) ? row.capabilityImportsTotal : famHits.length;
     const shown = famHits.slice(0, FORENSICS_IMPORT_CAP).map((s) => t(s, 40)).join(',');
-    parts.push(`危险族命中导入 ${famHits.length} ${shown}`
-      + (famHits.length > FORENSICS_IMPORT_CAP ? `…（还有 ${famHits.length - FORENSICS_IMPORT_CAP} 个）` : ''));
+    parts.push(`危险族命中导入 ${total} ${shown}`
+      + (total > FORENSICS_IMPORT_CAP ? `…（还有 ${total - FORENSICS_IMPORT_CAP} 个）` : ''));
   }
+  // 下限声明自己占一格，而且排在「静态结论」之前：那句拼在 summary 末尾会被 200 字符上限切掉，
+  // 于是「族集合是下限」这句话在最需要它的长名单那一发上恰好消失。
+  if (row.capabilityImportsCapped) parts.push('危险族名单被上限截过：族集合是下限');
   const needed = Array.isArray(row.needed) ? row.needed : [];
   if (needed.length) parts.push(`NEEDED ${needed.slice(0, FORENSICS_NEEDED_CAP).map((s) => t(s, 30)).join(',')}`);
   const families = Array.isArray(row.families) ? row.families : [];

