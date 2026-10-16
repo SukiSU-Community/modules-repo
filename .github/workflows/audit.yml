@@ -932,8 +932,11 @@ jobs:
           path: pending-changed/pending/
           if-no-files-found: warn
 
+      # 只有 PR 事件有 PR 可评论：手动触发那一条路上 context.issue.number 解析成 0，
+      # createComment 直接 404（2026-10-16 run 38890758068 实测），整条作业因通道而红，
+      # 读不出「这批包过没过检」。不跑，而不是跑了再炸。
       - name: 发布 PR 评论
-        if: steps.locate.outputs.found == 'true'
+        if: github.event_name == 'pull_request' && steps.locate.outputs.found == 'true'
         uses: actions/github-script@v7
         env:
           RISK: ${{ steps.triage.outputs.risk }}
@@ -1153,8 +1156,9 @@ jobs:
       # ---------------------------------------------------------------
       # 6. 打标签
       # ---------------------------------------------------------------
+      # 与上面那一步同一条理由：addLabels 用的也是 PR/issue 编号，dispatch 上没有对象。
       - name: 打标签
-        if: steps.locate.outputs.found == 'true'
+        if: github.event_name == 'pull_request' && steps.locate.outputs.found == 'true'
         uses: actions/github-script@v7
         env:
           LABEL: ${{ steps.triage.outputs.label }}

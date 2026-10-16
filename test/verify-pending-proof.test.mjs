@@ -540,6 +540,28 @@ test('pin 只挂在 pull_request 上：dispatch 用自己这一份扫描器，�
   assert.match(stepBlock(wf, 'id: proof'), /^ {8}if: github\.event_name == 'pull_request'$/m);
 });
 
+test('写回 PR 的那两步只挂 pull_request —— dispatch 里没有 PR 可写，撞上去是通道自己坏', () => {
+  // 2026-10-16 run 38890758068（第一条 dispatch canary）实测：AI 那一步 success、分流 success、
+  // artifact 也传了，然后 发布 PR 评论 抛 `HttpError: Not Found` —— 因为它取的是
+  // `context.issue.number`，而 dispatch 事件既没有 issue 也没有 pull_request，那个数是 0。
+  // 后果不是「少一条评论」：整条 audit 作业判红 → approve 第一步按 fail-closed 再红一次，
+  // 维护者拿不到「这条包过没过检」的读数。所以这两步在 dispatch 上必须**不跑**，而不是跑了再炸。
+  const wf = fs.readFileSync(WF, 'utf8');
+  const blockOf = (name) => {
+    const start = wf.indexOf(`- name: ${name}`);
+    assert.ok(start >= 0, `workflow 里必须存在名为「${name}」的步骤（改名要一起改这里）`);
+    const rest = wf.slice(start);
+    const end = rest.search(/\n {6}- (?:name|uses):/);
+    return rest.slice(0, end === -1 ? rest.length : end);
+  };
+  for (const name of ['发布 PR 评论', '打标签']) {
+    const block = blockOf(name);
+    assert.match(block, /^ {8}if: github\.event_name == 'pull_request' && steps\.locate\.outputs\.found == 'true'$/m,
+      `${name}：PR 上下文与 found 两个条件都要在，少一半就把线上验证路和自动放行路绑死在一起`);
+    assert.match(block, /actions\/github-script@v7/);
+  }
+});
+
 /* --------------------------------------------------------- 与母本 / Worker 的对齐 */
 const TEMPLATE = path.resolve(import.meta.dirname, '../../audit/workflows/audit.yml');
 
