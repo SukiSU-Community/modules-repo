@@ -521,8 +521,28 @@ test('P3：按 coolapkUid 拉黑能挡住投稿（normalizeEntry 不带 uid，�
 });
 
 test('P3：空台账 = 行为与接台账之前逐字段一致（回归护栏）', () => {
-  const a = buildIndex({ index: emptyIndex, entries: [entry()] });
-  const b = buildIndex({ index: emptyIndex, entries: [entry()], dispositions: ledger() });
+  // 这条护栏在测的是「接台账之前与之后，产出的索引一模一样」，而它自己**不能**跟时钟赛跑。
+  // 根因（p5-t33-run/p3-probe.mjs 实测，2026-10-14）：buildIndex 在 scripts/build-index.mjs:354
+  // 会把 `out.lastUpdate = Date.now()` 写进产出（只在 modules 非空时），于是这里两次调用之间
+  // 只要跨过一毫秒边界，deepEqual 就红 —— 200 次背靠背跑出 4 次红（2%），与「连跑 8 次红 1 次」同量级；
+  // 强制隔 3 毫秒则必红，且红起来唯一的差异字段就是 lastUpdate（抹平它之后两边逐字段相等）。
+  //
+  // 治法选**钉时间源**，不选「把 lastUpdate 排除在比对之外」：后者等于给这条护栏开一个永远不被看的洞，
+  // 而「空台账不许动 lastUpdate 之外的任何字段」这一格恰恰要靠全字段比对才成立。
+  // 时间源钉不住时下面两条 assert.equal 会当场红 —— 钉了个寂寞也算故障。
+  const FIXED_NOW = 1700000000000;
+  const realNow = Date.now;
+  let a;
+  let b;
+  try {
+    Date.now = () => FIXED_NOW;
+    a = buildIndex({ index: emptyIndex, entries: [entry()] });
+    b = buildIndex({ index: emptyIndex, entries: [entry()], dispositions: ledger() });
+  } finally {
+    Date.now = realNow; // 夹具不许把时钟留给下一个测试
+  }
+  assert.equal(a.index.lastUpdate, FIXED_NOW, '时间源必须真的被钉住：钉不住时下面那条比对还是在跟毫秒赛跑');
+  assert.equal(b.index.lastUpdate, FIXED_NOW, '接台账那一侧同样走钉住的时间源');
   assert.deepEqual(b.index, a.index);
   assert.equal(b.stats.blocked, 0);
 });

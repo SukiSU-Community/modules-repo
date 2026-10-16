@@ -1,0 +1,973 @@
+#!/usr/bin/env node
+/**
+ * audit-corpus.mjs —— 把「真包语料」做成仓库常驻的一把量尺。
+ *
+ * 这工具存在的理由：危险族成员表将来可能要收窄（把不是本族链接期事实的成员摘出去），
+ * 而收窄是**放宽方向**的改动，按规矩要先有「含原生码的公开包会不会因此翻结论」的影响面。
+ * 影响量不出来就只能拍脑袋，所以这里把「下载 → 扫描 → 按候选表重算族集 → 打前后表」
+ * 这条链固定成可重跑的命令，而不是一次性脚本里的临时产物。
+ *
+ * 三条硬规矩（写代码前先记住，改代码时更要记住）：
+ * 1. **只读，绝不执行**：包内任何条目都不 import、不 spawn、不 adb、不解压到盘外。
+ *    全工具唯一的外调是 fetch 那一步的 curl，它只把附件字节取回内存；scan / diff / selftest 一条外调都没有
+ *    （所以「CI 不许下载」不靠约定，靠的是那三个子命令的代码里根本走不到网络）。
+ *    扫描走 audit/scan.mjs 的 scanZip(zipPath, opts) —— 那是生产入口（AI 复核与 CI 用的同一把），
+ *    收的是 zip 的路径而不是 Buffer。这里不 import audit/fixtures.mjs：那份文件是给测试改的，
+ *    工具一旦依赖它，「和生产同一把」就成了假话。
+ * 2. **CI 不许下载**：fetch 是唯一走网络的子命令，而且要人显式敲；scan / diff / selftest 零网络。
+ *    下载的 zip 与两份 JSON 产物一律落在仓库外，见下面 --out 那道闸 —— 本仓 .gitignore 里有 *.zip，
+ *    真把包下进仓里，git status 一个字都不会提醒，所以那道闸是唯一会响的那一个。
+ * 3. **判据不许有第二份**：族词汇从 audit/elf-forensics.mjs 读（现表就是 CAPABILITY_FAMILIES 那一份），
+ *    重算族集的 familiesUnder 只做「小写 + 前缀 startsWith」这一条，与 capabilitySymbols 的规则一字不差，
+ *    并由 test/audit-corpus.test.mjs 钉住「同表时两套算法结果一致」。
+ *
+ * 用法见 USAGE。
+ */
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
+import process from 'node:process';
+import { fileURLToPath } from 'node:url';
+
+import { CAPABILITY_FAMILIES, capabilityFamilies } from '../audit/elf-forensics.mjs';
+import { isCliEntry, scanZip } from '../audit/scan.mjs';
+
+/** 清单与候选表的默认形状。 */
+export const SUBCOMMANDS = ['fetch', 'scan', 'diff', 'selftest'];
+const DEFAULT_MANIFEST = resolve(dirname(fileURLToPath(import.meta.url)), 'corpus-manifest.json');
+export const LOCK_NAME = 'corpus-lock.json';
+export const DUMP_NAME = 'corpus-dump.json';
+const API_ROOT = 'https://api.github.com';
+
+const USAGE = `用法: node scripts/audit-corpus.mjs <fetch|scan|diff|selftest> --out <dir> [--manifest <path>] [--candidate <path>] [--only <name>]
+
+  fetch      按清单里的 tag 现问 Releases API 取直链并下载（唯一走网络的子命令，CI 不许跑）。
+             落 <out>/zips/<name>.zip，逐条把 sha256 等写进 <out>/corpus-lock.json。
+  scan       对 <out>/zips/*.zip 逐个跑生产入口 scanZip，写 <out>/corpus-dump.json 并打一张人读表。
+             没有 corpus-lock.json 就拒绝跑 —— 不扫来路不明的 zip。
+  diff       读 <out>/corpus-dump.json，用 --candidate 那份候选族表只在族进料上重算族集，打逐包前后表。
+             candidate 必须是现表的**收窄**（不许有现表里不存在的前缀）：加严需要全量 UND 进料，
+             这份数据不在 dump 里，拿这张表算加严得出的「0 移动」是假的。
+  selftest   零网络、零 zip，跑几个纯函数断言并打印 ok。
+
+--out 必填，且解析后的路径与它的每一级祖先都不许有 .git（下载的包与产物不进仓库，也不进任何仓的工作树）。
+非零退出一律带用法；缺参数不「打印用法后 exit 0」。`;
+
+/**
+ * 命令行解析。`--k=v` 与 `--k v` 两种写法都认，第一个裸参数当子命令。
+ * @param {string[]} argv
+ */
+export function parseArgs(argv) {
+  const o = { command: '', out: '', manifest: DEFAULT_MANIFEST, candidate: '', only: '', help: false };
+  const rest = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = String(argv[i]);
+    if (a === '--help' || a === '-h') { o.help = true; continue; }
+    if (!a.startsWith('--')) { rest.push(a); continue; }
+    const body = a.slice(2);
+    const eq = body.indexOf('=');
+    const key = eq >= 0 ? body.slice(0, eq) : body;
+    let val = eq >= 0 ? body.slice(eq + 1) : undefined;
+    if (val === undefined && i + 1 < argv.length && !String(argv[i + 1]).startsWith('--')) {
+      val = String(argv[++i]);
+    }
+    if (key === 'out') o.out = val ?? '';
+    else if (key === 'manifest') o.manifest = val || DEFAULT_MANIFEST;
+    else if (key === 'candidate') o.candidate = val ?? '';
+    else if (key === 'only') o.only = val ?? '';
+    else o.unknown = [o.unknown || [], key].flat();
+  }
+  o.command = rest[0] || '';
+  o.extra = rest.slice(1);
+  return o;
+}
+
+/**
+ * 清单校验。返回 { ok, errors, entries }，entries 是**只保留五个白名单键**的规范化副本 ——
+ * 下载直链这类键就算混进了清单，也不会被规范化副本带到下游。
+ * @param {unknown} value
+ */
+export function validateManifest(value) {
+  const errors = [];
+  const entries = [];
+  const text = JSON.stringify(value ?? {});
+  // 任何形式的带协议直链都不许出现在清单里。
+  if (/https?:\/\//i.test(text)) {
+    errors.push('清单里出现了带协议（http/https）的下载物地址：直链必须由 fetch 按 tag 现问 API 拿，写死进清单等于放弃身份绑定');
+  }
+  if (!value || typeof value !== 'object' || !Array.isArray(value.entries)) {
+    errors.push('清单必须是一个带 entries 数组的对象');
+    return { ok: false, errors, entries };
+  }
+  if (value.entries.length === 0) errors.push('entries 是空的，没有可下载的东西');
+  const seen = new Set();
+  value.entries.forEach((e, i) => {
+    const at = `entries[${i}]`;
+    if (!e || typeof e !== 'object' || Array.isArray(e)) { errors.push(`${at} 不是对象`); return; }
+    // 键名层面也拦一次：值为空串的 url 键同样会让「钉的是 tag」这句话变成假话。
+    for (const k of Object.keys(e)) {
+      if (/url|link|href|download_uri/i.test(k)) errors.push(`${at}.${k}：清单里不许存下载地址，只存 repo/tag/asset 名`);
+    }
+    for (const k of ['name', 'repo', 'tag', 'asset']) {
+      const v = e[k];
+      if (typeof v !== 'string' || !v.trim()) errors.push(`${at}.${k} 必须是非空字符串（实测 ${JSON.stringify(v)}）`);
+    }
+    if (typeof e.repo === 'string' && !/^[^\s/]+\/[^\s/]+$/.test(e.repo.trim())) {
+      errors.push(`${at}.repo 必须是 owner/name 形状（实测 "${e.repo}"）`);
+    }
+    if (typeof e.asset === 'string' && (e.asset.includes('/') || e.asset.includes('\\'))) {
+      errors.push(`${at}.asset 是 release 附件的文件名，不许带路径分隔符（实测 "${e.asset}"）`);
+    }
+    if (!Number.isInteger(e.bytes) || e.bytes <= 0) {
+      errors.push(`${at}.bytes 必须是正整数（身份绑定的一半，实测 ${JSON.stringify(e.bytes)}）`);
+    }
+    if (typeof e.name === 'string' && e.name.trim()) {
+      if (seen.has(e.name)) errors.push(`${at}.name 与前一条重名：${e.name} —— 重名的两枚会互相盖写下载物`);
+      seen.add(e.name);
+    }
+    entries.push({ name: e.name, repo: e.repo, tag: e.tag, asset: e.asset, bytes: e.bytes });
+  });
+  return { ok: errors.length === 0, errors, entries };
+}
+
+/**
+ * 族表形状检查：[[族名, 标签, [前缀…]], …]。
+ * 表不对就要炸出来 —— 静默把空表当「什么都不命中」，读的人会当成语料干净。
+ */
+export function assertFamilyTable(table, where = '族表') {
+  if (!Array.isArray(table) || table.length === 0) throw new Error(`${where}必须是 [[族名,标签,[前缀…]],…] 形状且非空`);
+  for (const row of table) {
+    if (!Array.isArray(row) || row.length < 3 || typeof row[0] !== 'string' || !row[0].trim() || !Array.isArray(row[2])) {
+      throw new Error(`${where} 的一条不合法：${JSON.stringify(row)}（要 [族名, 标签, 前缀数组]）`);
+    }
+    for (const p of row[2]) {
+      if (typeof p !== 'string' || !p.trim()) throw new Error(`${where} ${row[0]} 的前缀名单里有空或非字符串项：${JSON.stringify(p)}`);
+    }
+  }
+  return table;
+}
+
+/**
+ * 按给定族表算族名集合（排序、去重）。
+ * 规则与 audit/elf-forensics.mjs 的 capabilitySymbols **一字不差**：小写后 `startsWith(prefix)`，
+ * 没有第二个条件。返回形状对齐 capabilityFamilies（排序去重的族名数组）。
+ * @param {string[]} names 族进料（report.binaryForensics[].capabilityImports 那一格）
+ * @param {Array<[string, string, string[]]>} table 族表，默认现表
+ */
+export function familiesUnder(names, table = CAPABILITY_FAMILIES) {
+  assertFamilyTable(table, 'familiesUnder 的');
+  const list = Array.isArray(names) ? names.filter((x) => typeof x === 'string' && x.length > 0) : [];
+  const hit = new Set();
+  for (const name of list) {
+    const low = name.toLowerCase();
+    for (const [family, , prefixes] of table) {
+      if (prefixes.some((p) => low.startsWith(p))) hit.add(family);
+    }
+  }
+  return [...hit].sort();
+}
+
+/**
+ * 从 target 往上逐层问「这一层有没有 .git」。
+ * 不只问本仓那一层：两棵仓在同一个父目录下时，只查本仓会让 `--out ..` 正好把 zip 摞在母本脚边。
+ * @param {string} target
+ * @param {{ hasDotGit?: (p: string) => boolean }} [fs]
+ * @returns {string|null} 命中就返回那一级目录，否则 null
+ */
+export function findGitWorktreeRoot(target, { hasDotGit } = {}) {
+  const has = typeof hasDotGit === 'function' ? hasDotGit : (p) => existsSync(resolve(p, '.git'));
+  let cur = resolve(String(target || '.'));
+  for (;;) {
+    if (has(cur)) return cur;
+    const parent = dirname(cur);
+    if (parent === cur) return null;                        // 撞到文件系统根
+    cur = parent;
+  }
+}
+
+/**
+ * --out 那道闸。返回 { ok, abs, root, reason }。
+ * @param {string} out
+ */
+export function checkOutDir(out) {
+  const abs = resolve(String(out || ''));
+  const root = findGitWorktreeRoot(abs);
+  if (root) {
+    return {
+      ok: false,
+      abs,
+      root,
+      reason: `--out 解析到 ${abs}，它或它的某一级祖先 ${root} 里有 .git —— 下载的包与语料产物不许落在任何 git 工作树里。`,
+    };
+  }
+  return { ok: true, abs, root: null, reason: '' };
+}
+
+/** sha256（Buffer 或文件路径）。语料的身份就靠这一个值。 */
+export function sha256Of(input) {
+  const buf = Buffer.isBuffer(input) ? input : readFileSync(input);
+  return createHash('sha256').update(buf).digest('hex');
+}
+
+/**
+ * 按 tag 问 release（**不是 latest**）：钉的是 tag，取 latest 会让上游新版本悄悄换掉下载物。
+ * @param {{ repo: string, tag: string }} entry
+ * @param {{ apiGet?: Function }} [deps]
+ */
+export async function releaseForTag(entry, deps = {}) {
+  const apiGet = deps.apiGet || defaultApiGet;
+  return apiGet(entry.repo, entry.tag);
+}
+
+async function defaultApiGet(repo, tag) {
+  const url = `${API_ROOT}/repos/${repo}/releases/tags/${encodeURIComponent(tag)}`;
+  const res = await fetch(url, {
+    method: 'GET',
+    signal: AbortSignal.timeout(30000),
+    headers: { 'user-agent': 'audit-corpus', accept: 'application/vnd.github+json' },
+  });
+  if (!res.ok) throw new Error(`GET /repos/${repo}/releases/tags/${tag} 回了 HTTP ${res.status}`);
+  return res.json();
+}
+
+/**
+ * 从 release 应答里挑出**名字逐字等于**清单 asset 的那一枚，同时核 API 报的字节数。
+ * 名字近似（少一个 -release、大小写不同）一律算没找到：静默拿「长得像的那个」下来扫，
+ * 事后没人知道扫的是哪个东西。
+ */
+export function pickAsset(release, entry) {
+  const problems = [];
+  if (!release || typeof release !== 'object') return { ok: false, problems: ['release 应答不是一个对象'] };
+  if (String(release.tag_name || '') !== String(entry.tag)) {
+    problems.push(`API 回显的 tag_name 是 "${release.tag_name}"，与清单钉的 "${entry.tag}" 不符`);
+  }
+  const assets = Array.isArray(release.assets) ? release.assets : [];
+  const exact = assets.filter((a) => String(a && a.name) === String(entry.asset));
+  if (exact.length !== 1) {
+    problems.push(`按名逐字找附件 "${entry.asset}" 找到 ${exact.length} 个（清单钉的是全名）。可用附件：${assets.map((a) => a && a.name).join(', ') || '(空)'}`);
+    return { ok: false, problems };
+  }
+  const asset = exact[0];
+  if (!asset.browser_download_url) problems.push(`附件 ${entry.asset} 没有 browser_download_url`);
+  if (Number.isInteger(asset.size) && asset.size !== entry.bytes) {
+    problems.push(`${entry.asset}：API 报 ${asset.size} 字节，清单记 ${entry.bytes} 字节 —— 上游动过这个 release，或者清单记错了`);
+  }
+  return { ok: problems.length === 0, problems, asset };
+}
+
+/**
+ * 下载后的身份绑定。**两道都要过**：
+ * 1. 字节数与清单不符 ⇒ 停；
+ * 2. 目标路径已存在同名文件而 sha256 与本次不同 ⇒ 停，**不覆盖**。
+ *
+ * 第 2 道是本仓最常翻车的地方：旧包的字节盖到新包上，之后所有扫描结论都记在一个从没存在过的
+ * 东西身上，而 dump 里的 sha256 看着完全自洽。宁可停下来让人去看，不许静默换芯。
+ * @param {string} targetPath <out>/zips/<name>.zip
+ * @param {Buffer} incoming 本次下载到的字节
+ * @param {{ bytes: number, name: string }} entry
+ * @param {{ read?: Function, write?: Function, exists?: Function, sha256?: Function }} [fs]
+ */
+export function placeZip(targetPath, incoming, entry, fs = {}) {
+  const read = fs.read || ((p) => readFileSync(p));
+  const write = fs.write || ((p, b) => writeFileSync(p, b));
+  const exists = fs.exists || ((p) => existsSync(p));
+  const sha = fs.sha256 || sha256Of;
+  const incomingSha = sha(incoming);
+  const incomingBytes = Buffer.isBuffer(incoming) ? incoming.length : Number(incomingBytesOf(incoming));
+  if (Number.isInteger(entry.bytes) && incomingBytes !== entry.bytes) {
+    return { ok: false, stopped: 'bytes-mismatch', path: targetPath, expected: entry.bytes, actual: incomingBytes, sha256: incomingSha };
+  }
+  if (exists(targetPath)) {
+    const existing = read(targetPath);
+    const existingSha = sha(existing);
+    if (existingSha !== incomingSha) {
+      return { ok: false, stopped: 'name-collision', path: targetPath, existingBytes: existing.length, existingSha, incomingSha };
+    }
+    return { ok: true, reused: true, path: targetPath, sha256: incomingSha, bytes: incomingBytes };
+  }
+  write(targetPath, incoming);
+  return { ok: true, wrote: true, path: targetPath, sha256: incomingSha, bytes: incomingBytes };
+}
+
+function incomingBytesOf(input) {
+  return Buffer.isBuffer(input) ? input.length : String(input ?? '').length;
+}
+
+/** curl -sSL 下载。只把字节收进内存，落盘由 placeZip 决定。 */
+function defaultDownload(url) {
+  const r = spawnSync('curl', ['-sSL', '--fail', '--fail-early', '--max-time', '180', url], {
+    encoding: 'buffer', maxBuffer: 64 * 1024 * 1024,
+  });
+  if (r.error) throw new Error(`curl 起不来：${r.error.message}`);
+  if (r.status !== 0) {
+    const tail = Buffer.from(r.stderr || Buffer.alloc(0)).toString('utf8').trim().slice(0, 300);
+    throw new Error(`curl 退出码 ${r.status}${tail ? `：${tail}` : ''}`);
+  }
+  return r.stdout;
+}
+
+/**
+ * 取一个 lock 行（下载来路的证人）。缺 lock 就拒绝扫 —— 不扫不知道来路的 zip。
+ * @param {string} lockPath
+ * @param {{ name: string, repo: string, tag: string, asset: string, bytes: number }} entry
+ */
+export function lockRowFor(lock, entry) {
+  const rows = Array.isArray(lock && lock.entries) ? lock.entries : [];
+  return rows.find((r) => String(r && r.name) === String(entry.name)) || null;
+}
+
+/**
+ * fetch 一个包：现问 API ⇒ 逐字挑附件 ⇒ curl 下载 ⇒ 身份绑定落盘 ⇒ 交 lock 行。
+ * @param {{ name:string, repo:string, tag:string, asset:string, bytes:number }} entry
+ * @param {object} [deps]
+ */
+export async function fetchOne(entry, deps = {}) {
+  const log = deps.log || console;
+  const zipsDir = deps.zipsDir;
+  const targetPath = join(zipsDir, `${entry.name}.zip`);
+  let release;
+  try {
+    release = await releaseForTag(entry, { apiGet: deps.apiGet });
+  } catch (err) {
+    return { ok: false, name: entry.name, why: `问 release 这一步就没成：${err.message}` };
+  }
+  const picked = pickAsset(release, entry);
+  if (!picked.ok) return { ok: false, name: entry.name, why: picked.problems.join('；') };
+
+  if (existsSync(targetPath)) log.log(`${entry.name}: ${targetPath} 已存在，照样下载一份来比字节（同名不同字节必须当场可见）`);
+  let incoming;
+  try {
+    incoming = (deps.download || defaultDownload)(picked.asset.browser_download_url);
+  } catch (err) {
+    return { ok: false, name: entry.name, why: `下载失败（${picked.asset.browser_download_url}）：${err.message}` };
+  }
+  const placed = placeZip(targetPath, incoming, entry, { read: deps.read, write: deps.write, exists: deps.exists, sha256: deps.sha256 });
+  if (!placed.ok) {
+    const why = placed.stopped === 'name-collision'
+      ? `同名不同字节：${placed.path} 已是 sha256 ${placed.existingSha}（${placed.existingBytes}B），本次下载到 ${placed.incomingSha} —— 不覆盖。可能是上游改过这个 release，也可能是旧包盖在新包上。`
+      : `字节数与清单不符：清单记 ${placed.expected}，本次拿到 ${placed.actual} —— 不覆盖。`;
+    return { ok: false, name: entry.name, why, stopped: placed.stopped };
+  }
+  return {
+    ok: true,
+    row: {
+      name: entry.name, repo: entry.repo, tag: entry.tag, asset: entry.asset,
+      url: picked.asset.browser_download_url, bytes: placed.bytes, sha256: placed.sha256,
+      fetched_at: new Date().toISOString(), reused: placed.reused === true,
+    },
+  };
+}
+
+/**
+ * 从生产报告里取一格现成的字段搭 dump 行。字段名一律取自报告，不做第二份猜法：
+ * 报告里没有 level 这个键（只有 riskLevel），逐枚二进制在 binaryForensics 而不是 binaries，
+ * decide() 返回的是对象（取 .action）。ruleHistogram 是**本工具自己数的**，报告里没有这一格。
+ * @param {{ name: string, zipSha256: string, zipBytes: number, zipPath: string }} src
+ * @param {object} report scanZip 的返回
+ */
+export function buildDumpRow(src, report) {
+  const rows = Array.isArray(report.binaryForensics) ? report.binaryForensics : [];
+  const histogram = new Map();
+  for (const f of (Array.isArray(report.findings) ? report.findings : [])) {
+    const id = String((f && f.ruleId) || '(无 ruleId)');
+    histogram.set(id, (histogram.get(id) || 0) + 1);
+  }
+  return {
+    name: src.name,
+    zipPath: src.zipPath,
+    zipBytes: src.zipBytes,
+    zipSha256: src.zipSha256,
+    riskLevel: report.riskLevel,
+    counts: report.counts,
+    decision: report.decision && report.decision.action,
+    // 本工具衍生：报告里没有 ruleHistogram 这一格，这里只是把 findings 的 ruleId 数一遍，
+    // 好让「这一包的噪声长什么样」在重跑之间可比。
+    ruleHistogram: Object.fromEntries([...histogram.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))),
+    binaries: rows.map((row) => {
+      const out = {
+        name: row.name,
+        outcome: row.outcome,
+        families: Array.isArray(row.families) ? row.families : [],
+        importCount: row.importCount,
+        sensitiveImports: Array.isArray(row.sensitiveImports) ? row.sensitiveImports : [],
+        capabilityImports: Array.isArray(row.capabilityImports) ? row.capabilityImports : [],
+        capabilityImportsTotal: row.capabilityImportsTotal,
+      };
+      if (row.machineName) out.machineName = row.machineName;
+      if (Array.isArray(row.needed)) out.needed = row.needed;
+      if (row.parseError) out.parseError = row.parseError;
+      if (row.inputCapped === true) out.inputCapped = true;
+      // 报告里这一格**只在被截时才写**，读它要 `=== true`，别假设键一定在。
+      if (row.capabilityImportsCapped === true) out.capabilityImportsCapped = true;
+      return out;
+    }),
+  };
+}
+
+/** 逐包的族集（取该包所有枚的并集，排序）。档位口径 ≥2 族才算危险族多族，见 diff 的前后表。 */
+export function familiesOfDumpRow(row) {
+  const set = new Set();
+  for (const b of (row.binaries || [])) for (const f of (b.families || [])) set.add(f);
+  return [...set].sort();
+}
+
+function renderScanTable(rows) {
+  const lines = [];
+  lines.push('包名 | ELF 数 | 每枚的族 | riskLevel | 结论');
+  lines.push('--- | --- | --- | --- | ---');
+  for (const r of rows) {
+    const per = (r.binaries || []).map((b) => `${b.name}: ${(b.families || []).join('+') || '无族'}`).join(' ; ') || '(没有 ELF)';
+    lines.push(`${r.name} | ${(r.binaries || []).length} | ${per} | ${r.riskLevel} | ${r.decision}`);
+  }
+  return lines;
+}
+
+/**
+ * 把本次取到的 lock 行合进已有 lock（按 name 覆盖同名行，其余保留）。
+ * 单独成函数是为了让 --only 跑半截时不至于把别的包证人清空 —— 那等于让 scan 再也认不出那些包。
+ * 纯函数：不碰盘，只吃两个 JSON 对象。
+ * @param {object|null} existing
+ * @param {object[]} fresh
+ */
+export function mergeLock(existing, fresh) {
+  const byName = new Map();
+  for (const r of (Array.isArray(existing && existing.entries) ? existing.entries : [])) {
+    if (r && typeof r.name === 'string') byName.set(r.name, r);
+  }
+  for (const r of (Array.isArray(fresh) ? fresh : [])) byName.set(r.name, r);
+  return {
+    schema: 'audit-corpus-lock/v1',
+    updated_at: new Date().toISOString(),
+    entries: [...byName.values()].sort((a, b) => (a.name < b.name ? -1 : 1)),
+  };
+}
+
+/**
+ * fetch：读清单 ⇒ 每条按 tag 现问 API ⇒ curl -sSL 下载 ⇒ 身份绑定落盘 ⇒ 写 <out>/corpus-lock.json。
+ * 这是本工具唯一走网络的子命令，而且必须由人显式敲；CI 不许跑。
+ * 一条身份绑定不过就整轮停下来报出来，不覆盖已有 zip。
+ */
+export async function runFetch(deps = {}) {
+  const log = deps.log || console;
+  const out = deps.out;
+  const manifest = deps.manifest;
+  const zipsDir = join(out, 'zips');
+  mkdirSync(zipsDir, { recursive: true });
+  const only = deps.only || '';
+  const wanted = manifest.entries.filter((e) => !only || e.name === only);
+  if (!wanted.length) return { code: 2, problems: [`--only "${only}" 在清单里没有这一条`] };
+
+  const problems = [];
+  const fresh = [];
+  for (const entry of wanted) {
+    const r = await fetchOne(entry, {
+      zipsDir, log, apiGet: deps.apiGet, download: deps.download,
+      read: deps.read, write: deps.write, exists: deps.exists, sha256: deps.sha256,
+    });
+    if (r.ok) {
+      fresh.push(r.row);
+      log.log(`${entry.name}: ${r.row.bytes} 字节 sha256=${r.row.sha256}（${r.row.reused ? '与盘上一致，未改写' : '新落盘'}）`);
+    } else {
+      problems.push(`${r.name}: ${r.why}`);
+      log.error(`停下来 ${r.name}: ${r.why}`);
+    }
+  }
+  const lockPath = join(out, LOCK_NAME);
+  const existing = existsSync(lockPath) ? safeReadJson(lockPath) : null;
+  const lock = mergeLock(existing, fresh);
+  writeFileSync(lockPath, `${JSON.stringify(lock, null, 2)}\n`);
+  log.log(`lock 写了 ${fresh.length} 条（本次成功），累计 ${lock.entries.length} 条 ⇒ ${lockPath}`);
+  if (problems.length) return { code: 1, problems, lock };
+  return { code: 0, problems: [], lock };
+}
+
+function safeReadJson(p) {
+  try {
+    return JSON.parse(readFileSync(p, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把本次扫到的行合进已有 dump（按包名覆盖同名行，其余保留）。
+ * 为什么必须有这一格：--only 只想重扫一个包时，直接把 dump 写成「只剩这一行」，
+ * 下一步 diff 读到的就是一张只有一枚包的表，而它打印出来的汇总看着完全自洽 ——
+ * 于是「整个语料都不变」这个结论其实是「只有一个包」。
+ * @param {object|null} existing
+ * @param {object[]} fresh
+ * @param {{ current?: Array<[string, string, string[]]> }} [opts]
+ */
+export function mergeDump(existing, fresh, opts = {}) {
+  const current = opts.current || CAPABILITY_FAMILIES;
+  const byName = new Map();
+  for (const r of (Array.isArray(existing && existing.rows) ? existing.rows : [])) {
+    if (r && typeof r.name === 'string') byName.set(r.name, r);
+  }
+  for (const r of (Array.isArray(fresh) ? fresh : [])) byName.set(r.name, r);
+  return {
+    schema: 'audit-corpus-dump/v1',
+    generatedAt: new Date().toISOString(),
+    tool: 'scripts/audit-corpus.mjs scan',
+    // 这份 dump 是用哪一张表扫出来的。diff 那一步会**读**它：与现表一漂就整张作废、退出码 2
+    // （tableDriftProblems），另有一道逐枚比对兜住「表没漂但这份 dump 是旧工具写的」那种形状。
+    currentTable: current.map(([f, , ps]) => [f, ps]),
+    rows: [...byName.values()].sort((a, b) => (a.name < b.name ? -1 : 1)),
+  };
+}
+
+/**
+ * scan：读 <out>/zips/*.zip（按 lock 逐条核字节与 sha256）⇒ 每个包跑生产入口
+ * scanZip(路径, { changeType: 'first' }) ⇒ 写 <out>/corpus-dump.json ⇒ 打人读表。
+ * 只读，不执行包里任何东西。
+ */
+export async function runScan(deps = {}) {
+  const log = deps.log || console;
+  const out = deps.out;
+  const manifest = deps.manifest;
+  const zipsDir = join(out, 'zips');
+  const lockPath = join(out, LOCK_NAME);
+  if (!existsSync(lockPath)) {
+    return { code: 2, problems: [`没有 ${LOCK_NAME} —— 拒绝扫描：不扫来路不明的 zip。先跑 fetch。`] };
+  }
+  let lock;
+  try {
+    lock = JSON.parse(readFileSync(lockPath, 'utf8'));
+  } catch (err) {
+    return { code: 2, problems: [`${LOCK_NAME} 读不出来：${err.message}`] };
+  }
+  const only = deps.only || '';
+  const wanted = manifest.entries.filter((e) => !only || e.name === only);
+  if (!wanted.length) return { code: 2, problems: [`--only "${only}" 在清单里没有这一条`] };
+  const rows = [];
+  const problems = [];
+  for (const entry of wanted) {
+    const row = lockRowFor(lock, entry);
+    if (!row) { problems.push(`${entry.name} 不在 ${LOCK_NAME} 里 —— 它没有来路证人，不扫。`); continue; }
+    const zipPath = join(zipsDir, `${entry.name}.zip`);
+    if (!existsSync(zipPath)) { problems.push(`${zipPath} 不在盘上（fetch 没成功或被删）。`); continue; }
+    const actual = sha256Of(zipPath);
+    if (actual !== row.sha256) {
+      problems.push(`${entry.name}: 盘上字节 sha256 ${actual} 与 lock 记的 ${row.sha256} 不一致 —— 停下来，不扫一个说不清来路的东西。`);
+      continue;
+    }
+    if (Number.isInteger(row.bytes) && statSize(zipPath) !== row.bytes) {
+      problems.push(`${entry.name}: 盘上 ${statSize(zipPath)} 字节与 lock 记的 ${row.bytes} 不符。`);
+      continue;
+    }
+    let report;
+    try {
+      report = await scanZip(zipPath, { changeType: 'first' });
+    } catch (err) {
+      problems.push(`${entry.name}: scanZip 抛了 —— ${err && err.message}`);
+      continue;
+    }
+    rows.push(buildDumpRow({
+      name: entry.name, zipPath, zipBytes: statSize(zipPath), zipSha256: row.sha256,
+    }, report));
+  }
+  if (problems.length) return { code: 1, problems, rows };
+  const dumpPath = join(out, DUMP_NAME);
+  const existing = existsSync(dumpPath) ? safeReadJson(dumpPath) : null;
+  const dump = mergeDump(existing, rows);
+  writeFileSync(dumpPath, `${JSON.stringify(dump, null, 2)}\n`);
+  const carried = dump.rows.length - rows.length;
+  log.log(`扫了 ${rows.length} 个包，dump 里累计 ${dump.rows.length} 个${carried > 0 ? `（${carried} 行是上一轮留下的，本轮没重扫）` : ''} ⇒ ${dumpPath}`);
+  for (const line of renderScanTable(rows)) log.log(line);
+  const capped = rows.flatMap((r) => (r.binaries || []).filter((b) => b.capabilityImportsCapped === true).map((b) => `${r.name}/${b.name}`));
+  if (capped.length) log.log(`注意：这些枚的族名单被截过（族数偏低的那一格）：${capped.join(', ')}`);
+  return { code: 0, problems: [], rows, dumpPath: join(out, DUMP_NAME) };
+}
+
+function statSize(p) {
+  try {
+    return statSync(p).size;
+  } catch {
+    return -1;
+  }
+}
+
+/**
+ * 族数档位：0/1 族 → medium，≥2 族 → high（照 audit/risk-rules.mjs 表③④⑤ 那一条公式）。
+ * 这里**只报族数落在哪一档**，不重算 riskLevel 也不重算 decision —— 那两个还吃别的发现，
+ * 在这里复制一份就是发明第二把定级尺，正是这工具要避免的事。
+ */
+export function familyTier(families) {
+  return (Array.isArray(families) ? families.length : 0) >= 2 ? 'high' : 'medium';
+}
+
+/**
+ * candidate 必须是现表的**收窄**。返回问题数组（空即合格）。
+ * 为什么要拦加严：dump 带的是**已经命中现表**的名字集，全量 UND 进料不在这份数据里。
+ * 往表里加前缀时，那些新名字从来就没进过 dump，重算当然一个都不中 —— 于是得到一张
+ * 假的「0 移动」表，而它看起来像证据。
+ * @param {Array<[string, string, string[]]>} candidate
+ * @param {Array<[string, string, string[]]>} current
+ */
+export function candidateNarrowingProblems(candidate, current = CAPABILITY_FAMILIES) {
+  assertFamilyTable(candidate, '候选');
+  assertFamilyTable(current, '现');
+  const currentFamilies = new Map();
+  for (const [family, , prefixes] of current) {
+    if (!currentFamilies.has(family)) currentFamilies.set(family, new Set());
+    for (const p of prefixes) currentFamilies.get(family).add(p);
+  }
+  const problems = [];
+  for (const [family, , prefixes] of candidate) {
+    if (!currentFamilies.has(family)) {
+      problems.push(`候选里出现了现表没有的族名 "${family}"：加族等于加严，同样的假 0 移动`);
+      continue;
+    }
+    const known = currentFamilies.get(family);
+    for (const p of prefixes) {
+      if (!known.has(p)) {
+        const elsewhere = current.filter(([, , ps]) => ps.includes(p)).map(([f]) => f);
+        problems.push(`候选给族 ${family} 新增了前缀 "${p}"（现表里${elsewhere.length ? `它在 ${elsewhere.join('/')}` : '它根本不存在'}）—— `
+          + 'dump 里的名字集是**已命中现表**的那一份，加严需要全量 UND 进料，那份数据不在这里，拿这张表算加严是假的 0 移动');
+      }
+    }
+  }
+  return problems;
+}
+
+/**
+ * dump 里那格 `currentTable` 是「这份 dump 用哪一张成员表扫出来的」的唯一证人。
+ * 写它却不读它，就等于在前后表上盖了一个来源不明的章 —— 而 B 那一发改的正是这张表：
+ * 没有这道闸，将来有人拿到一张 step4-diff.txt 时分不清它是改前扫的还是改后扫的，
+ * 而「前栏来自生产报告」那句话就变成了猜测。
+ *
+ * 只回**至多一条**：成员表是一整个前置条件，炸了就整张作废。逐族列问题会让人以为能挑着用。
+ *
+ * @param {Array<[string, string[]]>} dumpTable  dump 里的形状（没有那个人类标签那一元）
+ * @param {Array<[string, string, string[]]>} [liveTable]  代码里那份现表
+ */
+export function tableDriftProblems(dumpTable, liveTable = CAPABILITY_FAMILIES) {
+  // 两种形状都收：[族, 前缀…] 与 [族, 标签, 前缀…] ⇒ 取最后一个数组当成员表。
+  const norm = (t) => {
+    const m = new Map();
+    for (const row of (Array.isArray(t) ? t : [])) {
+      if (!Array.isArray(row) || typeof row[0] !== 'string') continue;
+      const ps = Array.isArray(row[row.length - 1]) ? row[row.length - 1].map(String) : [];
+      m.set(row[0], new Set(ps));
+    }
+    return m;
+  };
+  const dump = norm(dumpTable);
+  const live = norm(liveTable);
+  const order = [...live.keys(), ...[...dump.keys()].filter((f) => !live.has(f))];
+  const details = [];
+  for (const family of order) {
+    if (!dump.has(family)) { details.push(`${family}：dump 里整族没有`); continue; }
+    if (!live.has(family)) { details.push(`${family}：现表里已经没有这一族`); continue; }
+    const inDump = [...dump.get(family)].filter((p) => !live.get(family).has(p));
+    const inLive = [...live.get(family)].filter((p) => !dump.get(family).has(p));
+    if (inDump.length || inLive.length) {
+      details.push(`${family}：dump 多 [${inDump.join(',')}] / 现表多 [${inLive.join(',')}]`);
+    }
+  }
+  if (!details.length) return [];
+  return [`dump 的成员表与现表不一致（${details.join('；')}）⇒ 这份 dump 不是用现表扫的，`
+    + '前栏那格 families 的来源就不明 —— 先重跑 scan 再打前后表。'];
+}
+
+/**
+ * 用候选表在**族进料**上重算族集，出前后两栏。
+ * @param {object} dump runScan 写出的那份 corpus-dump.json
+ * @param {Array<[string, string, string[]]>} candidateTable
+ * @param {{ current?: Array<[string, string, string[]]> }} [opts]
+ */
+export function diffDump(dump, candidateTable, opts = {}) {
+  const current = opts.current || CAPABILITY_FAMILIES;
+  // 表来源先问一遍：漂了就整张作废，不产出任何前后表。
+  // 旧 dump 没有这一格 ⇒ 不拒（退回逐枚比对那道闸，行为与加这道闸之前一字相同）。
+  const tableDrift = Array.isArray(dump && dump.currentTable)
+    ? tableDriftProblems(dump.currentTable, current) : [];
+  if (tableDrift.length) {
+    return {
+      problems: tableDrift,
+      tableDrift,
+      packages: [],
+      summary: {
+        packages: 0, binaries: 0, packagesWithFamilyChange: 0, packagesWithTierChange: 0,
+        binariesCrossingTheTwoFamilyEdge: 0, problems: tableDrift.length,
+      },
+    };
+  }
+  const problems = [];
+  const packages = [];
+  let crossed = 0;
+  for (const pkg of (Array.isArray(dump && dump.rows) ? dump.rows : [])) {
+    const binaries = [];
+    const beforeSet = new Set();
+    const afterSet = new Set();
+    for (const b of (Array.isArray(pkg.binaries) ? pkg.binaries : [])) {
+      const feed = Array.isArray(b.capabilityImports) ? b.capabilityImports : [];
+      const recomputedCurrent = familiesUnder(feed, current);
+      const reported = Array.isArray(b.families) ? b.families : [];
+      // 两栏必须是同一个东西：报告里那格 families 就是现表算出来的。不一致说明 dump 与词汇表
+      // 已经脱节（上游改过表、或者 dump 是旧版工具写的），这时候前后表没有意义。
+      if (JSON.stringify(recomputedCurrent) !== JSON.stringify(reported)) {
+        problems.push(`${pkg.name}/${b.name}：报告里的 families ${JSON.stringify(reported)} `
+          + `与现表重算 ${JSON.stringify(recomputedCurrent)} 不一致 —— dump 过期了，先重跑 scan`);
+      }
+      const after = familiesUnder(feed, candidateTable);
+      const t0 = familyTier(reported);
+      const t1 = familyTier(after);
+      if (t0 !== t1) crossed += 1;
+      for (const f of reported) beforeSet.add(f);
+      for (const f of after) afterSet.add(f);
+      binaries.push({
+        name: b.name,
+        feedCount: feed.length,
+        before: reported,
+        after,
+        beforeCount: reported.length,
+        afterCount: after.length,
+        beforeTier: t0,
+        afterTier: t1,
+        changed: reported.length !== after.length || t0 !== t1,
+        // 前栏直接来自生产报告（report.binaryForensics[].families），后栏是候选表在这枚的
+        // capabilityImports 上重算的 —— 两栏同源才可比。
+        beforeSource: 'report',
+        afterSource: 'candidate-recomputed',
+      });
+    }
+    const pkgBefore = [...beforeSet].sort();
+    const pkgAfter = [...afterSet].sort();
+    const worst = (rows, key) => (rows.some((r) => r[key] === 'high') ? 'high' : 'medium');
+    const worstBefore = worst(binaries, 'beforeTier');
+    const worstAfter = worst(binaries, 'afterTier');
+    packages.push({
+      name: pkg.name,
+      zipSha256: pkg.zipSha256,
+      riskLevel: pkg.riskLevel,
+      decision: pkg.decision,
+      binaries,
+      packageFamiliesBefore: pkgBefore,
+      packageFamiliesAfter: pkgAfter,
+      packageTierBefore: pkgBefore.length >= 2 ? 'high' : 'medium',
+      packageTierAfter: pkgAfter.length >= 2 ? 'high' : 'medium',
+      tierChanged: worstBefore !== worstAfter || pkgBefore.length !== pkgAfter.length,
+    });
+  }
+  const summary = {
+    packages: packages.length,
+    binaries: packages.reduce((a, p) => a + p.binaries.length, 0),
+    packagesWithFamilyChange: packages.filter((p) => JSON.stringify(p.packageFamiliesBefore) !== JSON.stringify(p.packageFamiliesAfter)).length,
+    packagesWithTierChange: packages.filter((p) => p.packageTierBefore !== p.packageTierAfter).length,
+    binariesCrossingTheTwoFamilyEdge: crossed,
+    problems: problems.length,
+  };
+  return { problems, packages, summary, tableDrift: [] };
+}
+
+function renderDiffTable(result) {
+  const lines = [];
+  for (const p of result.packages) {
+    lines.push(`${p.name}（zip sha256=${String(p.zipSha256).slice(0, 12)}…，报告口径 riskLevel=${p.riskLevel}/${p.decision}）`);
+    for (const b of p.binaries) {
+      lines.push(`  枚级 ${b.name}：族 ${b.beforeCount}→${b.afterCount}  ${b.before.join('+') || '无'} → ${b.after.join('+') || '无'}`
+        + ` ；档 ${b.beforeTier}→${b.afterTier}${b.beforeTier !== b.afterTier ? '  ★跨 ≥2 那条边界' : ''}`);
+    }
+    lines.push(`  包级（取最严）：族集 ${p.packageFamiliesBefore.join('+') || '无'} → ${p.packageFamiliesAfter.join('+') || '无'}`
+      + ` ；档 ${p.packageTierBefore}→${p.packageTierAfter}${p.packageTierBefore !== p.packageTierAfter ? '  ★会变' : ''}`);
+  }
+  const s = result.summary;
+  lines.push(`汇总：${s.packages} 个包 / ${s.binaries} 枚；族集有变的包 ${s.packagesWithFamilyChange} 个，`
+    + `包级最严档有变的包 ${s.packagesWithTierChange} 个，跨 ≥2 那条边界的枚数 ${s.binariesCrossingTheTwoFamilyEdge}。`);
+  lines.push('（档这一栏只是族数落在 0/1 还是 ≥2，不重算 riskLevel 与 decision —— 那两个还吃别的发现，'
+    + '这里复制一份就成了第二把定级尺。）');
+  return lines;
+}
+
+/**
+ * diff：读 <out>/corpus-dump.json 与 --candidate 那份候选族表，只在族进料上重算族集，打前后表。
+ * candidate 里有新增前缀（或新增族）就 exit 2 —— 理由见 candidateNarrowingProblems。
+ */
+export function runDiff(deps = {}) {
+  const log = deps.log || console;
+  const out = deps.out;
+  if (!deps.candidate) {
+    return { code: 2, problems: ['diff 要 --candidate <path>：候选族表就是这一发要量的那个形状。'] };
+  }
+  const dumpPath = join(out, DUMP_NAME);
+  if (!existsSync(dumpPath)) return { code: 2, problems: [`没有 ${dumpPath} —— 先跑 scan。`] };
+  let dump;
+  try {
+    dump = JSON.parse(readFileSync(dumpPath, 'utf8'));
+  } catch (err) {
+    return { code: 2, problems: [`dump 读不出来：${err.message}`] };
+  }
+  let candidate;
+  try {
+    candidate = JSON.parse(readFileSync(deps.candidate, 'utf8'));
+  } catch (err) {
+    return { code: 2, problems: [`候选表读不出来（${deps.candidate}）：${err.message}`] };
+  }
+  if (candidate && typeof candidate === 'object' && !Array.isArray(candidate) && Array.isArray(candidate.families)) {
+    candidate = candidate.families;                                 // 允许包一层 {"families": […]}
+  }
+  try {
+    assertFamilyTable(candidate, '候选表');
+  } catch (err) {
+    return { code: 2, problems: [`候选表形状不对：${err.message}`] };
+  }
+  const widening = candidateNarrowingProblems(candidate, CAPABILITY_FAMILIES);
+  if (widening.length) {
+    for (const w of widening) log.error(`候选表加严了：${w}`);
+    return { code: 2, problems: widening };
+  }
+  const result = diffDump(dump, candidate);
+  // 表来源漂了是**前置条件不成立**（和「没有 dump」「候选表加严」同一类），所以退出码 2；
+  // 逐枚比对那种不一致留给 code 1 —— 那种是「算出来了但账对不上」，人还可以看剩下的表。
+  if (result.tableDrift.length) {
+    for (const d of result.tableDrift) log.error(d);
+    return { code: 2, problems: result.tableDrift, result };
+  }
+  for (const p of result.problems) log.error(p);
+  if (result.problems.length) return { code: 1, problems: result.problems, result };
+  for (const line of renderDiffTable(result)) log.log(line);
+  return { code: 0, problems: [], result };
+}
+
+/**
+ * selftest：零网络、零 zip，把上面几个纯函数的关键刻度当场量一遍。
+ * 这里放的是「不需要真包就能钉住」的那几条，其余在 test/audit-corpus.test.mjs。
+ */
+export function runSelftest(deps = {}) {
+  const log = deps.log || console;
+  const manifestPath = deps.manifestPath || DEFAULT_MANIFEST;
+  const problems = [];
+  const need = (cond, msg) => { if (!cond) problems.push(msg); };
+
+  const names = ['execvp', 'mkdir', 'unlink'];
+  need(JSON.stringify(familiesUnder(names, CAPABILITY_FAMILIES)) === JSON.stringify(['EXEC', 'FILEWRITE']),
+    `familiesUnder(${names.join(',')}, 现表) 应为 [EXEC,FILEWRITE]`);
+  need(JSON.stringify(familiesUnder([], CAPABILITY_FAMILIES)) === JSON.stringify([]),
+    '空进料必须有确定的空输出');
+
+  // 现表上两套算法一字不差 —— 判据只有一份这件事的当场自检。
+  const probe = ['execve', 'socket', 'setns', '__system_property_get', 'unlink', 'fork', 'mkdir', 'chdir', 'bogus_name'];
+  need(JSON.stringify(familiesUnder(probe, CAPABILITY_FAMILIES)) === JSON.stringify(capabilityFamilies(probe)),
+    '同表时 familiesUnder 与 capabilityFamilies 必须一字不差（出现了第二份词汇表）');
+
+  // 收窄只可能让族变少。
+  const narrowed = CAPABILITY_FAMILIES.map(([f, l, ps]) => [f, l, f === 'FILEWRITE' ? ps.filter((p) => p !== 'unlink' && p !== 'mkdir') : ps]);
+  need(familiesUnder(names, narrowed).length <= familiesUnder(names, CAPABILITY_FAMILIES).length,
+    '摘成员之后族数反而变多 —— 单调性破了');
+
+  let manifest;
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  } catch (err) {
+    problems.push(`清单读不出来（${manifestPath}）：${err.message}`);
+  }
+  if (manifest) {
+    const v = validateManifest(manifest);
+    for (const e of v.errors) problems.push(`清单：${e}`);
+    need(v.entries.length === 5, `清单应当是 5 条，实测 ${v.entries.length}`);
+  }
+
+  need(findGitWorktreeRoot(process.execPath, { hasDotGit: () => false }) === null, '祖先链走到文件系统根应当收口');
+
+  // 收窄那道闸当场验一次：加前缀必须被拦，现表自己是合格候选。
+  need(candidateNarrowingProblems(CAPABILITY_FAMILIES, CAPABILITY_FAMILIES).length === 0, '现表自己应当是合格的候选表');
+  const widened = CAPABILITY_FAMILIES.map(([f, l, ps]) => (f === 'EXEC' ? [f, l, [...ps, 'ptrace']] : [f, l, ps]));
+  need(candidateNarrowingProblems(widened, CAPABILITY_FAMILIES).length > 0, '候选表加了新前缀却没被拦下 —— 那张表会给出假的 0 移动');
+
+  // 族数档位那一条公式：0/1 → medium，≥2 → high。
+  need(familyTier(['EXEC']) === 'medium' && familyTier(['EXEC', 'NS']) === 'high' && familyTier([]) === 'medium',
+    '族数档位公式与 audit/risk-rules.mjs 表③④⑤ 那条不一致');
+
+  // dump 里 currentTable 那一格当场验一次：同表放过、漂一个前缀必须报。
+  // 漂移取「第一个族少掉它的第一个前缀」这种通用形状 —— 写死某个成员名会让自检跟着表一起腐坏。
+  const asDumpTable = CAPABILITY_FAMILIES.map(([f, , ps]) => [f, ps]);
+  need(tableDriftProblems(asDumpTable, CAPABILITY_FAMILIES).length === 0, '现表自己不该报表漂');
+  const driftProbe = asDumpTable.map(([f, ps], i) => [f, i === 0 ? ps.slice(1) : ps]);
+  need(tableDriftProblems(driftProbe, CAPABILITY_FAMILIES).length === 1,
+    'dump 的表少掉一个前缀却没报 —— currentTable 那一格又变成装饰品了');
+
+  for (const p of problems) log.error(`selftest 不通过：${p}`);
+  if (problems.length) return 1;
+  log.log('ok');
+  return 0;
+}
+
+/**
+ * @param {string[]} argv
+ * @param {{ log?: { log:Function, error:Function }, fetchImpl?:Function, runDownload?:Function }} [deps]
+ * @returns {Promise<number>} 退出码
+ */
+export async function main(argv = process.argv.slice(2), deps = {}) {
+  const log = deps.log || console;
+  const opts = parseArgs(argv);
+  if (opts.help && !opts.command) {
+    log.log(USAGE);
+    return 0;
+  }
+  if (!opts.command || !SUBCOMMANDS.includes(opts.command)) {
+    log.error(`子命令 "${opts.command || '(空)'}" 不在值域里 —— 只认 ${SUBCOMMANDS.join('/')}。`);
+    log.error(USAGE);
+    return 2;
+  }
+  if (!opts.out) {
+    log.error('缺 --out：产物必须显式给一个仓库外的目录。');
+    log.error(USAGE);
+    return 2;
+  }
+  const gate = checkOutDir(opts.out);
+  if (!gate.ok) {
+    log.error(gate.reason);
+    log.error(USAGE);
+    return 2;
+  }
+
+  if (opts.command === 'selftest') {
+    return runSelftest({ log, manifestPath: opts.manifest });
+  }
+
+  let manifestJson = null;
+  try {
+    manifestJson = JSON.parse(readFileSync(opts.manifest, 'utf8'));
+  } catch (err) {
+    log.error(`清单读不出来（${opts.manifest}）：${err.message}`);
+    return 2;
+  }
+  const checked = validateManifest(manifestJson);
+  if (!checked.ok) {
+    for (const e of checked.errors) log.error(`清单：${e}`);
+    log.error(USAGE);
+    return 2;
+  }
+  const manifest = { schema: manifestJson.schema, entries: checked.entries };
+
+  if (opts.command === 'fetch') {
+    const r = await runFetch({
+      log, out: gate.abs, manifest, only: opts.only,
+      apiGet: deps.apiGet, download: deps.download, read: deps.read, write: deps.write, exists: deps.exists, sha256: deps.sha256,
+    });
+    for (const p of r.problems) log.error(p);
+    return r.code;
+  }
+  if (opts.command === 'scan') {
+    const r = await runScan({ log, out: gate.abs, manifest, only: opts.only });
+    for (const p of r.problems) log.error(p);
+    return r.code;
+  }
+  if (opts.command === 'diff') {
+    const r = runDiff({ log, out: gate.abs, candidate: opts.candidate ? resolve(opts.candidate) : '' });
+    for (const p of r.problems) log.error(p);
+    if (r.code === 2) log.error(USAGE);
+    return r.code;
+  }
+  log.error(`子命令 ${opts.command} 还没接到这次交付里。`);
+  log.error(USAGE);
+  return 1;
+}
+
+// 入口判据用 resolve 比对绝对路径（与本仓其它 CLI 同一个形状）：拿 argv[1] 拼 file:// URL
+// 在 Windows 上永远不等于 import.meta.url，脚本会静默不跑。
+if (isCliEntry(process.argv[1], fileURLToPath(import.meta.url))) {
+  main().then((rc) => { process.exitCode = rc; });
+}

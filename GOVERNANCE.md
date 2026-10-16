@@ -103,3 +103,31 @@
 - 签核人名单 = org 成员，所以 org 管理员实际上决定签核权（第 1 节已写明）。
 - 目前实际维护者是一个人。也就是说「两个不同的人」这一条在多数时候意味着
   「我和一个愿意签的朋友」—— 比单人强，但别把它读成成熟的多人共治。
+
+## 8. AI 安全员（QCA）的换代纪律
+
+`audit.yml` 的 `id: ai` 那一步只认四个 variables 加一个 secret，且**只加严、永远不决定放行**：
+
+| 键 | 含义 |
+| --- | --- |
+| `QODER_PAT`（secret） | 运行这一发的那把凭据。**资源必须建在同一把凭据的账号里** —— 用别的身份 `list` 出来能看到不算配好，要用它 `GET` 一次那个 id |
+| `QCA_AGENT_ID` / `QCA_AGENT_VERSION` | agent 与**整数版本**。版本号必须成对改：跟着 latest 走 = 谁改了 system prompt 都是改了闸，而 CI 完全看不见 |
+| `QCA_ENVIRONMENT_ID` | 排程环境：`networking=limited`、不给 MCP、不给包管理、不装任何包（这一层不执行投稿者的代码） |
+| `QCA_PROMPT_SHA` | 期望的 prompt 摘要。设了且对不上 ⇒ 退出码 2、状态文件都写不出来；不设 ⇒ 只把算出的值记进产物 |
+
+换代只有三句，顺序不许变（`repo/` 下执行）：
+
+```sh
+node -e "import('./audit/ai-review.mjs').then(m=>console.log(m.PROMPT_SHA256))"   # 现算，别抄任何文档里的旧值
+# 用脚本 import 同一份 SYSTEM_PROMPT 更新 agent（POST /agents/<id> 带当前 version），再取回显算第二遍：
+# 两次 sha 必须相等，也要等于上面那行；然后才改 QCA_PROMPT_SHA / QCA_AGENT_VERSION 这一对。
+gh variable list -R <repo> | grep QCA                                              # 回读，不复述命令输出
+```
+
+**手抄 prompt 是被 sha 闸抓住的错，但它抓住的方式是 CI 红，不是静默跑偏** ⇒ 这类东西要么程序生成，
+要么抄完双份对 sha。两处实测过的代价要带着：
+
+- 判定的墙钟里大头是**排程**而不是模型（本机两发：约 312s 与约 790s，后者 635s 还在 `rescheduling`）。
+  超时会把这一层念成 `failed`（往严，不会误放行），但**掐断之后那一发照样计费** ⇒ 超时不是免费的保守。
+- 单发小包实测 `usage.total_credits` ≈ 10.72（≈21.5 KB brief、`medium`）。credits 与钱的换算没核过，
+  「一条多包 PR × 每包一发」是本闸的真实成本形状，别按单次调用估。
