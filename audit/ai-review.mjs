@@ -441,6 +441,16 @@ function forensicsDigest(name, forensicsByName) {
     parts.push(`敏感导入 ${sensitive.length} ${shown}`
       + (sensitive.length > FORENSICS_IMPORT_CAP ? `…（还有 ${sensitive.length - FORENSICS_IMPORT_CAP} 个）` : ''));
   }
+  // S3-A（工单 §2.3）：A 之后族来自 `capabilityImports`（全量 UND 里命中族表的那份），不是上面那份
+  // 给人看的筛后名单。少这一段就会喂给模型一个自相矛盾的投影 —— 只导入 execvp 的 .so 会念成
+  // 「能力族 EXEC，但同一行的名单里一个 EXEC 成员都没有」，而这一层的职责正是判断静态结论偏不偏松。
+  // 上面那段（敏感导入）是呈现面，留着不动；这里复用同一对上限与同一把消毒。
+  const famHits = Array.isArray(row.capabilityImports) ? row.capabilityImports : [];
+  if (famHits.length) {
+    const shown = famHits.slice(0, FORENSICS_IMPORT_CAP).map((s) => t(s, 40)).join(',');
+    parts.push(`危险族命中导入 ${famHits.length} ${shown}`
+      + (famHits.length > FORENSICS_IMPORT_CAP ? `…（还有 ${famHits.length - FORENSICS_IMPORT_CAP} 个）` : ''));
+  }
   const needed = Array.isArray(row.needed) ? row.needed : [];
   if (needed.length) parts.push(`NEEDED ${needed.slice(0, FORENSICS_NEEDED_CAP).map((s) => t(s, 30)).join(',')}`);
   const families = Array.isArray(row.families) ? row.families : [];

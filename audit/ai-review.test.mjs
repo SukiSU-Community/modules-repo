@@ -17,7 +17,7 @@ import {
   SYSTEM_PROMPT, STATUS_VALUES, MODULE_WRITABLE_STATUSES, MIN_MAX_TOKENS, QCA_BASE,
   sanitizeUntrusted, BUDGET_BASIS, QFMODEL_MAX_INPUT_TOKENS, DEFAULT_MAX_BRIEF_BYTES,
   EVENT_PAGE_SIZE, MAX_EVENT_PAGES, MAX_RAW_EXCERPT, UNTRUSTED_MARK, OVER_BUDGET_REASON_CODES,
-  PROMPT_SHA256, NON_TEXT_MARK, FORENSICS_LINE_CAP,
+  PROMPT_SHA256, NON_TEXT_MARK, FORENSICS_LINE_CAP, FORENSICS_IMPORT_CAP,
 } from './ai-review.mjs';
 import { detectBinary, trimSnippet } from './risk-rules.mjs';
 import { scanZip, isCliEntry, isNonTextContent, readZip } from './scan.mjs';
@@ -1527,6 +1527,51 @@ test('M1-4 跳过必登记：③ 那一行要同时给元信息、静态记账�
   assert.ok(/能力族 EXEC,NET/.test(line) && /敏感导入 3 fork,ptrace,socket/.test(line));
   const other = b.text.split('\n').find((l) => l.startsWith('- zygisk/x86_64.so |'));
   assert.ok(other && !/链接期取证/.test(other), '报告里没有对应取证行时不许编一条出来');
+});
+
+test('S3A-20 ③ 的投影不许自相矛盾：族来自 capabilityImports ⇒ 同一行必须打印它的成员名字', () => {
+  // 形状就是 A 之后真会出现的那一发：一枚只导入 execvp 的 .so。
+  // 少这一段的话，模型读到「能力族 EXEC」而同一行名单（敏感导入）里一个 EXEC 成员都没有，
+  // 而这一层的职责正是判断静态结论是不是偏松 —— 喂它一个自相矛盾的投影等于没喂。
+  const elf = Buffer.concat([Buffer.from(ELF8), randomBuf(21, 700)]);
+  const report = {
+    ...R,
+    binaryForensics: [{
+      name: 'zygisk/execvp.so', kind: 'ELF', entryBytes: 708, outcome: 'ELF_FAMILY',
+      machineName: 'ARM', type: 'EXEC', stripped: true, importCount: 1,
+      sensitiveImports: [],                       // 旧进料（呈现面）：execvp 从来进不到这里
+      capabilityImports: ['execvp'], capabilityImportsTotal: 1,
+      needed: ['libc.so'], families: ['EXEC'],
+      summary: 'zygisk/execvp.so：ELF（ARM，1 个导入，已 strip） —— 链接期一定会用到 1 类危险能力：EXEC 起新程序/运行时加载（execvp）。',
+    }],
+    binaries: [{ name: 'zygisk/execvp.so', kind: 'ELF', bytes: 708 }],
+  };
+  const b = buildBrief({ report, entries: [file('module.prop', 'id=demo\n'), entryOf('zygisk/execvp.so', elf)] });
+  const line = b.text.split('\n').find((l) => l.startsWith('- zygisk/execvp.so |'));
+  assert.ok(line, `③ 必须有这一行：${b.text.slice(0, 400)}`);
+  assert.match(line, /能力族 EXEC/);
+  assert.match(line, /危险族命中导入 1 execvp/,
+    `族名与它的成员名字要同一行可见（A 之后族不再来自敏感导入那份名单）：${line}`);
+  assert.equal(line.includes('敏感导入'), false, '那份筛后名单空就别打印，不许拿它冒充族的证据');
+});
+
+test('S3A-21 危险族命中导入那一行的两条边角：条数上限复用 FORENSICS_IMPORT_CAP，缺字段就不打印', () => {
+  const elf = Buffer.concat([Buffer.from(ELF8), randomBuf(22, 600)]);
+  const many = Array.from({ length: FORENSICS_IMPORT_CAP + 3 }, (_, i) => `unlink_s${String(i).padStart(2, '0')}`);
+  const mk = (extra) => ({
+    name: 'z.so', kind: 'ELF', entryBytes: 608, outcome: 'ELF_FAMILY', importCount: many.length,
+    families: ['FILEWRITE'], summary: 's', ...extra,
+  });
+  const lineOf = (row) => {
+    const b = buildBrief({ report: { ...R, binaryForensics: [row] }, entries: [entryOf('z.so', elf)] });
+    return b.text.split('\n').find((l) => l.startsWith('- z.so |')) || '';
+  };
+  const capped = lineOf(mk({ capabilityImports: many, capabilityImportsTotal: many.length }));
+  assert.match(capped, new RegExp(`危险族命中导入 ${many.length}`), '报的是名单条数');
+  assert.ok(capped.includes(`…（还有 3 个）`), `超出呈现上限要照「敏感导入」那句写明还剩几个：${capped.slice(-120)}`);
+  assert.equal(capped.includes(many[many.length - 1]), false, '上限之外的名字不许挤进这一行');
+  const absent = lineOf(mk({ sensitiveImports: ['fork'] }));
+  assert.equal(absent.includes('危险族命中导入'), false, '老报告没有这个字段时不许编一条出来（也不许炸）');
 });
 
 test('M1-5 polyglot 送全文并可逐字复验（静态按 T4 读过的条目，AI 不许只拿元信息）', () => {
