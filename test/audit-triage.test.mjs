@@ -229,7 +229,11 @@ function runAiStep(opts = {}) {
   let stdout = '';
   let stderr = '';
   try {
-    const r = execFileSync('bash', ['ai-step.sh'], {
+    // 起法必须与 runner 一致（2026-10-16 run 38904316355 实测到的）：GitHub 对 `shell: bash` 展开成
+    // `bash --noprofile --norc -e -o pipefail` —— **那个 `-e` 是 runner 给的，脚本里写 `set -uo pipefail`
+    // 撤不掉它**。旧夹具用 `bash ai-step.sh`（没有 -e），跑这段 bash 的用例就全在比线上宽松一档的壳里：
+    // 同一个缺陷（把 `|| CODE=$?` 退回裸 `node` + `CODE=$?`）在旧夹具下 57/57 全绿，在忠实夹具下 5 红。
+    const r = execFileSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', 'ai-step.sh'], {
       cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env,
     });
     stdout = r.stdout;
@@ -485,11 +489,22 @@ test('AI 步：脚本崩溃（非 0 也非 2、没写状态）→ 同一条收�
   assert.doesNotMatch(r.errors, /分叉/, '退出码 1 不是配置错误那条路；把两种病写成一句，运维就只能猜');
 });
 
-test('AI 步的形状：不挂 set -e、收口认全五态、if 仍挂 found（不许 always()）', () => {
+test('AI 步的形状：node 那发必须自带 `|| CODE=$?`、收口认全五态、if 仍挂 found（不许 always()）', () => {
   const { region } = extractStep(AI_STEP);
   const { text } = extractStep(AI_STEP);
-  assert.doesNotMatch(text, /set -eu/, 'set -e 会让 over-budget 那一发在 AI 步先红，triage 整步被跳过（§0.2-2）');
-  assert.match(text, /set -u/, 'set -u 要留着：拼错的变量名不该静默成空串');
+  // 「非 ok 不在本步开火」这条规矩（§0.2-2）的兑现位置是**调用点**，不是脚本头的 `set` 行：
+  // runner 把 `shell: bash` 展开成 `bash --noprofile --norc -e -o pipefail`（2026-10-16 run
+  // 38904316355 实测），那个 `-e` 是它给的，脚本里写 `set -uo pipefail` 撤不掉。
+  // 所以这里断言的是「预期会非 0 的那一发有没有带 `||`」——带了就收进 CODE，没带就是整步打断。
+  assert.doesNotMatch(text, /set -eu/, '本步不额外加 -e：非 ok 的红由 分流决策 在判据那层开火');
+  assert.match(text, /set -u/, 'set -u 要留着：拼错的变量名不该静默成空串（CODE 归零那条也靠它兜）');
+  assert.ok(text.includes('node "$AI" "${ARGS[@]}" || CODE=$?'),
+    '裸 `node` + 下一行 `CODE=$?` 在线上等于「第一个非 0 退出码当场打断整步」：CODE 来不及收，收口与 triage 一起没了');
+  const nodeLine = text.split('\n').find((l) => l.includes('node "$AI" "${ARGS[@]}" || CODE=$?'));
+  const bodyIndent = nodeLine.length - nodeLine.trimStart().length;
+  assert.match(text, new RegExp(`^ {${bodyIndent}}CODE=0$`, 'm'),
+    '每包归零，且必须与那发 node 同缩进（hoist 到 while 之外 = 又回到「上一包的退出码当成这一包的」）：'
+    + '`||` 只在失败那发赋值，不归零还是 set -u 下的未绑定变量');
   assert.match(text, /disabled\|ok\|failed\|untrusted\|over-budget/,
     '收口的 case 必须含 over-budget：M1 之后脚本会真写它，漏了就是把合法状态判成非法（§0.2-1）');
   assert.match(region, /^ {8}if: steps\.locate\.outputs\.found == 'true'$/m,
