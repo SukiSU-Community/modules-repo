@@ -8,7 +8,9 @@
  * 这条链固定成可重跑的命令，而不是一次性脚本里的临时产物。
  *
  * 三条硬规矩（写代码前先记住，改代码时更要记住）：
- * 1. **只读，绝不执行**：不 import、不 spawn、不 adb、不解压到盘外，包里任何文件都不当代码跑。
+ * 1. **只读，绝不执行**：包内任何条目都不 import、不 spawn、不 adb、不解压到盘外。
+ *    全工具唯一的外调是 fetch 那一步的 curl，它只把附件字节取回内存；scan / diff / selftest 一条外调都没有
+ *    （所以「CI 不许下载」不靠约定，靠的是那三个子命令的代码里根本走不到网络）。
  *    扫描走 audit/scan.mjs 的 scanZip(zipPath, opts) —— 那是生产入口（AI 复核与 CI 用的同一把），
  *    收的是 zip 的路径而不是 Buffer。这里不 import audit/fixtures.mjs：那份文件是给测试改的，
  *    工具一旦依赖它，「和生产同一把」就成了假话。
@@ -508,7 +510,8 @@ export function mergeDump(existing, fresh, opts = {}) {
     schema: 'audit-corpus-dump/v1',
     generatedAt: new Date().toISOString(),
     tool: 'scripts/audit-corpus.mjs scan',
-    // 这份 dump 是用哪一张表扫出来的，diff 那一步要靠它判断报告里的 families 还作不作数。
+    // 这份 dump 是用哪一张表扫出来的。diff 那一步会**读**它：与现表一漂就整张作废、退出码 2
+    // （tableDriftProblems），另有一道逐枚比对兜住「表没漂但这份 dump 是旧工具写的」那种形状。
     currentTable: current.map(([f, , ps]) => [f, ps]),
     rows: [...byName.values()].sort((a, b) => (a.name < b.name ? -1 : 1)),
   };
@@ -629,6 +632,46 @@ export function candidateNarrowingProblems(candidate, current = CAPABILITY_FAMIL
 }
 
 /**
+ * dump 里那格 `currentTable` 是「这份 dump 用哪一张成员表扫出来的」的唯一证人。
+ * 写它却不读它，就等于在前后表上盖了一个来源不明的章 —— 而 B 那一发改的正是这张表：
+ * 没有这道闸，将来有人拿到一张 step4-diff.txt 时分不清它是改前扫的还是改后扫的，
+ * 而「前栏来自生产报告」那句话就变成了猜测。
+ *
+ * 只回**至多一条**：成员表是一整个前置条件，炸了就整张作废。逐族列问题会让人以为能挑着用。
+ *
+ * @param {Array<[string, string[]]>} dumpTable  dump 里的形状（没有那个人类标签那一元）
+ * @param {Array<[string, string, string[]]>} [liveTable]  代码里那份现表
+ */
+export function tableDriftProblems(dumpTable, liveTable = CAPABILITY_FAMILIES) {
+  // 两种形状都收：[族, 前缀…] 与 [族, 标签, 前缀…] ⇒ 取最后一个数组当成员表。
+  const norm = (t) => {
+    const m = new Map();
+    for (const row of (Array.isArray(t) ? t : [])) {
+      if (!Array.isArray(row) || typeof row[0] !== 'string') continue;
+      const ps = Array.isArray(row[row.length - 1]) ? row[row.length - 1].map(String) : [];
+      m.set(row[0], new Set(ps));
+    }
+    return m;
+  };
+  const dump = norm(dumpTable);
+  const live = norm(liveTable);
+  const order = [...live.keys(), ...[...dump.keys()].filter((f) => !live.has(f))];
+  const details = [];
+  for (const family of order) {
+    if (!dump.has(family)) { details.push(`${family}：dump 里整族没有`); continue; }
+    if (!live.has(family)) { details.push(`${family}：现表里已经没有这一族`); continue; }
+    const inDump = [...dump.get(family)].filter((p) => !live.get(family).has(p));
+    const inLive = [...live.get(family)].filter((p) => !dump.get(family).has(p));
+    if (inDump.length || inLive.length) {
+      details.push(`${family}：dump 多 [${inDump.join(',')}] / 现表多 [${inLive.join(',')}]`);
+    }
+  }
+  if (!details.length) return [];
+  return [`dump 的成员表与现表不一致（${details.join('；')}）⇒ 这份 dump 不是用现表扫的，`
+    + '前栏那格 families 的来源就不明 —— 先重跑 scan 再打前后表。'];
+}
+
+/**
  * 用候选表在**族进料**上重算族集，出前后两栏。
  * @param {object} dump runScan 写出的那份 corpus-dump.json
  * @param {Array<[string, string, string[]]>} candidateTable
@@ -636,6 +679,21 @@ export function candidateNarrowingProblems(candidate, current = CAPABILITY_FAMIL
  */
 export function diffDump(dump, candidateTable, opts = {}) {
   const current = opts.current || CAPABILITY_FAMILIES;
+  // 表来源先问一遍：漂了就整张作废，不产出任何前后表。
+  // 旧 dump 没有这一格 ⇒ 不拒（退回逐枚比对那道闸，行为与加这道闸之前一字相同）。
+  const tableDrift = Array.isArray(dump && dump.currentTable)
+    ? tableDriftProblems(dump.currentTable, current) : [];
+  if (tableDrift.length) {
+    return {
+      problems: tableDrift,
+      tableDrift,
+      packages: [],
+      summary: {
+        packages: 0, binaries: 0, packagesWithFamilyChange: 0, packagesWithTierChange: 0,
+        binariesCrossingTheTwoFamilyEdge: 0, problems: tableDrift.length,
+      },
+    };
+  }
   const problems = [];
   const packages = [];
   let crossed = 0;
@@ -701,7 +759,7 @@ export function diffDump(dump, candidateTable, opts = {}) {
     binariesCrossingTheTwoFamilyEdge: crossed,
     problems: problems.length,
   };
-  return { problems, packages, summary };
+  return { problems, packages, summary, tableDrift: [] };
 }
 
 function renderDiffTable(result) {
@@ -761,6 +819,12 @@ export function runDiff(deps = {}) {
     return { code: 2, problems: widening };
   }
   const result = diffDump(dump, candidate);
+  // 表来源漂了是**前置条件不成立**（和「没有 dump」「候选表加严」同一类），所以退出码 2；
+  // 逐枚比对那种不一致留给 code 1 —— 那种是「算出来了但账对不上」，人还可以看剩下的表。
+  if (result.tableDrift.length) {
+    for (const d of result.tableDrift) log.error(d);
+    return { code: 2, problems: result.tableDrift, result };
+  }
   for (const p of result.problems) log.error(p);
   if (result.problems.length) return { code: 1, problems: result.problems, result };
   for (const line of renderDiffTable(result)) log.log(line);
@@ -815,6 +879,14 @@ export function runSelftest(deps = {}) {
   // 族数档位那一条公式：0/1 → medium，≥2 → high。
   need(familyTier(['EXEC']) === 'medium' && familyTier(['EXEC', 'NS']) === 'high' && familyTier([]) === 'medium',
     '族数档位公式与 audit/risk-rules.mjs 表③④⑤ 那条不一致');
+
+  // dump 里 currentTable 那一格当场验一次：同表放过、漂一个前缀必须报。
+  // 漂移取「第一个族少掉它的第一个前缀」这种通用形状 —— 写死某个成员名会让自检跟着表一起腐坏。
+  const asDumpTable = CAPABILITY_FAMILIES.map(([f, , ps]) => [f, ps]);
+  need(tableDriftProblems(asDumpTable, CAPABILITY_FAMILIES).length === 0, '现表自己不该报表漂');
+  const driftProbe = asDumpTable.map(([f, ps], i) => [f, i === 0 ? ps.slice(1) : ps]);
+  need(tableDriftProblems(driftProbe, CAPABILITY_FAMILIES).length === 1,
+    'dump 的表少掉一个前缀却没报 —— currentTable 那一格又变成装饰品了');
 
   for (const p of problems) log.error(`selftest 不通过：${p}`);
   if (problems.length) return 1;
