@@ -5989,6 +5989,38 @@ test('T57-19 登记三键进 report.binaryForensics：名单与真实计数各�
   assert.equal(sharedT4.binaryForensicsRows(T57_BIN1, t57Map('zygisk/arm64-v8a.so', capped)).length, 1);
 });
 
+test('T57-20 S3-A Step 5 呈现面一字不变：不命中任何新名字的包，findings/decision/counts 与改前逐字节相同，登记只多出这三个键', async () => {
+  // 这一发喂的是 hmaSmall（hma-arm64.so，24 个导入，UND 里没有任何名字命中族表）：
+  // A 改的是族的进料，而这个包的新旧族集合都是空 ⇒ 它是「改前 == 改后」的那一枚证人。
+  // 下面三个 sha 与两个字面量都是**在 d255937 的 audit/ 整份导出上实测**的（BASE 那一跑），不是从 HEAD 反推的。
+  const r = await t57Run('hmaSmall');
+  assert.equal(T57_SHA1(Buffer.from(JSON.stringify(r.findings), 'utf8')),
+    '30bb0eb161d43953e4e095e33f624d799eb63ccb', 'findings 逐字节不变（改前实测同一个 sha）');
+  assert.deepEqual(r.counts, { high: 0, medium: 1, low: 0, info: 0 }, 'counts 一字不变');
+  assert.deepEqual(r.decision, {
+    action: 'block', label: 'needs-human-review', needsHumanReview: true,
+    reason: '风险等级为 medium，需人工审核后方可合入索引',
+  }, 'decision 一字不变：本轮不可能让任何包变得更容易自动放行');
+  assert.equal(r.riskLevel, 'medium');
+
+  const row = t57Row(r, 'zygisk/arm64-v8a.so');
+  assert.deepEqual(row.sensitiveImports, ['close', 'closedir', 'mmap', 'readdir64'],
+    '给人看的那份筛后名单照旧（工单 §2.1：SENSITIVE 与 sensitiveImports 一字未动）');
+  assert.deepEqual(row.capabilityImports, [], '这个包的族进料确实是空 —— 那个 0 是证出来的');
+  assert.equal(row.capabilityImportsTotal, 0);
+  assert.equal('capabilityImportsCapped' in row, false, '与 inputCapped 同形：false 时不带这个键');
+
+  const json = renderJSON(r);
+  assert.ok(json.includes('"capabilityImports": []'), 'renderJSON 里必须看得到这个键');
+  assert.ok(json.includes('"capabilityImportsTotal": 0'), '真实计数单独一格，不与名单混');
+  assert.equal(json.includes('capabilityImportsCapped'), false, '没截过就不许多一个键');
+  // 别的包的同一格也照过来：polyglotReal 里那枚 hma-x86.so 同样不命中任何新名字。
+  const p = await t57Run('polyglotReal');
+  assert.equal(T57_SHA1(Buffer.from(JSON.stringify(p.findings), 'utf8')),
+    'a033258c5d531c4387976fa3ee9641ea1f18e6f2', 'polyglotReal 的 findings 也逐字节不变（改前实测）');
+  assert.equal(t57Row(p, 'zygisk/arm64-v8a.so').capabilityImportsTotal, 0);
+});
+
 test('T57-10 device_faker 那两枚真 ELF ⇒ high，report.binaryForensics 的 importCount 是 86 / 70', async () => {
   const r = await t57Run('df2');
   assert.deepEqual(t57Spots(r), ['bin/device_faker_cli:0/high', 'zygisk/arm64-v8a.so:0/high']);
