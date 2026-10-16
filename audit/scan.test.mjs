@@ -5789,9 +5789,12 @@ const t57Spots = (r) => t57Struct(r).map((f) => `${f.file}:0/${f.severity}`);
 const t57Row = (r, name) => (r.binaryForensics || []).find((x) => x.name === name) || null;
 
 const T57_BIN1 = [{ name: 'zygisk/arm64-v8a.so', id: 'ELF', why: 'ELF 可执行文件/共享库', bytes: 983624 }];
+// S3-A 工单 §3 Step 2：定级口径的进料换成 capabilityImports（全量 UND 里命中族表的那份）。
+// 手搓记录默认给一份**空**的族进料 ⇒ 凡期望族集合非空的用例都必须自己把名字补进 capabilityImports，
+// 而「只有 sensitiveImports、没有 capabilityImports」那一发必须读成 PARSE_ERROR（见 T57-18）。
 const t57Rec = (over = {}) => ({
   name: 'zygisk/arm64-v8a.so', kind: 'ELF', bytes: 983624, machineName: 'AArch64', type: 'DYN',
-  stripped: true, importCount: 86, sensitiveImports: [], needed: ['libc.so'], ...over,
+  stripped: true, importCount: 86, sensitiveImports: [], capabilityImports: [], needed: ['libc.so'], ...over,
 });
 /** 纯函数层只喂构造记录，所以第二参两种形状都要认：Map（scan.mjs 用）与朴素对象（工单 §3 的写法）。 */
 const t57Map = (name, rec) => new Map([[name, rec]]);
@@ -5851,7 +5854,8 @@ test('T57-04 判据表第三行：ELF、危险族 0 类 ⇒ medium，且必须�
 
 test('T57-05 判据表第四行：危险族 1 类 ⇒ medium，列出族名与每族至多 5 个代表符号', () => {
   const exec8 = ['fork', 'clone', 'execve', 'system', 'popen', 'dlopen', 'dlsym', 'vfork'];
-  const g = checkBinaries(T57_BIN1, t57Map('zygisk/arm64-v8a.so', t57Rec({ importCount: 120, sensitiveImports: exec8 })));
+  const g = checkBinaries(T57_BIN1, t57Map('zygisk/arm64-v8a.so',
+    t57Rec({ importCount: 120, sensitiveImports: exec8, capabilityImports: exec8 })));
   assert.equal(g.length, 1);
   assert.equal(g[0].severity, 'medium', '单族不许升 high');
   assert.match(g[0].message, /1 类危险能力/);
@@ -5863,7 +5867,7 @@ test('T57-05 判据表第四行：危险族 1 类 ⇒ medium，列出族名与�
 
 test('T57-06 判据表第五行：危险族 ≥2 类 ⇒ high，并写明「≥2 类链接期能力」是升级理由；复断 0 族那一行含「不等于安全」', () => {
   const g = checkBinaries(T57_BIN1, t57Map('zygisk/arm64-v8a.so',
-    t57Rec({ sensitiveImports: ['fork', 'socket'] })));
+    t57Rec({ sensitiveImports: ['fork', 'socket'], capabilityImports: ['fork', 'socket'] })));
   assert.equal(g.length, 1);
   assert.equal(g[0].severity, 'high');
   assert.match(g[0].message, /≥2 类链接期能力/);
@@ -5916,7 +5920,7 @@ test('T57-07 能力族纯函数：arm64-v8a.so 的真名单逐字断族，外加
 });
 
 test('T57-08 一个条目只出一条：重名条目各出一条，一条也许多不许（§0.7 那个重复记账的病）', () => {
-  const rec = t57Rec({ sensitiveImports: ['fork', 'socket'] });
+  const rec = t57Rec({ sensitiveImports: ['fork', 'socket'], capabilityImports: ['fork', 'socket'] });
   const one = checkBinaries(T57_BIN1, t57Map('zygisk/arm64-v8a.so', rec));
   assert.equal(one.length, 1, JSON.stringify(one));
   assert.deepEqual([...new Set(one.map((f) => f.ruleId))], ['STRUCT_BINARY'], '不许顺带产出别的 ruleId');
@@ -5935,6 +5939,53 @@ test('T57-09 超限输入不许被念成「取证成功、0 危险族」（工�
   assert.match(g[0].message, /输入不完整/);
   assert.match(g[0].message, /8388608/, '要写清只喂进去多少字节');
   assert.doesNotMatch(g[0].message, /无一落在危险族/, '截断过的输入什么都不能证明，不许说「0 族」');
+});
+
+test('T57-17 S3-A 那道新闸有牙：记录只有 sensitiveImports、没有 capabilityImports ⇒ 必须 PARSE_ERROR，不是 ELF_NO_FAMILY', () => {
+  // 手搓一份「新字段没接上」的记录：缺 capabilityImports，其余字段与 t57Rec 默认值同形。
+  const stale = {
+    name: 'zygisk/arm64-v8a.so', kind: 'ELF', bytes: 983624, machineName: 'AArch64', type: 'DYN',
+    stripped: true, importCount: 86, sensitiveImports: ['fork', 'socket'], needed: ['libc.so'],
+  };
+  assert.equal('capabilityImports' in stale, false, '夹具自己得先确认：这一发真的没有那个键');
+  const g = checkBinaries(T57_BIN1, t57Map('zygisk/arm64-v8a.so', stale));
+  assert.equal(g.length, 1);
+  assert.match(g[0].message, /读不出不等于没有/);
+  assert.doesNotMatch(g[0].message, /无一落在危险族/, '「新字段没接上」不许被念成「这个包零危险族」');
+  assert.equal(g[0].severity, 'medium');
+  assert.equal(sharedT4.binaryForensicsRows(T57_BIN1, t57Map('zygisk/arm64-v8a.so', stale))[0].outcome,
+    'PARSE_ERROR', '登记那一面也必须走同一把闸（binaryForensicsRows 与 checkBinaries 同一个分派）');
+});
+
+test('T57-18 S3-A 换了进料而不是加第二条路：族只认 capabilityImports，sensitiveImports 里的名字不再算族', () => {
+  // 同一份名字放在不同的键上，结论必须不同 —— 这一发证明读的不是「两个都行」的兼容支路。
+  const onlySensitive = t57Rec({ sensitiveImports: ['fork', 'socket'], capabilityImports: [] });
+  const onlyCapability = t57Rec({ sensitiveImports: [], capabilityImports: ['fork', 'socket'] });
+  const a = checkBinaries(T57_BIN1, t57Map('zygisk/arm64-v8a.so', onlySensitive))[0];
+  const b = checkBinaries(T57_BIN1, t57Map('zygisk/arm64-v8a.so', onlyCapability))[0];
+  assert.match(a.message, /无一落在危险族/, '筛后名单不再喂族函数');
+  assert.equal(a.severity, 'medium');
+  assert.equal(b.severity, 'high', '族进料 = capabilityImports ⇒ 同样两个名字现在是 ≥2 族');
+  assert.match(b.message, /EXEC/);
+  assert.match(b.message, /NET/);
+});
+
+test('T57-19 登记三键进 report.binaryForensics：名单与真实计数各一格，capped 只在 true 时带（与 inputCapped 同形）', () => {
+  const rec = t57Rec({ sensitiveImports: ['close'], capabilityImports: ['execvp', 'mkdir'],
+    capabilityImportsTotal: 3, capabilityImportsCapped: false });
+  const row = sharedT4.binaryForensicsRows(T57_BIN1, t57Map('zygisk/arm64-v8a.so', rec))[0];
+  assert.deepEqual(row.capabilityImports, ['execvp', 'mkdir']);
+  assert.equal(row.capabilityImportsTotal, 3, '被上报的总数与截过的名单是两个数，登记里都要在');
+  assert.equal('capabilityImportsCapped' in row, false, 'false 时不带这个键');
+  assert.deepEqual(row.sensitiveImports, ['close'], '给人看的那份筛后名单照旧进登记（呈现面没换口径）');
+
+  const capped = t57Rec({ capabilityImports: ['execvp'], capabilityImportsTotal: 65, capabilityImportsCapped: true });
+  const row2 = sharedT4.binaryForensicsRows(T57_BIN1, t57Map('zygisk/arm64-v8a.so', capped))[0];
+  assert.equal(row2.capabilityImportsCapped, true, '截过的那一刻必须看得见');
+  assert.equal(row2.capabilityImportsTotal, 65);
+  const f2 = checkBinaries(T57_BIN1, t57Map('zygisk/arm64-v8a.so', capped))[0];
+  assert.equal(f2.ruleId, 'STRUCT_BINARY', '不新增 ruleId（§0.7 那个重复计数的病）');
+  assert.equal(sharedT4.binaryForensicsRows(T57_BIN1, t57Map('zygisk/arm64-v8a.so', capped)).length, 1);
 });
 
 test('T57-10 device_faker 那两枚真 ELF ⇒ high，report.binaryForensics 的 importCount 是 86 / 70', async () => {

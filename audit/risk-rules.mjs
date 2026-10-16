@@ -20,8 +20,10 @@
 //
 // Task 5.7 起本文件 import 了 ./elf-forensics.mjs 里的 capabilitySymbols —— 那是同一套纯函数
 // （零 I/O、零依赖），引它只为「能力族表全仓只许有一份」（工单 §2）。
+// S3-A（2026-10-16）起还 import CAPABILITY_IMPORT_CAP：截断文案里的这个数只许来自那一个常量，
+// 本文件不许再写一遍 64。
 
-import { capabilitySymbols } from './elf-forensics.mjs';
+import { capabilitySymbols, CAPABILITY_IMPORT_CAP } from './elf-forensics.mjs';
 
 export const SEVERITY_ORDER = { info: 0, low: 1, medium: 2, high: 3 };
 
@@ -2069,6 +2071,13 @@ export function checkUnread(unread = []) {
 //      而「0 危险族」那一行自己必须写着「这不等于安全」（§0.8 那条双向边界）。
 //
 // 能力族表住在 audit/elf-forensics.mjs（只此一份，T57-07 按源码钉），这里只消费。
+//
+// S3-A（工单 briefs/task-s3a.md，2026-10-16）改的只有**谁把名字交给这张表**：族的进料从
+// `sensitiveImports`（SENSITIVE 筛后、给人看的那份）换成 `capabilityImports`（全量 UND 里命中族表的那份），
+// 于是族表里那批「写了却永远进不来」的成员第一次到得了族函数面前（成员名逐个列在
+// briefs/task-s3-pre-report.md 那张死成员表里；这里不复述 —— T57-07 按源码钉「族词汇只住一份」，注释也算它扫）。
+// 方向是加严，且只可能加严：成员表一字未动、档位公式一字未动、`sensitiveImports` 与其呈现面一字未动。
+// 新字段缺失一律走 PARSE_ERROR（从严），不留兼容支路。
 // ---------------------------------------------------------------------------
 
 /**
@@ -2138,7 +2147,11 @@ function binaryVerdict(b, found) {
   }
 
   // 表②：ELF 但 parseError（畸形头、大端、越界的表项，或字节面在解码时就已经坏了）。
-  const unparsed = !Number.isInteger(rec.importCount) || !Array.isArray(rec.sensitiveImports);
+  // S3-A 工单 §2.2：`capabilityImports` 缺字段也算「读不出来」。**没有兼容支路** ——
+  // 写成 `rec.capabilityImports || rec.sensitiveImports` 就等于把「新字段没接上」念成「这个包零危险族」，
+  // 而那正是本轮要消灭的形状（从严走 PARSE_ERROR）。
+  const unparsed = !Number.isInteger(rec.importCount) || !Array.isArray(rec.sensitiveImports)
+    || !Array.isArray(rec.capabilityImports);
   if (rec.parseError || unparsed) {
     return {
       outcome: 'PARSE_ERROR', severity: 'medium', families: [],
@@ -2149,7 +2162,12 @@ function binaryVerdict(b, found) {
   }
 
   // 表③④⑤：读出来了，按危险族数量分档。
-  const fams = capabilitySymbols(rec.sensitiveImports);
+  // S3-A：族的进料是**全量 UND 里命中族表的那份名单**（forensics 的 capabilityImports），
+  // 不再是给人看的那份筛后名单 —— 后者让一批**写在族表里**的成员永远到不了这张表面前
+  // （成员名不在这里复述：T57-07 按源码钉「族词汇只住一份」，注释也算它扫。逐个词的实测见
+  //  briefs/task-s3-pre-report.md 那张死成员表与真夹具的 UND 对照）。
+  // 档位公式一字未改：0/1 族 → medium，≥2 族 → high；本轮只可能让族数变多，不可能变少。
+  const fams = capabilitySymbols(rec.capabilityImports);
   const read = `${name}：ELF（${rec.machineName || '未知架构'}，${rec.importCount} 个导入`
     + `${rec.stripped ? '，已 strip' : ''}）`;
   const families = fams.map((x) => x.family);
@@ -2162,12 +2180,16 @@ function binaryVerdict(b, found) {
   }
   const listing = fams.map((x) => `${x.family} ${x.label}（${x.symbols.join(', ')}`
     + `${x.symbolTotal > x.symbols.length ? `…共 ${x.symbolTotal} 个` : ''}）`).join('；');
+  // 呈现纪律（工单 §2.2）：名单被 CAPABILITY_IMPORT_CAP 截过 ⇒ 族数只会偏低，而偏低正是本轮要
+  // 消灭的那种「被念成干净」。这一句只在 capped === true 时出现，不开新档、不改 outcome。
+  const capNote = rec.capabilityImportsCapped === true
+    ? `；危险族名单在 ${CAPABILITY_IMPORT_CAP} 条处截过，族集合是下限` : '';
   return {
     outcome: fams.length >= 2 ? 'ELF_FAMILIES' : 'ELF_FAMILY',
     severity: fams.length >= 2 ? 'high' : 'medium',
     families,
     message: `${read} —— 链接期一定会用到 ${fams.length} 类危险能力：${listing}`
-      + (fams.length >= 2 ? '；升级理由：≥2 类链接期能力。' : '。'),
+      + (fams.length >= 2 ? '；升级理由：≥2 类链接期能力。' : '。') + capNote,
     extraAdvice: ' 导入表是动态链接器必须满足的集合：名字出现过就一定用得到。'
       + '核对这些能力是否都在它自称的功能里。',
   };
@@ -2226,6 +2248,11 @@ export function binaryForensicsRows(binaries = [], forensicsByName = null) {
       if (typeof rec.stripped === 'boolean') row.stripped = rec.stripped;
       if (Number.isInteger(rec.importCount)) row.importCount = rec.importCount;
       if (Array.isArray(rec.sensitiveImports)) row.sensitiveImports = rec.sensitiveImports;
+      // S3-A 工单 §2.2：定级口径那份进料也要进登记，否则「报告说它读到 86 个导入」与
+      // 「这条为什么是 high」又会各念一套。ruleId 仍是 STRUCT_BINARY，不新增 id（§0.7 那个重复计数的病）。
+      if (Array.isArray(rec.capabilityImports)) row.capabilityImports = rec.capabilityImports;
+      if (Number.isInteger(rec.capabilityImportsTotal)) row.capabilityImportsTotal = rec.capabilityImportsTotal;
+      if (rec.capabilityImportsCapped) row.capabilityImportsCapped = true;
       if (Array.isArray(rec.needed)) row.needed = rec.needed;
       if (rec.parseError) row.parseError = rec.parseError;
       if (rec.inputCapped) row.inputCapped = true;
