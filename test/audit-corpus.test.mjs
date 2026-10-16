@@ -22,6 +22,7 @@ import { makeModuleZip } from '../audit/fixtures.mjs';
 import {
   familiesUnder, validateManifest, findGitWorktreeRoot, sha256Of,
   placeZip, pickAsset, fetchOne, mergeLock, buildDumpRow, runScan, familiesOfDumpRow,
+  candidateNarrowingProblems, diffDump, runDiff, familyTier,
 } from '../scripts/audit-corpus.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -369,4 +370,103 @@ test('Step 2 dump 字段口径一律从报告取：riskLevel/counts/decision/bin
   assert.deepEqual(familiesOfDumpRow(row), ['EXEC', 'FILEWRITE', 'NET', 'NS', 'PROP']);
   rmSync(dirname(zipPath), { recursive: true, force: true });
 });
+
+// ---------------------------------------------------------------------------
+// Step 3 —— diff 的收窄闸，以及一张**不依赖下载**的前后表
+// ---------------------------------------------------------------------------
+
+/** Step 4 那一发的候选表：摘掉这五枚成员（族名 + 前缀，逐词对过现表）。 */
+const STEP4_REMOVALS = [['NET', 'send'], ['FILEWRITE', 'chdir'], ['NS', 'kill'], ['NS', 'sigaction'], ['NS', 'prctl']];
+
+/** 从现表里按 [族,前缀] 摘成员。摘之前先确认它真在现表里 —— 表改了这发要响，而不是偷偷测了个空集。 */
+function narrow(pairs) {
+  for (const [family, prefix] of pairs) {
+    const row = CAPABILITY_FAMILIES.find(([f]) => f === family);
+    assert.ok(row && row[2].includes(prefix), `现表里 ${family} 没有前缀 ${prefix} —— 这张候选表的前提已经不成立了`);
+  }
+  return CAPABILITY_FAMILIES.map(([f, l, ps]) => [f, l, ps.filter((p) => !pairs.some(([pf, pp]) => pf === f && pp === p))]);
+}
+
+/** 离线造一份 dump：六枚常驻真 ELF 进合成 zip ⇒ 生产入口扫 ⇒ buildDumpRow。 */
+async function offlineDump() {
+  const zipPath = syntheticZip();
+  const report = await scanZip(zipPath, { changeType: 'first' });
+  const row = buildDumpRow({ name: 'fixtures-six', zipPath, zipBytes: statOf(zipPath), zipSha256: sha256Of(zipPath) }, report);
+  rmSync(dirname(zipPath), { recursive: true, force: true });
+  return { schema: 'audit-corpus-dump/v1', rows: [row] };
+}
+
+test('Step 3 收窄闸：候选表里有新增前缀或新增族 ⇒ 非零退出，且理由里写着「假的 0 移动」', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'corpus-diff-'));
+  try {
+    // 纯函数那一层。
+    assert.deepEqual(candidateNarrowingProblems(CAPABILITY_FAMILIES, CAPABILITY_FAMILIES), [], '现表自己是合格候选');
+    assert.deepEqual(candidateNarrowingProblems(narrow(STEP4_REMOVALS), CAPABILITY_FAMILIES), [], 'Step 4 那张表是收窄，该放过');
+    const addedPrefix = CAPABILITY_FAMILIES.map(([f, l, ps]) => (f === 'EXEC' ? [f, l, [...ps, 'ptrace']] : [f, l, ps]));
+    assert.ok(candidateNarrowingProblems(addedPrefix, CAPABILITY_FAMILIES).length === 1, '把别族的前缀搬进 EXEC 也要算新增');
+    assert.match(candidateNarrowingProblems(addedPrefix, CAPABILITY_FAMILIES)[0], /假的 0 移动/);
+    const addedFamily = [...CAPABILITY_FAMILIES, ['OWN', '凭空一族', ['ptrace']]];
+    assert.ok(candidateNarrowingProblems(addedFamily, CAPABILITY_FAMILIES).length === 1, '新增族同样要拦');
+
+    // CLI 那一层：真跑一发，退出码必须是 2。
+    const dump = { schema: 'audit-corpus-dump/v1', rows: [] };
+    writeFileSync(join(dir, 'corpus-dump.json'), JSON.stringify(dump));
+    const badCand = join(dir, 'widening.json');
+    writeFileSync(badCand, JSON.stringify(addedPrefix));
+    const r = runCli(['diff', '--out', dir, '--candidate', badCand]);
+    assert.equal(r.status, 2, `加严的候选表必须以 2 退出，实测 ${r.status}`);
+    assert.match(r.output, /假的 0 移动|全量 UND/, '报错要把理由写进去');
+
+    const goodCand = join(dir, 'narrowing.json');
+    writeFileSync(goodCand, JSON.stringify(narrow(STEP4_REMOVALS)));
+    const ok = runCli(['diff', '--out', dir, '--candidate', goodCand]);
+    assert.equal(ok.status, 0, ok.output);
+    assert.match(ok.output, /汇总/);
+
+    const noCand = runCli(['diff', '--out', dir]);
+    assert.equal(noCand.status, 2, 'diff 少了 --candidate 也要非零');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('Step 3 离线前后表：六枚常驻夹具 + Step 4 候选表 ⇒ 4→3 / 4→3 / 4→4 / 0→0×3，跨 ≥2 边界的枚数 = 0', async () => {
+  const dump = await offlineDump();
+  const result = diffDump(dump, narrow(STEP4_REMOVALS));
+  assert.deepEqual(result.problems, [], `报告里的 families 与现表重算不一致：${result.problems.join(' | ')}`);
+  assert.equal(result.packages.length, 1);
+  const pkg = result.packages[0];
+  const byName = Object.fromEntries(pkg.binaries.map((b) => [b.name.replace(/^lib\//, ''), b]));
+
+  assert.deepEqual(Object.keys(byName).sort(), [...SIX].sort());
+  assert.deepEqual([byName.device_faker_cli.beforeCount, byName.device_faker_cli.afterCount], [4, 3]);
+  assert.deepEqual([byName['detach-arm32'].beforeCount, byName['detach-arm32'].afterCount], [4, 3]);
+  assert.deepEqual([byName['arm64-v8a.so'].beforeCount, byName['arm64-v8a.so'].afterCount], [4, 4]);
+  for (const n of ['hma-arm64.so', 'hma-armeabi-v7a.so', 'hma-x86.so']) {
+    assert.deepEqual([byName[n].beforeCount, byName[n].afterCount], [0, 0], `${n} 两栏都该是 0`);
+  }
+  // 跨 ≥2 那条边界的枚数 = 0 ⇒ 这一发在夹具上不给档位变化（工单原话，跑出来不是 0 就是不一致）。
+  assert.equal(result.summary.binariesCrossingTheTwoFamilyEdge, 0);
+  assert.equal(pkg.packageTierBefore, 'high');
+  assert.equal(pkg.packageTierAfter, 'high');
+
+  // 前栏来自报告、后栏是候选表重算 —— 这两栏的来源要如实标出来。
+  for (const b of pkg.binaries) {
+    assert.equal(b.beforeSource, 'report');
+    assert.equal(b.afterSource, 'candidate-recomputed');
+    assert.ok(b.after.every((f) => b.before.includes(f)), `${b.name}：摘成员之后冒出前栏没有的族`);
+  }
+
+  // dump 过期那一格必须响：把某枚的 families 改成别的值，diff 要报不一致而不是安静地给假表。
+  const stale = JSON.parse(JSON.stringify(dump));
+  stale.rows[0].binaries[0].families = ['EXEC'];
+  const r2 = diffDump(stale, narrow(STEP4_REMOVALS));
+  assert.ok(r2.problems.length === 1, 'dump 与现表脱节时必须报出来');
+  assert.match(r2.problems[0], /不一致/);
+
+  // 族数档位那条公式本身也钉一下（0/1 → medium，≥2 → high），跨边界的计数才有出处。
+  assert.equal(familyTier(['EXEC']), 'medium');
+  assert.equal(familyTier(['EXEC', 'NET']), 'high');
+});
+
 

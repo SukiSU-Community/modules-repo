@@ -557,6 +557,188 @@ function statSize(p) {
 }
 
 /**
+ * 族数档位：0/1 族 → medium，≥2 族 → high（照 audit/risk-rules.mjs 表③④⑤ 那一条公式）。
+ * 这里**只报族数落在哪一档**，不重算 riskLevel 也不重算 decision —— 那两个还吃别的发现，
+ * 在这里复制一份就是发明第二把定级尺，正是这工具要避免的事。
+ */
+export function familyTier(families) {
+  return (Array.isArray(families) ? families.length : 0) >= 2 ? 'high' : 'medium';
+}
+
+/**
+ * candidate 必须是现表的**收窄**。返回问题数组（空即合格）。
+ * 为什么要拦加严：dump 带的是**已经命中现表**的名字集，全量 UND 进料不在这份数据里。
+ * 往表里加前缀时，那些新名字从来就没进过 dump，重算当然一个都不中 —— 于是得到一张
+ * 假的「0 移动」表，而它看起来像证据。
+ * @param {Array<[string, string, string[]]>} candidate
+ * @param {Array<[string, string, string[]]>} current
+ */
+export function candidateNarrowingProblems(candidate, current = CAPABILITY_FAMILIES) {
+  assertFamilyTable(candidate, '候选');
+  assertFamilyTable(current, '现');
+  const currentFamilies = new Map();
+  for (const [family, , prefixes] of current) {
+    if (!currentFamilies.has(family)) currentFamilies.set(family, new Set());
+    for (const p of prefixes) currentFamilies.get(family).add(p);
+  }
+  const problems = [];
+  for (const [family, , prefixes] of candidate) {
+    if (!currentFamilies.has(family)) {
+      problems.push(`候选里出现了现表没有的族名 "${family}"：加族等于加严，同样的假 0 移动`);
+      continue;
+    }
+    const known = currentFamilies.get(family);
+    for (const p of prefixes) {
+      if (!known.has(p)) {
+        const elsewhere = current.filter(([, , ps]) => ps.includes(p)).map(([f]) => f);
+        problems.push(`候选给族 ${family} 新增了前缀 "${p}"（现表里${elsewhere.length ? `它在 ${elsewhere.join('/')}` : '它根本不存在'}）—— `
+          + 'dump 里的名字集是**已命中现表**的那一份，加严需要全量 UND 进料，那份数据不在这里，拿这张表算加严是假的 0 移动');
+      }
+    }
+  }
+  return problems;
+}
+
+/**
+ * 用候选表在**族进料**上重算族集，出前后两栏。
+ * @param {object} dump runScan 写出的那份 corpus-dump.json
+ * @param {Array<[string, string, string[]]>} candidateTable
+ * @param {{ current?: Array<[string, string, string[]]> }} [opts]
+ */
+export function diffDump(dump, candidateTable, opts = {}) {
+  const current = opts.current || CAPABILITY_FAMILIES;
+  const problems = [];
+  const packages = [];
+  let crossed = 0;
+  for (const pkg of (Array.isArray(dump && dump.rows) ? dump.rows : [])) {
+    const binaries = [];
+    const beforeSet = new Set();
+    const afterSet = new Set();
+    for (const b of (Array.isArray(pkg.binaries) ? pkg.binaries : [])) {
+      const feed = Array.isArray(b.capabilityImports) ? b.capabilityImports : [];
+      const recomputedCurrent = familiesUnder(feed, current);
+      const reported = Array.isArray(b.families) ? b.families : [];
+      // 两栏必须是同一个东西：报告里那格 families 就是现表算出来的。不一致说明 dump 与词汇表
+      // 已经脱节（上游改过表、或者 dump 是旧版工具写的），这时候前后表没有意义。
+      if (JSON.stringify(recomputedCurrent) !== JSON.stringify(reported)) {
+        problems.push(`${pkg.name}/${b.name}：报告里的 families ${JSON.stringify(reported)} `
+          + `与现表重算 ${JSON.stringify(recomputedCurrent)} 不一致 —— dump 过期了，先重跑 scan`);
+      }
+      const after = familiesUnder(feed, candidateTable);
+      const t0 = familyTier(reported);
+      const t1 = familyTier(after);
+      if (t0 !== t1) crossed += 1;
+      for (const f of reported) beforeSet.add(f);
+      for (const f of after) afterSet.add(f);
+      binaries.push({
+        name: b.name,
+        feedCount: feed.length,
+        before: reported,
+        after,
+        beforeCount: reported.length,
+        afterCount: after.length,
+        beforeTier: t0,
+        afterTier: t1,
+        changed: reported.length !== after.length || t0 !== t1,
+        // 前栏直接来自生产报告（report.binaryForensics[].families），后栏是候选表在这枚的
+        // capabilityImports 上重算的 —— 两栏同源才可比。
+        beforeSource: 'report',
+        afterSource: 'candidate-recomputed',
+      });
+    }
+    const pkgBefore = [...beforeSet].sort();
+    const pkgAfter = [...afterSet].sort();
+    const worst = (rows, key) => (rows.some((r) => r[key] === 'high') ? 'high' : 'medium');
+    const worstBefore = worst(binaries, 'beforeTier');
+    const worstAfter = worst(binaries, 'afterTier');
+    packages.push({
+      name: pkg.name,
+      zipSha256: pkg.zipSha256,
+      riskLevel: pkg.riskLevel,
+      decision: pkg.decision,
+      binaries,
+      packageFamiliesBefore: pkgBefore,
+      packageFamiliesAfter: pkgAfter,
+      packageTierBefore: pkgBefore.length >= 2 ? 'high' : 'medium',
+      packageTierAfter: pkgAfter.length >= 2 ? 'high' : 'medium',
+      tierChanged: worstBefore !== worstAfter || pkgBefore.length !== pkgAfter.length,
+    });
+  }
+  const summary = {
+    packages: packages.length,
+    binaries: packages.reduce((a, p) => a + p.binaries.length, 0),
+    packagesWithFamilyChange: packages.filter((p) => JSON.stringify(p.packageFamiliesBefore) !== JSON.stringify(p.packageFamiliesAfter)).length,
+    packagesWithTierChange: packages.filter((p) => p.packageTierBefore !== p.packageTierAfter).length,
+    binariesCrossingTheTwoFamilyEdge: crossed,
+    problems: problems.length,
+  };
+  return { problems, packages, summary };
+}
+
+function renderDiffTable(result) {
+  const lines = [];
+  for (const p of result.packages) {
+    lines.push(`${p.name}（zip sha256=${String(p.zipSha256).slice(0, 12)}…，报告口径 riskLevel=${p.riskLevel}/${p.decision}）`);
+    for (const b of p.binaries) {
+      lines.push(`  枚级 ${b.name}：族 ${b.beforeCount}→${b.afterCount}  ${b.before.join('+') || '无'} → ${b.after.join('+') || '无'}`
+        + ` ；档 ${b.beforeTier}→${b.afterTier}${b.beforeTier !== b.afterTier ? '  ★跨 ≥2 那条边界' : ''}`);
+    }
+    lines.push(`  包级（取最严）：族集 ${p.packageFamiliesBefore.join('+') || '无'} → ${p.packageFamiliesAfter.join('+') || '无'}`
+      + ` ；档 ${p.packageTierBefore}→${p.packageTierAfter}${p.packageTierBefore !== p.packageTierAfter ? '  ★会变' : ''}`);
+  }
+  const s = result.summary;
+  lines.push(`汇总：${s.packages} 个包 / ${s.binaries} 枚；族集有变的包 ${s.packagesWithFamilyChange} 个，`
+    + `包级最严档有变的包 ${s.packagesWithTierChange} 个，跨 ≥2 那条边界的枚数 ${s.binariesCrossingTheTwoFamilyEdge}。`);
+  lines.push('（档这一栏只是族数落在 0/1 还是 ≥2，不重算 riskLevel 与 decision —— 那两个还吃别的发现，'
+    + '这里复制一份就成了第二把定级尺。）');
+  return lines;
+}
+
+/**
+ * diff：读 <out>/corpus-dump.json 与 --candidate 那份候选族表，只在族进料上重算族集，打前后表。
+ * candidate 里有新增前缀（或新增族）就 exit 2 —— 理由见 candidateNarrowingProblems。
+ */
+export function runDiff(deps = {}) {
+  const log = deps.log || console;
+  const out = deps.out;
+  if (!deps.candidate) {
+    return { code: 2, problems: ['diff 要 --candidate <path>：候选族表就是这一发要量的那个形状。'] };
+  }
+  const dumpPath = join(out, DUMP_NAME);
+  if (!existsSync(dumpPath)) return { code: 2, problems: [`没有 ${dumpPath} —— 先跑 scan。`] };
+  let dump;
+  try {
+    dump = JSON.parse(readFileSync(dumpPath, 'utf8'));
+  } catch (err) {
+    return { code: 2, problems: [`dump 读不出来：${err.message}`] };
+  }
+  let candidate;
+  try {
+    candidate = JSON.parse(readFileSync(deps.candidate, 'utf8'));
+  } catch (err) {
+    return { code: 2, problems: [`候选表读不出来（${deps.candidate}）：${err.message}`] };
+  }
+  if (candidate && typeof candidate === 'object' && !Array.isArray(candidate) && Array.isArray(candidate.families)) {
+    candidate = candidate.families;                                 // 允许包一层 {"families": […]}
+  }
+  try {
+    assertFamilyTable(candidate, '候选表');
+  } catch (err) {
+    return { code: 2, problems: [`候选表形状不对：${err.message}`] };
+  }
+  const widening = candidateNarrowingProblems(candidate, CAPABILITY_FAMILIES);
+  if (widening.length) {
+    for (const w of widening) log.error(`候选表加严了：${w}`);
+    return { code: 2, problems: widening };
+  }
+  const result = diffDump(dump, candidate);
+  for (const p of result.problems) log.error(p);
+  if (result.problems.length) return { code: 1, problems: result.problems, result };
+  for (const line of renderDiffTable(result)) log.log(line);
+  return { code: 0, problems: [], result };
+}
+
+/**
  * selftest：零网络、零 zip，把上面几个纯函数的关键刻度当场量一遍。
  * 这里放的是「不需要真包就能钉住」的那几条，其余在 test/audit-corpus.test.mjs。
  */
@@ -595,6 +777,15 @@ export function runSelftest(deps = {}) {
   }
 
   need(findGitWorktreeRoot(process.execPath, { hasDotGit: () => false }) === null, '祖先链走到文件系统根应当收口');
+
+  // 收窄那道闸当场验一次：加前缀必须被拦，现表自己是合格候选。
+  need(candidateNarrowingProblems(CAPABILITY_FAMILIES, CAPABILITY_FAMILIES).length === 0, '现表自己应当是合格的候选表');
+  const widened = CAPABILITY_FAMILIES.map(([f, l, ps]) => (f === 'EXEC' ? [f, l, [...ps, 'ptrace']] : [f, l, ps]));
+  need(candidateNarrowingProblems(widened, CAPABILITY_FAMILIES).length > 0, '候选表加了新前缀却没被拦下 —— 那张表会给出假的 0 移动');
+
+  // 族数档位那一条公式：0/1 → medium，≥2 → high。
+  need(familyTier(['EXEC']) === 'medium' && familyTier(['EXEC', 'NS']) === 'high' && familyTier([]) === 'medium',
+    '族数档位公式与 audit/risk-rules.mjs 表③④⑤ 那条不一致');
 
   for (const p of problems) log.error(`selftest 不通过：${p}`);
   if (problems.length) return 1;
@@ -663,7 +854,13 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     for (const p of r.problems) log.error(p);
     return r.code;
   }
-  log.error(`子命令 ${opts.command} 还没接到这次交付里（本步只落 fetch 与 scan）。`);
+  if (opts.command === 'diff') {
+    const r = runDiff({ log, out: gate.abs, candidate: opts.candidate ? resolve(opts.candidate) : '' });
+    for (const p of r.problems) log.error(p);
+    if (r.code === 2) log.error(USAGE);
+    return r.code;
+  }
+  log.error(`子命令 ${opts.command} 还没接到这次交付里。`);
   log.error(USAGE);
   return 1;
 }
