@@ -145,7 +145,14 @@ export const BUDGET_BASIS = 'uncalibrated-conservative-byte-proxy：DEFAULT_MAX_
  */
 export const MIN_MAX_TOKENS = 2000;
 
-export const DEFAULT_TIMEOUT_MS = 180000;
+/**
+ * 一发判定的墙上时间上限。180000 是拍出来的，2026-10-16 本机打真接口把它证伪了：
+ * 会话先 `rescheduling` 约 300s 才 `running`，整发 active_seconds=311.98（brief 才 21 KB、
+ * medium effort —— 慢在排程，不在模型）。在 180s 掐断那一发之后，会话**照样跑完并计费 10.72 credits**，
+ * 我们只是把已经付过钱的结论丢成 failed。超时偏短的方向是「更严」（不会误放行），
+ * 但每一包都 failed 等于这一层根本没接上，所以按实测冷启动的 2 倍取。
+ */
+export const DEFAULT_TIMEOUT_MS = 600000;
 
 /**
  * QCA 事件分页（评审 F8：limit=100 不翻页时，消息多于 100 条的会话永远读不到结论）。
@@ -870,7 +877,8 @@ async function callQca({ cfg, prompt, signal, deadline, timeoutMs, fetchImpl }) 
   await qcaFetchJson(fetchImpl, joinUrl(base, `/sessions/${sessionId}/events`), {
     method: 'POST',
     headers,
-    body: JSON.stringify({ session_id: sessionId, events: [{ type: 'user.message', content: [{ type: 'text', text: prompt }] }] }),
+    // body 顶层只带 events：会话 id 已在路径里，再塞一份 session_id 会被真 API 判成未知字段（400，实测）。
+    body: JSON.stringify({ events: [{ type: 'user.message', content: [{ type: 'text', text: prompt }] }] }),
     signal,
   }, 'qca send_session_events');
 

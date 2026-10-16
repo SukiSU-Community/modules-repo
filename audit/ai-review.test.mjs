@@ -18,6 +18,7 @@ import {
   sanitizeUntrusted, BUDGET_BASIS, QFMODEL_MAX_INPUT_TOKENS, DEFAULT_MAX_BRIEF_BYTES,
   EVENT_PAGE_SIZE, MAX_EVENT_PAGES, MAX_RAW_EXCERPT, UNTRUSTED_MARK, OVER_BUDGET_REASON_CODES,
   PROMPT_SHA256, NON_TEXT_MARK, FORENSICS_LINE_CAP, FORENSICS_IMPORT_CAP,
+  DEFAULT_TIMEOUT_MS,
 } from './ai-review.mjs';
 import { detectBinary, trimSnippet } from './risk-rules.mjs';
 import { scanZip, isCliEntry, isNonTextContent, readZip } from './scan.mjs';
@@ -172,6 +173,32 @@ test('callModel：QCA 取结果按 session_id，不许按「最近的会话」',
   const url = seen.join('\n');
   assert.match(url, /sess_expected/, '轮询必须回到自己那一发的 session id');
   assert.equal(out.raw.includes('schemaVersion'), true);
+});
+
+test('callModel：QCA 发事件的请求体只带 events —— 带 session_id 会被真 API 拒成 400（实测）', async () => {
+  // 2026-10-16 本机打真接口：POST /sessions/<id>/events 的 body 里再放一份 session_id，
+  // 服务端回 `{"error":{"message":"Request body contains unrecognized fields.
+  // json: unknown field \"session_id\"","type":"invalid_request_error"}}`。
+  // 会话 id 已经在路径里；stub fetch 永远测不到这条，所以把它钉成 body 形状而不是「能返回 200」。
+  const sent = [];
+  const fakeFetch = async (url, init) => {
+    const u = String(url);
+    if (init && init.method === 'POST' && /\/events$/.test(u)) sent.push({ u, body: JSON.parse(init.body) });
+    if (/\/sessions(\/|$|\?)/.test(u) && !/events/.test(u)) {
+      return { ok: true, status: 200, json: async () => ({ item: { id: 'sess_shape' } }) };
+    }
+    return { ok: true, status: 200,
+      json: async () => ({ items: [{ id: 'e1', type: 'agent.message',
+        payload: { content: [{ text: '{"schemaVersion":1}' }] } }] }) };
+  };
+  await callModel({ backend: 'qca',
+    cfg: { pat: 'p', agentId: 'agent_x', agentVersion: 1, environmentId: 'env_x' },
+    brief: { text: 'x' } }, fakeFetch);
+  assert.equal(sent.length, 1, '只应发出一发 send_session_events');
+  assert.equal(sent[0].u.endsWith('/sessions/sess_shape/events'), true);
+  assert.deepEqual(Object.keys(sent[0].body), ['events'], 'body 顶层只许 events：多一个键就是 400');
+  assert.equal(sent[0].body.events[0].type, 'user.message');
+  assert.ok(Array.isArray(sent[0].body.events[0].content), 'content 必须是块数组，裸字符串不收');
 });
 
 // ---------------------------------------------------------------------------
@@ -923,8 +950,16 @@ test('F3e：无参数的相对路径调用（CI 传空变量的形态）进程�
 // 评审 F4（硬洞）：预算没有依据 → ①写明未标定 ②文案说「需要」多少 ③maxBytes 是硬上界
 // ---------------------------------------------------------------------------
 
+test('真接口实测：DEFAULT_TIMEOUT_MS 必须盖过 QCA 的排程冷启动，否则每一发都是 failed', () => {
+  // 2026-10-16 本机一发（21,409 B 的 brief、medium effort）：会话先 rescheduling 约 300s，
+  // 到 running 再到 idle 共 active_seconds=311.98、total_credits=10.72。
+  // 旧默认 180000 在那一发上于 180s 掐断 —— 掐断后**会话照样跑完并照常计费**，我们只是把结论丢了。
+  // 超时偏短只会把闸念成 failed（往严走，不会误放行），但每一发包都 failed 等于这一层没接上。
+  assert.ok(DEFAULT_TIMEOUT_MS >= 600000,
+    `默认超时 ${DEFAULT_TIMEOUT_MS}ms 盖不住实测冷启动 312s（rescheduling 约 300s）`);
+});
+
 test('F4a：预算依据如实写明是未标定的保守字节代理，没有发明 token 系数', () => {
-  assert.equal(typeof BUDGET_BASIS, 'string');
   assert.match(BUDGET_BASIS, /uncalibrated|未标定/);
   assert.match(BUDGET_BASIS, /真实发送/, '标定需要一次真实发送 —— 这条必须写在依据里，不是藏在注释里');
   assert.match(String(QFMODEL_MAX_INPUT_TOKENS), /180000/);
