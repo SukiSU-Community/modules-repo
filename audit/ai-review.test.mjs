@@ -1032,13 +1032,38 @@ test('F3e：无参数的相对路径调用（CI 传空变量的形态）进程�
 // 评审 F4（硬洞）：预算没有依据 → ①写明未标定 ②文案说「需要」多少 ③maxBytes 是硬上界
 // ---------------------------------------------------------------------------
 
+test('引用 ③ 那一行必须是连续一段：省略号拼接与自己加的 #2 都复验不过（第二发真应答实测）', () => {
+  // 第二发（㉓ 落地之后）模型交的还是 ELF 取证行，但它写成
+  // `- bin/arm/detach | 118380 B | ELF（…共享库）... 危险族命中导入 ` —— 中间一个 `...` 把两截拼起来，
+  // file 又加了包里根本不存在的 `#2`。两个都是**该拒**的形状：放行省略号等于允许跨行拼接证据。
+  const row = '- bin/arm/detach | 118380 B | ELF（ELF 可执行文件/共享库） | 熵 2.99 bit/byte | 危险族命中导入 9 chroot,fork,kill';
+  const corpus = new Map([['bin/arm/detach', [row]]]);
+  const stitched = { findings: [{ file: 'bin/arm/detach', line: 1,
+    quote: 'ELF（ELF 可执行文件/共享库）... 危险族命中导入', severity: 'high', why: 'w' }] };
+  assert.equal(verifyQuotes(stitched, corpus).ok, false, '用省略号拼两截不是「逐字」，必须整份作废');
+  const selfLabelled = { findings: [{ file: 'bin/arm/detach#2', line: 1,
+    quote: '危险族命中导入', severity: 'high', why: 'w' }] };
+  assert.equal(verifyQuotes(selfLabelled, corpus).ok, false, '包里没出现的标签不许自己造（#2 只能来自 ② 的标注）');
+  const contiguous = { findings: [{ file: 'bin/arm/detach', line: 1,
+    quote: '危险族命中导入 9 chroot,fork,kill', severity: 'high', why: 'w' }] };
+  assert.equal(verifyQuotes(contiguous, corpus).ok, true, '连续的一段仍然复验得过 —— 收紧不等于封死这一面');
+});
+
+test('prompt 必须把「怎么引那一行」说到位：连续一段、不许省略号、标签不许自己加', () => {
+  assert.match(SYSTEM_PROMPT, /连续的一段/);
+  assert.match(SYSTEM_PROMPT, /不许用省略号/);
+  assert.match(SYSTEM_PROMPT, /只有 ② 节里真出现过的标签才能原样抄进 file/);
+});
+
 test('真接口实测：DEFAULT_TIMEOUT_MS 必须盖过 QCA 的排程冷启动，否则每一发都是 failed', () => {
-  // 2026-10-16 本机一发（21,409 B 的 brief、medium effort）：会话先 rescheduling 约 300s，
-  // 到 running 再到 idle 共 active_seconds=311.98、total_credits=10.72。
-  // 旧默认 180000 在那一发上于 180s 掐断 —— 掐断后**会话照样跑完并照常计费**，我们只是把结论丢了。
-  // 超时偏短只会把闸念成 failed（往严走，不会误放行），但每一发包都 failed 等于这一层没接上。
-  assert.ok(DEFAULT_TIMEOUT_MS >= 600000,
-    `默认超时 ${DEFAULT_TIMEOUT_MS}ms 盖不住实测冷启动 312s（rescheduling 约 300s）`);
+  // 两发实测（同一枚包、同一份 brief ≈21.5 KB、medium effort）：
+  //   第一发 active_seconds=311.98（rescheduling 约 300s）；
+  //   第二发整发墙上时间约 790s，其中到 635s 还在 rescheduling、没进 running。
+  // 慢在**排程**不在模型。180000 掐断过第一发，600000 掐断过第二发 —— 掐断后会话照样跑完并计费 10.72 credits，
+  // 我们只是把已经付过钱的结论丢成 failed。方向上偏短只会更严（不会误放行），但每包都 failed 等于这一层没接上。
+  // 尾巴没量过：n=2 只能保证盖住这两发，不许当成「上限」。
+  assert.ok(DEFAULT_TIMEOUT_MS >= 900000,
+    `默认超时 ${DEFAULT_TIMEOUT_MS}ms 盖不住实测第二发的 790s（rescheduling 635s 仍在排程）`);
 });
 
 test('F4a：预算依据如实写明是未标定的保守字节代理，没有发明 token 系数', () => {
