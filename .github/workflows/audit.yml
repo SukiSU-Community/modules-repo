@@ -597,6 +597,13 @@ jobs:
             }
             const lst = await get("/repos/" + owner + "/" + repo + "/collaborators?per_page=100");
             log("collaborators 整表 -> HTTP " + lst.st + " 条数=" + (Array.isArray(lst.j) ? lst.j.length : "n/a") + (lst.msg ? " msg=" + lst.msg : ""));
+            // 对照组：octocat 是 GitHub 的演示账号，确定不是这个仓库的协作者。
+            // 没有这一格，上面那个 permission=admin 说明不了任何事 —— 万一这个端点对
+            // workflow token「逢人就说 admin」，拿它当信任来源等于把双签变成任何人可签。
+            for (const neg of ["octocat", "dependabot[bot]"]) {
+              const rp = await get("/repos/" + owner + "/" + repo + "/collaborators/" + neg + "/permission");
+              log("对照 collaborators/" + neg + "/permission -> HTTP " + rp.st + " permission=" + (rp.j && rp.j.permission) + " role=" + (rp.j && rp.j.role_name) + (rp.msg ? " msg=" + rp.msg : ""));
+            }
             log("探针到此为止：这一步永远 exit 0，不参与任何判定");
           '
 
