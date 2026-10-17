@@ -971,7 +971,8 @@ const COMMENT_RUNNER = [
  * `${{ steps.x.outputs.不存在 }}` 的处理同形，所以「键名漂了」在这里就是拿到空串，不是拿不到变量。
  */
 function runCommentStep(opts = {}) {
-  const slice = extractStep(COMMENT_STEP, 'script');
+  // `js` 只给变异哨兵用：默认**每次现切**，所以测试里改坏的副本不可能被下一条用例捡到。
+  const slice = opts.js === undefined ? extractStep(COMMENT_STEP, 'script') : { text: opts.js, region: '' };
   const dir = opts.dir || fs.mkdtempSync(path.join(TMP, 'comment-'));
   fs.mkdirSync(path.join(dir, 'audit-out'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'step.cjs'),
@@ -1015,7 +1016,17 @@ function runCommentFrom({ reports, ai, md, rawStatus, env = {}, moduleAt } = {})
   }
   const mapped = {};
   for (const [k, v] of Object.entries(ENV_OF)) mapped[v] = t.kv[k];
-  const c = runCommentStep({ dir, env: { ...mapped, ...env } });
+  // `steps.<id>.conclusion` 这几格由 GitHub 填，本地这条链跑不到 ⇒ 在这儿显式补成
+  // 「上游全部跑成」的形状。评论步现在**只认 conclusion 判有没有结论**（见 T6.3），
+  // 不补就会把每一发 T6.2 都渲染成「分流整步没跑」—— 那是渲染层的形状，不是这些用例要量的东西。
+  const conclusions = {
+    TRIAGE_CONCLUSION: 'success', PROOF_CONCLUSION: 'success',
+    SCAN_CONCLUSION: 'success', AI_CONCLUSION: 'success', DISPOSE_CONCLUSION: 'success',
+    // 这条链只跑到分流，台账那一格没参与 ⇒ 显式给一个「没命中」，
+    // 否则评论会按「没有结论」那一支渲染，而 T6.2 量的是绿那一发的正文。
+    DISPOSITION: 'clear', DISPOSITION_REASON: '',
+  };
+  const c = runCommentStep({ dir, env: { ...conclusions, ...mapped, ...env } });
   return { ...c, kv: t.kv, triageErr: t.err, triageStderr: t.stderr };
 }
 
@@ -1375,4 +1386,220 @@ test('T6.2·折叠边界：依据与模块 id 里的 `</details>`、反引号、
   assert.equal((r.body.match(/```/g) || []).length, 2,
     '反引号围栏只许来自我们的 AI 块；依据/模块 id 里的反引号必须先变成实体');
   assert.match(r.body, /&lt;|&#96;/, '被中和之后仍然要看得见原文内容，不许直接删掉（删了就没人知道投稿者写了什么）');
+});
+
+/* =========================================================================
+ * T6.3 呈现层的「本轮到底有没有结论」：success / failure / 整步没跑 三种形状
+ *
+ * 上面那批 T6.2 全部是**绿那一发**的渲染（等级、逐包块、白名单、围栏）。这一批钉的是
+ * 判据红之后评论与标签**还要不要跑、跑起来说什么** —— 2026-10-17 把这两步放宽成
+ * `!cancelled()` 之前欠的三件事，做完的凭据在这儿，不在 `if:` 那几行结构断言里：
+ *   ①「分流整步被跳过」与「分流跑了但判不动」两种空**长得一样、意思相反**，
+ *     只有 steps.triage.conclusion 分得开（run 39007438609 / 38908245528 各是其一，都是实测）；
+ *   ② 没有结论那一发**不许念等级、不许念处置**，还要点名先红的是哪一步；
+ *   ③ 依据条数、模块 id 个数、单条长度都过 seal（≤10 条 / 单条 ≤200），藏了多少要点名。
+ * 绿那一发的三支分支（✅ / ⚠️ / ⛔）这里不重复钉 —— T6.2 已经钉过，重复一份只会多一处要同步的口径。
+ * ========================================================================= */
+
+const CONCL_OK = {
+  TRIAGE_CONCLUSION: 'success', PROOF_CONCLUSION: 'success',
+  SCAN_CONCLUSION: 'success', AI_CONCLUSION: 'success', DISPOSE_CONCLUSION: 'success',
+};
+
+/** 只渲染 intro 的那一发：不放 audit-out 里的报告，逐包那一节自然走「没有可贴出的报告」。 */
+const introOnly = (over = {}) => runCommentStep({
+  env: {
+    ...CONCL_OK, DISPOSITION: 'clear', DISPOSITION_REASON: '',
+    RISK: 'low', ACTION: 'auto-approve', LABEL: 'auto-approved', CHANGE_TYPE: 'first',
+    AI_NOTE: 'AI 安全员已复核：同意静态结论', MODULE_ID: 'demo', PACKAGE_COUNT: '1',
+    REASONS: '静态扫描未发现风险', ...over,
+  },
+});
+
+const introLine = (body, prefix) => body.split('\n').find((l) => l.startsWith(prefix));
+
+test('T6.3·分流判不动而红：等级明确写「没有等级」，处置照抄 fail-closed 的 block，绝不念「中/高风险」', () => {
+  const { body } = introOnly({
+    TRIAGE_CONCLUSION: 'failure', RISK: '', ACTION: 'block', LABEL: 'needs-human-review',
+    REASONS: '分流决策异常：x is not iterable', AI_NOTE: '',
+  });
+  assert.match(body, /- 风险等级：\*\*（本轮没有等级：分流自己没过检）\*\* —— 这一格空着是判据，不是漏填/);
+  assert.doesNotMatch(body, /（取本 PR 全部报告里最严的一份）/, '那句是绿那一发的口径；判不动这一发没量过等级，不配引用它');
+  assert.match(body, /- 处置：\*\*`block`\*\*/);
+  assert.match(body, /故障安全方向/);
+  assert.doesNotMatch(body, /⛔ 中\/高风险|✅|⚠️ 风险虽低/);
+  // 空 ai_note 不能渲染成一对空反引号：那读起来是「没人说过话」，不是「这一格没写」
+  assert.match(body, /- 复核方式：（分流这一步没写出复核方式/);
+});
+
+test('T6.3·分流整步没跑（proof 先红）：没有等级、没有处置、没有依据，且点名先红的是哪一步', () => {
+  const { body } = introOnly({
+    TRIAGE_CONCLUSION: '', PROOF_CONCLUSION: 'failure',
+    RISK: '', ACTION: '', LABEL: '', CHANGE_TYPE: '', REASONS: '', AI_NOTE: '', MODULE_ID: '',
+  });
+  assert.match(body, /本轮\*\*没有判据\*\*：分流决策这一步没有运行（先红的是「验 pending 凭据与来源复核」）/);
+  assert.equal(introLine(body, '- 风险等级'), undefined, '这一发没有任何一格被人写过，念出来就是一句假陈述');
+  assert.equal(introLine(body, '- 处置：'), undefined);
+  assert.equal(introLine(body, '- 依据：'), undefined);
+  assert.doesNotMatch(body, /⛔|✅|⚠️ 风险虽低|故障安全方向/);
+  // 「没跑完」不等于「不通过」这句必须在，否则投稿者只会把这条读成被拒
+  assert.match(body, /不是「低风险」，也不是「不通过」，是没量/);
+});
+
+test('T6.3·同一形状里换成 AI 步先红：点名的是 AI，不许错怪 proof', () => {
+  const { body } = introOnly({
+    TRIAGE_CONCLUSION: '', PROOF_CONCLUSION: 'success', AI_CONCLUSION: 'failure',
+    RISK: '', ACTION: '', LABEL: '', REASONS: '', AI_NOTE: '', MODULE_ID: '',
+  });
+  assert.match(body, /先红的是「AI 安全员复核」/);
+  assert.doesNotMatch(body, /先红的是「验 pending 凭据/);
+});
+
+test('T6.3·上游一格读数都没有：不瞎猜是谁红的', () => {
+  const { body } = introOnly({
+    TRIAGE_CONCLUSION: '', PROOF_CONCLUSION: '', SCAN_CONCLUSION: '', AI_CONCLUSION: '',
+    DISPOSE_CONCLUSION: '', RISK: '', ACTION: '', LABEL: '', REASONS: '', AI_NOTE: '', MODULE_ID: '',
+  });
+  assert.match(body, /分流决策这一步没有运行。/);
+  assert.doesNotMatch(body, /先红的是/);
+});
+
+test('T6.3·封口 1：依据 25 条只贴 10 条，剩下 15 条要点名（静默变短等于让人以为没人说过话）', () => {
+  const reasons = Array.from({ length: 25 }, (_, i) => '原因 ' + (i + 1)).join('；');
+  const { body } = introOnly({ REASONS: reasons });
+  assert.match(introLine(body, '- 依据：'), /原因 10…（另有 15 条未列出/);
+  assert.doesNotMatch(body, /原因 11/);
+});
+
+test('T6.3·封口 2：单条依据 500 字截到 200 —— 沿用本步那把 seal，不发明第二个口径', () => {
+  const { body } = introOnly({ REASONS: '长'.repeat(500) });
+  const line = introLine(body, '- 依据：');
+  assert.ok(line.startsWith('- 依据：' + '长'.repeat(200)), '必须正好截在 200');
+  assert.equal(body.includes('长'.repeat(201)), false);
+});
+
+test('T6.3·封口 3：模块 id 30 个只贴 10 个并点名余下 20 个', () => {
+  const ids = Array.from({ length: 30 }, (_, i) => 'mod_' + i).join(',');
+  const { body } = introOnly({ MODULE_ID: ids, RISK: 'high', ACTION: 'request-review', LABEL: 'needs-human-review' });
+  assert.match(introLine(body, '- 模块 id：'), /mod_9`…（另有 20 个未列出/);
+  assert.doesNotMatch(body, /mod_10/);
+});
+
+test('T6.3·台账命中那一发：分流写的是 auto-approve，评论必须改口成「被台账拦下」，不许念 ✅', () => {
+  // disposition-check 命中时**不改退出码**（scripts/disposition-check.mjs:132-135 那条设计），
+  // 所以这一发 audit 作业全绿、triage conclusion 是 success、ACTION 是 auto-approve ——
+  // 红的是 approve（读 needs.audit.outputs.disposition == 'hit'）。
+  // 评论要是只看 ACTION，就会对着一条被黑名单拦下的投稿念「已自动合入索引」。
+  const { body } = introOnly({ DISPOSITION: 'hit', DISPOSITION_REASON: '模块 demo 在黑名单里（dispositions.json 第 2 条）' });
+  assert.match(body, /⛔ 分流给出的是 auto-approve，但\*\*处置台账命中\*\*（下架或黑名单）：本 PR 不会合入/);
+  assert.match(body, /- 台账说：模块 demo 在黑名单里/);
+  assert.doesNotMatch(body, /✅/);
+});
+
+test('T6.3·台账没给出结论（读不懂时它 exit 3，output 是空的）：不声称已合入', () => {
+  const { body } = introOnly({ DISPOSITION: '', DISPOSE_CONCLUSION: 'failure' });
+  assert.match(body, /🛑 分流给出的是 auto-approve，但处置台账那一格\*\*没有结论\*\*/);
+  assert.doesNotMatch(body, /✅|已自动合入/);
+});
+
+test('T6.3·只有 DISPOSITION=clear 才配得上那句 ✅', () => {
+  const { body } = introOnly({ DISPOSITION: 'clear' });
+  assert.match(body, /✅ 静态扫描未发现风险且每份投稿都是首次收录，已自动合入索引/);
+});
+
+/* ------------------------------------------------------------- 打标签那一步 */
+const LABEL_STEP = '打标签';
+
+const LABEL_RUNNER = [
+  'const step = require("./step.cjs");',
+  'const fs = require("fs");',
+  'const calls = [];',
+  'const github = { rest: { issues: {',
+  '  getLabel: async ({ name }) => { calls.push(["get", name]); return {}; },',
+  '  createLabel: async ({ name }) => { calls.push(["create", name]); },',
+  '  addLabels: async (o) => { calls.push(["add", ...(o.labels || [])]); },',
+  '} } };',
+  'const context = { issue: { number: 7 }, repo: { owner: "tester", repo: "modules-repo" } };',
+  'const core = { info: (m) => console.log(String(m)), warning: (m) => console.warn(String(m)), setOutput: () => {} };',
+  'step(github, context, core).then(',
+  '  () => fs.writeFileSync("label.json", JSON.stringify(calls)),',
+  '  (e) => { console.error("LABEL-STEP-THREW: " + (e && e.message ? e.message : String(e))); process.exit(1); },',
+  ');',
+  '',
+].join('\n');
+
+/** 真跑「打标签」；js 传进来时用于变异哨兵，默认就是 workflow 里那一段。 */
+function runLabelStep(env = {}, js) {
+  const slice = js === undefined ? extractStep(LABEL_STEP, 'script') : { text: js, region: '' };
+  const dir = fs.mkdtempSync(path.join(TMP, 'label-'));
+  fs.writeFileSync(path.join(dir, 'step.cjs'),
+    `module.exports = async function step(github, context, core) {
+${slice.text}
+}
+`, 'utf8');
+  fs.writeFileSync(path.join(dir, 'runner.cjs'), LABEL_RUNNER, 'utf8');
+  const full = { ...process.env };
+  for (const [k, v] of Object.entries(env)) full[k] = v === undefined || v === null ? '' : String(v);
+  let err = null;
+  let stdout = '';
+  try {
+    stdout = execFileSync(process.execPath, ['runner.cjs'], { cwd: dir, encoding: 'utf8', env: full, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) { err = e; stdout = String(e.stdout || ''); }
+  const p = path.join(dir, 'label.json');
+  const calls = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : null;
+  return { err, stdout, calls, region: slice.region, script: slice.text,
+    stderr: err ? String(err.stderr || '') : '' };
+}
+
+test('T6.3·LABEL 为空（分流整步没跑）：一个标签都不打、不建、也不 get —— 空串递进 addLabels 是 API 报错', () => {
+  const r = runLabelStep({ LABEL: '' });
+  assert.equal(r.err, null, `这一步不许自己炸：${r.stderr}`);
+  assert.deepEqual(r.calls || [], [], '没标签可打时连一次 API 调用都不该发出去；报错会把「通道自己坏了」伪装成「打标签挂了」');
+  assert.match(r.stdout, /本轮不打标签/);
+});
+
+test('T6.3·needs-human-review 照旧连带 blocked-auto-merge；auto-approved 单独一个', () => {
+  const blocked = runLabelStep({ LABEL: 'needs-human-review' });
+  assert.deepEqual((blocked.calls || []).find((c) => c[0] === 'add'), ['add', 'needs-human-review', 'blocked-auto-merge']);
+  const ok = runLabelStep({ LABEL: 'auto-approved' });
+  assert.deepEqual((ok.calls || []).find((c) => c[0] === 'add'), ['add', 'auto-approved']);
+});
+
+/* --------------------------------------------------------------- 变异哨兵 */
+
+test('T6.3·变异一：把「有没有结论」改回读 risk 空不空 ⇒ 整步没跑那一发立刻开始念等级与处置', () => {
+  const src = extractStep(COMMENT_STEP, 'script').text;
+  const mutated = src.replace("const TRIAGE = String(process.env.TRIAGE_CONCLUSION || '');",
+    "const TRIAGE = process.env.RISK ? 'success' : 'failure';");
+  assert.notEqual(mutated, src, '变异没落地：TRIAGE 那一行的写法变了要一起改这里');
+  const c = runCommentStep({ js: mutated, env: {
+    TRIAGE_CONCLUSION: '', PROOF_CONCLUSION: 'failure', RISK: '', ACTION: '', LABEL: '',
+    CHANGE_TYPE: '', REASONS: '', AI_NOTE: '', MODULE_ID: '', PACKAGE_COUNT: '1',
+  } });
+  // 这一发的真形状是「分流整步没跑」；退回读 risk 之后它落进 failure 那一支，
+  // 于是开始念等级与处置 —— 那正是前提 ② 的原始症状。
+  assert.match(c.body, /- 风险等级：/);
+  assert.match(c.body, /- 处置：/);
+});
+
+test('T6.3·变异二：摘掉 LABEL 为空那道守卫 ⇒ addLabels 收到一个空串（就是那条 API 报错的成因）', () => {
+  const src = extractStep(LABEL_STEP, 'script').text;
+  const mutated = src.replace('if (!label) {', 'if (false) {');
+  assert.notEqual(mutated, src, '变异没落地：那道守卫的写法变了要一起改这里');
+  const r = runLabelStep({ LABEL: '' }, mutated);
+  const add = (r.calls || []).find((c) => c[0] === 'add');
+  assert.deepEqual(add, ['add', ''], '空串被当成一个标签递给 addLabels');
+});
+
+test('T6.3·变异三：把「✅ 只配 clear」那道闸退回成只看 ACTION ⇒ 被台账拦下那一发开始念已合入', () => {
+  const src = extractStep(COMMENT_STEP, 'script').text;
+  const mutated = src.replace("} else if (process.env.DISPOSITION === 'clear') {", '} else if (true) {');
+  assert.notEqual(mutated, src, '变异没落地：DISPOSITION 那一行的写法变了要一起改这里');
+  const c = runCommentStep({ js: mutated, env: {
+    ...CONCL_OK, DISPOSITION: 'hit', DISPOSITION_REASON: '模块 demo 在黑名单里',
+    RISK: 'low', ACTION: 'auto-approve', LABEL: 'auto-approved', CHANGE_TYPE: 'first',
+    AI_NOTE: '同意静态结论', MODULE_ID: 'demo', PACKAGE_COUNT: '1', REASONS: '未发现风险',
+  } });
+  assert.match(c.body, /✅/, '变异体必须真的念出已合入 —— 念不出来是这条哨兵自己失效，不是闸还在');
+  assert.doesNotMatch(c.body, /处置台账命中/, '变异体绕过了 hit 那一支，所以那句不该出现');
 });

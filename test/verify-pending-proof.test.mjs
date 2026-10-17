@@ -556,21 +556,30 @@ test('写回 PR 的那两步只挂 pull_request —— dispatch 里没有 PR 可
   };
   for (const name of ['发布 PR 评论', '打标签']) {
     const block = blockOf(name);
-    assert.match(block, /^ {8}if: github\.event_name == 'pull_request' && steps\.locate\.outputs\.found == 'true'$/m,
-      `${name}：PR 上下文与 found 两个条件都要在，少一半就把线上验证路和自动放行路绑死在一起`);
+    assert.match(block, /^ {8}if: github\.event_name == 'pull_request' && !cancelled\(\) && steps\.locate\.outputs\.found == 'true'$/m,
+      `${name}：PR 上下文与 found 两个条件都要在，少一半就把线上验证路和自动放行路绑死在一起`
+      + '（`!cancelled()` 是后加的：见下面那条「判据红那一发留下什么」—— 但加它的前提是 PR 条件仍在最前，dispatch 上这两步必须不跑）');
     assert.match(block, /actions\/github-script@v7/);
   }
 });
 
-test('判据红的那一发也要把报告留下 —— 只有 上传报告 允许 !cancelled()，其余四步不许跟着加', () => {
+test('判据红的那一发留下什么 —— 证据位与呈现位三步放宽（上传报告 / 发布 PR 评论 / 打标签），判据位两步不放宽', () => {
   // 2026-10-16 run 38908245528（坏配置的失败面 canary，修完 -e 那一发）实测：
   // `AI 安全员复核 => success`、`分流决策 => failure` 都对，但后面 `处置台账核对 / 上传报告 /
   // 上传待合并 pending / 发布 PR 评论 / 打标签` 全 `skipped` —— GitHub 对「前一步红」的默认处理
   // 就是跳过后续步骤，而那两步挂的 `if` 里没有 `always()` 家族的任何东西。
   // 后果是**最该留证据的那一发什么都没留**：整份 `audit-out/`（扫描报告 + AI 五态产物）只活在
-  // runner 日志里，日志会过期，而投稿者那边只剩一个红叉 —— 与本文件上面那条「不跑而不是跑了再炸」
-  // 是同一类病，只是这次缺的不是通道而是证据。
-  // 只放宽 artifact 那一格：它是**原样落盘的字节**，不解释、不参与批准，放宽它零风险。
+  // runner 日志里，日志会过期，而投稿者那边只剩一个红叉。
+  // 放宽的三格各买到什么，按「它会不会改变批准结论」划线：
+  // - 上传报告：原样落盘的字节，不解释、不参与批准；
+  // - 发布 PR 评论 / 打标签：给人读的文本与队列里的颜色。**这两格能加是欠的三件事补齐之后**
+  //   （#48 写完 fail-closed 判据 → 三件事里的 ②③ 有地方渲染；run 39007438609 量到 ①），
+  //   所以真正的钉子不在这一发 assert 的这几行 `if:`，而在 `test/audit-presentation.test.mjs`
+  //   那批**真跑这段脚本**的用例：没有结论的那一发必须不念等级、不念处置，还要点名先红的是哪一步。
+  // 判据位两步**不许**跟着加：
+  // - 处置台账核对：它自己就是判据，跑在红之后只会把「谁挡的」变成两条互相覆盖的红。
+  // - 上传待合并 pending：唯一的消费者是 publish，而它只认 `action == 'auto-approve'`
+  //   ⇒ 红的那一发没有消费者（fail-closed 写的是 block），放宽它只是多传一份没人读的东西。
   const wf = fs.readFileSync(WF, 'utf8');
   // 只认**步骤级 `if:` 那一行**，不在整块里扫 `!cancelled` / `always()`：块尾会把下一步前面的
   // 那段注释一起吃进来（本文件那条「耦合钉子」用例就是被自己的注释打红的，同一个坑不踩第二次）。
@@ -580,7 +589,7 @@ test('判据红的那一发也要把报告留下 —— 只有 上传报告 允�
     return m[0];
   };
   const FOUND = "        if: steps.locate.outputs.found == 'true'";
-  const PR_FOUND = "        if: github.event_name == 'pull_request' && steps.locate.outputs.found == 'true'";
+  const PR_CANCELLED = "        if: github.event_name == 'pull_request' && !cancelled() && steps.locate.outputs.found == 'true'";
 
   assert.equal(ifLineOf('上传报告'),
     "        if: ${{ !cancelled() && steps.locate.outputs.found == 'true' }}",
@@ -589,26 +598,12 @@ test('判据红的那一发也要把报告留下 —— 只有 上传报告 允�
   assert.match(rep, /name: module-audit-report/);
   assert.match(rep, /path: audit-out\//);
 
-  // 另外四步**不许**跟着加上同一把：
-  // - 发布 PR 评论 / 打标签：#46 那一版写的理由是「分流里写 output 的那一段（`w("risk",…)` 那批）
-  //   在整个脚本末尾，而三条 fail-closed 都在它之前 `process.exit(1)` ⇒ 判据红的那一发
-  //   `steps.triage.outputs.*` 全空」。**那一半已经改掉了**（G.2：writeFailClosed 先写完 fail-closed
-  //   判据再 exit 1），所以这条理由今天窄成三件还没做的事：
-  //   ① 分流**整步被跳过**时 output 仍旧全空 —— AI 步先红就是这形状，而下面那条「耦合钉子」
-  //     钉的正是「两步挂同一条 if、都没有 always()」这个前提；
-  //   ② 评论那段 intro 只有三支（auto-approve / risk 是 low / 其余念「中高风险」），没有
-  //     「本轮没有结论」那一支 —— fail-closed 故意把 risk 留空，落进第三支就是替一个我们没量过的
-  //     等级说话（§0.42「把效果当立场」的同族）；要区分这两件事得读 steps.triage.conclusion；
-  //   ③ fail-closed 的 reasons / ai_note 没过绿那一发那两根柱子（条数 ≤10、单条 ≤200）：
-  //     fire() 自己把每条 reason 截到 200，但包数没有上限。
-  //   三件做完才谈给这两步放宽；在那之前加上就是拿空值或半份值渲染一句给人看的话。
-  // - 处置台账核对：它自己就是判据，跑在红之后只会把「谁挡的」变成两条互相覆盖的红。
-  // - 上传待合并 pending：唯一的消费者是 publish 作业，而它只认 `action == 'auto-approve'`
-  //   ⇒ 红的那一发没有消费者（fail-closed 写的是 block），放宽它只是多传一份没人读的东西。
+  assert.equal(ifLineOf('发布 PR 评论'), PR_CANCELLED,
+    '投稿者屏幕上只有红叉就是这一格没跑；它渲染什么由 audit-presentation 那批用例钉，不由这条 if 钉');
+  assert.equal(ifLineOf('打标签'), PR_CANCELLED,
+    '同一发；LABEL 为空时那一步必须自己 return，不许拿空串去 addLabels（那条由下面的用例钉）');
   assert.equal(ifLineOf('处置台账核对（下架 / 黑名单）'), FOUND, '判据位不放宽：它在红之后再跑只会把「谁挡的」念成两条互相覆盖的红');
   assert.equal(ifLineOf('上传待合并 pending'), FOUND, '这份 artifact 的唯一消费者是 publish，而它只认 auto-approve');
-  assert.equal(ifLineOf('发布 PR 评论'), PR_FOUND, '分流被整步跳过时 output 仍是空的，而 intro 没有「本轮没有结论」那一支（见上面三件）');
-  assert.equal(ifLineOf('打标签'), PR_FOUND, 'LABEL 为空时这一步会拿空串去 addLabels：不是留白，是通道自己炸');
 });
 
 /* --------------------------------------------------------- 与母本 / Worker 的对齐 */

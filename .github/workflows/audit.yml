@@ -954,20 +954,22 @@ jobs:
       # ---------------------------------------------------------------
       # 5. 把报告贴到 PR
       # ---------------------------------------------------------------
-      # 这一步是**唯一**在判据红之后还要跑的一步：`!cancelled()`。
+      # 这一格与下面**评论、标签两格**是判据红之后仍要跑的三步，都挂 `!cancelled()`。
       # 动机是 run 38908245528 实测到的形状：分流决策按设计判红之后，`上传报告` 与后面三步全 `skipped`，
-      # 于是最该留证据的那一发（整份 `audit-out/`：扫描报告 + AI 五态产物）只活在会过期的 runner 日志里。
-      # 这里放宽的只是**证据位**：artifact 是原样落盘的字节，不解释、不参与批准，也不进任何判据。
-      # 评论与标签两步**仍然不许**跟着加，但理由比 #46 那一版窄了：分流自己判红的那一发现在会
-      # 先写完 fail-closed 判据再 `exit 1`（见上面 writeFailClosed），不再是全空。还剩三件事：
-      #   ① 分流**整步被跳过**时 output 依旧是空的 —— AI 步先红就是这形状（那两步挂同一条 if、
-      #      都没有 always()，这是「耦合钉子」那条用例钉住的前提），拿空值渲染还是一句假陈述；
-      #   ② 下面那段 intro 只有三支（auto-approve / risk 是 low / 其余念「中高风险」），
-      #      没有「本轮没有结论」那一支 —— 而 fail-closed 故意把 risk 留空，落进第三支
-      #      就是替一个我们没量过的等级说话；要区分这两件事，读 steps.triage.conclusion；
-      #   ③ fail-closed 的 reasons / ai_note 没过绿那一发那两根柱子（条数 ≤10、单条 ≤200）：
-      #      fire() 自己把每条 reason 截到 200，但**包数没有上限**。
-      # 判据位与证据位的分法本身不变。
+      # 于是最该留证据的那一发（整份 `audit-out/`：扫描报告 + AI 五态产物）只活在会过期的 runner 日志里，
+      # 而投稿者屏幕上只有一个红叉。
+      # 这里放宽的是**呈现位与证据位**：artifact 是原样落盘的字节，评论是给人读的文本，标签是队列里的颜色 ——
+      # 三样都不参与批准，`approve` 读的是 job outputs 而不是这三步，`publish` 只认 `auto-approve`。
+      # 评论与标签两步能跟着加，是欠的三件事补齐了（2026-10-17，两条 run 实测）：
+      #   ① 「分流整步被跳过」那一发由 run 39007438609 量到（`proof` 先红 ⇒ 11 格 output 天然全空），
+      #      所以「有没有结论」**只读 steps.triage.conclusion**，不许读 `risk` 空不空 —— 两种空长得一样、
+      #      意思相反：failure 有 fail-closed 写齐的字面量处置，''(skipped) 什么都没人写过；
+      #   ② intro 现在按那三种结论分叉，「本轮没有结论」那一支不念等级、不念处置，并点名先红的是哪一步；
+      #   ③ 依据条数、模块 id 个数、复核方式长度都过了 seal（≤10 条 / 单条 ≤200），
+      #      藏了多少要点名 —— 静默变短等于让人以为没人说过话。
+      # 标签那格另有一条：LABEL 为空时直接 return，不许拿空串去 addLabels（那是 API 报错，
+      # 会把「通道自己坏了」伪装成「打标签这一步挂了」）。
+      # 判据位（scan / ai / 分流 / 处置台账 / 上传待合并 pending）仍然不放宽，分法不变。
       - name: 上传报告
         if: ${{ !cancelled() && steps.locate.outputs.found == 'true' }}
         uses: actions/upload-artifact@v4
@@ -989,9 +991,16 @@ jobs:
       # createComment 直接 404（2026-10-16 run 38890758068 实测），整条作业因通道而红，
       # 读不出「这批包过没过检」。不跑，而不是跑了再炸。
       - name: 发布 PR 评论
-        if: github.event_name == 'pull_request' && steps.locate.outputs.found == 'true'
+        if: github.event_name == 'pull_request' && !cancelled() && steps.locate.outputs.found == 'true'
         uses: actions/github-script@v7
         env:
+          TRIAGE_CONCLUSION: ${{ steps.triage.conclusion }}
+          PROOF_CONCLUSION: ${{ steps.proof.conclusion }}
+          SCAN_CONCLUSION: ${{ steps.scan.conclusion }}
+          AI_CONCLUSION: ${{ steps.ai.conclusion }}
+          DISPOSE_CONCLUSION: ${{ steps.dispose.conclusion }}
+          DISPOSITION: ${{ steps.dispose.outputs.hit }}
+          DISPOSITION_REASON: ${{ steps.dispose.outputs.why }}
           RISK: ${{ steps.triage.outputs.risk }}
           ACTION: ${{ steps.triage.outputs.action }}
           LABEL: ${{ steps.triage.outputs.label }}
@@ -1162,23 +1171,86 @@ jobs:
                 + `${over ? `\n${TRUNC}\n` : ''}</details>\n`;
             }
 
-            let intro = `## 模块投稿安全审核\n\n`
-              + `- 本 PR 内投稿数：**${COUNT}**\n`
-              + `- 模块 id：\`${inert(process.env.MODULE_ID)}\`\n`
-              + `- 风险等级：**${String(process.env.RISK).toUpperCase()}**（取本 PR 全部报告里最严的一份）\n`
-              + `- 变更类型：**${ctLabel(process.env.CHANGE_TYPE)}**\n`
-              + `- 处置：**\`${process.env.ACTION}\`** / 标签 \`${process.env.LABEL}\`\n`
-              + `- 依据：${inert(process.env.REASONS)}\n`
-              + `- 复核方式：${inert(process.env.AI_NOTE || '（分流这一步没写出复核方式：AI 那一层没有可呈现的文案）')}\n`;
+            // ---- 本轮「有没有结论」由 steps.triage.conclusion 说，不由 risk 空不空说。
+            // 两种空长得一样但意思相反（2026-10-17 两条 run 实测）：
+            //   failure = 分流跑了、判不动，自己红的 —— 那一发有 #48 写齐的 11 格 fail-closed 判据可读；
+            //   ''(skipped) = 分流整步没运行 —— 没有任何一格被人写过，此时贴「风险等级：（空）」
+            //   或替它念一句「⛔ 中/高风险」都是在替一个我们没量过的等级说话。
+            const TRIAGE = String(process.env.TRIAGE_CONCLUSION || '');
+            const STEP_NAMES = [
+              ['验 pending 凭据与来源复核', 'PROOF_CONCLUSION'],
+              ['运行 scan.mjs', 'SCAN_CONCLUSION'],
+              ['AI 安全员复核', 'AI_CONCLUSION'],
+              ['处置台账核对（下架 / 黑名单）', 'DISPOSE_CONCLUSION'],
+            ];
+            const brokenStep = STEP_NAMES.find(([, k]) => {
+              const v = String(process.env[k] || '');
+              return v !== '' && v !== 'success';
+            });
 
-            if (process.env.ACTION === 'auto-approve') {
-              intro += `\n✅ 静态扫描未发现风险且每份投稿都是首次收录，已自动合入索引。\n`;
-            } else if (process.env.RISK === 'low') {
-              // 走到这一支只有两种可能：含已收录模块的更新，或多份投稿里不全是首次收录。
-              // 两种都不是「中/高风险」——把它写成中/高风险就是把我们的判据说反。
-              intro += `\n⚠️ 风险虽低，但按规则不自动合入（含已收录模块的版本更新，或本 PR 内并非每份投稿都是首次收录）：转人工审核。\n`;
+            // 条数与单条长度这两根柱子原来只量绿那一发；fail-closed 的 reasons 是我们自己的
+            // 异常文本，包数与条数都没有上限（盘点 G.2 前提 ③）。沿用上面那把 seal，不在这里
+            // 发明第二个口径，只补「藏了几条要点名」——静默变短等于让人以为没人说过话。
+            const capItems = (s, sep) => {
+              const all = String(s === null || s === undefined ? '' : s).split(sep)
+                .map((x) => seal(x)).filter((x) => x !== '');
+              const kept = all.slice(0, CAP_ITEMS);
+              return { text: kept.join(sep), hidden: all.length - kept.length };
+            };
+            const capOne = (s) => {
+              const raw = String(s === null || s === undefined ? '' : s);
+              const one = seal(raw);
+              return { text: one, hidden: raw.length > one.length ? raw.length - one.length : 0 };
+            };
+            const moreNote = (n, what) => (n > 0 ? `…（另有 ${n} ${what}未列出，完整见 artifact：module-audit-report）` : '');
+
+            const idsCap = capItems(process.env.MODULE_ID, ',');
+            const reasonsCap = capItems(process.env.REASONS, '；');
+            const aiNoteCap = capOne(process.env.AI_NOTE || '（分流这一步没写出复核方式：AI 那一层没有可呈现的文案）');
+
+            const head = `- 本 PR 内投稿数：**${COUNT}**\n`
+              + `- 模块 id：\`${inert(idsCap.text)}\`${moreNote(idsCap.hidden, '个')}\n`;
+            const verdict = (risk, riskNote, changeType) => head
+              + `- 风险等级：**${risk}**${riskNote}\n`
+              + `- 变更类型：**${changeType}**\n`
+              + `- 处置：**\`${process.env.ACTION}\`** / 标签 \`${process.env.LABEL}\`\n`
+              + `- 依据：${inert(reasonsCap.text)}${moreNote(reasonsCap.hidden, '条')}\n`
+              + `- 复核方式：${inert(aiNoteCap.text)}${moreNote(aiNoteCap.hidden, '字')}\n`;
+
+            let intro = '## 模块投稿安全审核\n\n';
+            const disReason = capOne(process.env.DISPOSITION_REASON);
+            if (TRIAGE === 'success') {
+              intro += verdict(String(process.env.RISK).toUpperCase(),
+                '（取本 PR 全部报告里最严的一份）', ctLabel(process.env.CHANGE_TYPE));
+              if (process.env.ACTION !== 'auto-approve') {
+                if (process.env.RISK === 'low') {
+                  // 走到这一支只有两种可能：含已收录模块的更新，或多份投稿里不全是首次收录。
+                  // 两种都不是「中/高风险」——把它写成中/高风险就是把我们的判据说反。
+                  intro += `\n⚠️ 风险虽低，但按规则不自动合入（含已收录模块的版本更新，或本 PR 内并非每份投稿都是首次收录）：转人工审核。\n`;
+                } else {
+                  intro += `\n⛔ 中/高风险，需人工审核后才可进入正式索引；本 PR 不会自动合入。\n`;
+                }
+              } else if (process.env.DISPOSITION === 'clear') {
+                intro += `\n✅ 静态扫描未发现风险且每份投稿都是首次收录，已自动合入索引。\n`;
+              } else if (process.env.DISPOSITION === 'hit') {
+                // 「命中」不改退出码（disposition-check.mjs:132-135 那条设计：红会把报告与标签一起带走），
+                // 所以这一发的 audit 作业是绿的、分流写的确实是 auto-approve，红的是 approve（audit.yml 的
+                // DISPOSITION = hit 那一格）。不写这一支，评论就会对着一条被台账拦下的投稿念「已自动合入」。
+                intro += `\n⛔ 分流给出的是 auto-approve，但**处置台账命中**（下架或黑名单）：本 PR 不会合入。\n`
+                  + `- 台账说：${inert(disReason.text)}${moreNote(disReason.hidden, '字')}\n`;
+              } else {
+                // 既不是 clear 也不是 hit = 台账那一格没给出结论（读不懂时它 exit 3，output 就是空的）。
+                intro += `\n🛑 分流给出的是 auto-approve，但处置台账那一格**没有结论**（这一步没跑完或台账读不懂）：这里不声称已合入 —— 合不合由 approve 判，不由这句判。\n`;
+              }
+            } else if (TRIAGE === 'failure') {
+              // 分流跑了但判不动、自己红的 —— 处置与标签是 #48 写死的字面量，等级**故意**是空的。
+              intro += verdict('（本轮没有等级：分流自己没过检）',
+                ' —— 这一格空着是判据，不是漏填', ctLabel(process.env.CHANGE_TYPE));
+              intro += '\n🛑 上面那个处置是**故障安全方向**（不放行），不是对这一个模块量出来的结论。风险等级填任何一档都是替一个没量过的等级说话；这条通道自己坏了，需要维护者看这条 run。\n';
             } else {
-              intro += `\n⛔ 中/高风险，需人工审核后才可进入正式索引；本 PR 不会自动合入。\n`;
+              intro += `- 本轮**没有判据**：分流决策这一步没有运行${brokenStep ? `（先红的是「${brokenStep[0]}」）` : ''}。\n`
+                + '- 因此这一条评论里没有任何风险等级、处置或标签结论 —— 不是「低风险」，也不是「不通过」，是没量。\n';
+              intro += '\n🛑 审核通道在出结论之前中止了。这不说明你的模块有没有风险，只说明我们这一侧没跑完；请维护者看这条 run 的日志。这条 PR 不会被自动合入。\n';
             }
 
             let body;
@@ -1214,13 +1286,21 @@ jobs:
       # ---------------------------------------------------------------
       # 与上面那一步同一条理由：addLabels 用的也是 PR/issue 编号，dispatch 上没有对象。
       - name: 打标签
-        if: github.event_name == 'pull_request' && steps.locate.outputs.found == 'true'
+        if: github.event_name == 'pull_request' && !cancelled() && steps.locate.outputs.found == 'true'
         uses: actions/github-script@v7
         env:
           LABEL: ${{ steps.triage.outputs.label }}
         with:
           script: |
-            const label = process.env.LABEL;
+            // LABEL 为空只有一种意思：分流决策整步没运行（跑了但判不动的那一发写的是 needs-human-review）。
+            // 这时候**一个标签都不许打**：拿空串去 addLabels 不是留白，是 API 报错，
+            // 而那个报错会把「我们这条通道自己坏了」伪装成「打标签这一步挂了」。
+            // 「需要有人看」这件事已经由评论里那句「先红的是哪一步」承担了，不在这里发明第二个信号。
+            const label = String(process.env.LABEL || '').trim();
+            if (!label) {
+              console.log('分流决策没有产出标签（整步未运行）：本轮不打标签，也不建标签');
+              return;
+            }
             const add = [label];
             if (label === 'needs-human-review') add.push('blocked-auto-merge');
             // 标签可能尚未在仓库中创建，缺失时先建后打
