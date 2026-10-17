@@ -590,19 +590,25 @@ test('判据红的那一发也要把报告留下 —— 只有 上传报告 允�
   assert.match(rep, /path: audit-out\//);
 
   // 另外四步**不许**跟着加上同一把：
-  // - 发布 PR 评论 / 打标签：分流里写 output 的那一段（`w("risk",…)` 那批）在整个脚本**末尾**，
-  //   而 `failed` / `untrusted` / `over-budget` 三条 fail-closed 都在它之前 `process.exit(1)`
-  //   ⇒ 判据红的那一发 `steps.triage.outputs.*` 是**全空**的。加了 `!cancelled()` 就是拿空值渲染
-  //   一句给人看的话：要么是一条假陈述（§0.42 那条「把效果当立场」的同族），要么是通道自己坏。
+  // - 发布 PR 评论 / 打标签：#46 那一版写的理由是「分流里写 output 的那一段（`w("risk",…)` 那批）
+  //   在整个脚本末尾，而三条 fail-closed 都在它之前 `process.exit(1)` ⇒ 判据红的那一发
+  //   `steps.triage.outputs.*` 全空」。**那一半已经改掉了**（G.2：writeFailClosed 先写完 fail-closed
+  //   判据再 exit 1），所以这条理由今天窄成三件还没做的事：
+  //   ① 分流**整步被跳过**时 output 仍旧全空 —— AI 步先红就是这形状，而下面那条「耦合钉子」
+  //     钉的正是「两步挂同一条 if、都没有 always()」这个前提；
+  //   ② 评论那段 intro 只有三支（auto-approve / risk 是 low / 其余念「中高风险」），没有
+  //     「本轮没有结论」那一支 —— fail-closed 故意把 risk 留空，落进第三支就是替一个我们没量过的
+  //     等级说话（§0.42「把效果当立场」的同族）；要区分这两件事得读 steps.triage.conclusion；
+  //   ③ fail-closed 的 reasons / ai_note 没过绿那一发那两根柱子（条数 ≤10、单条 ≤200）：
+  //     fire() 自己把每条 reason 截到 200，但包数没有上限。
+  //   三件做完才谈给这两步放宽；在那之前加上就是拿空值或半份值渲染一句给人看的话。
   // - 处置台账核对：它自己就是判据，跑在红之后只会把「谁挡的」变成两条互相覆盖的红。
   // - 上传待合并 pending：唯一的消费者是 publish 作业，而它只认 `action == 'auto-approve'`
-  //   ⇒ 红的那一发没有消费者，放宽它只是多传一份没人读的东西。
-  //   真要把「没跑成」那句写到 PR 上，正确的改法是**先写完判据 output 再红**，那是分流自己的事，
-  //   属于「红的时候对外说什么」，不在这一格里顺手做。
+  //   ⇒ 红的那一发没有消费者（fail-closed 写的是 block），放宽它只是多传一份没人读的东西。
   assert.equal(ifLineOf('处置台账核对（下架 / 黑名单）'), FOUND, '判据位不放宽：它在红之后再跑只会把「谁挡的」念成两条互相覆盖的红');
   assert.equal(ifLineOf('上传待合并 pending'), FOUND, '这份 artifact 的唯一消费者是 publish，而它只认 auto-approve');
-  assert.equal(ifLineOf('发布 PR 评论'), PR_FOUND, '判据红的那一发 triage 的 output 全空，拿空值渲染 = 假陈述');
-  assert.equal(ifLineOf('打标签'), PR_FOUND, '同上：标签读的也是那批空 output');
+  assert.equal(ifLineOf('发布 PR 评论'), PR_FOUND, '分流被整步跳过时 output 仍是空的，而 intro 没有「本轮没有结论」那一支（见上面三件）');
+  assert.equal(ifLineOf('打标签'), PR_FOUND, 'LABEL 为空时这一步会拿空串去 addLabels：不是留白，是通道自己炸');
 });
 
 /* --------------------------------------------------------- 与母本 / Worker 的对齐 */

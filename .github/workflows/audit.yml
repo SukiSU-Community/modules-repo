@@ -741,22 +741,56 @@ jobs:
           # 红开在这里而不是 AI 那一步，是因为那一步先红会把本步整步跳过（found=='true' 没有 always()）：
           # 那样五态文案出不来、判据全空、PR 一片沉默 —— 判据层才是开火的正确位置。
           node -e '
-            (async () => {
             const fs=require("fs");
             const path=require("node:path");
             const {pathToFileURL}=require("node:url");
             const dir="audit-out";
-            const names=fs.readdirSync(dir).filter((f)=>f.endsWith(".audit.json")).sort();
+            const out=process.env.GITHUB_OUTPUT;
+            const w=(k,v)=>fs.appendFileSync(out,`${k}=${String(v).replace(/\r?\n/g," ")}\n`);
+            const idOf=(r)=> (r.meta && r.meta.id) ? r.meta.id : "(缺失)";
+            const verOf=(r)=> (r.meta && r.meta.version) ? r.meta.version : "";
+            // changeType 的算法只许有一份：绿那一发与红那一发必须报出同一个值。
+            const changeTypeOf=(rs)=>{
+              const u=[...new Set(rs.map((x)=>x.r.changeType||"unknown"))];
+              return u.length===1 ? u[0] : u.sort().join("+");
+            };
+            let names=[];
+            let reports=[];
+            // 判据红的那一发也要先把 output 写完再 exit 1（盘点 G.2；§0.47 留下的那半边）。
+            // 原来写 $GITHUB_OUTPUT 的整段在脚本**末尾**，而每一条 fail-closed 都在它之前 process.exit(1)
+            // ⇒ 红那一发 steps.triage.outputs.* 全空，下游想解释「红叉为什么」只能拿空值渲染 = 一句假陈述。
+            // 写的方向只有一个：fail closed。**红仍然是这一发的结论** —— 退出码一个字没动。
+            // risk 故意留空：本轮没有产出等级。填 high 是把我们的故障说成投稿者的风险，
+            // 填静态那一档是把「AI 没来得及抬级」说成「已经量过」—— 两句都是假陈述。
+            // 下游要区分「没有结论」与「量出来是 X」，靠的是 steps.triage.conclusion，不是这个字段。
+            const writeFailClosed=(m,aboutAi)=>{
+              w("risk","");
+              w("change_type",reports.length ? changeTypeOf(reports) : "");
+              w("module_id",[...new Set(reports.map((x)=>idOf(x.r)))].join(","));
+              w("module_version",[...new Set(reports.map((x)=>verOf(x.r)))].join(","));
+              // 一份报告都没读成时，还能说的只剩「这个 PR 里有几份报告文件」。
+              w("package_count",String(reports.length || names.length));
+              w("ai_note",aboutAi===false ? "" : m);
+              w("reasons",m);
+              // 这三格永远不过 decide()：红那一发的处置只有一个方向。而 auto-approve 是 publish 作业的门票
+              // （它的 if 认 found 与 action 两个 output）、auto-approved 是标签步会真打上去的颜色 ——
+              // 判据自己没跑成却写出这两格里任何一个，就是把「通道坏了」渲染成「已放行」。
+              w("action","block"); w("label","needs-human-review"); w("needs_human_review","true");
+            };
+            const fail=(m,aboutAi)=>{ console.error(`::error::分流决策：${m}`); writeFailClosed(m,aboutAi); process.exit(1); };
+            const NO_REPORT="found=true 但 audit-out 里没有任何 .audit.json —— 没有报告就不定级，更不放行";
+            (async () => {
+            names=fs.readdirSync(dir).filter((f)=>f.endsWith(".audit.json")).sort();
             if (names.length===0) {
-              console.error("::error::found=true 但 audit-out 里没有任何 .audit.json —— 没有报告就不定级，更不放行");
+              console.error(`::error::${NO_REPORT}`);
+              writeFailClosed(NO_REPORT,false);
               process.exit(1);
             }
-            const fail=(m)=>{ console.error(`::error::分流决策：${m}`); process.exit(1); };
             const order={low:1,medium:2,high:3};
             // 读不懂的报告不是「低风险」。riskLevel 缺失或不在枚举里时按 high 排 ——
             // 否则排序比较器拿到 undefined 会当成「相等」，一份坏报告就能把整条 PR 顶到 low。
             const riskOf=(x)=>(typeof x.riskLevel === "string" && order[x.riskLevel] !== undefined) ? x.riskLevel : "high";
-            const reports=names.map((f)=>({
+            reports=names.map((f)=>({
               pkg:f.replace(/\.audit\.json$/,""),
               r:JSON.parse(fs.readFileSync(dir+"/"+f,"utf8")),
             }));
@@ -833,9 +867,7 @@ jobs:
             }
             const risk=reports.map((x)=>(aiLevel[x.pkg]!==undefined ? aiLevel[x.pkg] : riskOf(x.r)))
               .sort((a,b)=>order[b]-order[a])[0];
-            const types=reports.map((x)=>x.r.changeType||"unknown");
-            const unique=[...new Set(types)];
-            const changeType=unique.length===1 ? unique[0] : unique.sort().join("+");
+            const changeType=changeTypeOf(reports);
             let reasons=reports.flatMap((x)=>(x.r.riskReasons||[])
               .map((y)=> reports.length>1 ? `${x.pkg}: ${y}` : y));
             // 输入侧「只送投影」那层防护已被撤销（D5b），所以这两根柱子必须留着：
@@ -871,10 +903,6 @@ jobs:
               // 混合形态不可能由脚本产生，但也不许被写成「AI 同意」—— 按「有 N 包没有 AI 意见」呈现。
               if (disabledPkgs.length) aiNote+=`；另有 ${disabledPkgs.length} 包没有 AI 意见（未启用）`;
             }
-            const idOf=(r)=> (r.meta && r.meta.id) ? r.meta.id : "(缺失)";
-            const verOf=(r)=> (r.meta && r.meta.version) ? r.meta.version : "";
-            const out=process.env.GITHUB_OUTPUT;
-            const w=(k,v)=>fs.appendFileSync(out,`${k}=${String(v).replace(/\r?\n/g," ")}\n`);
             w("risk",risk); w("change_type",changeType);
             w("module_id",[...new Set(reports.map((x)=>idOf(x.r)))].join(","));
             w("module_version",[...new Set(reports.map((x)=>verOf(x.r)))].join(","));
@@ -891,7 +919,11 @@ jobs:
             w("action",d.action); w("label",d.label); w("needs_human_review",d.needs_human_review);
             })().catch((e)=>{
               // 判据自己出问题 = 红。兜成「按静态结论继续」等于把这道闸交给故障。
-              console.error(`::error::分流决策异常：${e && e.message ? e.message : String(e)}`);
+              const m=`分流决策异常：${e && e.message ? e.message : String(e)}`;
+              console.error(`::error::${m}`);
+              // 异常这一路不算 AI 层的说法（它可能压根没走到 AI 那几格），所以不占 ai_note ——
+              // 留空时评论层有它自己那句「分流这一步没写出复核方式」，比在这里编一句准确。
+              writeFailClosed(m,false);
               process.exit(1);
             });
           '
@@ -926,9 +958,16 @@ jobs:
       # 动机是 run 38908245528 实测到的形状：分流决策按设计判红之后，`上传报告` 与后面三步全 `skipped`，
       # 于是最该留证据的那一发（整份 `audit-out/`：扫描报告 + AI 五态产物）只活在会过期的 runner 日志里。
       # 这里放宽的只是**证据位**：artifact 是原样落盘的字节，不解释、不参与批准，也不进任何判据。
-      # 评论与标签两步**不许**跟着加 —— 分流里写 output 那一段在整个脚本末尾，三条 fail-closed 都在它之前
-      # `exit 1`，所以判据红的那一发 `steps.triage.outputs.*` 全空；拿空值渲染一句给人看的话，
-      # 要么是一条假陈述，要么是通道自己坏。真要把「没跑成」写到 PR 上，改法是分流先写完判据再红。
+      # 评论与标签两步**仍然不许**跟着加，但理由比 #46 那一版窄了：分流自己判红的那一发现在会
+      # 先写完 fail-closed 判据再 `exit 1`（见上面 writeFailClosed），不再是全空。还剩三件事：
+      #   ① 分流**整步被跳过**时 output 依旧是空的 —— AI 步先红就是这形状（那两步挂同一条 if、
+      #      都没有 always()，这是「耦合钉子」那条用例钉住的前提），拿空值渲染还是一句假陈述；
+      #   ② 下面那段 intro 只有三支（auto-approve / risk 是 low / 其余念「中高风险」），
+      #      没有「本轮没有结论」那一支 —— 而 fail-closed 故意把 risk 留空，落进第三支
+      #      就是替一个我们没量过的等级说话；要区分这两件事，读 steps.triage.conclusion；
+      #   ③ fail-closed 的 reasons / ai_note 没过绿那一发那两根柱子（条数 ≤10、单条 ≤200）：
+      #      fire() 自己把每条 reason 截到 200，但**包数没有上限**。
+      # 判据位与证据位的分法本身不变。
       - name: 上传报告
         if: ${{ !cancelled() && steps.locate.outputs.found == 'true' }}
         uses: actions/upload-artifact@v4

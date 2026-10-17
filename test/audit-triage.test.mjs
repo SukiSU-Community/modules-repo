@@ -123,6 +123,34 @@ function runTriage(reports, ai, opts = {}) {
   return { kv, err, stderr: err ? String(err.stderr || '') : '', dir };
 }
 
+/* ------------------------------------------------- G.2：红那一发写出的 fail-closed 判据 */
+
+/**
+ * 绿那一发与红那一发写出的键集必须逐字相同 —— 「缺的写成空值而不是整个消失」本身是契约
+ * （同形的一条见 §0.44：评论顶层的 budgetBasis 写成 null 而不是不见）。
+ */
+const VERDICT_KEYS = ['risk', 'change_type', 'module_id', 'module_version', 'package_count',
+  'ai_note', 'reasons', 'action', 'label', 'needs_human_review'].sort();
+
+/**
+ * 判据红的那一发必须写出的东西（盘点 G.2）。原来这批用例钉的是 `deepEqual(kv, {})`
+ * （「失败时不许留下半份判据」），G.2 把它反过来：红那一发**必须**留下判据，否则下游
+ * 想解释「红叉为什么」只能拿空值渲染 —— 那要么是一句假陈述，要么是通道自己坏。
+ *
+ * 不许留下的是**放行**。三格是硬的：
+ *   action / label / needs_human_review 永远不过 decide()，红那一发只有 block 一个方向
+ *   （action=auto-approve 是 publish 作业的门票、label=auto-approved 是标签步会真打上去的颜色）；
+ *   risk 永远留空 —— 本轮没有产出等级，填 high 是把我们的故障说成投稿者的风险，
+ *   填静态那一档是把「AI 没来得及抬级」说成「已经量过」，两句都是假陈述。
+ */
+function assertFailClosed(kv, msg = '') {
+  assert.deepEqual(Object.keys(kv).sort(), VERDICT_KEYS, `${msg}键集要与绿那一发逐字相同`);
+  assert.equal(kv.action, 'block', `${msg}红那一发的处置只有 block 一个方向`);
+  assert.equal(kv.label, 'needs-human-review', msg);
+  assert.equal(kv.needs_human_review, 'true', msg);
+  assert.equal(kv.risk, '', `${msg}没有结论就留空，不许填一个看起来量出来的等级`);
+}
+
 /* ------------------------------------------------------------------ T6.1：AI 步（bash）的夹具 */
 
 /** AI 步在 workflow 里的步骤名（改名要一起改这里 —— extractStep 会带着这句话红）。 */
@@ -334,18 +362,29 @@ test('报告缺 riskLevel 或等级不在枚举里 → 按 high 处理，不许�
   assert.equal(runTriage({ a: rep('catastrophic', 'first') }).kv.risk, 'high');
 });
 
-test('audit-out 里一份报告都没有 → 这一步直接失败且不写任何判据', () => {
+test('audit-out 里一份报告都没有 → 这一步直接失败，并留下 fail-closed 判据（不是「什么都不留」）', () => {
   const { kv, err, stderr } = runTriage({});
   assert.notEqual(err, null, 'found=true 却没有报告时必须是红，不能给「什么都没扫到」盖章放行');
   assert.match(stderr, /没有任何 \.audit\.json/);
-  assert.deepEqual(kv, {}, '失败时不许留下半份判据让下游继续用');
+  assertFailClosed(kv);
+  assert.equal(kv.package_count, '0', '一份报告文件都没有，这个 0 是数出来的不是兜出来的');
+  assert.equal(kv.change_type, '');
+  assert.equal(kv.module_id, '');
+  // 这一发跟 AI 层无关（压根没走到那几格），所以不占 ai_note —— 评论层有它自己那句
+  // 「分流这一步没写出复核方式」，比在这里替 AI 编一句准确。
+  assert.equal(kv.ai_note, '');
+  assert.match(kv.reasons, /没有任何 \.audit\.json/, '红叉的依据要能在 output 里读到，不只活在 runner 日志里');
 });
 
 test('有一份报告坏了 → 整步失败，不许「跳过坏的那份、用最严的好那份」继续定级', () => {
   // parse 抛错就是抛错。把它兜成「忽略这份」等于给投稿者一条「让扫描器产出一份读不懂的文件」的绕过路径。
   const { kv, err } = runTriage({ broken: '{ "riskLevel": "high"', good: rep('low', 'first') });
   assert.notEqual(err, null, 'JSON.parse 抛错必须把这一步带红');
-  assert.equal(kv.action, undefined, '失败时不留下可被下游消费的判据');
+  assertFailClosed(kv);
+  // 读成 0 份，但文件确实有 2 份 —— 红那一发能说的只有后者，说前者是谎报。
+  assert.equal(kv.package_count, '2');
+  assert.equal(kv.module_id, '', '一份都没读成，就一个 id 都不许报（报出来的是「跳过坏的那份」的产物）');
+  assert.match(kv.reasons, /分流决策异常/);
 });
 
 /* --------------------------------------------------------------- AI 复核只能加严 */
@@ -380,8 +419,8 @@ test('变异哨兵：把判据退回「只取最新那一份报告」，多包�
   // 然后喂同一个「一份 high 写得早、一份 low+first 写得晚」的 PR。
   // 旧语义在这里必须给出 auto-approve —— 给出了，才证明 F16 是真的洞、上面的 block 断言不是空跑。
   const mutated = TRIAGE_JS.replace(
-    /const names=[^\n]*/,
-    'const names=(()=>{const all=fs.readdirSync(dir).filter((f)=>f.endsWith(".audit.json"));'
+    /^names=fs\.readdirSync[^\n]*/m,
+    'names=(()=>{const all=fs.readdirSync(dir).filter((f)=>f.endsWith(".audit.json"));'
     + 'return [all.sort((a,b)=>fs.statSync(dir+"/"+b).mtimeMs-fs.statSync(dir+"/"+a).mtimeMs)[0]]})()',
   );
   assert.notEqual(mutated, TRIAGE_JS,
@@ -397,6 +436,43 @@ test('变异哨兵：把判据退回「只取最新那一份报告」，多包�
   assert.equal(kv.package_count, '1', '旧语义只看得到一份报告');
   assert.equal(kv.risk, 'low', '那份 high 根本没参与定级');
   assert.equal(kv.action, 'auto-approve', '旧语义下这条混投 PR 会被自动合并 —— 这就是 F16');
+});
+
+/* ------------------------------------- 变异哨兵（G.2）：证明上面那批 fail-closed 断言不是空跑 */
+
+/** 造一发判据红：AI 状态 failed 而静态是 low+first —— 最容易被「顺手放行」的那个形状。 */
+const redRun = (script) => runTriage({ 'demo.zip': rep('low', 'first') },
+  { 'demo.zip': { status: 'failed', artifact: aiArt('demo.zip', { status: 'failed', reason: '超时' }) } },
+  { script });
+
+test('变异哨兵：把 fail() 退回「先 exit 1、output 一段不写」，红那一发就又是一片空白', () => {
+  const mutated = TRIAGE_JS.replace(
+    /const fail=\(m,aboutAi\)=>\{[^\n]*\};/,
+    'const fail=(m,aboutAi)=>{ console.error(`::error::分流决策：${m}`); process.exit(1); };',
+  );
+  assert.notEqual(mutated, TRIAGE_JS, '变异哨兵的替换点漂了（fail 那行改了写法）—— 更新它，别删掉它');
+  const old = path.join(TMP, 'triage-silent.cjs');
+  fs.writeFileSync(old, mutated, 'utf8');
+  const { kv, err } = redRun(old);
+  assert.notEqual(err, null, '退回旧写法照样是红 —— 这一发要证的是红那一发**什么都不说**');
+  assert.deepEqual(kv, {}, '旧写法下 steps.triage.outputs.* 全空：下游想解释「红叉为什么」只能拿空值渲染');
+});
+
+test('变异哨兵：把红那一发的处置写成 auto-approve，就是给一发判据没跑成的投稿盖放行章', () => {
+  const mutated = TRIAGE_JS.replace(
+    'w("action","block"); w("label","needs-human-review"); w("needs_human_review","true");',
+    'w("action","auto-approve"); w("label","auto-approved"); w("needs_human_review","false");',
+  );
+  assert.notEqual(mutated, TRIAGE_JS, '变异哨兵的替换点漂了（fail-closed 那三格改了写法）—— 更新它，别删掉它');
+  const bad = path.join(TMP, 'triage-approve.cjs');
+  fs.writeFileSync(bad, mutated, 'utf8');
+  const { kv, err } = redRun(bad);
+  assert.notEqual(err, null, '这一步仍然红：变异改的是它留下的话，不是它的结论');
+  assert.equal(kv.action, 'auto-approve');
+  assert.equal(kv.label, 'auto-approved');
+  assert.equal(kv.needs_human_review, 'false');
+  // 这三格正是 publish 作业的门票（它的 if 认 found 与 action 两个 output）与标签步会真打上去的颜色
+  // ⇒ assertFailClosed 里那三条 equal 是挡住「通道坏了被渲染成已放行」的唯一一道牙。
 });
 
 /* --------------------------------------------------------------- 旧形态不许回来 */
@@ -565,13 +641,19 @@ test('矩阵·disabled：等级不动、action 不变、文案是「未启用」
   assert.doesNotMatch(kv.ai_note, /同意|复验/, '没跑过的层不许冒充跑过');
 });
 
-test('矩阵·failed：分流整步 exit 1，文案「没跑成」，且不留下任何判据', () => {
+test('矩阵·failed：分流整步 exit 1，文案「没跑成」，判据留下但只有 fail-closed 那一个方向', () => {
   const { kv, err, stderr } = runTriage({ 'demo.zip': rep('low', 'first') },
     { 'demo.zip': { status: 'failed', artifact: aiArt('demo.zip', { status: 'failed', reason: '模型调用失败：超时' }) } });
   assert.notEqual(err, null, 'failed 必须是红，不是「AI 没意见所以按静态放行」');
   assert.match(stderr, /没跑成/);
   assert.match(stderr, /demo\.zip/, '要点名是哪一包');
-  assert.deepEqual(kv, {}, '红的时候不许留下半份判据给下游（approve 读到 action 就有一扇门）');
+  assertFailClosed(kv);
+  // 静态明明说 low，而这一轮没有结论 ⇒ risk 留空。写成 low 会让评论层落进「风险虽低但含版本更新」
+  // 那句（说的是另一件事），写成 high 则是把平台故障算到投稿者头上（§2.7 文案纪律）。
+  assert.equal(kv.change_type, 'first', 'changeType 是报告里的事实，与 AI 跑没跑成无关');
+  assert.equal(kv.package_count, '1');
+  assert.match(kv.ai_note, /没跑成/);
+  assert.match(kv.reasons, /模型调用失败：超时/, '被弃的原因要能进 output，不只活在会过期的 runner 日志里');
 });
 
 test('矩阵·untrusted：exit 1，文案「判据不可采信」，与 failed 那句不同串', () => {
@@ -580,22 +662,29 @@ test('矩阵·untrusted：exit 1，文案「判据不可采信」，与 failed �
   assert.notEqual(err, null);
   assert.match(stderr, /判据不可采信/);
   assert.doesNotMatch(stderr, /没跑成/, '四句串各用各的：合并成一句就等于只剩一种下游后果（§0.1）');
-  assert.deepEqual(kv, {});
+  assertFailClosed(kv);
+  assert.match(kv.ai_note, /判据不可采信/);
+  assert.doesNotMatch(kv.ai_note, /没跑成/, '同一句话进了 output 也还是不许并串');
 });
 
-test('矩阵·over-budget：exit 1，那句含「没看全」，绝不含「同意静态结论」，也不产出复核文案', () => {
+test('矩阵·over-budget：exit 1，那句含「没看全」，绝不含「同意静态结论」', () => {
   const { kv, err, stderr } = runTriage({ 'demo.zip': rep('low', 'first'), 'evil.zip': rep('low', 'first') },
     { 'demo.zip': 'disabled',
       'evil.zip': { status: 'over-budget', artifact: aiArt('evil.zip', { status: 'over-budget', reason: '需要 90000 B，预算 60000 B' }) } });
   assert.notEqual(err, null);
   assert.match(stderr, /没看全/);
   // 工单要求「不含同意」。字面断 !includes('同意') 做不到 —— over-budget 那句本身就该含
-  // 「不是它同意，是没看全」（§1 第 2 步），所以钉子钉在「不许声称模型同意」那一侧：
-  // 既不出现「同意静态结论」这类文案，也根本不产出 ai_note（红的时候 PR 上无话可说）。
-  // T6.2 前这个键叫 llm_note；改名闭合那条用例钉的是「写出处与消费处必须同时改」。
+  // 「不是它同意，是没看全」（§1 第 2 步），所以钉子钉在「不许声称模型同意」那一侧。
   assert.doesNotMatch(stderr, /同意静态结论|模型同意|AI 全部看过/);
-  assert.equal(kv.ai_note, undefined, '判据不成立时连文案都不许留下');
+  assertFailClosed(kv);
+  // 这一格原来钉的是 `ai_note === undefined`（「判据不成立时连文案都不许留下」）。G.2 把它反过来：
+  // 文案正是这一发唯一能送到投稿者眼前的东西。要钉的是它**不许声称模型同意**，
+  // 以及两包都是 low+first 时 risk 仍然留空 —— 「没结论」与「量出来是 low」是两句话。
+  assert.match(kv.ai_note, /送不全/);
+  assert.doesNotMatch(kv.ai_note, /同意静态结论|模型同意|AI 全部看过/);
   assert.doesNotMatch(stderr, /未启用/, '送不全不是未启用：那是运维没配凭据');
+  assert.equal(kv.package_count, '2');
+  assert.equal(kv.change_type, 'first');
 });
 
 test('矩阵·ok+raise：静态 low+first、模型 high → action 不再是 auto-approve（整层的存在理由）', () => {
@@ -672,7 +761,12 @@ test('矩阵：一包 ok 抬级、另一包 failed → 仍然红，红的是 fai
   assert.notEqual(err, null, '任何一包没跑成都不是「其余包按静态定级就行」');
   assert.match(stderr, /没跑成/);
   assert.match(stderr, /b\.zip/);
-  assert.deepEqual(kv, {});
+  assertFailClosed(kv, 'a.zip 抬到 high 这件事不许变成结论：');
+  // 这一发最容易写错的地方：a.zip 真的 ok 且真的抬到了 high，于是「顺手把算出来的等级填进去」
+  // 看起来很合理 —— 但整轮没有结论（b.zip 没跑成），填进去就是把半份定级说成定级。
+  assert.equal(kv.risk, '');
+  assert.match(kv.ai_note, /没跑成/);
+  assert.match(kv.ai_note, /b\.zip/);
 });
 
 test('矩阵：一个 ai-*.status 都没有 → 等级不动，文案说「这一步没有产物」，不是旧的「已跳过 LLM 复核」', () => {
@@ -694,7 +788,9 @@ test('口径钉子：状态名里把 .zip 去掉了 → 分流立刻红，不许
   assert.notEqual(err, null, '对不上口径必须红');
   assert.match(stderr, /口径|对不上/);
   assert.match(stderr, /ai-demo\.status/);
-  assert.deepEqual(kv, {});
+  assertFailClosed(kv);
+  assert.match(kv.ai_note, /口径|对不上/, '漂了哪一个文件名要能在 output 里读到');
+  assert.equal(kv.package_count, '1', 'ai-demo.status 不是 ai-demo.zip.status ⇒ 报告仍是一份');
 });
 
 test('口径钉子：另一包没有对应的 ai-*.status → 红（缺状态不等于没配凭据）', () => {
@@ -712,7 +808,9 @@ test('状态文件里写了五态之外的值 → 红，并点名是哪个值', 
   assert.notEqual(err, null);
   assert.match(stderr, /不是五态之一/);
   assert.match(stderr, /succeeded/);
-  assert.deepEqual(kv, {});
+  assertFailClosed(kv);
+  assert.match(kv.ai_note, /不是五态之一/);
+  assert.match(kv.ai_note, /succeeded/, '认不出的那个值要念出来，否则运维不知道该改哪一格配置');
 });
 
 test('ok 但产物读不到 / 产物与状态不一致 / 产物指向别的包 → 三发都红', () => {
@@ -720,18 +818,22 @@ test('ok 但产物读不到 / 产物与状态不一致 / 产物指向别的包 �
     { 'demo.zip': { status: 'ok', artifact: null } });
   assert.notEqual(noArt.err, null, '状态说 ok、产物却不在，那就没有「逐字复验过」这回事');
   assert.match(noArt.stderr, /产物/);
+  assertFailClosed(noArt.kv);
 
   const mismatch = runTriage({ 'demo.zip': rep('low', 'first') }, {
     'demo.zip': { status: 'ok', artifact: aiArt('demo.zip', { status: 'failed' }) },
   });
   assert.notEqual(mismatch.err, null, 'status 文件说 ok、产物 JSON 说 failed：两份不一致时按红处理');
   assert.match(mismatch.stderr, /不一致/);
+  assertFailClosed(mismatch.kv);
 
   const otherPkg = runTriage({ 'demo.zip': rep('low', 'first') }, {
     'demo.zip': { status: 'ok', artifact: aiArt('demo.zip', { target: { zip: 'x.zip', report: 'audit-out/other.zip.audit.json' } }) },
   });
   assert.notEqual(otherPkg.err, null, 'A 包配 B 包的产物 = F7 那个错法的产物版');
   assert.match(otherPkg.stderr, /别的包|不一致/);
+  assertFailClosed(otherPkg.kv);
+  assert.equal(otherPkg.kv.module_id, 'demo', '这一发报告读成了，id 是事实位，照报');
 });
 
 /* --------------------------------------------------------------- 判据实现只许有一份 */
@@ -764,7 +866,14 @@ test('判自动放行只许一处：TRIAGE_JS 里 "auto-approve" 与「low+first
   assert.equal((TRIAGE_JS.match(/"auto-approve"/g) || []).length, 1,
     'action 一律由 decide(risk, changeType) 重算；多一处字面量就是有人另开了一扇门');
   assert.equal((TRIAGE_JS.match(/===\s*"first"/g) || []).length, 1, '自动放行的判据只许在 decide 里算一次');
-  assert.match(TRIAGE_JS, /decide\(/);
+  assert.match(TRIAGE_JS, /=decide\(/);
+  // 钉**调用点**（`=decide(`）而不是 `decide(`：writeFailClosed 上面那段注释里合法地写着
+  // 「这三格永远不过 decide()」，扫关键字会把自己的说明当成第二个调用点打红 —— 与本文件那条
+  // 「耦合钉子」被自己的注释打红是同一个坑，不踩第二次。
+  assert.equal((TRIAGE_JS.match(/=decide\(/g) || []).length, 1,
+    'decide() 只许被调用一次（绿那一发）：红那一发的处置是 writeFailClosed 里写死的三格，不过决策矩阵');
+  assert.match(TRIAGE_JS, /w\("action","block"\); w\("label","needs-human-review"\); w\("needs_human_review","true"\);/,
+    'fail-closed 那三格必须是写死的字面量 —— 让它由任何函数算出来，就等于给「算错方向」留了位置');
 });
 
 /* --------------------------------------------------------------- 旧分支已死 */
@@ -802,7 +911,10 @@ test('端到端：AI 步写出的那批文件，分流按同一口径读得到�
   const { err, stderr, kv } = runTriage({}, undefined, { dir: r.dir, module: false });
   assert.notEqual(err, null, 'AI 步 exit 0 + 分流红 = §0.2-2 要求的分工');
   assert.match(stderr, /没看全/);
-  assert.deepEqual(kv, {});
+  assertFailClosed(kv);
+  assert.match(kv.ai_note, /送不全/);
+  assert.equal(kv.module_id, 'demo,evil', '这一发的报告是 AI 步真写出来的，事实位照报');
+  assert.equal(kv.package_count, '2');
 });
 
 test('端到端：ok+agree:false 经 AI 步落盘后，分流的 action 从 auto-approve 变成 block', () => {
