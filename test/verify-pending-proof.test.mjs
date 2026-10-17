@@ -547,19 +547,104 @@ test('pin 闸门二合不动时不许吞掉 git 的原话 —— 那句「冲突
   // 也就是说那句话当时是不是真的，谁都不知道，包括这条 workflow 自己：原来的写法是
   // `if ! git merge … >/dev/null 2>&1`，git 到底说了什么被整条抹掉，剩下的一律念成「内容冲突」。
   // 这一格改的只有观测：闸的行为（合不动 → abort → exit 1）一个字没动。
-  // ⚠️ 证据边界：这里是**结构断言**，不是真跑那一步 —— 要真跑得造一个内容与 main 冲突的 PR 形状，
-  // 而那次线上失败的形状我本地复现不出来，所以造不出可比的夹具。
   const block = stepBlock(fs.readFileSync(WF, 'utf8'), 'id: pin');
   assert.ok(!/git merge --no-commit --no-ff "\$BASE_SHA" >\/dev\/null/.test(block),
     '那条 >/dev/null 2>&1 一回来，「冲突」这句就又可能只是一句没有依据的猜测');
+  // ⚠️ 证据边界：这一格是**结构断言**，不是真跑那一步 —— 要真跑得造一个内容与 main 冲突的 PR 形状，
+  // 而那次线上失败的形状我本地复现不出来，所以造不出可比的夹具。（下面那格能真跑，因为它复现的是
+  // 「需要新建合并提交 + 没有 committer 身份」这一种，那种形状本地造得出来。）
   for (const must of [
-    'MERGE_OUT="$(git merge --no-commit --no-ff "$BASE_SHA" 2>&1)"',
+    'MERGE_OUT="$(git -c user.name=modules-audit-pin -c user.email=modules-audit-pin@invalid.invalid merge --no-commit --no-ff "$BASE_SHA" 2>&1)"',
     `printf '%s\\n' "$MERGE_OUT"`,
     'git merge --abort 2>/dev/null || true',
   ]) assert.ok(block.includes(must), `这一格必须原样在场：${must}`);
   // 行为没被顺手放宽：合不动仍然是拒。
   assert.match(block, /exit 1/);
   assert.ok(block.includes('不替 git 改口'), '那句诊断的措辞要说明：git 的原话才是原因');
+});
+
+// 这一格真跑那一句 merge（不是结构断言）。形状来自 run 39022231657 的 attempt 2：
+// 重跑一条 base 已前进的旧 PR ⇒ 这句 merge 需要**新建一个合并提交** ⇒ 没有 committer 身份就红。
+test('pin 闸门二在「没有 git 身份 + 需要新建合并提交」时也必须合得动', () => {
+  const block = stepBlock(fs.readFileSync(WF, 'utf8'), 'id: pin');
+  const m = /MERGE_OUT="\$\((git [^"]*?merge --no-commit --no-ff "\$BASE_SHA" 2>&1)\)"/.exec(block);
+  assert.ok(m, '得能从 pin 那一步里取出那句 merge，才能逐字跑它：\n' + block.slice(0, 400));
+  const fixedCall = 'MERGE_OUT="$(' + m[1] + ')"';
+  const bareCall = fixedCall.replace('-c user.name=modules-audit-pin -c user.email=modules-audit-pin@invalid.invalid ', '');
+  // 起法必须逐字等于生产：那一步写的是 `if ! MERGE_OUT="$(…)" ; then` —— 直接 `MERGE_OUT="$(…)"` 再加
+  // `set -e` 会在赋值那一行就退出，git 的原话根本来不及打（我第一版就是这么起的，红得没有输出可读）。
+  const wrap = (call, sha) => [
+    'set -euo pipefail',
+    `BASE_SHA=${sha}`,
+    `if ! ${call}; then`,
+    '  printf \'%s\\n\' "$MERGE_OUT"',
+    '  echo MERGE_FAILED',
+    '  exit 3',
+    'fi',
+    'echo MERGE_OK',
+  ].join('\n');
+
+  const mk = () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pin-identity-'));
+    const G = (...a) => execFileSync('git', a, { cwd: dir, encoding: 'utf8' });
+    G('init', '-q', '-b', 'main');
+    fs.mkdirSync(path.join(dir, 'json'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'json', 'modules.json'), '{}\n');
+    G('add', '-A');
+    // 这两次提交要身份 —— runner 上也有（actions/checkout 会设好），缺的是 merge 那一步的 committer。
+    G('-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-qm', 'base');
+    G('-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'main 前进一格');
+    G('branch', 'canary');
+    G('checkout', '-q', 'canary');
+    G('-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'PR 自己的提交');
+    G('checkout', '-q', 'main');
+    G('-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'main 又前进一格');
+    G('checkout', '-q', 'canary');
+    const baseSha = G('rev-parse', 'main').trim();
+    return { dir, baseSha };
+  };
+  const emptyConfig = path.join(os.tmpdir(), 'pin-none-gitconfig');
+  fs.writeFileSync(emptyConfig, '');
+  const noIdEnv = () => {
+    const env = {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: emptyConfig,
+      GIT_CONFIG_NOSYSTEM: '1',
+      HOME: os.tmpdir(),
+      USERPROFILE: os.tmpdir(),
+    };
+    // 不许有人用环境变量把身份偷偷带进来（那样这两格都会假绿）—— 只在这格剥，不动测试进程自己的 env。
+    for (const k of ['GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'EMAIL']) delete env[k];
+    return env;
+  };
+
+  const run = (dir, sha, bare) => {
+    const script = wrap(bare ? bareCall : fixedCall, sha);
+    try {
+      return { rc: 0, out: String(execFileSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', script],
+        { cwd: dir, encoding: 'utf8', env: noIdEnv() })) };
+    } catch (e) {
+      return { rc: e.status === undefined ? -1 : e.status, out: String((e.stdout || '') + (e.stderr || '')) };
+    }
+  };
+
+  const fixed = mk();
+  const r1 = run(fixed.dir, fixed.baseSha, false);
+  assert.match(r1.out, /MERGE_OK/, '带占位身份的那句 merge 必须合得动，git 原话：' + r1.out);
+  assert.equal(fs.existsSync(path.join(fixed.dir, '.git', 'MERGE_HEAD')), true,
+    '合过了就该留下 MERGE_HEAD（--no-commit 停在提交之前，不写任何提交）');
+  fs.rmSync(fixed.dir, { recursive: true, force: true });
+
+  const bare = mk();
+  const r2 = run(bare.dir, bare.baseSha, true);
+  // 这一格断言的是**因果**，不是「一定红」：在某些机器上 git 能从别处凑出身份，那时 r2 会是 MERGE_OK。
+  // 但一旦它红，原因只许是身份 —— 那句 workflow 自己写的「冲突」不许又复活成默认解释。
+  if (r2.rc !== 0) {
+    assert.match(r2.out, /MERGE_FAILED/, '红也要红在那句 if 里：' + r2.out);
+    assert.match(r2.out, /identity unknown|empty ident|auto-detect email/i,
+      '无身份的那句 merge 红了，但红的原因不是身份，这格的证据链就断了：' + r2.out);
+  }
+  fs.rmSync(bare.dir, { recursive: true, force: true });
 });
 
 test('写回 PR 的那两步只挂 pull_request —— dispatch 里没有 PR 可写，撞上去是通道自己坏', () => {

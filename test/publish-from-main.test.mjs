@@ -1097,7 +1097,13 @@ test('审核不许要求 PR 已包含当前 main，只允许「合得动就审�
       .filter((l) => !/^\s*#/.test(l))
       .join('\n');
     assert.doesNotMatch(code, /merge-base\s+--is-ancestor/, `${f} 里不许再有祖先检查，它会冻死机器人投稿`);
-    assert.match(code, /git merge --no-commit --no-ff/, `${f} 的闸门二必须是「合并当前 base」`);
+    assert.match(code, /git (?:-c \S+ )*merge --no-commit --no-ff/, `${f} 的闸门二必须是「合并当前 base」`);
+    // 那两个 -c 不是装饰：runner 上没有 committer 身份，而「需要新建一个合并提交」的 merge ——
+    // 重跑一条 base 已前进的旧 PR 就是这个形状 —— 即使带着 --no-commit 也照样要身份
+    // （run 39022231657 attempt 2 实测红在那句；本地复现 rc=128 且不写 MERGE_HEAD）。
+    // 真跑那一句的用例在 test/verify-pending-proof.test.mjs，这一格只钉它在场。
+    assert.match(code, /-c user\.name=\S+ -c user\.email=\S+ merge --no-commit --no-ff/,
+      `${f} 的闸门二必须自带占位身份，否则重跑旧 PR 会死在 Committer identity unknown`);
     assert.match(code, /git merge --abort/, `${f} 冲突时必须撤回合并并明确失败，不能猜哪一边`);
   }
 });
