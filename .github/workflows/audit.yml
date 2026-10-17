@@ -172,7 +172,20 @@ jobs:
           # **两种都合得干净**。所以那条 ::error:: 是一句没有依据的诊断：它把「merge 没成功」
           # 一律念成「内容冲突」，可原因还有十种。闸的行为一个字不动（合不动仍然拒、仍然 exit 1），
           # 这一发改的只有**别替 git 改口**：把它到底说了什么一起打出来。
-          if ! MERGE_OUT="$(git merge --no-commit --no-ff "$BASE_SHA" 2>&1)"; then
+          #
+          # 2026-10-17 同一天第二次咬：给一条**旧 PR 做整条重跑**取新读数时（run 39022231657 的
+          # attempt 2），这一格红在 `Committer identity unknown` + `fatal: empty ident name
+          # (for <runner@runnervm…>) not allowed`。本地复现（temp 仓库、global/system 配置指到空文件、
+          # head 与 base 各前进一个提交）量到的形状：
+          #   有身份 → rc=0，一句 "Automatic merge went well; stopped before committing as requested"
+          #   无身份 → rc=128，且连 MERGE_HEAD 都不写
+          # 也就是说 `--no-commit` 并不省掉 committer 身份 —— 只要这次 merge **需要新建一个合并提交**
+          # 就要。日常 PR 不踩，是因为 actions/checkout 取的是 refs/pull/N/merge（GitHub 已经合好了），
+          # 这句退化成 "Already up to date"；而重跑一条 base 已前进的旧 PR 才要真合 ——
+          # 「重跑旧 PR 拿新读数」正是这条线反复在做的事（今天就三次：#54 接线、#57 观测、#60 换来源）。
+          # 修法只给身份，不动闸的语义：`--no-commit` 不写任何提交，所以这是个**占位身份**，
+          # 不构成署名 —— 结论、PR 评论、标签仍然全挂在真实的 workflow run 上。
+          if ! MERGE_OUT="$(git -c user.name=modules-audit-pin -c user.email=modules-audit-pin@invalid.invalid merge --no-commit --no-ff "$BASE_SHA" 2>&1)"; then
             {
               echo "::error::把当前 origin/$BASE_REF 合进本 PR 没有成功，审核因此没有一个可信的基准。"
               echo "::error::（不替 git 改口 —— 以前这里只留一句「冲突」，而那句可能不是原因。）"
@@ -467,7 +480,7 @@ jobs:
           # ⇒ 台账进过 diff 就不算索引重建，无论索引改没改、改成什么形状（那步 churn 就是为了让这一步看见）。
           # 这里**故意不加 --diff-filter**：把整个 json/dispositions.json 删掉是一次 D，
           # 那正是一整本处置的消失，必须和「改一条」同样拦。
-          # 但这条路不是「停在人工」：它换了一道判据 —— derive 去取两名组织成员的 #human-approved，
+          # 但这条路不是「停在人工」：它换了一道判据 —— derive 去取两名「对这个仓库有 write/admin」的人的 #human-approved，
           # 并逐条把新增/改动的 by 回访成其中一个人的真评论（判据在 verify-index-pr.mjs，
           # 复用 publish-from-main 的 findHumanApprovals / REQUIRED_SIGNERS=2，不另起一套）。
           # 签齐 ⇒ ledger_sealed=true ⇒ merge-index 走 ledger 那一支照旧自动合，
@@ -476,7 +489,7 @@ jobs:
           # #53 那条 canary 在线上读到的正是它，所以台账这一支必须排在那句前面。
           CHANGED_LEDGER=$(git diff --name-only "$BASE_SHA" HEAD -- 'json/dispositions.json' || true)
           # 台账这条路单独导出一个 ledger_pr：它不是「索引重建」，但也不是「没有内容要判」——
-          # 它是一次人的决定，要有两名成员签在上面（derive 那一步去取这个证据），签齐了才许自动合。
+          # 它是一次人的决定，要有两名有仓库写权限的人签在上面（derive 那一步去取这个证据），签齐了才许自动合。
           echo "ledger_pr=$([ -n "$CHANGED_LEDGER" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           if [ -n "$CHANGED_JSON" ] && [ -z "$CHANGED_LEDGER" ] && [ "${FOUND:-}" != "true" ]; then
             echo "index_pr=true" >> "$GITHUB_OUTPUT"
@@ -484,7 +497,7 @@ jobs:
           else
             echo "index_pr=false" >> "$GITHUB_OUTPUT"
             if [ -n "$CHANGED_LEDGER" ]; then
-              echo "::warning::这个 PR 动了处置台账（$CHANGED_LEDGER）—— 台账上的处置是人工判断：不认领索引重建，改由 derive 那一步查两名组织成员的 #human-approved（签不齐 approve 直接红，见 GOVERNANCE.md）。"
+              echo "::warning::这个 PR 动了处置台账（$CHANGED_LEDGER）—— 台账上的处置是人工判断：不认领索引重建，改由 derive 那一步逐个查签名人的仓库权限（write/admin 才算；签不齐 approve 直接红，见 GOVERNANCE.md）。"
             elif [ -n "$CHANGED_JSON" ]; then
               echo "::warning::这个 PR 同时带投稿和索引改动 —— 索引改动不会被推导判定放行，投稿按扫描结论走。"
             fi
@@ -1461,7 +1474,7 @@ jobs:
           fi
           echo "上游都过了：audit=success selftest=success，继续按内容与推导判定。"
 
-      - name: 只批准「低风险 + 首次收录」或「可复算的索引重建」或「两名成员签过的台账改动」
+      - name: 只批准「低风险 + 首次收录」或「可复算的索引重建」或「两名有写权限的人签过的台账改动」
         shell: bash
         env:
           FOUND: ${{ needs.audit.outputs.found }}
@@ -1510,13 +1523,13 @@ jobs:
           # by 回访得到其中一个人的真评论）；这里只读它导出的那一个布尔，不在这里再判一遍。
           if [ "${LEDGER_PR:-}" = "true" ]; then
             if [ "${LEDGER_SEALED:-}" = "true" ]; then
-              echo "批准：这次处置台账改动有两名组织成员的签名，且每条新增/改动的 by 都回访得到其中一个人的评论。"
+              echo "批准：这次处置台账改动有两名有仓库写权限的人的签名，且每条新增/改动的 by 都回访得到其中一个人的评论。"
               echo "（合并由 merge-index 走 ledger 那一支：它还会按此刻的 main 重推导一遍，并在合完立刻 purge CDN。）"
               exit 0
             fi
             {
               echo "::error::未获批准：这条 PR 动了 json/dispositions.json，而处置署名不成立。"
-              echo "::error::要求是：两名不同的人在本 PR 评论**首行**写 #human-approved（author_association 须为 OWNER 或 MEMBER），"
+              echo "::error::要求是：两名不同的人在本 PR 评论**首行**写 #human-approved（签名的人得对这个仓库有 write/admin —— CI 逐个查 permission，不吃 author_association：那字段按请求者算），"
               echo "  且每条新增/改动的处置的 by 要能回访成这两人之一的真评论 —— 见 derive 那一步的输出与 report 里的 seal 一格。"
               echo "::error::为什么不能只靠「推导结果对得上」：重算是拿公开仓库里同一份 build-index.mjs 就能自己做出来的，"
               echo "  一致只能证明内容自洽，证明不了有人看过这条处置（2026-10-17 本地复现打出的四格全是这个形状）。"
@@ -1537,7 +1550,7 @@ jobs:
           {
             echo "::error::未获批准：action=${ACTION:-<空>} label=${LABEL:-<空>} risk=${RISK:-<空>} changeType=${CHANGE_TYPE:-<空>}"
             echo "::error::依据：${REASONS:-（无）}"
-            echo "::error::本 PR 不满足自动放行条件，需人工审核后走双签盖章流程（见仓库根 GOVERNANCE.md：两名组织成员各在 PR 评论首行写 #human-approved）。"
+            echo "::error::本 PR 不满足自动放行条件，需人工审核后走双签盖章流程（见仓库根 GOVERNANCE.md：两名有仓库写权限的人各在 PR 评论首行写 #human-approved）。"
           } >&2
           exit 1
 
@@ -1638,7 +1651,7 @@ jobs:
     needs: [audit, approve]
     # 两条机器路由，都要 index_derived（内容确由 base 推导），差别只在批准证据是哪一半：
     #   index_pr  —— 消费了有外部批准证据的 pending（投稿收录）
-    #   ledger_pr —— 动了处置台账，且 derive 取到了两名成员的签名（下架 / 拉黑 / 解封）
+    #   ledger_pr —— 动了处置台账，且 derive 取到了两名有写权限的人的签名（下架 / 拉黑 / 解封）
     # 两个 output 由 kind 步互斥地导出（台账进过 diff 就不可能是 index_pr），所以这里不必再防「两个都真」。
     # 写成 `index_pr || (ledger_pr && ledger_sealed)` 而不是把 ledger 那半并进第一个合取项：
     # 少了 ledger_sealed 这一格，自动合并就又回到「内容自洽就够了」那个被打穿的形状。
@@ -1707,7 +1720,7 @@ jobs:
           SCRIPTS_DIR="${PREFIX:+$PREFIX/}scripts"
 
           echo "重推导：base=${BASE_SHA:0:8}（此刻的 ${BASE_REF}），head=$(git rev-parse --short HEAD)"
-          # --pr 必须带上：动了台账的那一半判据（两名成员的签 + by 回访）在这里再取一次，
+          # --pr 必须带上：动了台账的那一半判据（两名有写权限的人的签 + by 回访）在这里再取一次，
           # 用的仍是同一个脚本、同一套判据。不带 --pr 就等于台账类 PR 在合并这一步退成
           # 「内容对得上就合」，而签名只在 derive 那一步查过一次 —— 那一步的结论绑的是 head sha，
           # 恰好是这条重推导存在的理由（base 变了要重算），不能当成已经查过。
