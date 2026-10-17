@@ -248,9 +248,9 @@ test('真仓库：--report 里留下可复核的证据指针', async () => {
 
 /* ------------------------------------------------------- P3：台账参与重推导 */
 
-const revokeOf = (id) => ({
+const revokeOf = (id, by = 'gh:t@1') => ({
   schema: 'sukisu-dispositions-v1',
-  dispositions: [{ kind: 'revoke', id, reason: 'test-probe', by: 'gh:t@1', at: '2026-10-11T00:00:00Z' }],
+  dispositions: [{ kind: 'revoke', id, reason: 'test-probe', by, at: '2026-10-11T00:00:00Z' }],
 });
 
 const SEAL_OK = {
@@ -636,4 +636,55 @@ test('ledgerSealEvidence：走的是 findHumanApprovals 那份判据，评论列
   const r6 = await ledgerSealEvidence({ owner: 'o', repo: 'r', prNumber: 9, baseLedger: head, headLedger: head, token: 't', deps: noopStub });
   assert.equal(r6.ok, true);
   assert.equal(noopStub.seen.length, 0, '没有实质改动就不该花钱去取证据');
+});
+
+/* 生产路径上没有人注入 deps.seal：CI 只给 --pr，取证全靠 deps.fetch。
+ * 上面那批 ledgerSealEvidence 用例证明「这个函数被单独调用时判得对」，但它们不能证明
+ * main() 真的会去调它 —— 那条路要是接错了，整条署名判定就是生产上的死码，而单测照样全绿。
+ * 这两格把「main → 取证据 → 判定 → 日志/report 留痕」这一段钉住。 */
+test('main 只给 --pr 与 deps.fetch 时真的走完取证（绿的那格）', async () => {
+  const dir = ledgerFixture();
+  makeRevokePr(dir, revokeOf('mod_a', BY1));
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'vip-seal-out-'));
+  const report = path.join(out, 'r.json');
+  const stub = stubFetch({
+    comments: [signComment(10, 'member-one'), signComment(11, 'member-two')],
+    byComments: { 1111111111: { id: 1111111111, user: { login: 'member-one' }, author_association: 'MEMBER' } },
+  });
+  const log = quiet();
+  const m = await V();
+  const rc = await m.main(
+    ['--base', 'main', '--head', 'HEAD', '--owner', 'o', '--repo', 'r', '--cwd', dir, '--pr', '9', '--report', report],
+    { log, token: 't', attest: () => ({ ok: true }), fetch: stub.fetch });
+  assert.equal(rc, 0, allLogs(log));
+  assert.ok(stub.seen.some((u) => /\/repos\/o\/r\/issues\/9\/comments\?per_page=100$/.test(u)),
+    'main 要按 PR 编号取评论列表：' + stub.seen.join(' '));
+  assert.ok(stub.seen.some((u) => /\/repos\/SukiSU-Community\/modules-repo\/issues\/comments\/1111111111$/.test(u)),
+    'by 的回访要用 by 自己的 owner/repo，不是这条 PR 的：' + stub.seen.join(' '));
+  assert.match(allLogs(log), /by 回访 \S+ → member-one\(MEMBER\)/);
+  const r = JSON.parse(fs.readFileSync(report, 'utf8'));
+  assert.equal(r.seal.ok, true, r.seal.reason);
+  assert.equal(r.seal.signerCount, 2);
+  assert.deepEqual(r.seal.resolved[BY1], { ok: true, login: 'member-one', assoc: 'MEMBER', reason: null });
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(out, { recursive: true, force: true });
+});
+
+test('main 只给 --pr 与 deps.fetch 时真的走完取证（by 404 的那格要红，且红在回访那一句）', async () => {
+  const dir = ledgerFixture();
+  makeRevokePr(dir, revokeOf('mod_a', BY1));
+  const stub = stubFetch({
+    comments: [signComment(10, 'member-one'), signComment(11, 'member-two')],
+    byComments: {},                     // 两签齐，但那条评论不存在
+  });
+  const log = quiet();
+  const m = await V();
+  const rc = await m.main(
+    ['--base', 'main', '--head', 'HEAD', '--owner', 'o', '--repo', 'r', '--cwd', dir, '--pr', '9'],
+    { log, token: 't', attest: () => ({ ok: true }), fetch: stub.fetch });
+  assert.equal(rc, 1, allLogs(log));
+  assert.equal(stub.seen.filter((u) => /\/issues\/comments\//.test(u)).length, 1, '一条 by 回访一次');
+  assert.match(allLogs(log), /by 回访 \S+ → 读不到：HTTP 404/);
+  assert.match(allLogs(log), /mod_a 的 by 回访不到那条评论/);
+  fs.rmSync(dir, { recursive: true, force: true });
 });
