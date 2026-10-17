@@ -540,6 +540,28 @@ test('pin 只挂在 pull_request 上：dispatch 用自己这一份扫描器，�
   assert.match(stepBlock(wf, 'id: proof'), /^ {8}if: github\.event_name == 'pull_request'$/m);
 });
 
+test('pin 闸门二合不动时不许吞掉 git 的原话 —— 那句「冲突」曾经是一句没有依据的诊断', () => {
+  // 2026-10-17 run 39009735993（重开的那条来源核对 canary）红在 `把扫描器…钉回 base 版本`，
+  // 打出来的是一句 workflow 自己写的 `PR 分支与当前 origin/main 冲突`。我事后在本地把两种形状
+  // 都复现过：head 落后 base 一个提交、以及直接取 PR 的 merge ref —— **两种都合得干净**（exit 0）。
+  // 也就是说那句话当时是不是真的，谁都不知道，包括这条 workflow 自己：原来的写法是
+  // `if ! git merge … >/dev/null 2>&1`，git 到底说了什么被整条抹掉，剩下的一律念成「内容冲突」。
+  // 这一格改的只有观测：闸的行为（合不动 → abort → exit 1）一个字没动。
+  // ⚠️ 证据边界：这里是**结构断言**，不是真跑那一步 —— 要真跑得造一个内容与 main 冲突的 PR 形状，
+  // 而那次线上失败的形状我本地复现不出来，所以造不出可比的夹具。
+  const block = stepBlock(fs.readFileSync(WF, 'utf8'), 'id: pin');
+  assert.ok(!/git merge --no-commit --no-ff "\$BASE_SHA" >\/dev\/null/.test(block),
+    '那条 >/dev/null 2>&1 一回来，「冲突」这句就又可能只是一句没有依据的猜测');
+  for (const must of [
+    'MERGE_OUT="$(git merge --no-commit --no-ff "$BASE_SHA" 2>&1)"',
+    `printf '%s\\n' "$MERGE_OUT"`,
+    'git merge --abort 2>/dev/null || true',
+  ]) assert.ok(block.includes(must), `这一格必须原样在场：${must}`);
+  // 行为没被顺手放宽：合不动仍然是拒。
+  assert.match(block, /exit 1/);
+  assert.ok(block.includes('不替 git 改口'), '那句诊断的措辞要说明：git 的原话才是原因');
+});
+
 test('写回 PR 的那两步只挂 pull_request —— dispatch 里没有 PR 可写，撞上去是通道自己坏', () => {
   // 2026-10-16 run 38890758068（第一条 dispatch canary）实测：AI 那一步 success、分流 success、
   // artifact 也传了，然后 发布 PR 评论 抛 `HttpError: Not Found` —— 因为它取的是
