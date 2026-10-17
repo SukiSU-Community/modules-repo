@@ -1,0 +1,31 @@
+{
+  "approved": false,
+  "id": "proof-canary-forged",
+  "name": "Proof Gate Canary (do not merge)",
+  "author": "ci-canary",
+  "description": "CI 复核对齐用的 canary 条目：三道闸都按规矩填（内容寻址直链、assetName、sha256、proofPrefix 互相咬合），唯一的问题是它由人手写、不是 Worker 的 App 带进来的。合进 main 就是错的。",
+  "versions": [
+    {
+      "version": "1.0.0",
+      "versionCode": 1,
+      "zipUrl": "https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/c13897d267d64a4dfcde9c5799b57c006c040b3d6c43c6f309f8411654f42b6f.zip",
+      "size": 119342,
+      "time": 1792212053000,
+      "sha256": "c13897d267d64a4dfcde9c5799b57c006c040b3d6c43c6f309f8411654f42b6f"
+    }
+  ],
+  "pledge": {
+    "version": "pledge-v1",
+    "atMs": 1792212053000
+  },
+  "ownership": {
+    "nonce": "canary",
+    "proofPrefix": "c174a7f2",
+    "via": "bio",
+    "verifiedAt": 1792212053000
+  },
+  "storage": "github-release-asset",
+  "releaseTag": "assets-v1",
+  "assetName": "c13897d267d64a4dfcde9c5799b57c006c040b3d6c43c6f309f8411654f42b6f.zip",
+  "submittedAt": "2026-10-17T04:40:53.000Z"
+}
