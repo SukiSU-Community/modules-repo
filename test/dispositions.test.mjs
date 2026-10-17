@@ -14,6 +14,7 @@ import path from 'node:path';
 
 import {
   DISPOSITIONS_SCHEMA,
+  KNOWN_DISPOSITIONS_SCHEMAS,
   DispositionError,
   loadDispositions,
   matchAny,
@@ -73,6 +74,65 @@ test('schema 不认识 → 抛（不许拿一份旧口径的台账来判新索�
   assert.throws(() => parseDispositions({ dispositions: [] }), /未知 schema/);
   assert.throws(() => parseDispositions([]), /台账必须是对象/);
   assert.throws(() => parseDispositions({ schema: DISPOSITIONS_SCHEMA }), /必须是数组/);
+});
+
+/* ------------------------------------------------ v2：subject 与 evidence（都可选、都不参与匹配） */
+
+const EV_FILE = `evidence/${'f'.repeat(64)}.json`;
+
+test('v1 台账照样读得动：线上那 5 条历史条目没有 subject / evidence', () => {
+  // 这一条钉的是「升 v2 不许把已经公示的数据读没了」——spec §10 要求 v1 数据照旧渲染。
+  // 建索引的三处调用全部走 parseDispositions，所以这里读不动 == 索引推导当场红。
+  const list = parseDispositions(
+    { schema: 'sukisu-dispositions-v1', lastUpdate: 0, dispositions: [d(), d({ id: undefined, sha256: SHA_A })] },
+    'v1.json',
+  );
+  assert.equal(list.length, 2);
+  assert.equal('subject' in list[0], false, 'v1 条目不许被补出一个空 subject');
+  assert.equal('evidence' in list[1], false);
+  assert.equal(matchDisposition(list[1], entry()).via, 'sha256');
+});
+
+test('v2 的 subject 只是聚合键，不参加匹配：按 id 下的处置不会因为它而漏命中', () => {
+  const [one] = parseDispositions(doc(d({ subject: { coolapkUid: '99999999', username: '被处置的人' } })));
+  assert.deepEqual(one.subject, { coolapkUid: '99999999', username: '被处置的人' });
+  // 命中仍然只看 id：投稿者 UID 与 subject 不同的人投同一个 id，照样被这条 revoke 抹掉。
+  assert.equal(matchDisposition(one, entry({ coolapkUid: '11111111' })).via, 'id');
+  assert.equal(matchDisposition(one, entry({ id: 'other' })), null);
+});
+
+test('v2 的 evidence 落进归一化结果，形状合格的原样带过', () => {
+  const [one] = parseDispositions(doc(d({ evidence: [{ file: EV_FILE, pr: 53, at: '2026-10-17T08:00:00+08:00' }] })));
+  assert.deepEqual(one.evidence, [{ file: EV_FILE, pr: 53, at: '2026-10-17T00:00:00.000Z' }],
+    'at 必须归一成 UTC —— 台账在 CI（UTC）和国内机器（+08）上读出来必须是同一个时刻');
+});
+
+test('v2 的两个新字段各自的红法：坏形状一律抛，绝不静默丢字段', () => {
+  const bad = [
+    // subject
+    [{ subject: {} }, /subject\.coolapkUid 必须是/],
+    [{ subject: '99999999' }, /subject 必须是对象/],
+    [{ subject: { coolapkUid: '99999999', username: '   ' } }, /不能是空串/],
+    [{ subject: { coolapkUid: '99999999', username: 'x'.repeat(65) } }, /超过 64 字符/],
+    [{ coolapkUid: '11111111', subject: { coolapkUid: '99999999' } }, /与条目选择器 coolapkUid 不一致/],
+    // evidence
+    [{ evidence: [] }, /必须是非空数组/],
+    [{ evidence: 'x' }, /必须是非空数组/],
+    [{ evidence: [EV_FILE] }, /必须是对象/],
+    [{ evidence: [{ file: 'evidence/../evil.json' }] }, /evidence\/<64 位十六进制/],
+    [{ evidence: [{ file: `https://evil.example/${EV_FILE}` }] }, /evidence\/<64 位十六进制/],
+    [{ evidence: [{ file: `evidence/${'f'.repeat(63)}.json` }] }, /evidence\/<64 位十六进制/],
+    [{ evidence: [{ file: EV_FILE, pr: 0 }] }, /pr 必须是正整数/],
+    [{ evidence: [{ file: EV_FILE, at: '2026-10-17 08:00:00' }] }, /带时区的 ISO 8601/],
+  ];
+  for (const [over, re] of bad) {
+    assert.throws(() => parseDispositions(doc(d(over))), re, JSON.stringify(over));
+  }
+});
+
+test('v2 认 v1、认 v2，认 v3 就抛 —— 升级是读的一侧加一档，不是把旧数据读没', () => {
+  assert.deepEqual(KNOWN_DISPOSITIONS_SCHEMAS, ['sukisu-dispositions-v2', 'sukisu-dispositions-v1']);
+  assert.throws(() => parseDispositions({ schema: 'sukisu-dispositions-v3', dispositions: [] }), /未知 schema/);
 });
 
 test('选择器全空 → 抛：它等价于「匹配一切」，绝不能生效', () => {
