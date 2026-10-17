@@ -361,7 +361,7 @@ export async function ledgerSealEvidence({
       resolved[p.url] = { ok: false, reason: String(e.message || e) };
     }
   }
-  return judgeLedgerSeal({ touched, signers: sig.signers, resolved, require });
+  return { ...judgeLedgerSeal({ touched, signers: sig.signers, resolved, require }), resolved, signerCount: sig.signers.length };
 }
 
 /* ------------------------------------------------------------ 取证与 I/O */
@@ -586,6 +586,12 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
         owner: opts.owner, repo: opts.repo, prNumber: opts.pr,
         baseLedger: baseDispositions, headLedger: dispositions, apiBase, token, deps,
       });
+    // 每条 by 的回访结果各打一行：判定只看「全部对得上」，而生产上最需要看见的是
+    // 单条评论读不读得到（workflow token 能不能取 issues/comments/{id} 就靠这几行说话）。
+    for (const [url, r] of Object.entries(seal.resolved || {})) {
+      (r.ok ? log.log : log.error).call(log, '[verify-index-pr] by 回访 ' + url + ' → '
+        + (r.ok ? `${r.login || '(这条评论没有作者)'}(${r.assoc || '未知身份'})` : `读不到：${r.reason}`));
+    }
   }
 
   const verdict = judgeIndexPr({
@@ -601,8 +607,13 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     ok: seal.ok,
     reason: seal.reason,
     signers: (seal.signers || []).map((s) => ({ login: s.login, assoc: s.assoc, id: s.id })),
+    signerCount: seal.signerCount ?? (seal.signers || []).length,
     touched: seal.touched
       ? { added: seal.touched.added.length, changed: seal.touched.changed.length, removed: seal.touched.removed.length }
+      : null,
+    resolved: seal.resolved
+      ? Object.fromEntries(Object.entries(seal.resolved)
+        .map(([u, r]) => [u, { ok: r.ok, login: r.login || null, assoc: r.assoc || null, reason: r.reason || null }]))
       : null,
   } : null;
   report.changedPaths = changedPaths;
