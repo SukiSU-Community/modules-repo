@@ -208,6 +208,27 @@ test('findHumanApprovals：非签名评论直接跳过，不参与判定也不�
   assert.equal(r.enough, false);
 });
 
+test('findHumanApprovals：第三个参数换「谁算签核人」的来源，默认值一位不动（人工路照旧吃 assoc）', () => {
+  const comments = [sign(9, 'alice', 'CONTRIBUTOR'), sign(10, 'bob', 'MEMBER')];
+
+  // 默认：assoc 说了算 —— 这条就是人在本地拿自己的 token 跑 publish-from-main 时的形状。
+  const dflt = findHumanApprovals(comments);
+  assert.deepEqual(dflt.signers.map((s) => s.login), ['bob']);
+  assert.equal(dflt.rejected[0].why, '身份是 CONTRIBUTOR，不是 OWNER/MEMBER');
+
+  // 传入判定：assoc 整个不参与，返回字符串就当拒绝理由写进 rejected。
+  // CI 那条路必须这样用 —— workflow token 读维护者只回 CONTRIBUTOR（canary #58/#59 实测），
+  // 吃 assoc 等于永远数不到签；它查的是 collaborators/{login}/permission。
+  const byWrite = new Set(['alice']);
+  const r = findHumanApprovals(comments, 2, (login) => (byWrite.has(login) ? true : '这个人对这个仓库没有写权限'));
+  assert.deepEqual(r.signers.map((s) => s.login), ['alice'], '数到的是权限名单里的人，跟 assoc 无关');
+  assert.deepEqual(r.rejected.map((x) => x.why), ['这个人对这个仓库没有写权限']);
+
+  // 没给第三个参数时，不许有人顺手把可信名单写成「谁都能签」：predicate 返回 true 之外的一切都算拒绝。
+  const sloppy = findHumanApprovals(comments, 2, () => undefined);
+  assert.equal(sloppy.signers.length, 0);
+});
+
 /* -------------------------------------------------------------- 章的内容 */
 
 test('章里的 by 是可复验的指针（含 owner/repo/PR 号与 head sha 前缀）', () => {

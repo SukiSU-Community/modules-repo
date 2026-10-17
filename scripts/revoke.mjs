@@ -195,7 +195,7 @@ export function main(argv = process.argv.slice(2), io = console, deps = {}) {
   io.log('  git push -u origin HEAD && gh pr create --title "chore(dispose): 下架 …" --body "…"');
   io.log('  然后看 approve 是否绿：它会重算一遍并逐字段比对（verify-index-pr 的台账驱动模式）。');
   io.log('  ⚠️ 动了台账的 PR 不算索引重建，它换了一道准入：需要**两名不同的人**在本 PR 评论**首行**写');
-  io.log('     #human-approved（author_association 须为 OWNER/MEMBER），且每条新增/改动的处置的 --by 那条链接');
+  io.log('     #human-approved，且签的人得对这个仓库有 write/admin（CI 逐个查 permission，见 GOVERNANCE 第 7 节），');
   io.log('     要能回访成这两人之一的真评论 —— 所以 --by 必须是你们其中一人真发过的评论，不是「admin 说的」。');
   io.log('     签齐 ⇒ merge-index 自动合并在 main 上，并立刻 purge CDN；签不齐 ⇒ approve 红，什么都不合。');
   io.log('     判据在 scripts/verify-index-pr.mjs（复用 publish-from-main 的 REQUIRED_SIGNERS=2），见 GOVERNANCE.md 第 2 节。');

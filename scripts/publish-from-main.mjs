@@ -76,12 +76,18 @@ export const REQUIRED_SIGNERS = 2;
  * 判据全部是可复验的字段，不碰任何「看起来像官方」的文本：
  *   * 第一行以 `#human-approved` 开头（写在第一行是为了让人一眼看出这条评论的**用途**，
  *     而不是在讨论中间夹一句就能冒充）；
- *   * `author_association` ∈ {OWNER, MEMBER} —— 这是 GitHub 在读取时算出来的关系，
- *     冒充不了；
+ *   * 可信身份 —— 默认 `author_association` ∈ {OWNER, MEMBER}；
  *   * 有数字 `id`（拿它就能回访那条评论）。
  * 按 login 去重，所以同一个人刷多少条都只算一签。
+ *
+ * 第三个参数 `isTrusted(login, comment)` 是给**执行环境**换可信来源用的，默认值不动：
+ * `author_association` 是 GitHub **按请求者**算出来的字段，不是那个人的固定属性。
+ * 2026-10-17 实测（canary #58/#59，公开仓）：同一条评论，人的 user token 读回 MEMBER，
+ * workflow 的 `github.token` 读回 CONTRIBUTOR。所以吃 assoc 的那条**人工**路（这个脚本，
+ * 由人拿自己的 token 跑）是对的，而 CI 里必须换成逐个查仓库权限的来源 —— 见
+ * verify-index-pr.mjs 的 `signerTrust`。返回值 `true` 才算签；返回字符串就当拒绝理由用。
  */
-export function findHumanApprovals(comments = [], require = REQUIRED_SIGNERS) {
+export function findHumanApprovals(comments = [], require = REQUIRED_SIGNERS, isTrusted = null) {
   const valid = [];
   const rejected = [];
   for (const c of (Array.isArray(comments) ? comments : [])) {
@@ -91,8 +97,14 @@ export function findHumanApprovals(comments = [], require = REQUIRED_SIGNERS) {
     const assoc = String((c && c.author_association) || '').toUpperCase();
     const login = String((c && c.user && c.user.login) || '');
     const id = Number(c && c.id);
-    if (!TRUSTED_ASSOCIATIONS.has(assoc)) {
-      rejected.push({ id, login, why: `身份是 ${assoc || '未知'}，不是 OWNER/MEMBER` });
+    const trusted = isTrusted ? isTrusted(login, c) : TRUSTED_ASSOCIATIONS.has(assoc);
+    if (trusted !== true) {
+      rejected.push({
+        id, login,
+        why: typeof trusted === 'string' && trusted
+          ? trusted
+          : `身份是 ${assoc || '未知'}，不是 OWNER/MEMBER`,
+      });
       continue;
     }
     if (!login || !Number.isFinite(id)) {

@@ -26,10 +26,13 @@
  * 台账那条路今天有两道闸：
  *   ① 上游 audit.yml 的 kind 步按路径名单独认一次 json/dispositions.json 的改动（不带
  *      --diff-filter，所以整本被删也算），台账进过 diff 就不进机器路由；
- *   ② 本脚本的台账驱动分支要求人的署名：两名 author_association ∈ {OWNER,MEMBER} 的成员
- *      在这条 PR 的评论里各留一枚 #human-approved（判据复用 publish-from-main 的
- *      findHumanApprovals / REQUIRED_SIGNERS，不在这里另起一套），且每条**新增或改动**的处置，
- *      它的 by 要能回访成一条真评论、而作者就是那两个人之一。
+ *   ② 本脚本的台账驱动分支要求人的署名：两个**对这个仓库有 write/admin** 的人在这条 PR 的
+ *      评论里各留一枚 #human-approved（标记与人数复用 publish-from-main 的 findHumanApprovals /
+ *      REQUIRED_SIGNERS，不在这里另起一套），且每条**新增或改动**的处置，它的 by 要能回访成
+ *      一条真评论、而作者就是那两个人之一。「谁算签核人」在 CI 里查的是
+ *      GET /repos/{o}/{r}/collaborators/{login}/permission，**不是** author_association：
+ *      那个字段按请求者算，workflow token 读维护者只回 CONTRIBUTOR（2026-10-17 canary #58/#59
+ *      线上实测），照旧吃它就等于谁也数不到 —— 实测表在 signerTrust 上面。
  * 为什么必须有②：B 的判据是「重算结果与 PR 里的索引一致」，而一致是攻击者自己就能做出来的
  * —— 他手上和我们有同一份 build-index.mjs（公开仓库）。2026-10-17 本地复现打出的四格全是这个形状。
  * 另：normalizeIndex 只比 name + modules，所以索引里别的顶层键不过这道判定；要往索引里放新事实
@@ -50,7 +53,7 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { buildIndex, markApproved, collectPendingFiles } from './build-index.mjs';
-import { findPrForCommit, assertMergeApproved, approvalBy, findHumanApprovals, REQUIRED_SIGNERS } from './publish-from-main.mjs';
+import { findPrForCommit, assertMergeApproved, approvalBy, findHumanApprovals, REQUIRED_SIGNERS, HUMAN_APPROVAL_MARKER } from './publish-from-main.mjs';
 import { DEFAULT_DISPOSITIONS_FILE, parseDispositions } from './dispositions.mjs';
 // `by` 的形状只在写入端校验过（revoke.mjs 的 PROOF_URL_RE）。CI 这一侧要复核同一条形状，
 // 就复用那一个常量，不在这里再拼一份正则 —— 两份形状迟早漂，而漂了的那一份是没人看的判定。
@@ -206,7 +209,7 @@ export function judgeIndexPr(input) {
     return {
       ok: true,
       reason: `索引与推导一致（台账驱动：按 ${dispositions.length} 条处置记录重算，未消费投稿；`
-        + `署名为 ${(seal.signers || []).map((s) => `${s.login}(${s.assoc})`).join('、')}）`,
+        + `署名为 ${(seal.signers || []).map((s) => `${s.login}(${s.trust || s.assoc})`).join('、')}）`,
       evidences,
       consumed: [],
       seal,
@@ -232,7 +235,7 @@ function selectorOf(d) {
  *
  * 加一条（凭空下架 / 凭空拉黑）、改一条（换署名换理由）、**删一条**（把人从黑名单里放出来）——
  * #35 当初把台账挪出机器路由，为的就是最后那一格。删除那条没有 `by` 可查，
- * 所以它只计入「这条 PR 动了台账」这个事实，由「两名成员签」那一句拦住，不参与逐条对署名。
+ * 所以它只计入「这条 PR 动了台账」这个事实，由「两名有仓库写权限的人签」那一句拦住，不参与逐条对署名。
  */
 export function ledgerTouched(baseList = [], headList = []) {
   const b = new Map(baseList.map((d) => [selectorOf(d), d]));
@@ -264,12 +267,14 @@ const described = (d) => (d.id ? `id=${d.id}` : d.sha256 ? `sha256=${String(d.sh
  * 证据（签名列表、每条 by 解析到的评论）都在外面取好了传进来 —— 这个函数不发请求，
  * 所以每一条失效方向都能被单测逐字打到。
  *
- * 信任的锚点只取一处：`signers` 来自 findHumanApprovals（它按 author_association ∈ {OWNER,MEMBER}
- * 与 login 去重，是 publish-from-main 人工路那份判据，不是这里新造的）。
+ * 信任的锚点只取一处：`signers` 来自 findHumanApprovals（按 login 去重、要求标记在首行），
+ * 而**它吃什么算可信身份**由调用环境决定：人工路吃 author_association ∈ {OWNER,MEMBER}，
+ * CI 路吃 `collaborators/{login}/permission` ∈ {admin,write} —— 因为前者是按请求者算的字段，
+ * workflow token 读同一条评论只能拿到 CONTRIBUTOR（canary #58/#59 实测），照旧吃它就等于谁也数不到。
  * 逐条 `by` 那次请求只回答两件事：那条评论**存在**，且它的**作者在这条 PR 上签过**。
  */
 export function judgeLedgerSeal({ touched, signers = [], resolved = {}, require = REQUIRED_SIGNERS } = {}) {
-  const who = signers.map((s) => `${s.login}(${s.assoc})`).join('、') || '一个都没有';
+  const who = signers.map((s) => `${s.login}(${s.trust || s.assoc})`).join('、') || '一个都没有';
   if (!touched || !touched.any) {
     return { ok: true, reason: '台账内容没有实质改动（只动了 lastUpdate 一类的元数据）', signers, touched };
   }
@@ -277,8 +282,8 @@ export function judgeLedgerSeal({ touched, signers = [], resolved = {}, require 
     return {
       ok: false,
       reason: `动了 ${touched.added.length} 条新增 / ${touched.changed.length} 条改动 / ${touched.removed.length} 条删除，`
-        + `而这条 PR 上只有 ${signers.length} 名成员的人工签（${who}），少于要求的 ${require} 名`
-        + '（要签请在评论**首行**写 #human-approved，见 GOVERNANCE.md）',
+        + `而这条 PR 上只有 ${signers.length} 名有写权限的人签了（${who}），少于要求的 ${require} 名`
+        + '（要签请在评论**首行**写 #human-approved，且签的人得对这个仓库有 write/admin，见 GOVERNANCE.md）',
       signers, touched,
     };
   }
@@ -301,7 +306,7 @@ export function judgeLedgerSeal({ touched, signers = [], resolved = {}, require 
   if (bad.length) {
     return { ok: false, reason: `有 ${bad.length} 条处置的署名对不上：\n  - ` + bad.join('\n  - '), signers, touched };
   }
-  const note = touched.removed.length ? `；其中 ${touched.removed.length} 条删除没有 by 可查，由上面那两名成员的签覆盖` : '';
+  const note = touched.removed.length ? `；其中 ${touched.removed.length} 条删除没有 by 可查，由上面那两名签核人的签覆盖` : '';
   return {
     ok: true,
     reason: `${touched.added.length + touched.changed.length} 条新增/改动的 by 全部回访得到，作者都在 ${who} 之中${note}`,
@@ -323,11 +328,47 @@ async function getJson(url, token, deps = {}) {
 }
 
 /**
- * 取这条 PR 的处置署名证据：评论列表 → findHumanApprovals → 逐条 by 回访那条评论。
+ * CI 里「谁写得动这个仓库」的唯一可信来源 —— 逐个查仓库权限，不吃 author_association。
  *
- * 用的是 `github.token`，与 pending 那条批准证据同一个身份；两个端点今天都被
- * findPrForCommit 在生产上跑过（`issues/{n}/comments`、`issues/comments/{id}` 单条实测回
- * `author_association`，取不到时是 404 而不是空数组 —— 所以这里的失败方向全是红，不是放行）。
+ * 探针（canary #59，全程用 workflow 的 `github.token`，公开仓）实测：
+ *   维护者            → HTTP 200 `permission=admin`
+ *   一个不存在的协作者（octocat）  → HTTP 200 `permission=read`   ← **不是 404**
+ *   一个 bot（dependabot[bot]）   → HTTP 200 `permission=none`
+ *   整张 `/collaborators` 表      → HTTP 200 但 **0 条**（列不出来，只能逐个问）
+ *   `/orgs/{owner}/memberships/{login}` → **403 "Resource not accessible by integration"**
+ *   `/orgs/{owner}/members/{login}`     → 404（不是公开成员）
+ * 两条反直觉的都在这：判据必须是**权限等级**而不是「HTTP 200 就是协作者」（非协作者也回 200），
+ * 而 org 那一层在这个 token 下问不到。任何读不到（403/404/5xx/网络）一律按不可信处理。
+ */
+export const TRUSTED_REPO_PERMISSIONS = new Set(['admin', 'write']);
+
+export async function signerTrust({
+  owner, repo, comments = [], apiBase = 'https://api.github.com', token = '', deps = {},
+} = {}) {
+  const api = String(apiBase).replace(/\/$/, '');
+  const isMarker = (c) => String((c && c.body) || '').trim().split('\n', 1)[0].trim().startsWith(HUMAN_APPROVAL_MARKER);
+  const out = new Map();
+  for (const c of (Array.isArray(comments) ? comments : [])) {
+    if (!isMarker(c)) continue;                     // 不是签核评论的作者就不花钱查
+    const login = String((c && c.user && c.user.login) || '');
+    if (!login || out.has(login)) continue;
+    try {
+      const j = await getJson(`${api}/repos/${owner}/${repo}/collaborators/${encodeURIComponent(login)}/permission`, token, deps);
+      const permission = String((j && j.permission) || '').toLowerCase();
+      out.set(login, { ok: TRUSTED_REPO_PERMISSIONS.has(permission), permission });
+    } catch (e) {
+      out.set(login, { ok: false, permission: '', why: '查不到仓库权限：' + String(e.message || e) });
+    }
+  }
+  return out;
+}
+
+/**
+ * 取这条 PR 的处置署名证据：评论列表 → 逐个查仓库权限 → findHumanApprovals → 逐条 by 回访那条评论。
+ *
+ * 用的是 `github.token`，与 pending 那条批准证据同一个身份；三个端点今天都在 CI 里读过
+ * （`issues/{n}/comments`、`issues/comments/{id}`、`collaborators/{login}/permission`，
+ * 见 canary #58/#59 的日志）。取不到时全是红，不是放行。
  */
 export async function ledgerSealEvidence({
   owner, repo, prNumber, baseLedger = [], headLedger = [],
@@ -349,7 +390,17 @@ export async function ledgerSealEvidence({
   } catch (e) {
     return { ok: false, reason: `拿不到 PR #${n} 的评论：${String(e.message || e)}`, touched };
   }
-  const sig = findHumanApprovals(comments, require);
+  const trust = await signerTrust({ owner, repo, comments, apiBase: api, token, deps });
+  const sig = findHumanApprovals(comments, require, (login) => {
+    const t = trust.get(login);
+    if (!t) return '没查到这个人的仓库权限（签名评论的作者不在待查名单里？）';
+    if (t.ok) return true;
+    return t.why || `仓库权限是 ${t.permission || '无'}，不到 write`;
+  });
+  for (const s of sig.signers) {
+    const t = trust.get(s.login) || {};
+    s.trust = 'permission=' + (t.permission || '未知');
+  }
   const resolved = {};
   for (const d of [...touched.added, ...touched.changed.map((c) => c.to)]) {
     const p = parseProofUrl(d.by);
@@ -361,7 +412,12 @@ export async function ledgerSealEvidence({
       resolved[p.url] = { ok: false, reason: String(e.message || e) };
     }
   }
-  return { ...judgeLedgerSeal({ touched, signers: sig.signers, resolved, require }), resolved, signerCount: sig.signers.length };
+  return {
+    ...judgeLedgerSeal({ touched, signers: sig.signers, resolved, require }),
+    resolved,
+    trust: Object.fromEntries([...trust].map(([k, v]) => [k, { ok: v.ok, permission: v.permission, why: v.why || null }])),
+    signerCount: sig.signers.length,
+  };
 }
 
 /* ------------------------------------------------------------ 取证与 I/O */
@@ -464,7 +520,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
        [--pending-dir pending] [--index-file json/modules.json] [--dispositions-file json/dispositions.json]
        [--cwd <dir>] [--report <file>] [--pr <PR 编号>]
    判定当前工作树里的索引是否等于「base 内容 + 被本 PR 消费的已批准条目 + head 上的处置台账」的推导结果。
-   动了处置台账时必须给 --pr：那一条分支要额外查两名成员的 #human-approved，而签是在 PR 的评论里。`);
+   动了处置台账时必须给 --pr：那一条分支要额外查两个有仓库写权限的人的 #human-approved，而签是在 PR 的评论里。`);
     return opts.help ? 0 : 2;
   }
   const cwd = opts.cwd ? path.resolve(opts.cwd) : process.cwd();
@@ -592,6 +648,13 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       (r.ok ? log.log : log.error).call(log, '[verify-index-pr] by 回访 ' + url + ' → '
         + (r.ok ? `${r.login || '(这条评论没有作者)'}(${r.assoc || '未知身份'})` : `读不到：${r.reason}`));
     }
+    // 每个签核评论的作者查到的仓库权限也各打一行 —— 这一格是「谁算签核人」的唯一来源，
+    // 而它换过一次（author_association 在 workflow token 下会退化成 CONTRIBUTOR）。
+    for (const [login, t] of Object.entries(seal.trust || {})) {
+      (t.ok ? log.log : log.error).call(log, '[verify-index-pr] 署名可信度 ' + login
+        + ' → permission=' + (t.permission || '无') + ' 可信=' + (t.ok ? 'yes' : 'no')
+        + (t.why ? '（' + t.why + '）' : ''));
+    }
   }
 
   const verdict = judgeIndexPr({
@@ -606,8 +669,9 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   report.seal = seal ? {
     ok: seal.ok,
     reason: seal.reason,
-    signers: (seal.signers || []).map((s) => ({ login: s.login, assoc: s.assoc, id: s.id })),
+    signers: (seal.signers || []).map((s) => ({ login: s.login, assoc: s.assoc, trust: s.trust || null, id: s.id })),
     signerCount: seal.signerCount ?? (seal.signers || []).length,
+    trust: seal.trust || null,
     touched: seal.touched
       ? { added: seal.touched.added.length, changed: seal.touched.changed.length, removed: seal.touched.removed.length }
       : null,

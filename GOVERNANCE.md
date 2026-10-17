@@ -27,7 +27,8 @@
 4. 机器人只合两条：
    * **索引重建** —— 索引内容真的变了、变得能对得上推导（消费的是有外部批准证据的 pending），
      且这条 PR **没动处置台账**；
-   * **处置台账改动** —— 这条 PR 有**两名不同的人**（`author_association` 为 OWNER/MEMBER）在评论
+   * **处置台账改动** —— 这条 PR 有**两名不同的人**（CI 查的是此人对这个仓库有 write/admin，
+     `GET /repos/{o}/{r}/collaborators/{login}/permission`；见第 7 节为什么不吃 `author_association`）在评论
      首行写 `#human-approved`，且每条新增/改动的处置的 `by` 能回访成这两人之一的真评论。
    签不齐的台账 PR，`approve` 直接红 —— 不是「绿着等人来点」，因为绿勾是会被点的。
    为什么动了台账要单独一条判据、光「推导一致」不算：重算是拿公开仓库里同一份 `build-index.mjs`
@@ -112,6 +113,12 @@
 - 评论可以被作者**事后编辑**。签名有效性以读取时的正文与身份为准，编辑历史要靠 GitHub 的
   activity log 人工看，这里不假装能自动防。
 - org 成员资格被回收**不会**追溯撤销已经发生过的签名。已经放行的模块要撤，走 `revoke.mjs`。
+- 「谁算签核人」有**两个来源**，因为 `author_association` 是 GitHub **按请求者**算出来的字段：
+  人拿自己的 token 跑 `publish-from-main.mjs` 时它是准的（OWNER/MEMBER），而 Actions 里那个
+  `github.token` 读同一条评论只回 CONTRIBUTOR（2026-10-17 用 canary #58/#59 线上实测：
+  维护者 admin、非协作者 octocat 也回 HTTP 200 但 `permission=read`、bot 回 `none`；
+  `/orgs/{owner}/memberships/{login}` 在这个 token 下是 403）。所以 CI 那条路改吃**逐个查仓库权限**，
+  判据是权限等级而不是「HTTP 200」。两条路的标记与人数是同一套，只有「谁算人」这一步按执行环境分。
 - 签核人名单 = org 成员，所以 org 管理员实际上决定签核权（第 1 节已写明）。
 - 目前实际维护者是一个人。也就是说「两个不同的人」这一条在多数时候意味着
   「我和一个愿意签的朋友」—— 比单人强，但别把它读成成熟的多人共治。
