@@ -297,10 +297,10 @@ test('台账驱动那一支：索引算得对但没有署名证据 → 红（一
     deletedPaths: [], touchedPaths: [],
     dispositions: parseDispositions(revokeOf('mod_a')), ledgerChanged: true,
     attest: () => ({ ok: true }),
-    seal: { ok: false, reason: '这条 PR 上只有 1 名成员的人工签', signers: [{ login: 'solo', assoc: 'MEMBER' }] },
+    seal: { ok: false, reason: '这条 PR 上只有 1 名有写权限的人签了', signers: [{ login: 'solo', assoc: 'MEMBER' }] },
   });
   assert.equal(v2.ok, false);
-  assert.match(v2.reason, /只有 1 名成员的人工签/);
+  assert.match(v2.reason, /只有 1 名有写权限的人签了/);
 });
 
 
@@ -416,10 +416,10 @@ test('P3 真仓库：只改台账 + 重算索引的 PR，签齐才退出 0；没
   const rc2 = await m.main(['--base', 'main', '--head', 'HEAD', '--owner', 'o', '--repo', 'r', '--cwd', d2, '--pr', '9'],
     {
       log: log2, token: 't', attest: () => ({ ok: true }),
-      seal: { ok: false, reason: '这条 PR 上只有 1 名成员的人工签（member-one(MEMBER)），少于要求的 2 名', signers: [{ login: 'member-one', assoc: 'MEMBER', id: 1 }] },
+      seal: { ok: false, reason: '这条 PR 上只有 1 名有写权限的人签了（member-one(MEMBER)），少于要求的 2 名', signers: [{ login: 'member-one', assoc: 'MEMBER', id: 1 }] },
     });
   assert.equal(rc2, 1, allLogs(log2));
-  assert.match(allLogs(log2), /只有 1 名成员的人工签/);
+  assert.match(allLogs(log2), /只有 1 名有写权限的人签了/);
 
   // ③ 两名成员签齐 → 绿，且 report.seal 留下可复核的指针
   const d3 = ledgerFixture();
@@ -514,7 +514,7 @@ test('judgeLedgerSeal：两名成员 + 每条 by 回访得到且作者签过，�
   // ① 只有一签
   const one = judgeLedgerSeal({ touched, signers: [SIGNERS[0]], resolved: res });
   assert.equal(one.ok, false);
-  assert.match(one.reason, /只有 1 名成员的人工签/);
+  assert.match(one.reason, /只有 1 名有写权限的人签了/);
 
   // ② 两签齐，但 by 指向的那个人没在这条 PR 上签
   const stranger = judgeLedgerSeal({
@@ -556,14 +556,29 @@ test('judgeLedgerSeal：两名成员 + 每条 by 回访得到且作者签过，�
   assert.equal(chg.ok, true, chg.reason);
 });
 
-/** 只按 URL 分派的假 GitHub API，用来验 ledgerSealEvidence 的取证据形状。 */
-function stubFetch({ comments, byComments = {}, throwOn = '' } = {}) {
+/**
+ * 只按 URL 分派的假 GitHub API，用来验取证据那条路的形状。
+ *
+ * `collaborators/{login}/permission` 这一格是 2026-10-17 补的：CI 里「谁算签核人」改吃这个端点
+ * （canary #59 实测 workflow token 下 `author_association` 会退化成 CONTRIBUTOR）。
+ * 没在 `perms` 里点名的人一律回 `read` —— 那正是探针量到的真实形状（octocat 不是这个仓库的
+ * 协作者，HTTP 200 `permission=read`，**不是 404**），所以「列出来的人才有写权限」这个前提
+ * 在夹具里也是 fail closed 的。
+ */
+function stubFetch({ comments, byComments = {}, perms = {}, throwOn = '', failPerm = null } = {}) {
   const seen = [];
   return {
     seen,
     fetch: async (url) => {
       seen.push(String(url));
       if (throwOn && String(url).includes(throwOn)) throw new Error('HTTP 502');
+      const pm = /\/collaborators\/([^/]+)\/permission/.exec(String(url).split('?')[0]);
+      if (pm) {
+        const login = decodeURIComponent(pm[1]);
+        if (failPerm && failPerm[login]) throw new Error(`HTTP ${failPerm[login]}`);
+        const permission = Object.prototype.hasOwnProperty.call(perms, login) ? perms[login] : 'read';
+        return { ok: true, status: 200, json: async () => ({ permission, role_name: permission }) };
+      }
       const c = /\/issues\/comments\/(\d+)$/.exec(String(url).split('?')[0]);
       if (c) {
         const rec = byComments[c[1]];
@@ -576,9 +591,10 @@ function stubFetch({ comments, byComments = {}, throwOn = '' } = {}) {
     },
   };
 }
-const signComment = (id, login) => ({ id, user: { login }, author_association: 'MEMBER', body: `#human-approved ${login} 同意下架` });
+const signComment = (id, login, assoc = 'MEMBER') => ({ id, user: { login }, author_association: assoc, body: `#human-approved ${login} 同意下架` });
+const WRITE = { 'member-one': 'admin', 'member-two': 'write' };
 
-test('ledgerSealEvidence：走的是 findHumanApprovals 那份判据，评论列表取不到时红而不是放行', async () => {
+test('ledgerSealEvidence：签核人按仓库权限认，评论列表取不到时红而不是放行', async () => {
   const base = [];
   const head = parseDispositions({ schema: 'sukisu-dispositions-v1', dispositions: [D(), HEAD2()] });
   const BY_COMMENTS = {
@@ -589,7 +605,7 @@ test('ledgerSealEvidence：走的是 findHumanApprovals 那份判据，评论列
   // ① 两签齐且两条 by 都能回访到签名的人
   const okCase = stubFetch({
     comments: [signComment(10, 'member-one'), signComment(11, 'member-two')],
-    byComments: BY_COMMENTS,
+    byComments: BY_COMMENTS, perms: WRITE,
   });
   const r1 = await ledgerSealEvidence({
     owner: 'o', repo: 'r', prNumber: 9, baseLedger: base, headLedger: head, token: 't', deps: okCase,
@@ -598,21 +614,23 @@ test('ledgerSealEvidence：走的是 findHumanApprovals 那份判据，评论列
   assert.equal(r1.signers.length, 2);
   assert.ok(okCase.seen.some((u) => /\/repos\/o\/r\/issues\/9\/comments\?per_page=100/.test(u)), '要按这条 PR 的编号取评论，不是「最近哪条 PR」');
   assert.equal(okCase.seen.filter((u) => /\/issues\/comments\//.test(u)).length, 2, '两条 by 各回访一次');
+  assert.equal(okCase.seen.filter((u) => /\/collaborators\/[^/]+\/permission/.test(u)).length, 2, '两个签核人各查一次权限');
+  assert.deepEqual(Object.keys(r1.trust).sort(), ['member-one', 'member-two']);
 
   // ② 只有一个人签（他刷两条也只算一签 —— 去重住在 findHumanApprovals 里）
   const oneCase = stubFetch({
     comments: [signComment(10, 'member-one'), signComment(12, 'member-one'),
-      { id: 13, user: { login: 'outsider' }, author_association: 'NONE', body: '#human-approved 我不是成员' }],
-    byComments: BY_COMMENTS,
+      { id: 13, user: { login: 'outsider' }, author_association: 'NONE', body: '#human-approved 我签了但没权限' }],
+    byComments: BY_COMMENTS, perms: WRITE,
   });
   const r2 = await ledgerSealEvidence({ owner: 'o', repo: 'r', prNumber: 9, baseLedger: base, headLedger: head, token: 't', deps: oneCase });
   assert.equal(r2.ok, false);
-  assert.match(r2.reason, /只有 1 名成员的人工签/);
+  assert.match(r2.reason, /只有 1 名有写权限的人签了/);
 
   // ③ by 指向一条不存在的评论 → 404 → 红（复现里「形状合法、内容是编的」那一格的机器版）
   const four04 = stubFetch({
     comments: [signComment(10, 'member-one'), signComment(11, 'member-two')],
-    byComments: { 1111111111: BY_COMMENTS['1111111111'] },
+    byComments: { 1111111111: BY_COMMENTS['1111111111'] }, perms: WRITE,
   });
   const r3 = await ledgerSealEvidence({ owner: 'o', repo: 'r', prNumber: 9, baseLedger: base, headLedger: head, token: 't', deps: four04 });
   assert.equal(r3.ok, false);
@@ -636,6 +654,71 @@ test('ledgerSealEvidence：走的是 findHumanApprovals 那份判据，评论列
   const r6 = await ledgerSealEvidence({ owner: 'o', repo: 'r', prNumber: 9, baseLedger: head, headLedger: head, token: 't', deps: noopStub });
   assert.equal(r6.ok, true);
   assert.equal(noopStub.seen.length, 0, '没有实质改动就不该花钱去取证据');
+
+  // ⑦ 权限那个端点本身读不到（403/5xx）时也不许放行 —— 见下面单独那一格，
+  //    它要能独立报出「红在哪一格」，所以不跟在这里。
+});
+
+/* 下面这两格各自独立成 test，是为了变异能报到**为它而设的那一格**上：
+ * 混在同一格里时，前面那格的断言会先抛，读日志的人就看不见「反例被放过了」这句真正的话。 */
+
+// ⑦⑧ 这一对是 2026-10-17 那次换来源的全部理由：assoc 是**按请求者**算的。
+// canary #58/#59 线上实测：同一条评论，人的 token 读回 MEMBER，workflow 的 github.token 读回 CONTRIBUTOR。
+test('ledgerSealEvidence：assoc 退化成 CONTRIBUTOR 但权限够 ⇒ 照样数得到（CI 的真实形状）', async () => {
+  const base = [];
+  const head = parseDispositions({ schema: 'sukisu-dispositions-v1', dispositions: [D(), HEAD2()] });
+  const ciShape = stubFetch({
+    comments: [signComment(10, 'member-one', 'CONTRIBUTOR'), signComment(11, 'member-two', 'CONTRIBUTOR')],
+    byComments: {
+      1111111111: { id: 1111111111, user: { login: 'member-one' }, author_association: 'CONTRIBUTOR' },
+      2222222222: { id: 2222222222, user: { login: 'member-two' }, author_association: 'CONTRIBUTOR' },
+    },
+    perms: WRITE,
+  });
+  const r = await ledgerSealEvidence({ owner: 'o', repo: 'r', prNumber: 9, baseLedger: base, headLedger: head, token: 't', deps: ciShape });
+  assert.equal(r.ok, true, r.reason);
+  assert.deepEqual(r.signers.map((s) => s.trust), ['permission=admin', 'permission=write'],
+    '结论里要看得见权限，而不是那个会随请求者变的 assoc');
+});
+
+// 反过来那一格才证明牙在：assoc 全说 MEMBER/OWNER，但权限查出来是 read（探针里 octocat 的形状）
+// ⇒ 一签都不算。少了这格，「换成查权限」可能只是换了个也会说谎的来源。
+test('ledgerSealEvidence：assoc 说 MEMBER 而仓库权限只有 read ⇒ 一签都不算（octocat 形状）', async () => {
+  const base = [];
+  const head = parseDispositions({ schema: 'sukisu-dispositions-v1', dispositions: [D(), HEAD2()] });
+  const noWrite = stubFetch({
+    comments: [signComment(10, 'member-one', 'MEMBER'), signComment(11, 'member-two', 'OWNER')],
+    byComments: {
+      1111111111: { id: 1111111111, user: { login: 'member-one' }, author_association: 'MEMBER' },
+      2222222222: { id: 2222222222, user: { login: 'member-two' }, author_association: 'OWNER' },
+    },
+  });
+  const r = await ledgerSealEvidence({ owner: 'o', repo: 'r', prNumber: 9, baseLedger: base, headLedger: head, token: 't', deps: noWrite });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /只有 0 名有写权限的人签了/);
+  assert.deepEqual(Object.values(r.trust).map((t) => t.permission), ['read', 'read'],
+    '0 签时结论里不会写每个人的权限，但 trust 必须记着 —— 生产上就靠它解释「为什么数不到」');
+});
+
+// ⑨ 查权限这件事本身坏了 ⇒ 按不可信处理（fail closed），不是「查不到就算过」
+test('ledgerSealEvidence：权限端点回 403/500 时按不可信处理', async () => {
+  const base = [];
+  const head = parseDispositions({ schema: 'sukisu-dispositions-v1', dispositions: [D(), HEAD2()] });
+  const permBroken = stubFetch({
+    comments: [signComment(10, 'member-one'), signComment(11, 'member-two')],
+    byComments: {
+      1111111111: { id: 1111111111, user: { login: 'member-one' }, author_association: 'MEMBER' },
+      2222222222: { id: 2222222222, user: { login: 'member-two' }, author_association: 'MEMBER' },
+    },
+    failPerm: { 'member-one': 403, 'member-two': 500 },
+  });
+  const r = await ledgerSealEvidence({ owner: 'o', repo: 'r', prNumber: 9, baseLedger: base, headLedger: head, token: 't', deps: permBroken });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /只有 0 名有写权限的人签了/);
+  for (const t of Object.values(r.trust)) {
+    assert.equal(t.ok, false);
+    assert.match(t.why, /查不到仓库权限：HTTP (403|500)/);
+  }
 });
 
 /* 生产路径上没有人注入 deps.seal：CI 只给 --pr，取证全靠 deps.fetch。
@@ -648,8 +731,11 @@ test('main 只给 --pr 与 deps.fetch 时真的走完取证（绿的那格）', 
   const out = fs.mkdtempSync(path.join(os.tmpdir(), 'vip-seal-out-'));
   const report = path.join(out, 'r.json');
   const stub = stubFetch({
-    comments: [signComment(10, 'member-one'), signComment(11, 'member-two')],
-    byComments: { 1111111111: { id: 1111111111, user: { login: 'member-one' }, author_association: 'MEMBER' } },
+    // 用 CI 真实形状起夹具：assoc 全是 CONTRIBUTOR（workflow token 读回来就这样），
+    // 权限查出来才是 admin/write —— 这两格既要证 main 真走了取证，也要证它换来源之后照样数得到。
+    comments: [signComment(10, 'member-one', 'CONTRIBUTOR'), signComment(11, 'member-two', 'CONTRIBUTOR')],
+    byComments: { 1111111111: { id: 1111111111, user: { login: 'member-one' }, author_association: 'CONTRIBUTOR' } },
+    perms: WRITE,
   });
   const log = quiet();
   const m = await V();
@@ -661,11 +747,14 @@ test('main 只给 --pr 与 deps.fetch 时真的走完取证（绿的那格）', 
     'main 要按 PR 编号取评论列表：' + stub.seen.join(' '));
   assert.ok(stub.seen.some((u) => /\/repos\/SukiSU-Community\/modules-repo\/issues\/comments\/1111111111$/.test(u)),
     'by 的回访要用 by 自己的 owner/repo，不是这条 PR 的：' + stub.seen.join(' '));
-  assert.match(allLogs(log), /by 回访 \S+ → member-one\(MEMBER\)/);
+  assert.match(allLogs(log), /by 回访 \S+ → member-one\(CONTRIBUTOR\)/);
+  assert.match(allLogs(log), /署名可信度 member-one → permission=admin 可信=yes/);
+  assert.match(allLogs(log), /署名可信度 member-two → permission=write 可信=yes/);
   const r = JSON.parse(fs.readFileSync(report, 'utf8'));
   assert.equal(r.seal.ok, true, r.seal.reason);
   assert.equal(r.seal.signerCount, 2);
-  assert.deepEqual(r.seal.resolved[BY1], { ok: true, login: 'member-one', assoc: 'MEMBER', reason: null });
+  assert.deepEqual(r.seal.resolved[BY1], { ok: true, login: 'member-one', assoc: 'CONTRIBUTOR', reason: null });
+  assert.deepEqual(r.seal.trust['member-two'], { ok: true, permission: 'write', why: null });
   fs.rmSync(dir, { recursive: true, force: true });
   fs.rmSync(out, { recursive: true, force: true });
 });
@@ -675,7 +764,8 @@ test('main 只给 --pr 与 deps.fetch 时真的走完取证（by 404 的那格�
   makeRevokePr(dir, revokeOf('mod_a', BY1));
   const stub = stubFetch({
     comments: [signComment(10, 'member-one'), signComment(11, 'member-two')],
-    byComments: {},                     // 两签齐，但那条评论不存在
+    byComments: {},                     // 两签齐（权限也够），但那条评论不存在
+    perms: WRITE,
   });
   const log = quiet();
   const m = await V();
