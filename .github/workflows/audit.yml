@@ -91,6 +91,10 @@ jobs:
       # 索引重建 PR 走的是另一条判据：内容必须由 base 推导得出（见 kind/derive 两步）。
       index_pr: ${{ steps.kind.outputs.index_pr }}
       index_derived: ${{ steps.derive.outputs.derived }}
+      # 动了处置台账的 PR 是第三种形状：既不是「索引重建」也不是「没有内容要判」，而是一次人的决定。
+      # 这两个必须分开导出 —— 合成一个就会退成「台账改动也算索引 PR」，那正是 2026-10-17 复现打穿的形状。
+      ledger_pr: ${{ steps.kind.outputs.ledger_pr }}
+      ledger_sealed: ${{ steps.derive.outputs.sealed }}
       # 处置台账（下架/黑名单）在 CI 侧的那一道：hit / clear（见 dispose 步）。
       disposition: ${{ steps.dispose.outputs.hit }}
       disposition_reason: ${{ steps.dispose.outputs.why }}
@@ -393,9 +397,13 @@ jobs:
       #     index_pr=true ⇒ verify-index-pr.mjs 的台账驱动分支（:172-179）只看重算结果一致，
       #     对台账 diff 既不看凭据也不看署名（by 是自由文本），merge-index 于是自动合。
       #     本地复现打出四格（加 revoke、加 deny、删 revoke，后两格的索引只是缩进与键序变了）。
-      #     现在 kind 步按路径名单独认一次台账改动，台账进过 diff 就不进机器路由 —— 拦的位置在
-      #     `判定 PR 类型` 那一步，不在本步；判据由 test/publish-from-main.test.mjs 那批
-      #     「逐字执行 kind」的用例钉住（含一条变异哨兵证明牙在 `[ -z "$CHANGED_LEDGER" ]` 那一句）。
+      #     现在这条路有两道闸：① kind 步按路径名单独认一次台账改动，台账进过 diff 就不算「索引重建」；
+      #     ② derive 步在同一次调用里取处置署名（两名 OWNER/MEMBER 的 #human-approved，且每条新增/改动的
+      #     by 回访得到其中一个人的真评论），approve 对动了台账的 PR 要求这一格成立才给绿，
+      #     merge-index 只在签齐时才走 ledger 那一支自动合。两道都不在本步，也不由本步负责。
+      #     钉子：test/publish-from-main.test.mjs 那批「逐字执行 kind」的用例（含一条变异哨兵证明牙在
+      #     `[ -z "$CHANGED_LEDGER" ]` 那一句）、test/verify-index-pr.test.mjs 那批署名用例
+      #     （含一对正反形状：一致 + 有签 = 绿，一致 + 没签 = 红）。
       #     本步仍然不覆盖它：本步管的是 pending 的形状与来源，台账这条路今天不经本步、也不经机器路由。
       #
       # 只吃 pending-changed/pending：那是上面 locate 用 `git diff --no-renames --diff-filter=AM`
@@ -456,35 +464,45 @@ jobs:
           # 于是「改台账 + 索引只做缩进与键序的 churn」这一格：这一步说是索引重建，derive 说推导一致
           # ⇒ merge-index 自动合。载荷是任何账号都能下任意下架、或封掉一个 UID 的未来所有投稿，
           # 而伪造的 by 会被 Worker 当成「下处置的人」念给投稿者（台账命中不改退出码，署名是自由文本）。
-          # ⇒ 台账进过 diff 就不许走机器路由，无论索引改没改、改成什么形状。
+          # ⇒ 台账进过 diff 就不算索引重建，无论索引改没改、改成什么形状（那步 churn 就是为了让这一步看见）。
           # 这里**故意不加 --diff-filter**：把整个 json/dispositions.json 删掉是一次 D，
           # 那正是一整本处置的消失，必须和「改一条」同样拦。
-          # 合法下架照走得通：derive 不跑、approve 认「没有待审投稿内容」给绿，由维护者手动合并 ——
-          # GOVERNANCE.md 第 1 节本来就把这件事写在维护者手上。代价是这一步期间 merge-index 不跑，
-          # 挂在它后面那步的 CDN purge 也就跟着不跑；把自动合拿回来的下一步是给台账写入上可复验的署名。
+          # 但这条路不是「停在人工」：它换了一道判据 —— derive 去取两名组织成员的 #human-approved，
+          # 并逐条把新增/改动的 by 回访成其中一个人的真评论（判据在 verify-index-pr.mjs，
+          # 复用 publish-from-main 的 findHumanApprovals / REQUIRED_SIGNERS=2，不另起一套）。
+          # 签齐 ⇒ ledger_sealed=true ⇒ merge-index 走 ledger 那一支照旧自动合，
+          # 连带把它后面那步 CDN purge 一起跑掉（下架的生效速度由 TTL 决定，不由 main 决定）；
+          # 签不齐 ⇒ approve 红。顺序要紧：approve 那句「没有投稿内容 ⇒ 无批准事项」会给一枚绿勾，
+          # #53 那条 canary 在线上读到的正是它，所以台账这一支必须排在那句前面。
           CHANGED_LEDGER=$(git diff --name-only "$BASE_SHA" HEAD -- 'json/dispositions.json' || true)
+          # 台账这条路单独导出一个 ledger_pr：它不是「索引重建」，但也不是「没有内容要判」——
+          # 它是一次人的决定，要有两名成员签在上面（derive 那一步去取这个证据），签齐了才许自动合。
+          echo "ledger_pr=$([ -n "$CHANGED_LEDGER" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           if [ -n "$CHANGED_JSON" ] && [ -z "$CHANGED_LEDGER" ] && [ "${FOUND:-}" != "true" ]; then
             echo "index_pr=true" >> "$GITHUB_OUTPUT"
             echo "这是索引重建 PR（改了 json/modules.json，未动处置台账，且不含新投稿）：$CHANGED_JSON"
           else
             echo "index_pr=false" >> "$GITHUB_OUTPUT"
             if [ -n "$CHANGED_LEDGER" ]; then
-              echo "::warning::这个 PR 动了处置台账（$CHANGED_LEDGER）—— 台账上的处置是人工判断，不走机器路由：derive 不跑、merge-index 不合，请两名组织成员在评论里各留一枚 #human-approved 后由维护者合并（见 GOVERNANCE.md）。"
+              echo "::warning::这个 PR 动了处置台账（$CHANGED_LEDGER）—— 台账上的处置是人工判断：不认领索引重建，改由 derive 那一步查两名组织成员的 #human-approved（签不齐 approve 直接红，见 GOVERNANCE.md）。"
             elif [ -n "$CHANGED_JSON" ]; then
               echo "::warning::这个 PR 同时带投稿和索引改动 —— 索引改动不会被推导判定放行，投稿按扫描结论走。"
             fi
             echo "不是索引重建 PR（found=${FOUND:-<空>}，索引改动=${CHANGED_JSON:-无}，台账改动=${CHANGED_LEDGER:-无}）"
           fi
 
-      - name: 验索引确由 base 推导（只给索引 PR）
+      - name: 验索引由 base 推导 + 取处置署名（索引 PR 与台账 PR）
         id: derive
-        if: steps.kind.outputs.index_pr == 'true'
+        # 台账 PR 也走这一步：同一次调用既重算索引（内容那一半），也取处置署名（人的那一半）。
+        # 分两步写会多一次 git 遍历，更糟的是两份「这个 PR 动了什么」的判断可能漂开。
+        if: steps.kind.outputs.index_pr == 'true' || steps.kind.outputs.ledger_pr == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           BASE_SHA: ${{ steps.kind.outputs.base_sha }}
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           FORCE_PREFIX: ${{ vars.MODULE_REPO_PREFIX || '' }}
         run: |
           set -euo pipefail
@@ -498,6 +516,7 @@ jobs:
           node "$SCRIPTS_DIR/verify-index-pr.mjs" --base "$BASE_SHA" --head HEAD \
             --owner "$OWNER" --repo "$REPO" --pending-dir "$PENDING_DIR" \
             --index-file "$INDEX_FILE" --dispositions-file "$DISPOSITIONS_FILE" \
+            --pr "$PR_NUMBER" \
             --report verify-index-pr.report.json
           RC=$?
           set -e
@@ -507,6 +526,24 @@ jobs:
             echo "derived=false" >> "$GITHUB_OUTPUT"
             echo "::error::索引 PR 未通过推导校验，见上面输出。"
           fi
+          # sealed 单独导一个 output，且**读的是 report 里那个字段**，不是这一步的退出码：
+          # 退出码 0 只说明「索引算得对」，署名那一半没结论时（report.seal 为 null，即这条 PR
+          # 没动台账）要写成 false —— 让 approve 那边永远读到一个显式的 false，
+          # 而不是一个「没跑成所以大概是 true」的空白。
+          node -e '
+            const fs = require("fs");
+            let sealed = false;
+            let why = "读不到 verify-index-pr.report.json";
+            try {
+              const r = JSON.parse(fs.readFileSync("verify-index-pr.report.json", "utf8"));
+              if (r.seal && r.seal.ok) { sealed = true; }
+              else if (r.seal) { why = r.seal.reason; }
+              else if (r.ledger && r.ledger.changed) { why = "report 里没有 seal 这一格（脚本版本不对？）"; }
+              else { why = "这条 PR 没动台账，署名不适用"; }
+            } catch (e) { why = "解析 report 失败 - " + e.message; }
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, "sealed=" + sealed + "\n");
+            if (!sealed) console.log("[derive] sealed=false：" + why);
+          '
 
       # ---------------------------------------------------------------
       # 2. 跑静态扫描（纯 Node，无 npm 依赖）
@@ -1424,12 +1461,14 @@ jobs:
           fi
           echo "上游都过了：audit=success selftest=success，继续按内容与推导判定。"
 
-      - name: 只批准「低风险 + 首次收录」或「可复算的索引重建」
+      - name: 只批准「低风险 + 首次收录」或「可复算的索引重建」或「两名成员签过的台账改动」
         shell: bash
         env:
           FOUND: ${{ needs.audit.outputs.found }}
           INDEX_PR: ${{ needs.audit.outputs.index_pr }}
           DERIVED: ${{ needs.audit.outputs.index_derived }}
+          LEDGER_PR: ${{ needs.audit.outputs.ledger_pr }}
+          LEDGER_SEALED: ${{ needs.audit.outputs.ledger_sealed }}
           ACTION: ${{ needs.audit.outputs.action }}
           LABEL: ${{ needs.audit.outputs.label }}
           RISK: ${{ needs.audit.outputs.risk }}
@@ -1460,6 +1499,27 @@ jobs:
             {
               echo "::error::未获批准：这是索引重建 PR，但索引与 base 的推导结果不一致，或被消费的条目拿不到批准证据。"
               echo "::error::索引只能由 build-index.mjs 从 pending 推导，不接受手改；要下架请走 revoke 流程。"
+            } >&2
+            exit 1
+          fi
+          # 动了台账的 PR 排在这里，且**必须排在下面那句「没有投稿内容 ⇒ 无批准事项」之前**。
+          # 理由不是推演，是 #53 那条 canary 在线上的读数：那次 kind 判了 index_pr=false，
+          # 于是这一步走到「无批准事项」exit 0，PR 上挂着**一枚绿勾 + 一份被改写的黑名单**。
+          # 自动合并确实被挡住了，但「绿勾」这个东西人是会点的 —— 光挡住机器不够，得让它红。
+          # 证据由 derive 那一步取（两名 OWNER/MEMBER 的 #human-approved，且每条新增/改动的
+          # by 回访得到其中一个人的真评论）；这里只读它导出的那一个布尔，不在这里再判一遍。
+          if [ "${LEDGER_PR:-}" = "true" ]; then
+            if [ "${LEDGER_SEALED:-}" = "true" ]; then
+              echo "批准：这次处置台账改动有两名组织成员的签名，且每条新增/改动的 by 都回访得到其中一个人的评论。"
+              echo "（合并由 merge-index 走 ledger 那一支：它还会按此刻的 main 重推导一遍，并在合完立刻 purge CDN。）"
+              exit 0
+            fi
+            {
+              echo "::error::未获批准：这条 PR 动了 json/dispositions.json，而处置署名不成立。"
+              echo "::error::要求是：两名不同的人在本 PR 评论**首行**写 #human-approved（author_association 须为 OWNER 或 MEMBER），"
+              echo "  且每条新增/改动的处置的 by 要能回访成这两人之一的真评论 —— 见 derive 那一步的输出与 report 里的 seal 一格。"
+              echo "::error::为什么不能只靠「推导结果对得上」：重算是拿公开仓库里同一份 build-index.mjs 就能自己做出来的，"
+              echo "  一致只能证明内容自洽，证明不了有人看过这条处置（2026-10-17 本地复现打出的四格全是这个形状）。"
             } >&2
             exit 1
           fi
@@ -1576,7 +1636,13 @@ jobs:
   merge-index:
     name: Merge Index PR
     needs: [audit, approve]
-    if: needs.audit.outputs.index_pr == 'true' && needs.audit.outputs.index_derived == 'true'
+    # 两条机器路由，都要 index_derived（内容确由 base 推导），差别只在批准证据是哪一半：
+    #   index_pr  —— 消费了有外部批准证据的 pending（投稿收录）
+    #   ledger_pr —— 动了处置台账，且 derive 取到了两名成员的签名（下架 / 拉黑 / 解封）
+    # 两个 output 由 kind 步互斥地导出（台账进过 diff 就不可能是 index_pr），所以这里不必再防「两个都真」。
+    # 写成 `index_pr || (ledger_pr && ledger_sealed)` 而不是把 ledger 那半并进第一个合取项：
+    # 少了 ledger_sealed 这一格，自动合并就又回到「内容自洽就够了」那个被打穿的形状。
+    if: needs.audit.outputs.index_derived == 'true' && (needs.audit.outputs.index_pr == 'true' || (needs.audit.outputs.ledger_pr == 'true' && needs.audit.outputs.ledger_sealed == 'true'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1618,11 +1684,16 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           FORCE_PREFIX: ${{ vars.MODULE_REPO_PREFIX || '' }}
         run: |
           set -euo pipefail
           if [ -z "${BASE_REF:-}" ]; then
             echo "::error::这次运行不是来自 PR（dispatch 只重跑判定），索引合并要人工确认。"
+            exit 1
+          fi
+          if [ -z "${PR_NUMBER:-}" ]; then
+            echo "::error::拿不到 PR 编号，重推导入不了处置署名 —— 按不成立处理，不在这里合。"
             exit 1
           fi
           git fetch --no-tags origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" >/dev/null 2>&1
@@ -1636,9 +1707,14 @@ jobs:
           SCRIPTS_DIR="${PREFIX:+$PREFIX/}scripts"
 
           echo "重推导：base=${BASE_SHA:0:8}（此刻的 ${BASE_REF}），head=$(git rev-parse --short HEAD)"
+          # --pr 必须带上：动了台账的那一半判据（两名成员的签 + by 回访）在这里再取一次，
+          # 用的仍是同一个脚本、同一套判据。不带 --pr 就等于台账类 PR 在合并这一步退成
+          # 「内容对得上就合」，而签名只在 derive 那一步查过一次 —— 那一步的结论绑的是 head sha，
+          # 恰好是这条重推导存在的理由（base 变了要重算），不能当成已经查过。
           node "$SCRIPTS_DIR/verify-index-pr.mjs" --base "$BASE_SHA" --head HEAD \
             --owner "$OWNER" --repo "$REPO" --pending-dir "$PENDING_DIR" \
             --index-file "$INDEX_FILE" --dispositions-file "$DISPOSITIONS_FILE" \
+            --pr "$PR_NUMBER" \
             --report verify-at-merge.report.json
 
       - name: 合并（squash：main 上每个索引状态都对应一个过检的 PR）

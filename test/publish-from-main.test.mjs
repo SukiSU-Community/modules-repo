@@ -558,8 +558,16 @@ test('索引 PR 的合并挂在 audit 的 pull_request 上下文里，且两个�
     const job = next < 0 ? code.slice(at) : code.slice(at, at + 2 + next);
     // 少 index_pr 这一半 = 任何改脚本/文档的维护 PR 都会被机器人合进 main；
     // 少 index_derived 这一半 = 手抄一份 json/modules.json 就能进 main。
-    assert.match(job, /if: needs\.audit\.outputs\.index_pr == 'true' && needs\.audit\.outputs\.index_derived == 'true'/,
-      '两个条件必须同时钉住，且是 && 而不是 ||');
+    // 2026-10-17 加了第二条路由（台账改动 + 两名成员签），三条纪律都要保住：
+    //   ① index_derived 仍是**整体合取项**，不许被折进那条 `||` 里 —— 折进去就等于
+    //      「签齐了就不必对得上推导」，而签名买的是「有人看过这条处置」，买不到「索引算得对」；
+    //   ② ledger 那一支必须自己带上 ledger_sealed，不能靠 index_pr 替它担保；
+    //   ③ 两个 output 由 kind 互斥导出，所以这里不需要防「两个都真」，但要防「两个都不真时也能合」。
+    assert.match(job, /if: needs\.audit\.outputs\.index_derived == 'true' && \(needs\.audit\.outputs\.index_pr == 'true' \|\| \(needs\.audit\.outputs\.ledger_pr == 'true' && needs\.audit\.outputs\.ledger_sealed == 'true'\)\)/,
+      'index_derived 是整体合取项；两条路由各带自己的批准证据（ledger 那一条要带 ledger_sealed）');
+    assert.doesNotMatch(job, /index_derived == 'true' \|\|/, 'index_derived 不许出现在 || 的任何一侧');
+    assert.doesNotMatch(job, /if: needs\.audit\.outputs\.index_pr == 'true' && needs\.audit\.outputs\.index_derived == 'true'\s*$/,
+      '旧的那条（只认 index_pr）不许回来：它把合法下架一并挡在了机器路由外面');
     assert.match(job, /needs: \[audit, approve\]/, 'approve 红了就不能合并（job 默认要求 needs 成功）');
     assert.match(job, /gh pr merge .*--squash/, '合并方式必须是 squash：main 上每个索引状态对应一个过检 PR');
   }
@@ -618,6 +626,61 @@ test('kind 只把「索引真的变了且没动台账」的 PR 认成索引 PR',
     assert.ok(yml.includes('elif [ -n "$CHANGED_JSON" ]; then'), `${tag}混投稿那一支要退成 elif，不许被台账那支吃掉`);
   }
 });
+
+/* ---------------------------------------------------------------- 台账那条路的接线
+
+   两道闸分开发（#52 收紧 kind、#54 给 verify-index-pr 加署名、这一发把两者接上）。
+   接线最容易出的错不是判据写错，是**顺序**：approve 里那句「没有投稿内容 ⇒ 无批准事项」
+   会给一枚绿勾，而绿勾是会被点的 —— #53 那条 canary 在线上的读数就是这个形状。
+*/
+test('接线：kind 导出 ledger_pr，derive 两条路由都跑并取署名，approve 的台账支排在「无批准事项」之前', () => {
+  for (const f of AUDIT_COPIES) {
+    const yml = fs.readFileSync(f, 'utf8');
+    const tag = `${path.basename(f)}：`;
+    assert.ok(yml.includes('echo "ledger_pr=$([ -n "$CHANGED_LEDGER" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"'),
+      `${tag}kind 要把「动没动台账」单独导出，不能让 approve 自己去猜`);
+    assert.ok(yml.includes('ledger_pr: ${{ steps.kind.outputs.ledger_pr }}'), `${tag}job output 少了 ledger_pr，approve 读到的永远是空`);
+    assert.ok(yml.includes('ledger_sealed: ${{ steps.derive.outputs.sealed }}'), `${tag}job output 少了 ledger_sealed，同上`);
+    assert.ok(yml.includes("if: steps.kind.outputs.index_pr == 'true' || steps.kind.outputs.ledger_pr == 'true'"),
+      `${tag}derive 必须在两条路由上都跑 —— 署名就取在那一次调用里`);
+    // 两处调用（derive 与 merge-index 的重推导）都要带 --pr：
+    // 少了第二处，签名只在 derive 查过一次，而那次绑的是 head sha —— base 变了要重算正是它的存在理由。
+    assert.equal(yml.split('--pr "$PR_NUMBER"').length - 1, 2, `${tag}两处 verify-index-pr 调用都要带 --pr`);
+    assert.ok(yml.includes('PR_NUMBER: ${{ github.event.pull_request.number }}'), `${tag}两处都要有 PR_NUMBER 这个 env`);
+    // sealed 读的是 report 里的字段，不是那一步的退出码 —— 退出码 0 只说明「索引算得对」。
+    assert.ok(yml.includes('if (r.seal && r.seal.ok) { sealed = true; }'), `${tag}sealed 要从 report.seal.ok 取`);
+
+    const step = yml.slice(yml.indexOf('只批准「低风险'));
+    assert.ok(step.length > 0, `${tag}approve 那一步的名字被改了，这段切片会静默变空`);
+    const iDisp = step.indexOf('if [ "${DISPOSITION:-}" = "hit" ]');
+    const iIndex = step.indexOf('if [ "${INDEX_PR:-}" = "true" ]');
+    const iLedger = step.indexOf('if [ "${LEDGER_PR:-}" = "true" ]');
+    const iFound = step.indexOf('if [ "${FOUND:-}" != "true" ]');
+    for (const [name, at] of [['DISPOSITION', iDisp], ['INDEX_PR', iIndex], ['LEDGER_PR', iLedger], ['FOUND', iFound]]) {
+      assert.ok(at >= 0, `${tag}approve 里找不到 ${name} 那一支`);
+    }
+    assert.ok(iDisp < iLedger, `${tag}台账支不许排在「无批准事项」之后`);
+    assert.ok(iLedger < iFound, `${tag}台账支必须排在「没有投稿内容 ⇒ 无批准事项」之前（#53 线上读到的就是那枚绿勾）`);
+    const ledgerBranch = step.slice(iLedger, iFound);
+    assert.ok(ledgerBranch.includes('${LEDGER_SEALED:-}'), `${tag}台账支要读 derive 取来的署名结论`);
+    assert.ok(/exit 0/.test(ledgerBranch) && ledgerBranch.includes('exit 1'),
+      `${tag}台账支两面都要写：签齐 exit 0，签不齐 exit 1`);
+    assert.ok(ledgerBranch.includes('::error::'), `${tag}签不齐那句必须是 ::error:: 而不是普通输出`);
+  }
+});
+
+test('接线：merge-index 的重推导也带 --pr，且缺 PR_NUMBER 时先红再谈合', () => {
+  for (const f of AUDIT_COPIES) {
+    const code = fs.readFileSync(f, 'utf8').split(/\r?\n/).filter((l) => !/^\s*#/.test(l)).join('\n');
+    const at = code.indexOf('  merge-index:');
+    const next = code.slice(at + 2).search(/^ {2}[A-Za-z_-]+:$/m);
+    const job = next < 0 ? code.slice(at) : code.slice(at, at + 2 + next);
+    assert.ok(job.includes('--pr "$PR_NUMBER"'), `${path.basename(f)}：重推导不带 --pr，台账类 PR 会在合并这一步退成「内容对得上就合」`);
+    assert.ok(job.includes('拿不到 PR 编号'), `${path.basename(f)}：PR_NUMBER 为空要红，不能空着继续判`);
+    assert.ok(job.indexOf('--pr "$PR_NUMBER"') < job.indexOf('gh pr merge'), '带署名的那次重推导必须排在合并之前');
+  }
+});
+
 
 /* ---------------------------------------------------------------- kind 那一步逐字执行
 
@@ -736,23 +799,23 @@ function runKindStep({ root, repo }, js, found = 'false') {
 }
 
 const KIND_SHAPES = [
-  { name: 'ledger-add-churn-index', expect: 'false', why: '台账加一条 + 索引只改缩进与键序（复现里走通的那格）',
+  { name: 'ledger-add-churn-index', expect: 'false', ledger: 'true', why: '台账加一条 + 索引只改缩进与键序（复现里走通的那格）',
     pr: ({ put, churn }) => { put('json/dispositions.json', { ...LEDGER0, dispositions: [SEAL] }); churn(); } },
-  { name: 'ledger-add-rebuild-index', expect: 'false', why: '台账加一条 + 索引照推导删掉那个模块',
+  { name: 'ledger-add-rebuild-index', expect: 'false', ledger: 'true', why: '台账加一条 + 索引照推导删掉那个模块',
     pr: ({ put }) => {
       put('json/dispositions.json', { ...LEDGER0, dispositions: [SEAL] });
       put('json/modules.json', { ...INDEX0, modules: INDEX0.modules.filter((m) => m.id !== 'beta') });
     } },
-  { name: 'ledger-del-churn-index', expect: 'false', why: '台账删一条（解除封禁）+ 索引只改缩进与键序',
+  { name: 'ledger-del-churn-index', expect: 'false', ledger: 'true', why: '台账删一条（解除封禁）+ 索引只改缩进与键序',
     base: ({ put }) => put('json/dispositions.json', { ...LEDGER0, dispositions: [SEAL] }),
     pr: ({ put, churn }) => { put('json/dispositions.json', LEDGER0); churn(); } },
-  { name: 'ledger-only', expect: 'false', why: '只改台账、索引一个字节不动（#35 关掉的那格）',
+  { name: 'ledger-only', expect: 'false', ledger: 'true', why: '只改台账、索引一个字节不动（#35 关掉的那格）',
     pr: ({ put }) => put('json/dispositions.json', { ...LEDGER0, dispositions: [SEAL] }) },
-  { name: 'mode-a-consume', expect: 'true', why: '机器人那条：改了索引 + 消费掉 pending，台账不动 ⇒ 必须照旧进机器路由',
+  { name: 'mode-a-consume', expect: 'true', ledger: 'false', why: '机器人那条：改了索引 + 消费掉 pending，台账不动 ⇒ 必须照旧进机器路由',
     pr: ({ put, rm }) => { put('json/modules.json', { ...INDEX0, modules: [...INDEX0.modules, MOD('alpha', 2)] }); rm('pending/alpha/1.json'); } },
-  { name: 'index-only', expect: 'true', why: '手抄一份索引：分类仍是索引 PR，拦它的是下一步 derive，不是这一步',
+  { name: 'index-only', expect: 'true', ledger: 'false', why: '手抄一份索引：分类仍是索引 PR，拦它的是下一步 derive，不是这一步',
     pr: ({ put }) => put('json/modules.json', { ...INDEX0, modules: INDEX0.modules.filter((m) => m.id !== 'beta') }) },
-  { name: 'submission-plus-index', expect: 'false', found: 'true', why: '投稿 PR 里顺手带索引改动 ⇒ 按扫描结论走',
+  { name: 'submission-plus-index', expect: 'false', ledger: 'false', found: 'true', why: '投稿 PR 里顺手带索引改动 ⇒ 按扫描结论走',
     pr: ({ put }) => { put('json/modules.json', { ...INDEX0, modules: [...INDEX0.modules, MOD('gamma', 1)] }); put('pending/gamma/1.json', MOD('gamma', 1)); } },
 ];
 
@@ -764,6 +827,10 @@ test('kind 逐字执行：四格台账形状留在人工合并，机器人那格
     const r = runKindStep(makeKindRepo(s), js, s.found || 'false');
     assert.equal(r.code, 0, `${s.name}：这一步不该自己红（分类失败和判据失败是两件事）\n${r.stream}`);
     assert.equal(r.index_pr, s.expect, `${s.name}（${s.why}）期望 index_pr=${s.expect}，实得 ${r.index_pr}\n${r.stream}`);
+    // ledger_pr 是另一条路由的入口，它和 index_pr 必须互斥 —— 两个都 true 就等于
+    // 「同一条 PR 既能被当成索引重建、又能带着署名走第二支」，那正是 kind 该防的形状。
+    assert.equal(r.ledger_pr, s.ledger, `${s.name} 期望 ledger_pr=${s.ledger}，实得 ${r.ledger_pr}\n${r.stream}`);
+    assert.ok(!(r.index_pr === 'true' && r.ledger_pr === 'true'), `${s.name}：两个路由标记不许同时为真`);
     assert.match(r.base_sha || '', /^[0-9a-f]{40}$/, `${s.name}：base_sha 要解析成 40 位，否则后面两条 diff 都在比空气`);
   }
 });
