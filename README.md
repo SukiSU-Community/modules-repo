@@ -552,8 +552,27 @@ node --test test/build-index.test.mjs   # 只跑这一个文件
 node scripts/revoke.mjs --id <模块ID> [--version-code <n>] [--sha256 <64hex>] [--uid <酷安UID>] \
      --kind revoke|deny --reason <公示分类> \
      --by https://github.com/<owner>/<repo>/issues/<n>#issuecomment-<id> \
-     --note "<给人看的说明>" [--verify <任何人都能跑的复核命令>] [--dry-run]
+     --note "<给人看的说明>" [--verify <任何人都能跑的复核命令>] [--dry-run] [--no-harvest]
 ```
+
+### 同一条命令还会固化证据（§8）
+
+下处置的那一刻，`revoke.mjs` 顺手把**被处置的那一包当初审核过的东西**收进一个文件：
+
+- 从 git 历史捞出 `pending/<id>/<versionCode>.json` 那一份 blob（合并时 `--consume` 把它从工作树删掉了，
+  但历史里永远在）；
+- 从承载它的 PR 评论里捞出扫描报告的呈现块（`audit.yml` 贴的那条，永久可回访）；
+- 写成 `evidence/<sha256>.json` —— **文件名就是它自己字节的 SHA-256**，
+  字节定义 `JSON.stringify(对象,null,2) + 一个换行`。于是同一份内容固化两次必然落回同一个名字，
+  而「悄悄改掉一份已被人引用的证据」在结构上不可能不留痕迹：改名就是另一个文件，改内容就是撞名。
+
+台账里那条记录同时被填上 `subject`（被处置人的 `coolapkUid` + 当时的昵称快照，公示页的人卡按它聚合）
+和 `evidence[]`（指向那些文件）。这两个字段是 schema **v2** 新增的可选字段，所以：
+
+- 捞不到证据时这条处置**照写**，只是不带这两个键 —— 写一个指向不存在文件的指针会被
+  `verify-index-pr` 的互指认判红，等于把处置卡在 PR 外面。命令会打出一句怎么补跑。
+- 想跳过这一步用 `--no-harvest`（离线跑、或者这个克隆没有投稿历史时用）。
+- 证据文件与台账必须**同一条 PR**：`evidence/**` 只在「这条 PR 同时改了台账」时才算合法文件。
 
 `--by` 现在**必须**是浏览器里点得开的评论永久链接。旧形状 `gh:<login>@issuecomment-<id>`
 只有评论 id、没有 issue 号，而 GitHub 无法从评论 id 反查 URL（`api.github.com/repos/<o>/<r>/issues/comments/<id>`
