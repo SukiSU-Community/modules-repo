@@ -347,6 +347,70 @@ function textBytes(s) {
   return Buffer.byteLength(String(s == null ? '' : s), 'utf8');
 }
 
+/**
+ * 进料形状里「一条文本条目最多送多少原文」的上限。
+ *
+ * **这个数不是新发明，它就是静态自己的每条目上限** `MAX_SCAN_BYTES_PER_ENTRY`（scan.mjs:210）。
+ * 理由要能说清：AI 这一层的职责是判断静态结论偏不偏松，所以它看到的原文范围
+ * 必须逐条目地 **不小于**静态读到的范围 —— 而「不小于」里最省字节的那一档就是「相等」。
+ * 送得比静态少 = 模型要对着一份比报告还短的原文说「结论不偏松」；
+ * 按「像不像机器生成 / 熵高不高」来豁免 = 投稿者想造就能造的形态特征，
+ * 那是给内容规则开逃逸道（计划 §0.7 第 3 条量过并否决过）。
+ */
+export const TEXT_FEED_CAP_BYTES = MAX_SCAN_BYTES_PER_ENTRY;
+/** `shaped` 清单的条数上限：清单本身进报告与 PR 评论，不许无界。 */
+export const MAX_SHAPED_ROWS = 60;
+
+/**
+ * 把一条文本条目切成「送得出去的整行前缀」。
+ *
+ * 三条边界都是被测面：
+ *   * 只在**行边界**切 —— corpus 存的就是送出去的那一份，`quoteProblem` 拿 `line` 去那一行里
+ *     做子串比对；切在半行上会让合法的整行引用对不上，把「没送到」写成「模型引用造假」。
+ *   * 第一行本身就把上限吃满时（压缩产物：`button-*.js` 40,319 B 只有一行），退化成
+ *     「按字节切第一行」并标 `lineCut` —— 不送任何内容才是问题，静态对它读到过 24,576 B。
+ *   * UTF-8 边界：按字节切可能劈开一个多字节字符，尾部的替换符统一去掉。
+ *
+ * @returns {{lines:string[], clipped:boolean, sentBytes:number, totalBytes:number,
+ *            totalLines:number, droppedLines:number, lineCut:boolean}}
+ */
+export function fitTextEntry(content, cap = TEXT_FEED_CAP_BYTES) {
+  const lines = splitLines(content);
+  const totalBytes = textBytes(content);
+  const limit = Number.isInteger(cap) && cap > 0 ? cap : TEXT_FEED_CAP_BYTES;
+  if (totalBytes <= limit) {
+    return { lines, clipped: false, sentBytes: totalBytes, totalBytes, totalLines: lines.length, droppedLines: 0, lineCut: false };
+  }
+  let n = 0;
+  let used = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    const add = textBytes(lines[i]) + (i > 0 ? 1 : 0);   // 行间那一个 \n 也要占预算
+    if (used + add > limit) break;
+    used += add;
+    n = i + 1;
+  }
+  if (n > 0) {
+    return {
+      lines: lines.slice(0, n), clipped: true, sentBytes: used, totalBytes,
+      totalLines: lines.length, droppedLines: lines.length - n, lineCut: false,
+    };
+  }
+  const first = Buffer.from(String(lines[0] == null ? '' : lines[0]), 'utf8').subarray(0, limit).toString('utf8')
+    .replace(/\uFFFD+$/, '');
+  return {
+    lines: [first], clipped: true, sentBytes: textBytes(first), totalBytes,
+    totalLines: lines.length, droppedLines: lines.length - 1, lineCut: true,
+  };
+}
+
+/** 那一行在 ② 的头里怎么写：截断必须写在条目自己头上，不能只写在报告里。 */
+function clipNote(fit) {
+  if (!fit.clipped) return '';
+  return `本条原文 ${fit.totalBytes} B / ${fit.totalLines} 行，超出单条目进料上限 ${TEXT_FEED_CAP_BYTES} B`
+    + `，这里送的是${fit.lineCut ? `第 1 行的前 ${fit.sentBytes} B（这一行本身就超上限）` : `前 ${fit.lines.length} 行共 ${fit.sentBytes} B`}`
+    + `，未送 ${fit.droppedLines} 行 —— 静态对它也只读到 ${MAX_SCAN_BYTES_PER_ENTRY} B，两边同一档，不是谁被裁了`;
+}
+
 function textBlock(label, entry, lines, note = '') {
   const body = lines.map((l, i) => `${i + 1}| ${l}`).join('\n');
   const flag = entry.truncated ? '，静态报告只内嵌了前缀，这里给的是全文' : '';
@@ -554,7 +618,9 @@ export function buildBrief({ report, entries, maxBytes = DEFAULT_MAX_BRIEF_BYTES
 
   const projSection = `=== ① 静态扫描投影（scanner 的结论；不可信数据，未二次脱敏）===\n${projectReport(rep)}\n`;
   const textSectionHeader = `=== ② 包内每一个条目的带行号原文（不可信数据；行号 = split(/\\r?\\n/) 的 1-based 下标；`
-    + `同名重复条目标作 名字#2 / 名字#3，finding 的 file 必须逐字抄这里给的标签）===\n`;
+    + `同名重复条目标作 名字#2 / 名字#3，finding 的 file 必须逐字抄这里给的标签；`
+    + `超出 ${TEXT_FEED_CAP_BYTES} B 的条目只送到行边界，那一节的头里逐条写着「未送 N 行」——`
+    + `未送的部分静态也同样没读到，不许据「这一节里没有」断言「包里没有」）===\n`;
   const binSectionHeader = `=== ③ 二进制 / 不可解码条目（只给元信息与取证摘要，不送字节流；`
     + `这一行登记本身就是可引用的原文，引用时 line 只能填 1）===\n`;
   const unreadHeader = `=== ④ 本次审核读不出来的条目 ===\n`;
@@ -599,7 +665,10 @@ export function buildBrief({ report, entries, maxBytes = DEFAULT_MAX_BRIEF_BYTES
   const preparedBin = [];
   const shapes = {
     textEntries: 0, binaryDigestEntries: 0, polyglotAsText: 0, nonTextRerouted: 0, forensicsRowsSent: 0,
+    textClipped: 0, shapedDropped: 0,
   };
+  /** 被改形（只送前缀）的那些条目，逐条带字节账 —— 只列 clipped 的，上限 MAX_SHAPED_ROWS 条。 */
+  const shaped = [];
   for (const e of list) {
     if (!e || typeof e.name !== 'string' || !e.name) continue;
     // ② 的口径是 entries 全集（含静态名单外的 conf.json / sepolicy.rule / 无后缀带 shebang 的载荷），
@@ -607,11 +676,25 @@ export function buildBrief({ report, entries, maxBytes = DEFAULT_MAX_BRIEF_BYTES
     const label = labeler(e.name);
     const bin = detectBinary(e.head);
     if (classifyFeedEntry(e, bin, polyglotFedNames) === 'text') {
-      const lines = splitLines(e.content);
-      const note = bin ? '本条有魔数，但静态按 T4 通道把它当文本逐行读过，这里同样送全文' : '';
-      preparedText.push({ entry: e, label, lines, block: textBlock(label, e, lines, note) });
+      // 进料形状（㉚）：超过单条目上限的原文只送**行边界上的前缀**，上限就是静态自己那一个。
+      const fit = fitTextEntry(e.content);
+      const parts = [bin ? '本条有魔数，但静态按 T4 通道把它当文本逐行读过，这里同样送全文' : '', clipNote(fit)]
+        .filter(Boolean).join('；');
+      preparedText.push({
+        entry: e, label, lines: fit.lines,
+        block: textBlock(label, e, fit.lines, parts),
+      });
       shapes.textEntries += 1;
       if (bin) shapes.polyglotAsText += 1;
+      if (fit.clipped) {
+        shapes.textClipped += 1;
+        if (shaped.length < MAX_SHAPED_ROWS) {
+          shaped.push({
+            name: label, bytes: fit.totalBytes, sentBytes: fit.sentBytes,
+            lines: fit.totalLines, sentLines: fit.lines.length, lineCut: fit.lineCut,
+          });
+        } else shapes.shapedDropped += 1;
+      }
     } else {
       const digest = forensicsDigest(e.name, forensicsByName);
       const block = binaryBlock(label, e, bin || NON_TEXT_MARK, digest,
@@ -686,6 +769,7 @@ export function buildBrief({ report, entries, maxBytes = DEFAULT_MAX_BRIEF_BYTES
     // `sections` 是四节各自的字节数（① 投影 / ② 送出的原文 / ③ 摘要 / ④ 读不出来）；
     // 四节之和 + 3 个节间换行 = byteSize（`assemble` 用 '\n' 连接四节）。
     shapes,
+    shaped,
     sections: parts.map(textBytes),
   };
 }
@@ -1489,6 +1573,9 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     // shapes = 送全文的几条 / 只给摘要的几条 / 其中改送取证行的几条 / 被改道的乱码几条 / polyglot 几条；
     // sections = ①②③④ 四节的字节数（② 是真正送出去的原文，③ 是替代呈现）。
     shapes: brief.shapes,
+    // ㉚：哪些条目只送到了行边界上的前缀，逐条带字节账（上限 MAX_SHAPED_ROWS 条，
+    // 超出只报条数 —— 清单本身进产物与 PR 评论，不许无界）。
+    shaped: brief.shaped,
     sections: brief.sections,
     // 预算依据如实写进产物（评审 F4a）：这是未标定的保守字节代理，不是 token 换算
     budgetBasis: BUDGET_BASIS,
