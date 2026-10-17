@@ -546,6 +546,61 @@ jobs:
           '
 
       # ---------------------------------------------------------------
+      # 【探针，这条 PR 关掉即删，不进 main】workflow token 下各「谁算成员」来源的读数。
+      # 起因：canary #58 的 `by 回访` 打出的是 CONTRIBUTOR，而同一条评论用人的 user token
+      # 读是 MEMBER ⇒ author_association 是**按请求者算的**。而 findHumanApprovals 的
+      # TRUSTED_ASSOCIATIONS={OWNER,MEMBER} 吃的就是这个字段，所以在 CI 里它永远数到 0 名
+      # 成员（#58 重跑后仍是「一个都没有」，而那条评论当时已经在）。
+      # 这一步只读数、不判定、不改任何判据：逐端点打状态码，用来定唯一可信来源。
+      # ---------------------------------------------------------------
+      - name: 【探针】workflow token 下各可信来源的读数
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          OTHER_PR: "58"
+        run: |
+          node --input-type=module -e '
+            const api = "https://api.github.com";
+            const tok = process.env.GH_TOKEN, owner = process.env.OWNER, repo = process.env.REPO;
+            const H = { authorization: "Bearer " + tok, accept: "application/vnd.github+json", "user-agent": "sukisu-signer-probe" };
+            const get = async (p) => {
+              const r = await fetch(api + p, { headers: H });
+              const t = await r.text();
+              let j = null; try { j = JSON.parse(t); } catch {}
+              return { st: r.status, j, msg: j && j.message ? j.message : "" };
+            };
+            const log = (s) => console.log("[probe] " + s);
+            const people = new Map();
+            for (const n of [...new Set([process.env.PR_NUMBER, process.env.OTHER_PR])].filter(Boolean)) {
+              const r = await get("/repos/" + owner + "/" + repo + "/issues/" + n + "/comments?per_page=100");
+              const arr = Array.isArray(r.j) ? r.j : [];
+              log("列表 issues/" + n + "/comments -> HTTP " + r.st + " 条数=" + arr.length + (r.msg ? " msg=" + r.msg : ""));
+              for (const c of arr) {
+                const first = String(c.body || "").split("\n")[0].slice(0, 24);
+                log("  评论 " + c.id + " 作者=" + (c.user && c.user.login) + " 列表里的 assoc=" + c.author_association + " 首行=" + JSON.stringify(first));
+                if (c.user && c.user.login) people.set(c.user.login, c.id);
+              }
+            }
+            for (const pair of people) {
+              const login = pair[0], id = pair[1];
+              const one = await get("/repos/" + owner + "/" + repo + "/issues/comments/" + id);
+              log("单条 issues/comments/" + id + " -> HTTP " + one.st + " assoc=" + (one.j && one.j.author_association));
+              const mb = await get("/orgs/" + owner + "/memberships/" + login);
+              log("orgs/" + owner + "/memberships/" + login + " -> HTTP " + mb.st + " role=" + (mb.j && mb.j.role) + " state=" + (mb.j && mb.j.state) + (mb.msg ? " msg=" + mb.msg : ""));
+              const mm = await get("/orgs/" + owner + "/members/" + login);
+              log("orgs/" + owner + "/members/" + login + " -> HTTP " + mm.st + (mm.msg ? " msg=" + mm.msg : ""));
+              const rp = await get("/repos/" + owner + "/" + repo + "/collaborators/" + login + "/permission");
+              log("collaborators/" + login + "/permission -> HTTP " + rp.st + " permission=" + (rp.j && rp.j.permission) + " role=" + (rp.j && rp.j.role_name) + (rp.msg ? " msg=" + rp.msg : ""));
+            }
+            const lst = await get("/repos/" + owner + "/" + repo + "/collaborators?per_page=100");
+            log("collaborators 整表 -> HTTP " + lst.st + " 条数=" + (Array.isArray(lst.j) ? lst.j.length : "n/a") + (lst.msg ? " msg=" + lst.msg : ""));
+            log("探针到此为止：这一步永远 exit 0，不参与任何判定");
+          '
+
+      # ---------------------------------------------------------------
       # 2. 跑静态扫描（纯 Node，无 npm 依赖）
       # ---------------------------------------------------------------
       - name: 运行 scan.mjs
