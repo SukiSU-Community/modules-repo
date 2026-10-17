@@ -65,7 +65,7 @@ const UID_RE = /^[0-9]{4,12}$/;
  * 写成整串正则而不是「以 evidence/ 开头」是因为这个值会被人当成链接渲染 ——
  * 允许 `../` 或绝对 URL 就等于让台账条目把公示页的点击导向仓库之外。
  */
-const EVIDENCE_FILE_RE = /^evidence\/[0-9a-f]{64}\.json$/;
+export const EVIDENCE_FILE_RE = /^evidence\/[0-9a-f]{64}\.json$/;
 /** `subject.username` 是身份快照里抄来的昵称，不是给人自由发挥的字段。 */
 const USERNAME_MAX = 64;
 /**

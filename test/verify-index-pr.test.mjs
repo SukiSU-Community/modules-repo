@@ -10,7 +10,7 @@ import path from 'node:path';
 
 import {
   normalizeIndex, stableStringify, diffIndexes, judgeIndexPr, commitThatAdded, parseArgs,
-  ledgerTouched, parseProofUrl, judgeLedgerSeal, ledgerSealEvidence,
+  ledgerTouched, parseProofUrl, judgeLedgerSeal, ledgerSealEvidence, isEvidencePath,
 } from '../scripts/verify-index-pr.mjs';
 import { buildIndex, markApproved } from '../scripts/build-index.mjs';
 import { parseDispositions } from '../scripts/dispositions.mjs';
@@ -777,4 +777,80 @@ test('main 只给 --pr 与 deps.fetch 时真的走完取证（by 404 的那格�
   assert.match(allLogs(log), /by 回访 \S+ → 读不到：HTTP 404/);
   assert.match(allLogs(log), /mod_a 的 by 回访不到那条评论/);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+/* ---------------------------------------- evidence/** 与台账互指认（spec §7.2.9 + §8）
+   这一组钉的是「白名单开了一条目录，但那条目录只在跟着一次台账改动时才生效」，
+   以及证据与处置必须互相指认 —— 引用了一条不存在的证据，公示页就是在替它背书。 */
+
+const EV_SHA = 'a'.repeat(64);
+const EV = `evidence/${EV_SHA}.json`;
+const LEDGER_FILE = 'json/dispositions.json';
+
+/** 一份 head 上的台账：一条 revoke，引用 files 里那些证据文件。 */
+function ledgerEv(...files) {
+  return parseDispositions({
+    schema: 'sukisu-dispositions-v2',
+    dispositions: [{
+      kind: 'revoke',
+      id: 'mod_a',
+      reason: 'malware',
+      by: 'https://github.com/o/r/issues/33#issuecomment-1',
+      at: '2026-10-17T00:00:00Z',
+      ...(files.length ? { evidence: files.map((file) => ({ file })) } : {}),
+    }],
+  });
+}
+
+function evJudge({ changed = [LEDGER_FILE, EV], headEvidence = [EV], dispositions = ledgerEv(EV), ledgerChanged = true } = {}) {
+  return judgeIndexPr({
+    baseIndex: { name: 'x', lastUpdate: 0, modules: [{ id: 'mod_a', versions: [] }] },
+    actualIndex: { name: 'x', lastUpdate: 0, modules: [] },
+    deletedPaths: [], touchedPaths: [], attest: () => ({ ok: true }),
+    dispositions, ledgerChanged, seal: SEAL_OK,
+    changedPaths: changed, headEvidence,
+  });
+}
+
+test('evidence 文件跟着台账改动一起进 → 放行，且互指认成立', () => {
+  const v = evJudge();
+  assert.equal(v.ok, true, v.reason);
+  assert.equal(isEvidencePath(EV), true);
+  assert.equal(isEvidencePath('pending/mod_a-1.json'), false);
+});
+
+test('只加 evidence、不动台账 → 白名单拒：证据不进双签就等于往公示数据里塞材料', () => {
+  const v = evJudge({ ledgerChanged: false, dispositions: ledgerEv() });
+  assert.equal(v.ok, false);
+  assert.match(v.reason, /除了索引还改了/);
+  assert.match(v.reason, /仅当同一条 PR 改了台账/);
+});
+
+test('evidence 下的文件名形状不对 → 拒（子目录、别的后缀、不是 64 位十六进制都不行）', () => {
+  // 这些名字连台账那一侧的校验都过不了（dispositions.mjs 同一个正则），所以这里的
+  // `dispositions` 不带引用 —— 要测的是白名单那一层拦不拦得住，不是它能不能被引用。
+  for (const bad of ['evidence/notes.md', 'evidence/a/b.json', `evidence/${'a'.repeat(63)}.json`,
+    'evidence/zzzzzzzz.json']) {
+    const v = evJudge({ changed: [LEDGER_FILE, bad], headEvidence: [bad], dispositions: ledgerEv() });
+    assert.equal(v.ok, false, bad);
+    assert.match(v.reason, /必须是 evidence\/<64 位十六进制 sha256>\.json/, bad);
+  }
+});
+
+test('台账引用了 head 上不存在的证据文件 → 拒', () => {
+  const v = evJudge({ headEvidence: [] });
+  assert.equal(v.ok, false);
+  assert.match(v.reason, /在 head 上不存在/);
+});
+
+test('head 上有证据文件却没被任何一条台账引用 → 拒（孤证据不属于任何处置）', () => {
+  const v = evJudge({ changed: [LEDGER_FILE, EV], headEvidence: [EV, `evidence/${'b'.repeat(64)}.json`] });
+  assert.equal(v.ok, false);
+  assert.match(v.reason, /没被台账任何一条引用/);
+});
+
+test('调用方列不出 head 的 evidence/ 时不做互指认 —— 但白名单那一步照常生效', () => {
+  assert.equal(evJudge({ headEvidence: null }).ok, true);
+  // 反过来：headEvidence 给了 []，引用就落空，这一格不能因为「列不出来」而变成放行。
+  assert.equal(evJudge({ headEvidence: [] }).ok, false);
 });

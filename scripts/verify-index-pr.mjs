@@ -54,13 +54,20 @@ import { execFileSync } from 'node:child_process';
 
 import { buildIndex, markApproved, collectPendingFiles } from './build-index.mjs';
 import { findPrForCommit, assertMergeApproved, approvalBy, findHumanApprovals, REQUIRED_SIGNERS, HUMAN_APPROVAL_MARKER } from './publish-from-main.mjs';
-import { DEFAULT_DISPOSITIONS_FILE, parseDispositions } from './dispositions.mjs';
+import { DEFAULT_DISPOSITIONS_FILE, EVIDENCE_FILE_RE, parseDispositions } from './dispositions.mjs';
 // `by` 的形状只在写入端校验过（revoke.mjs 的 PROOF_URL_RE）。CI 这一侧要复核同一条形状，
 // 就复用那一个常量，不在这里再拼一份正则 —— 两份形状迟早漂，而漂了的那一份是没人看的判定。
 import { PROOF_URL_RE } from './revoke.mjs';
 
 /** 索引重建 PR 允许碰的文件。白名单外的任何改动都判「这不是重建，是夹带」。 */
 export const ALLOWED_INDEX_PR_PATHS = ['json/modules.json', DEFAULT_DISPOSITIONS_FILE];
+/** §8 固化 job 写出来的那些证据文件住在哪个目录下（前缀，不是文件）。 */
+export const EVIDENCE_DIR = 'evidence/';
+
+/** 这个路径是不是证据文件？（只看目录，形状另判） */
+export function isEvidencePath(p) {
+  return typeof p === 'string' && p.startsWith(EVIDENCE_DIR);
+}
 
 /**
  * 归一化到能逐字段比的状态。
@@ -125,6 +132,7 @@ export function diffIndexes(expected, actual) {
  *   dispositions?: object[],  // head 上的台账（已校验）
  *   ledgerChanged?: boolean,
  *   changedPaths?: string[],  // 本 PR 改到的所有文件
+ *   headEvidence?: string[] | null, // head 上 evidence/ 里的文件名全集（null = 调用方没列，跳过互指认）
  *   allowedPaths?: string[]
  * }} input
  */
@@ -132,7 +140,7 @@ export function judgeIndexPr(input) {
   const {
     baseIndex, baseEntries = [], deletedPaths = [], touchedPaths = [], actualIndex, attest,
     dispositions = [], ledgerChanged = false, changedPaths = null, allowedPaths = ALLOWED_INDEX_PR_PATHS,
-    seal = null,
+    headEvidence = null, seal = null,
   } = input;
   const fail = (reason, extra = {}) => ({ ok: false, reason, ...extra });
 
@@ -147,13 +155,48 @@ export function judgeIndexPr(input) {
   // 这是接台账时顺手补的：json/dispositions.json 一进允许列表，就必须把「除此之外不许碰」
   // 同时写死，否则允许列表会变成又一条自由通道。
   if (changedPaths) {
+    const evidence = changedPaths.filter(isEvidencePath);
     const outside = changedPaths.filter(
-      (p) => !allowedPaths.includes(p) && !(p === 'pending' || p.startsWith('pending/')),
+      (p) => !allowedPaths.includes(p) && !(p === 'pending' || p.startsWith('pending/'))
+        // `evidence/**` 只在「这条 PR 同时改了处置台账」时算合法文件。证据是台账条目的附件：
+        // 一份不挂在任何处置上的证据文件不进双签，而公示页会把里面的人当真的念给投稿者。
+        && !(isEvidencePath(p) && ledgerChanged),
     );
     if (outside.length) {
       return fail(`这个 PR 除了索引还改了：${outside.slice(0, 5).join('、')}`
-        + `${outside.length > 5 ? ' 等' : ''}。索引重建只许动 json/modules.json、json/dispositions.json 和 pending/**`
+        + `${outside.length > 5 ? ' 等' : ''}。索引重建只许动 json/modules.json、json/dispositions.json、`
+        + 'evidence/**（仅当同一条 PR 改了台账）和 pending/**'
         + '（要改脚本请另开 PR 走人工审核）');
+    }
+    // 形状：证据文件名与台账里 `evidence[].file` 用的是同一个正则（dispositions.mjs 那份），
+    // 不在这里另拼一份 —— 漂开的那一份没人看，而这两处一旦不一致就是「台账认得、白名单不认」。
+    const badShape = evidence.filter((p) => !EVIDENCE_FILE_RE.test(p));
+    if (badShape.length) {
+      return fail(`evidence/ 下的文件名必须是 evidence/<64 位十六进制 sha256>.json，收到：`
+        + `${badShape.slice(0, 5).join('、')}${badShape.length > 5 ? ' 等' : ''}`);
+    }
+  }
+
+  // 证据与台账互相指认（只在调用方真的列到 head 的 evidence/ 时判；列不到就交给上面的白名单）。
+  //   * 台账引用了 head 上不存在的文件 == 公示页给一条读不到的证据背书；
+  //   * head 上有证据文件却没被任何条目引用 == 有人往公示数据里塞了一份不属于任何处置的材料。
+  if (headEvidence !== null && headEvidence !== undefined) {
+    const headSet = new Set(headEvidence);
+    const referenced = new Set();
+    for (const d of dispositions || []) {
+      for (const e of (Array.isArray(d && d.evidence) ? d.evidence : [])) {
+        if (e && typeof e.file === 'string') referenced.add(e.file);
+      }
+    }
+    const missing = [...referenced].filter((f) => !headSet.has(f));
+    if (missing.length) {
+      return fail(`台账引用的证据文件在 head 上不存在：${missing.slice(0, 5).join('、')}`
+        + `${missing.length > 5 ? ' 等' : ''} —— 引用了就得真在`);
+    }
+    const orphan = headEvidence.filter((f) => !referenced.has(f));
+    if (orphan.length) {
+      return fail(`evidence/ 里有文件没被台账任何一条引用：${orphan.slice(0, 5).join('、')}`
+        + `${orphan.length > 5 ? ' 等' : ''} —— 证据要挂在处置上才有意义`);
     }
   }
 
@@ -618,6 +661,19 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     return 1;
   }
 
+  // head 上 evidence/ 到底有哪些文件。列不出来（目录不存在时 git 也回成功且空）就按「没有」处理，
+  // 但 git 本身失败必须红：那会让「引用了就得真在」这一判据静默不生效。
+  let headEvidence = null;
+  try {
+    headEvidence = git(cwd, ['ls-tree', '-r', '--name-only', headRef, '--', 'evidence'])
+      .split('\n').map((s) => s.trim()).filter(Boolean);
+  } catch (e) {
+    report.reason = `取不到 head 上的 evidence/ 清单（${String((e && e.stderr) || e.message).trim().split('\n')[0]}）`;
+    log.error('[verify-index-pr] ' + report.reason);
+    writeReport();
+    return 1;
+  }
+
   const attesters = new Map();
   const attest = (p) => {
     if (!attesters.has(p)) {
@@ -660,12 +716,17 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   const verdict = judgeIndexPr({
     baseIndex, baseEntries, deletedPaths, touchedPaths, actualIndex,
     attest: (p) => settled.get(p) || { ok: false, reason: '未取证' },
-    dispositions, ledgerChanged, changedPaths, seal,
+    dispositions, ledgerChanged, changedPaths, headEvidence, seal,
   });
   report.ok = verdict.ok;
   report.reason = verdict.reason;
   report.consumed = deletedPaths;
   report.ledger = { changed: ledgerChanged, entries: dispositions.length, file: dispFile };
+  report.evidence = {
+    changed: (changedPaths || []).filter(isEvidencePath),
+    onHead: headEvidence,
+    referenced: dispositions.reduce((n, d) => n + (Array.isArray(d && d.evidence) ? d.evidence.length : 0), 0),
+  };
   report.seal = seal ? {
     ok: seal.ok,
     reason: seal.reason,
