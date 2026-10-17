@@ -22,13 +22,18 @@
  * 因此台账必须参与推导（它由 build-index 从 head 上读），而**不能**塞进 json/modules.json
  * 的某个顶层键：normalizeIndex 只比 name + modules，藏在索引里的东西等于免检。
  *
- * 但「这条 PR 该不该走机器路由」不由本脚本决定，本脚本也无法决定 —— 它只在被调用时回答
- * 「索引是不是推导出来的」。台账那条路今天不进机器路由，闸门在上游 audit.yml 的 kind 步
- * （它按路径名单独认一次 json/dispositions.json 的改动，不带 --diff-filter，所以整本删除也算）。
- * 为什么必须单独认：B 的比对是**归一化后**的内容，而 kind 原来只看索引字节 —— 缩进与键序级别的
- * churn 让两把尺子给出相反答案，于是「只改台账」这种本该留人工的形状能被配对进来（2026-10-17
- * 本地复现打出四格）。把本脚本单独拿出来用时（例如手工校验某条历史 PR）别忘了这一点：
- * 它判 ok 不等于那次合并有人看过台账 diff。
+ * 但「这条 PR 该不该走机器路由」不由本脚本决定 —— 它只在被调用时回答「索引是不是推导出来的」。
+ * 台账那条路今天有两道闸：
+ *   ① 上游 audit.yml 的 kind 步按路径名单独认一次 json/dispositions.json 的改动（不带
+ *      --diff-filter，所以整本被删也算），台账进过 diff 就不进机器路由；
+ *   ② 本脚本的台账驱动分支要求人的署名：两名 author_association ∈ {OWNER,MEMBER} 的成员
+ *      在这条 PR 的评论里各留一枚 #human-approved（判据复用 publish-from-main 的
+ *      findHumanApprovals / REQUIRED_SIGNERS，不在这里另起一套），且每条**新增或改动**的处置，
+ *      它的 by 要能回访成一条真评论、而作者就是那两个人之一。
+ * 为什么必须有②：B 的判据是「重算结果与 PR 里的索引一致」，而一致是攻击者自己就能做出来的
+ * —— 他手上和我们有同一份 build-index.mjs（公开仓库）。2026-10-17 本地复现打出的四格全是这个形状。
+ * 另：normalizeIndex 只比 name + modules，所以索引里别的顶层键不过这道判定；要往索引里放新事实
+ * 必须先扩 normalizeIndex，不能靠「推导看不见」混进去。
  *
  * 而「被删掉的那些条目算已批准」这件事**不能由 PR 自己声明**：删掉一个从没批准的
  * pending 文件再把它手抄进索引，正好是绕过路径。批准依据必须是外部证据 ——
@@ -45,8 +50,11 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { buildIndex, markApproved, collectPendingFiles } from './build-index.mjs';
-import { findPrForCommit, assertMergeApproved, approvalBy } from './publish-from-main.mjs';
+import { findPrForCommit, assertMergeApproved, approvalBy, findHumanApprovals, REQUIRED_SIGNERS } from './publish-from-main.mjs';
 import { DEFAULT_DISPOSITIONS_FILE, parseDispositions } from './dispositions.mjs';
+// `by` 的形状只在写入端校验过（revoke.mjs 的 PROOF_URL_RE）。CI 这一侧要复核同一条形状，
+// 就复用那一个常量，不在这里再拼一份正则 —— 两份形状迟早漂，而漂了的那一份是没人看的判定。
+import { PROOF_URL_RE } from './revoke.mjs';
 
 /** 索引重建 PR 允许碰的文件。白名单外的任何改动都判「这不是重建，是夹带」。 */
 export const ALLOWED_INDEX_PR_PATHS = ['json/modules.json', DEFAULT_DISPOSITIONS_FILE];
@@ -121,6 +129,7 @@ export function judgeIndexPr(input) {
   const {
     baseIndex, baseEntries = [], deletedPaths = [], touchedPaths = [], actualIndex, attest,
     dispositions = [], ledgerChanged = false, changedPaths = null, allowedPaths = ALLOWED_INDEX_PR_PATHS,
+    seal = null,
   } = input;
   const fail = (reason, extra = {}) => ({ ok: false, reason, ...extra });
 
@@ -177,15 +186,182 @@ export function judgeIndexPr(input) {
   if (diffs.length) {
     return fail('PR 里的索引与推导结果不一致：\n  - ' + diffs.join('\n  - '), { diffs, evidences });
   }
+  // 动了台账就必须要人的署名。位置在内容比对**之后**：先写索引的人更该先知道自己的索引算错了，
+  // 而这一条不会因为顺序变松 —— 两道闸都在红的那一侧，攻击者做出来的「自洽索引」仍然过不了署名。
+  // 为什么内容一致还不够：B 的判据是「重算结果与 PR 里的索引一致」，而一致是攻击者自己做得出来的
+  // —— 他手上和我们有同一份 build-index.mjs（公开仓库）。2026-10-17 本地复现打出的四格全是这个形状。
+  // 要的不是「算得对」，是「有人签过」：两名 OWNER/MEMBER 的 #human-approved，
+  // 且每条新增/改动的处置的 by 要回访成其中一个真评论（判据复用 publish-from-main，不另起一套）。
+  if (ledgerChanged) {
+    if (!seal) {
+      return fail('这个 PR 动了处置台账，但没拿到署名证据（调用方没给 --pr，取不到这条 PR 的人工签）'
+        + ' —— 缺证据按不合格处理，不按「没有台账」处理');
+    }
+    if (!seal.ok) {
+      return fail(`这个 PR 动了处置台账，而署名不合格：${seal.reason}`, { seal });
+    }
+  }
+
   if (ledgerChanged && !deletedPaths.length) {
     return {
       ok: true,
-      reason: `索引与推导一致（台账驱动：按 ${dispositions.length} 条处置记录重算，未消费投稿）`,
+      reason: `索引与推导一致（台账驱动：按 ${dispositions.length} 条处置记录重算，未消费投稿；`
+        + `署名为 ${(seal.signers || []).map((s) => `${s.login}(${s.assoc})`).join('、')}）`,
       evidences,
       consumed: [],
+      seal,
     };
   }
   return { ok: true, reason: `索引与推导一致（消费 ${deletedPaths.length} 个已批准条目）`, evidences, consumed: deletedPaths };
+}
+
+/* ------------------------------------------------------------ 处置台账的署名 */
+
+/**
+ * 一条处置的「身份」= 它的选择器集合。
+ * 为什么不用整条记录的 JSON 当身份：`by`/`at`/`reason`/`note` 变了也是动了台账
+ * （换署名 = 换证人，换 reason = 换公示出来的罪名），必须一样要人签。
+ */
+function selectorOf(d) {
+  return [d.kind, d.id ?? '', d.sha256 ?? '', d.coolapkUid ?? '',
+    d.versionCode === undefined ? '' : String(d.versionCode)].join('|');
+}
+
+/**
+ * base 与 head 两份台账之间被动过的条目，三个方向都算。
+ *
+ * 加一条（凭空下架 / 凭空拉黑）、改一条（换署名换理由）、**删一条**（把人从黑名单里放出来）——
+ * #35 当初把台账挪出机器路由，为的就是最后那一格。删除那条没有 `by` 可查，
+ * 所以它只计入「这条 PR 动了台账」这个事实，由「两名成员签」那一句拦住，不参与逐条对署名。
+ */
+export function ledgerTouched(baseList = [], headList = []) {
+  const b = new Map(baseList.map((d) => [selectorOf(d), d]));
+  const h = new Map(headList.map((d) => [selectorOf(d), d]));
+  const added = [];
+  const changed = [];
+  const removed = [];
+  for (const [k, d] of h) {
+    if (!b.has(k)) { added.push(d); continue; }
+    if (stableStringify(b.get(k)) !== stableStringify(d)) changed.push({ from: b.get(k), to: d });
+  }
+  for (const [k, d] of b) if (!h.has(k)) removed.push(d);
+  return { added, changed, removed, any: added.length + changed.length + removed.length > 0 };
+}
+
+/** 把 `by` 那条证据链接拆成 owner/repo/issue/commentId；形状不对返回 null。 */
+export function parseProofUrl(url) {
+  const s = String(url || '').trim();
+  if (!PROOF_URL_RE.test(s)) return null;
+  const m = /^https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/issues\/(\d+)#issuecomment-(\d+)$/.exec(s);
+  if (!m) return null;
+  return { owner: m[1], repo: m[2], issue: Number(m[3]), id: Number(m[4]), url: s };
+}
+
+const described = (d) => (d.id ? `id=${d.id}` : d.sha256 ? `sha256=${String(d.sha256).slice(0, 12)}` : `coolapkUid=${d.coolapkUid}`);
+
+/**
+ * 纯判定：这批台账改动够不够「两个人签过，且下处置的人就是签名的人」。
+ * 证据（签名列表、每条 by 解析到的评论）都在外面取好了传进来 —— 这个函数不发请求，
+ * 所以每一条失效方向都能被单测逐字打到。
+ *
+ * 信任的锚点只取一处：`signers` 来自 findHumanApprovals（它按 author_association ∈ {OWNER,MEMBER}
+ * 与 login 去重，是 publish-from-main 人工路那份判据，不是这里新造的）。
+ * 逐条 `by` 那次请求只回答两件事：那条评论**存在**，且它的**作者在这条 PR 上签过**。
+ */
+export function judgeLedgerSeal({ touched, signers = [], resolved = {}, require = REQUIRED_SIGNERS } = {}) {
+  const who = signers.map((s) => `${s.login}(${s.assoc})`).join('、') || '一个都没有';
+  if (!touched || !touched.any) {
+    return { ok: true, reason: '台账内容没有实质改动（只动了 lastUpdate 一类的元数据）', signers, touched };
+  }
+  if (signers.length < require) {
+    return {
+      ok: false,
+      reason: `动了 ${touched.added.length} 条新增 / ${touched.changed.length} 条改动 / ${touched.removed.length} 条删除，`
+        + `而这条 PR 上只有 ${signers.length} 名成员的人工签（${who}），少于要求的 ${require} 名`
+        + '（要签请在评论**首行**写 #human-approved，见 GOVERNANCE.md）',
+      signers, touched,
+    };
+  }
+  const signed = new Set(signers.map((s) => String(s.login).toLowerCase()));
+  const bad = [];
+  for (const d of [...touched.added, ...touched.changed.map((c) => c.to)]) {
+    const p = parseProofUrl(d.by);
+    if (!p) {
+      bad.push(`${described(d)} 的 by 不是点得开的评论链接（${JSON.stringify(d.by)}）`);
+      continue;
+    }
+    const r = resolved[p.url];
+    if (!r) { bad.push(`${described(d)} 的 by 没有取证结果（${p.url}）`); continue; }
+    if (!r.ok) { bad.push(`${described(d)} 的 by 回访不到那条评论：${r.reason}`); continue; }
+    if (!r.login) { bad.push(`${described(d)} 的 by 那条评论没有作者，无从对署名`); continue; }
+    if (!signed.has(String(r.login).toLowerCase())) {
+      bad.push(`${described(d)} 的 by 署名是 ${r.login}，而这个人没有在这条 PR 上签 #human-approved`);
+    }
+  }
+  if (bad.length) {
+    return { ok: false, reason: `有 ${bad.length} 条处置的署名对不上：\n  - ` + bad.join('\n  - '), signers, touched };
+  }
+  const note = touched.removed.length ? `；其中 ${touched.removed.length} 条删除没有 by 可查，由上面那两名成员的签覆盖` : '';
+  return {
+    ok: true,
+    reason: `${touched.added.length + touched.changed.length} 条新增/改动的 by 全部回访得到，作者都在 ${who} 之中${note}`,
+    signers, touched,
+  };
+}
+
+async function getJson(url, token, deps = {}) {
+  const f = deps.fetch || globalThis.fetch;
+  const res = await f(url, {
+    headers: {
+      'user-agent': 'modules-repo-verify-index-pr',
+      accept: 'application/vnd.github+json',
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+/**
+ * 取这条 PR 的处置署名证据：评论列表 → findHumanApprovals → 逐条 by 回访那条评论。
+ *
+ * 用的是 `github.token`，与 pending 那条批准证据同一个身份；两个端点今天都被
+ * findPrForCommit 在生产上跑过（`issues/{n}/comments`、`issues/comments/{id}` 单条实测回
+ * `author_association`，取不到时是 404 而不是空数组 —— 所以这里的失败方向全是红，不是放行）。
+ */
+export async function ledgerSealEvidence({
+  owner, repo, prNumber, baseLedger = [], headLedger = [],
+  apiBase = 'https://api.github.com', token = '', require = REQUIRED_SIGNERS, deps = {},
+} = {}) {
+  const touched = ledgerTouched(baseLedger, headLedger);
+  if (!touched.any) {
+    return { ok: true, reason: '台账内容没有实质改动（只动了 lastUpdate 一类的元数据）', signers: [], touched };
+  }
+  const n = Number(prNumber);
+  if (!Number.isInteger(n) || n <= 0) {
+    return { ok: false, reason: `取不到这条 PR 的编号（--pr ${JSON.stringify(prNumber)}），没法查人工签`, touched };
+  }
+  const api = String(apiBase).replace(/\/$/, '');
+  let comments;
+  try {
+    const data = await getJson(`${api}/repos/${owner}/${repo}/issues/${n}/comments?per_page=100`, token, deps);
+    comments = Array.isArray(data) ? data : [];
+  } catch (e) {
+    return { ok: false, reason: `拿不到 PR #${n} 的评论：${String(e.message || e)}`, touched };
+  }
+  const sig = findHumanApprovals(comments, require);
+  const resolved = {};
+  for (const d of [...touched.added, ...touched.changed.map((c) => c.to)]) {
+    const p = parseProofUrl(d.by);
+    if (!p || resolved[p.url]) continue;   // 形状不对的交给 judgeLedgerSeal 报错，这里不重复判
+    try {
+      const c = await getJson(`${api}/repos/${p.owner}/${p.repo}/issues/comments/${p.id}`, token, deps);
+      resolved[p.url] = { ok: true, login: (c && c.user && c.user.login) || '', assoc: String((c && c.author_association) || '').toUpperCase(), id: c && c.id };
+    } catch (e) {
+      resolved[p.url] = { ok: false, reason: String(e.message || e) };
+    }
+  }
+  return judgeLedgerSeal({ touched, signers: sig.signers, resolved, require });
 }
 
 /* ------------------------------------------------------------ 取证与 I/O */
@@ -286,8 +462,9 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   if (opts.help || !opts.base || !opts.owner || !opts.repo) {
     log.log(`用法: node verify-index-pr.mjs --base <baseRef> --owner <o> --repo <r>
        [--pending-dir pending] [--index-file json/modules.json] [--dispositions-file json/dispositions.json]
-       [--cwd <dir>] [--report <file>]
-   判定当前工作树里的索引是否等于「base 内容 + 被本 PR 消费的已批准条目 + head 上的处置台账」的推导结果。`);
+       [--cwd <dir>] [--report <file>] [--pr <PR 编号>]
+   判定当前工作树里的索引是否等于「base 内容 + 被本 PR 消费的已批准条目 + head 上的处置台账」的推导结果。
+   动了处置台账时必须给 --pr：那一条分支要额外查两名成员的 #human-approved，而签是在 PR 的评论里。`);
     return opts.help ? 0 : 2;
   }
   const cwd = opts.cwd ? path.resolve(opts.cwd) : process.cwd();
@@ -358,6 +535,18 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     writeReport();
     return 1;
   }
+  // base 那份也要**解析后的**条目，不只是用来比「动没动」：逐条对署名要问「哪些是这次新加的」。
+  // base 读不懂时不能退回「base 是空的」—— 那会把整本台账都算成新增，等于把一次坏读取
+  // 变成一次「所有处置都需要人签」或（更糟）「所有处置都是新写的」。停住才是对的。
+  let baseDispositions = [];
+  try {
+    baseDispositions = baseLedger.present ? parseDispositions(baseLedger.json, `base:${dispFile}`) : [];
+  } catch (e) {
+    report.reason = `base 上的台账不合格：${e.message}`;
+    log.error('[verify-index-pr] ' + report.reason);
+    writeReport();
+    return 1;
+  }
   const ledgerChanged = stableStringify(baseLedger.json ?? null) !== stableStringify(headLedger.json ?? null);
 
   // 本 PR 到底动了哪些文件。拿不到就不判 —— 白名单检查缺席地「通过」比红更危险。
@@ -386,15 +575,36 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   // judgeIndexPr 是同步纯函数，而取证是异步的：先把证据取齐，再交给判定。
   const settled = new Map();
   for (const p of deletedPaths) settled.set(p, await attest(p));
+
+  // 动了台账 → 先取人的署名。取不到证据（没给 --pr、评论读不到、by 回访不到）一律按不合格处理，
+  // 不按「这条 PR 没动台账」处理 —— 后者等于让一次网络抖动变成一次放行。
+  let seal = null;
+  if (ledgerChanged) {
+    seal = deps.seal !== undefined
+      ? deps.seal
+      : await ledgerSealEvidence({
+        owner: opts.owner, repo: opts.repo, prNumber: opts.pr,
+        baseLedger: baseDispositions, headLedger: dispositions, apiBase, token, deps,
+      });
+  }
+
   const verdict = judgeIndexPr({
     baseIndex, baseEntries, deletedPaths, touchedPaths, actualIndex,
     attest: (p) => settled.get(p) || { ok: false, reason: '未取证' },
-    dispositions, ledgerChanged, changedPaths,
+    dispositions, ledgerChanged, changedPaths, seal,
   });
   report.ok = verdict.ok;
   report.reason = verdict.reason;
   report.consumed = deletedPaths;
   report.ledger = { changed: ledgerChanged, entries: dispositions.length, file: dispFile };
+  report.seal = seal ? {
+    ok: seal.ok,
+    reason: seal.reason,
+    signers: (seal.signers || []).map((s) => ({ login: s.login, assoc: s.assoc, id: s.id })),
+    touched: seal.touched
+      ? { added: seal.touched.added.length, changed: seal.touched.changed.length, removed: seal.touched.removed.length }
+      : null,
+  } : null;
   report.changedPaths = changedPaths;
   report.evidences = (verdict.evidences || []).map((e) => ({ path: e.path, pr: e.pr, commitSha: e.commitSha, ok: e.ok, reason: e.reason }));
   for (const line of String(verdict.reason).split('\n')) (verdict.ok ? log.log : log.error).call(log, '[verify-index-pr] ' + line);

@@ -10,6 +10,7 @@ import path from 'node:path';
 
 import {
   normalizeIndex, stableStringify, diffIndexes, judgeIndexPr, commitThatAdded, parseArgs,
+  ledgerTouched, parseProofUrl, judgeLedgerSeal, ledgerSealEvidence,
 } from '../scripts/verify-index-pr.mjs';
 import { buildIndex, markApproved } from '../scripts/build-index.mjs';
 import { parseDispositions } from '../scripts/dispositions.mjs';
@@ -252,7 +253,13 @@ const revokeOf = (id) => ({
   dispositions: [{ kind: 'revoke', id, reason: 'test-probe', by: 'gh:t@1', at: '2026-10-11T00:00:00Z' }],
 });
 
-test('P3 判定：台账驱动型重建（没消费 pending）→ 一致即放行', () => {
+const SEAL_OK = {
+  ok: true, reason: '测试注入的合格署名',
+  signers: [{ login: 'member-one', assoc: 'MEMBER', id: 1 }, { login: 'member-two', assoc: 'OWNER', id: 2 }],
+  touched: { added: [{ id: 'mod_a' }], changed: [], removed: [], any: true },
+};
+
+test('P3 判定：台账驱动型重建（没消费 pending）→ 一致且有人签才放行', () => {
   const base = { name: 'SukiSU-Ultra Modules', lastUpdate: 0, modules: [{ id: 'mod_a', versions: [] }] };
   const v = judgeIndexPr({
     baseIndex: base,
@@ -260,10 +267,42 @@ test('P3 判定：台账驱动型重建（没消费 pending）→ 一致即放�
     deletedPaths: [], touchedPaths: [],
     dispositions: parseDispositions(revokeOf('mod_a')), ledgerChanged: true,
     attest: () => ({ ok: true }),
+    seal: SEAL_OK,
   });
   assert.equal(v.ok, true, v.reason);
   assert.match(v.reason, /台账驱动/);
+  // 结论里要看得见是谁签的 —— 「推导一致」四个字不能把署名这件事糊过去
+  assert.match(v.reason, /member-one\(MEMBER\)、member-two\(OWNER\)/);
 });
+
+// 这一条是 2026-10-17 那四格复现的正主：索引与推导**完全一致**（攻击者自己就能算出来），
+// 缺的只是人的署名。缺证据必须是红，且要说清缺的是哪一半。
+test('台账驱动那一支：索引算得对但没有署名证据 → 红（一致不等于有人签过）', () => {
+  const base = { name: 'x', lastUpdate: 0, modules: [{ id: 'mod_a', versions: [] }] };
+  const v = judgeIndexPr({
+    baseIndex: base,
+    actualIndex: { name: 'x', lastUpdate: 0, modules: [] },
+    deletedPaths: [], touchedPaths: [],
+    dispositions: parseDispositions(revokeOf('mod_a')), ledgerChanged: true,
+    attest: () => ({ ok: true }),
+    // 没有 seal 这个入参 —— 等价于调用方忘了传 --pr
+  });
+  assert.equal(v.ok, false);
+  assert.match(v.reason, /没拿到署名证据/);
+  assert.match(v.reason, /不按「没有台账」处理/);
+
+  const v2 = judgeIndexPr({
+    baseIndex: base,
+    actualIndex: { name: 'x', lastUpdate: 0, modules: [] },
+    deletedPaths: [], touchedPaths: [],
+    dispositions: parseDispositions(revokeOf('mod_a')), ledgerChanged: true,
+    attest: () => ({ ok: true }),
+    seal: { ok: false, reason: '这条 PR 上只有 1 名成员的人工签', signers: [{ login: 'solo', assoc: 'MEMBER' }] },
+  });
+  assert.equal(v2.ok, false);
+  assert.match(v2.reason, /只有 1 名成员的人工签/);
+});
+
 
 test('P3 判定：改了台账但索引没按台账重算 → 判不一致（台账不是免检通行证）', () => {
   const base = { name: 'x', lastUpdate: 0, modules: [{ id: 'mod_a', name: 'A', author: 'a', description: 'd', versions: [{ versionCode: 1, sha256: '1'.repeat(64) }] }] };
@@ -358,16 +397,44 @@ function makeRevokePr(dir, ledger) {
   G(dir, 'commit', '-qm', 'chore(dispose): revoke mod_a');
 }
 
-test('P3 真仓库：只改台账 + 重算索引的 PR 判为一致 → 退出 0', async () => {
-  const dir = ledgerFixture();
-  makeRevokePr(dir, revokeOf('mod_a'));
-  const log = quiet();
+test('P3 真仓库：只改台账 + 重算索引的 PR，签齐才退出 0；没给 --pr 与签不齐都是红', async () => {
   const m = await V();
-  const rc = await m.main(['--base', 'main', '--head', 'HEAD', '--owner', 'o', '--repo', 'r', '--cwd', dir],
-    { log, token: 't', attest: () => ({ ok: true }) });
-  assert.equal(rc, 0, allLogs(log));
-  assert.match(allLogs(log), /台账驱动/);
-  fs.rmSync(dir, { recursive: true, force: true });
+
+  // ① 没给 --pr —— 取证无从开始，必须红（而不是「没有台账」）
+  const d1 = ledgerFixture();
+  makeRevokePr(d1, revokeOf('mod_a'));
+  const log1 = quiet();
+  const rc1 = await m.main(['--base', 'main', '--head', 'HEAD', '--owner', 'o', '--repo', 'r', '--cwd', d1],
+    { log: log1, token: 't', attest: () => ({ ok: true }), seal: undefined });
+  assert.equal(rc1, 1, allLogs(log1));
+  assert.match(allLogs(log1), /没拿到署名证据|--pr/);
+
+  // ② 给了 --pr 但这条 PR 上只有一个人签 → 红
+  const d2 = ledgerFixture();
+  makeRevokePr(d2, revokeOf('mod_a'));
+  const log2 = quiet();
+  const rc2 = await m.main(['--base', 'main', '--head', 'HEAD', '--owner', 'o', '--repo', 'r', '--cwd', d2, '--pr', '9'],
+    {
+      log: log2, token: 't', attest: () => ({ ok: true }),
+      seal: { ok: false, reason: '这条 PR 上只有 1 名成员的人工签（member-one(MEMBER)），少于要求的 2 名', signers: [{ login: 'member-one', assoc: 'MEMBER', id: 1 }] },
+    });
+  assert.equal(rc2, 1, allLogs(log2));
+  assert.match(allLogs(log2), /只有 1 名成员的人工签/);
+
+  // ③ 两名成员签齐 → 绿，且 report.seal 留下可复核的指针
+  const d3 = ledgerFixture();
+  makeRevokePr(d3, revokeOf('mod_a'));
+  const report = path.join(d3, 'r.json');
+  const log3 = quiet();
+  const rc3 = await m.main(['--base', 'main', '--head', 'HEAD', '--owner', 'o', '--repo', 'r', '--cwd', d3, '--pr', '9', '--report', report],
+    { log: log3, token: 't', attest: () => ({ ok: true }), seal: SEAL_OK });
+  assert.equal(rc3, 0, allLogs(log3));
+  assert.match(allLogs(log3), /台账驱动/);
+  const r = JSON.parse(fs.readFileSync(report, 'utf8'));
+  assert.equal(r.seal.ok, true, 'report 里要看得见署名的结论');
+  assert.deepEqual(r.seal.signers.map((s) => s.login), ['member-one', 'member-two']);
+  assert.deepEqual(r.seal.touched, { added: 1, changed: 0, removed: 0 });
+  for (const d of [d1, d2, d3]) fs.rmSync(d, { recursive: true, force: true });
 });
 
 test('P3 真仓库：台账坏了 → 停住，不当「没有台账」把下架全放回', async () => {
@@ -383,4 +450,190 @@ test('P3 真仓库：台账坏了 → 停住，不当「没有台账」把下架
   assert.equal(rc, 1);
   assert.match(allLogs(log), /读不懂|不合格/);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+/* ------------------------------------------------------- P4：处置台账的署名（两名成员 + by 回访） */
+
+const BY1 = 'https://github.com/SukiSU-Community/modules-repo/issues/40#issuecomment-1111111111';
+const BY2 = 'https://github.com/other-owner/other-repo/issues/7#issuecomment-2222222222';
+const D = (over = {}) => ({
+  kind: 'revoke', reason: 'malware', by: BY1, at: '2026-10-17T00:00:00.000Z', note: '', id: 'mod_x', ...over,
+});
+const HEAD2 = (over = {}) => ({
+  kind: 'revoke', reason: 'malware', by: BY2, at: '2026-10-17T00:00:00.000Z', note: '', id: 'mod_y', ...over,
+});
+const SIGNERS = [{ login: 'member-one', assoc: 'MEMBER', id: 10 }, { login: 'member-two', assoc: 'OWNER', id: 11 }];
+
+test('ledgerTouched：加 / 改 / 删三个方向都数得到，而只动 lastUpdate 不算实质改动', () => {
+  const base = [D(), HEAD2()];
+  const t0 = ledgerTouched(base, base);
+  assert.equal(t0.any, false, '同一份台账不该报「动过」');
+
+  // 只换署名/理由 —— 选择器没变，但证人变了：必须数成 changed
+  const t1 = ledgerTouched(base, [D({ by: BY2 }), HEAD2()]);
+  assert.deepEqual({ a: t1.added.length, c: t1.changed.length, r: t1.removed.length }, { a: 0, c: 1, r: 0 });
+  assert.equal(t1.changed[0].from.by, BY1, 'changed 要留着改前那一份，否则「换了谁的章」看不出来');
+
+  // 删掉一条 = 把人从黑名单里放出来（#35 当初就是为这一格把台账挪出机器路由）
+  const t2 = ledgerTouched(base, [D()]);
+  assert.deepEqual({ a: t2.added.length, c: t2.changed.length, r: t2.removed.length }, { a: 0, c: 0, r: 1 });
+
+  const t3 = ledgerTouched([], [D()]);
+  assert.deepEqual({ a: t3.added.length, r: t3.removed.length }, { a: 1, r: 0 });
+
+  // 元数据（lastUpdate 在 parseDispositions 之后根本不留）不该被当成一次处置改动
+  const t4 = ledgerTouched(parseDispositions({ schema: 'sukisu-dispositions-v1', lastUpdate: 1, dispositions: [D()] }),
+    parseDispositions({ schema: 'sukisu-dispositions-v1', lastUpdate: 999, dispositions: [D()] }));
+  assert.equal(t4.any, false, 'parseDispositions 的投影里没有 lastUpdate 的位置 —— 这一条是「不算实质改动」的机制，不是巧合');
+});
+
+test('parseProofUrl：只吃点得开的评论链接，形状不对一律 null（revoke.mjs 那一条正则复用，不另拼一份）', () => {
+  assert.deepEqual(parseProofUrl(BY1), {
+    owner: 'SukiSU-Community', repo: 'modules-repo', issue: 40, id: 1111111111, url: BY1,
+  });
+  for (const bad of [
+    'gh:member-one@issuecomment-1',                                  // 旧形状，浏览器里点不开
+    'https://github.com/o/r/issues/1#issuecomment-',                 // 缺 id
+    'https://github.com/o/r/pull/1#discussion_r1',                   // PR review 线程，不是评论指针
+    'https://example.com/o/r/issues/1#issuecomment-1',               // 不是 github
+    'https://github.com/o/r/issues/1#issuecomment-1 / 另一个人也同意', // 尾巴上有字
+    '',
+  ]) {
+    assert.equal(parseProofUrl(bad), null, `${JSON.stringify(bad)} 不该被当成可复核的署名`);
+  }
+});
+
+test('judgeLedgerSeal：两名成员 + 每条 by 回访得到且作者签过，缺一即红', () => {
+  const added = [D(), HEAD2()];
+  const touched = { added, changed: [], removed: [], any: true };
+  const res = { [BY1]: { ok: true, login: 'member-one', assoc: 'MEMBER', id: 10 }, [BY2]: { ok: true, login: 'member-two', assoc: 'OWNER', id: 11 } };
+
+  const good = judgeLedgerSeal({ touched, signers: SIGNERS, resolved: res });
+  assert.equal(good.ok, true, good.reason);
+
+  // ① 只有一签
+  const one = judgeLedgerSeal({ touched, signers: [SIGNERS[0]], resolved: res });
+  assert.equal(one.ok, false);
+  assert.match(one.reason, /只有 1 名成员的人工签/);
+
+  // ② 两签齐，但 by 指向的那个人没在这条 PR 上签
+  const stranger = judgeLedgerSeal({
+    touched, signers: SIGNERS,
+    resolved: { [BY1]: { ok: true, login: 'someone-else', assoc: 'MEMBER', id: 9 }, [BY2]: res[BY2] },
+  });
+  assert.equal(stranger.ok, false);
+  assert.match(stranger.reason, /mod_x 的 by 署名是 someone-else/);
+
+  // ③ by 回访不到（404 / 网络） —— 缺证据按不合格处理
+  const missing = judgeLedgerSeal({
+    touched, signers: SIGNERS,
+    resolved: { [BY1]: { ok: false, reason: 'HTTP 404' }, [BY2]: res[BY2] },
+  });
+  assert.equal(missing.ok, false);
+  assert.match(missing.reason, /mod_x 的 by 回访不到那条评论：HTTP 404/);
+
+  // ④ by 形状就不对（复现里那格用的是编造的链接）
+  const bogus = judgeLedgerSeal({
+    touched: { added: [D({ by: 'https://example.com/any' })], changed: [], removed: [], any: true },
+    signers: SIGNERS, resolved: {},
+  });
+  assert.equal(bogus.ok, false);
+  assert.match(bogus.reason, /不是点得开的评论链接/);
+
+  // ⑤ 只有删除：没有 by 可查，靠那两名成员的签覆盖，但结论里要说清这一层
+  const del = judgeLedgerSeal({
+    touched: { added: [], changed: [], removed: [D()], any: true }, signers: SIGNERS, resolved: {},
+  });
+  assert.equal(del.ok, true, del.reason);
+  assert.match(del.reason, /1 条删除没有 by 可查/);
+
+  // ⑥ 改了已有条目的署名 —— changed 也要逐条对，不能只查 added
+  const chg = judgeLedgerSeal({
+    touched: { added: [], changed: [{ from: D({ by: BY1 }), to: D({ by: BY2 }) }], removed: [], any: true },
+    signers: [{ login: 'member-two', assoc: 'MEMBER', id: 11 }, { login: 'member-one', assoc: 'OWNER', id: 10 }],
+    resolved: { [BY2]: { ok: true, login: 'member-one', assoc: 'MEMBER', id: 10 } },
+  });
+  assert.equal(chg.ok, true, chg.reason);
+});
+
+/** 只按 URL 分派的假 GitHub API，用来验 ledgerSealEvidence 的取证据形状。 */
+function stubFetch({ comments, byComments = {}, throwOn = '' } = {}) {
+  const seen = [];
+  return {
+    seen,
+    fetch: async (url) => {
+      seen.push(String(url));
+      if (throwOn && String(url).includes(throwOn)) throw new Error('HTTP 502');
+      const c = /\/issues\/comments\/(\d+)$/.exec(String(url).split('?')[0]);
+      if (c) {
+        const rec = byComments[c[1]];
+        // 真实 GitHub：取不到是 404，不是空对象
+        if (!rec) return { ok: false, status: 404, json: async () => ({ message: 'Not Found' }) };
+        return { ok: true, status: 200, json: async () => rec };
+      }
+      if (/\/issues\/\d+\/comments/.test(String(url))) return { ok: true, status: 200, json: async () => comments };
+      throw new Error(`stub 没准备的端点：${url}`);
+    },
+  };
+}
+const signComment = (id, login) => ({ id, user: { login }, author_association: 'MEMBER', body: `#human-approved ${login} 同意下架` });
+
+test('ledgerSealEvidence：走的是 findHumanApprovals 那份判据，评论列表取不到时红而不是放行', async () => {
+  const base = [];
+  const head = parseDispositions({ schema: 'sukisu-dispositions-v1', dispositions: [D(), HEAD2()] });
+  const BY_COMMENTS = {
+    1111111111: { id: 1111111111, user: { login: 'member-one' }, author_association: 'MEMBER' },
+    2222222222: { id: 2222222222, user: { login: 'member-two' }, author_association: 'MEMBER' },
+  };
+
+  // ① 两签齐且两条 by 都能回访到签名的人
+  const okCase = stubFetch({
+    comments: [signComment(10, 'member-one'), signComment(11, 'member-two')],
+    byComments: BY_COMMENTS,
+  });
+  const r1 = await ledgerSealEvidence({
+    owner: 'o', repo: 'r', prNumber: 9, baseLedger: base, headLedger: head, token: 't', deps: okCase,
+  });
+  assert.equal(r1.ok, true, r1.reason);
+  assert.equal(r1.signers.length, 2);
+  assert.ok(okCase.seen.some((u) => /\/repos\/o\/r\/issues\/9\/comments\?per_page=100/.test(u)), '要按这条 PR 的编号取评论，不是「最近哪条 PR」');
+  assert.equal(okCase.seen.filter((u) => /\/issues\/comments\//.test(u)).length, 2, '两条 by 各回访一次');
+
+  // ② 只有一个人签（他刷两条也只算一签 —— 去重住在 findHumanApprovals 里）
+  const oneCase = stubFetch({
+    comments: [signComment(10, 'member-one'), signComment(12, 'member-one'),
+      { id: 13, user: { login: 'outsider' }, author_association: 'NONE', body: '#human-approved 我不是成员' }],
+    byComments: BY_COMMENTS,
+  });
+  const r2 = await ledgerSealEvidence({ owner: 'o', repo: 'r', prNumber: 9, baseLedger: base, headLedger: head, token: 't', deps: oneCase });
+  assert.equal(r2.ok, false);
+  assert.match(r2.reason, /只有 1 名成员的人工签/);
+
+  // ③ by 指向一条不存在的评论 → 404 → 红（复现里「形状合法、内容是编的」那一格的机器版）
+  const four04 = stubFetch({
+    comments: [signComment(10, 'member-one'), signComment(11, 'member-two')],
+    byComments: { 1111111111: BY_COMMENTS['1111111111'] },
+  });
+  const r3 = await ledgerSealEvidence({ owner: 'o', repo: 'r', prNumber: 9, baseLedger: base, headLedger: head, token: 't', deps: four04 });
+  assert.equal(r3.ok, false);
+  assert.match(r3.reason, /mod_y 的 by 回访不到那条评论：HTTP 404/);
+
+  // ④ 评论列表这个端点本身坏了 → 红（这里绝不退成「没有台账」）
+  const broken = stubFetch({ comments: [], throwOn: '/issues/9/comments' });
+  const r4 = await ledgerSealEvidence({ owner: 'o', repo: 'r', prNumber: 9, baseLedger: base, headLedger: head, token: 't', deps: broken });
+  assert.equal(r4.ok, false);
+  assert.match(r4.reason, /拿不到 PR #9 的评论/);
+
+  // ⑤ 没给 --pr → 红，且不发任何请求
+  const quietStub = stubFetch({ comments: [] });
+  const r5 = await ledgerSealEvidence({ owner: 'o', repo: 'r', prNumber: undefined, baseLedger: base, headLedger: head, token: 't', deps: quietStub });
+  assert.equal(r5.ok, false);
+  assert.match(r5.reason, /取不到这条 PR 的编号/);
+  assert.equal(quietStub.seen.length, 0, '没有 PR 编号时一个请求都不该发');
+
+  // ⑥ 台账没动实质内容 → ok 且不去取证据（lastUpdate 那种改动不该逼人签）
+  const noopStub = stubFetch({ comments: [] });
+  const r6 = await ledgerSealEvidence({ owner: 'o', repo: 'r', prNumber: 9, baseLedger: head, headLedger: head, token: 't', deps: noopStub });
+  assert.equal(r6.ok, true);
+  assert.equal(noopStub.seen.length, 0, '没有实质改动就不该花钱去取证据');
 });
