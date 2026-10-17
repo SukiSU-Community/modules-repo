@@ -1,0 +1,48 @@
+{
+  "id": "p5-canary-evil",
+  "name": "P5 Dispatch Canary",
+  "author": "qoder-maintainer",
+  "description": "Canary for the CI gate; contains a bundled payload outside the scan list.",
+  "versions": [
+    {
+      "version": "1.0",
+      "versionCode": 1,
+      "zipUrl": "https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/c13897d267d64a4dfcde9c5799b57c006c040b3d6c43c6f309f8411654f42b6f.zip",
+      "size": 119342,
+      "time": 1792212053485,
+      "sha256": "c13897d267d64a4dfcde9c5799b57c006c040b3d6c43c6f309f8411654f42b6f"
+    }
+  ],
+  "source": "https://www.coolapk.com/u/2781460",
+  "uploader": "彧祜",
+  "coolapkUid": "2781460",
+  "pledge": {
+    "version": "pledge-v1",
+    "atMs": 1792212053485
+  },
+  "ownership": {
+    "nonce": "g1c4n9",
+    "proofPrefix": "75e605fa",
+    "via": "bio",
+    "verifiedAt": 1792212052219
+  },
+  "identity": {
+    "capturedAt": 1792212052219,
+    "username": "彧祜",
+    "displayUsername": "彧祜",
+    "level": 4,
+    "bio": "75e605fa-g1c4n9",
+    "regdate": 1562571600,
+    "logintime": 1792211861,
+    "userAvatar": "http://avatar.coolapk.com/data/002/78/14/60_avatar_big.jpg?t=1733673716",
+    "userBigAvatar": "http://avatar.coolapk.com/data/002/78/14/60_avatar_big.jpg?t=1733673716",
+    "cover": "http://avatar.coolapk.com/cover/17/77/43/2781460_1777438636.jpg",
+    "follow": 203,
+    "fans": 23,
+    "be_like_num": 372
+  },
+  "storage": "github-release-asset",
+  "releaseTag": "assets-v1",
+  "assetName": "c13897d267d64a4dfcde9c5799b57c006c040b3d6c43c6f309f8411654f42b6f.zip",
+  "submittedAt": "2026-10-17T04:40:53.485Z"
+}
