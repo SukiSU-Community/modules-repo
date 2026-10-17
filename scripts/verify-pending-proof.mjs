@@ -31,13 +31,15 @@
  *  两者买不到的东西，按「谁能用」列清楚，别再说成只剩内部人：
  *   * **有 main 写权限的内部人**手写一条自洽 pending —— 挡它的是处置公示的
  *     `REQUIRED_SIGNERS = 2`（scripts/publish-from-main.mjs 的人工路），不在本闸的购买范围内。
- *   * **还没有解决的第二个门（任何账号都能走，不需要写权限）**：一个 PR 同时改
- *     `json/dispositions.json` 和一份对得上的 `json/modules.json`，会被 audit.yml 判成
+ *   * **曾经存在的第二个门（任何账号都能走，不需要写权限；2026-10-17 已关）**：一个 PR 同时改
+ *     `json/dispositions.json` 和一份对得上的 `json/modules.json`，曾被 audit.yml 判成
  *     `index_pr=true` 并自动批准、自动合并 —— 因为 verify-index-pr.mjs 的「台账驱动」分支
- *     （:172-177）只要重算结果与 PR 里的索引一致就放行，对台账 diff 既不看凭据也不看署名
+ *     （:172-179）只要重算结果与 PR 里的索引一致就放行，对台账 diff 既不看凭据也不看署名
  *     （`by` 是自由文本）。REQUIRED_SIGNERS 管的是 publish-from-main.mjs:84-102 那条**人工**路，
- *     而这条走的是 :140 的**机器**路。本闸**不**覆盖它，也没有覆盖它 —— 那是另一个设计决定，
- *     记在这里是为了让读到这段的人知道 §14.2 的「封死手写路径」说的是 pending 这条路。
+ *     而那条走的是 :140 的**机器**路。现在 kind 步（audit.yml `判定 PR 类型`）按路径名单独认一次
+ *     台账改动，台账进过 diff 就不进机器路由，所以这条路今天既不经本闸、也不经机器路由。
+ *     记在这里是为了让读到这段的人知道 §14.2 的「封死手写路径」说的是 pending 这条路，
+ *     而台账那条路的闸门在 kind，不在本脚本。
  *
  * 作用范围（两处，缺一不可）：
  *   1. 检查的是**传给本脚本的目录**（audit.yml 接 pending-changed/pending，即 locate 用
@@ -455,7 +457,7 @@ export function main(argv = process.argv.slice(2), deps = {}) {
     fail(`${f.file}：${f.error}`);
   }
   log.error('[verify-pending-proof] 以上任一失败都挡住 approve —— (a) 复算挡不自洽的伪造，(b) 来源挡手写路径，范围自算挡「选择集被挑坏」。');
-  log.error('[verify-pending-proof] 本闸**不**覆盖两条路：① 有 main 写权限的内部人（那是 publish-from-main.mjs 人工路的 REQUIRED_SIGNERS=2）；② 改 json/dispositions.json + 对得上的 json/modules.json 的索引重建 PR（audit.yml 判 index_pr=true 后由 verify-index-pr.mjs 的台账驱动分支自动批准，不要求凭据也不看署名）—— ② 是还没关的门，见本文件头部说明。');
+  log.error('[verify-pending-proof] 本闸**不**覆盖两条路：① 有 main 写权限的内部人（那是 publish-from-main.mjs 人工路的 REQUIRED_SIGNERS=2）；② 改 json/dispositions.json 的索引重建 PR —— ② 今天不进机器路由（audit.yml 的 kind 步按路径名拦台账，见本文件头部说明），要合并得由两名组织成员签 #human-approved 后人工点。');
   return 1;
 }
 

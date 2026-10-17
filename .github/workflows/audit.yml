@@ -388,11 +388,15 @@ jobs:
       #
       # 买不到的两条，说破（旧注释把它写成「只剩内部人」，那是过度声称）：
       #   * 有 main 写权限的内部人 —— 挡它的是 publish-from-main.mjs 人工路的 REQUIRED_SIGNERS=2。
-      #   * 【还没关的门】一个 PR 同时改 json/dispositions.json 与对得上的 json/modules.json，
-      #     会被下面的 kind 步判成 index_pr=true 并自动批准/自动合并：verify-index-pr.mjs 的
-      #     台账驱动分支（:172-177）只要求重算结果与 PR 里的索引一致，对台账 diff 既不看凭据
-      #     也不看署名（by 是自由文本）。那条路不需要任何写权限，也不经过本步。修它是另一个
-      #     设计决定，不在这次改动范围内 —— 但别把这里读成「手写路径已经全封住」。
+      #   * 【2026-10-17 已关，关在本步之外】曾经有一条谁都能走的路：一个 PR 同时改
+      #     json/dispositions.json 与一份「对得上推导」的 json/modules.json，被下面的 kind 步判成
+      #     index_pr=true ⇒ verify-index-pr.mjs 的台账驱动分支（:172-179）只看重算结果一致，
+      #     对台账 diff 既不看凭据也不看署名（by 是自由文本），merge-index 于是自动合。
+      #     本地复现打出四格（加 revoke、加 deny、删 revoke，后两格的索引只是缩进与键序变了）。
+      #     现在 kind 步按路径名单独认一次台账改动，台账进过 diff 就不进机器路由 —— 拦的位置在
+      #     `判定 PR 类型` 那一步，不在本步；判据由 test/publish-from-main.test.mjs 那批
+      #     「逐字执行 kind」的用例钉住（含一条变异哨兵证明牙在 `[ -z "$CHANGED_LEDGER" ]` 那一句）。
+      #     本步仍然不覆盖它：本步管的是 pending 的形状与来源，台账这条路今天不经本步、也不经机器路由。
       #
       # 只吃 pending-changed/pending：那是上面 locate 用 `git diff --no-renames --diff-filter=AM`
       # 从 base..head 拷出来的「本 PR 新增/修改」集合，main 上的历史 pending（本轮之前
@@ -442,19 +446,34 @@ jobs:
           # 且变得能对得上推导」的 PR。把台账单独也算成索引改动会开一个洞：
           # 删掉一条处置记录（把某人从黑名单里放出来）既不消费 pending，也不改变当前索引，
           # 于是 expected == actual，模式 B 判「推导一致」→ merge-index 自动合。
-          # 削弱处置的决定不该由推导说了算，它是人工判断：留在这儿落到「无投稿内容」分支，
-          # 绿了也要人合；而它真正的后果（被放行的模块重新出现在下一次重建里）本来就
-          # 需要有人先把那条 pending 留着 —— 这正是 --consume 不删被台账挡下的 pending 的理由。
+          # 削弱处置的决定不该由推导说了算，它是人工判断：留在这儿落到「无投稿内容」分支，绿了也要人合。
           CHANGED_JSON=$(git diff --name-only --diff-filter=ACMR "$BASE_SHA" HEAD -- 'json/modules.json' || true)
-          if [ -n "$CHANGED_JSON" ] && [ "${FOUND:-}" != "true" ]; then
+          #
+          # 上面那句「不看整个 json/」防住的是**只改台账**那一格，2026-10-17 本地复现打出了另外四格
+          # （台账加一条 revoke、加一条 deny、删一条 revoke，都配一份索引）—— 洞不在「只看 modules.json」
+          # 这句选错了文件，而在**两把尺子不是同一把**：这一步按字节判「索引改没改」，
+          # derive 按 normalizeIndex（丢 lastUpdate、模块与版本重排）判「推不推导得出」。
+          # 于是「改台账 + 索引只做缩进与键序的 churn」这一格：这一步说是索引重建，derive 说推导一致
+          # ⇒ merge-index 自动合。载荷是任何账号都能下任意下架、或封掉一个 UID 的未来所有投稿，
+          # 而伪造的 by 会被 Worker 当成「下处置的人」念给投稿者（台账命中不改退出码，署名是自由文本）。
+          # ⇒ 台账进过 diff 就不许走机器路由，无论索引改没改、改成什么形状。
+          # 这里**故意不加 --diff-filter**：把整个 json/dispositions.json 删掉是一次 D，
+          # 那正是一整本处置的消失，必须和「改一条」同样拦。
+          # 合法下架照走得通：derive 不跑、approve 认「没有待审投稿内容」给绿，由维护者手动合并 ——
+          # GOVERNANCE.md 第 1 节本来就把这件事写在维护者手上。代价是这一步期间 merge-index 不跑，
+          # 挂在它后面那步的 CDN purge 也就跟着不跑；把自动合拿回来的下一步是给台账写入上可复验的署名。
+          CHANGED_LEDGER=$(git diff --name-only "$BASE_SHA" HEAD -- 'json/dispositions.json' || true)
+          if [ -n "$CHANGED_JSON" ] && [ -z "$CHANGED_LEDGER" ] && [ "${FOUND:-}" != "true" ]; then
             echo "index_pr=true" >> "$GITHUB_OUTPUT"
-            echo "这是索引重建 PR（改了 json/modules.json，且不含新投稿）：$CHANGED_JSON"
+            echo "这是索引重建 PR（改了 json/modules.json，未动处置台账，且不含新投稿）：$CHANGED_JSON"
           else
             echo "index_pr=false" >> "$GITHUB_OUTPUT"
-            if [ -n "$CHANGED_JSON" ]; then
+            if [ -n "$CHANGED_LEDGER" ]; then
+              echo "::warning::这个 PR 动了处置台账（$CHANGED_LEDGER）—— 台账上的处置是人工判断，不走机器路由：derive 不跑、merge-index 不合，请两名组织成员在评论里各留一枚 #human-approved 后由维护者合并（见 GOVERNANCE.md）。"
+            elif [ -n "$CHANGED_JSON" ]; then
               echo "::warning::这个 PR 同时带投稿和索引改动 —— 索引改动不会被推导判定放行，投稿按扫描结论走。"
             fi
-            echo "不是索引重建 PR（found=${FOUND:-<空>}，索引改动=${CHANGED_JSON:-无}）"
+            echo "不是索引重建 PR（found=${FOUND:-<空>}，索引改动=${CHANGED_JSON:-无}，台账改动=${CHANGED_LEDGER:-无}）"
           fi
 
       - name: 验索引确由 base 推导（只给索引 PR）

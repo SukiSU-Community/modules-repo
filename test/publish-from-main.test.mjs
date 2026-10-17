@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 import {
   APPROVE_CHECK_NAME,
@@ -594,14 +595,188 @@ test('merge-index 必须按「此刻的 main」重推导一遍，且排在合并
 // 为什么这算一条安全判据而不是分类细节：台账单独改动**既不消费 pending 也不改变当前索引**，
 // 于是推导必然「一致」—— 如果它被认成索引 PR，删掉一条处置（把某人从黑名单放出来）
 // 就会被 merge-index 自动合掉。削弱处置必须是人工判断。
-test('kind 只把「索引内容真的变了」的 PR 认成索引 PR，台账单独改动不算', () => {
+//
+// 2026-10-17 追加：光「不看 json/」这一句拦不住台账。本地复现打出四格，全是「改台账 + 一份索引」，
+// 其中两格的索引只是缩进与键序变了 —— derive 按 normalizeIndex 判（丢 lastUpdate、模块与版本重排），
+// 那种改动在它眼里等于没改，而这一步按字节判，于是把它认成索引重建 ⇒ 自动合。
+// ⇒ 台账要单独拦一次，且**不能带 --diff-filter**（删掉整本台账是一次 D，那是一整本处置的消失）。
+test('kind 只把「索引真的变了且没动台账」的 PR 认成索引 PR', () => {
   for (const f of AUDIT_COPIES) {
     const yml = fs.readFileSync(f, 'utf8');
-    assert.match(yml, /--diff-filter=ACMR "\$BASE_SHA" HEAD -- 'json\/modules\.json'/,
-      `${path.basename(f)}：路径过滤必须钉到 json/modules.json`);
-    assert.doesNotMatch(yml, /--diff-filter=ACMR "\$BASE_SHA" HEAD -- 'json\/'/,
-      `${path.basename(f)}：'json/' 会把只改台账的 PR 也认成索引 PR，从而可被自动合并`);
+    const tag = `${path.basename(f)}：`;
+    assert.ok(yml.includes(`--diff-filter=ACMR "$BASE_SHA" HEAD -- 'json/modules.json'`), `${tag}索引那条 diff 必须钉到 json/modules.json`);
+    assert.ok(!yml.includes(`--diff-filter=ACMR "$BASE_SHA" HEAD -- 'json/'`), `${tag}'json/' 会把只改台账的 PR 也认成索引 PR，从而可被自动合并`);
+    // 台账那条：只按路径名比。带上 --diff-filter 就漏掉「删掉整本 json/dispositions.json」那一格。
+    assert.ok(yml.includes(`CHANGED_LEDGER=$(git diff --name-only "$BASE_SHA" HEAD -- 'json/dispositions.json' || true)`),
+      `${tag}台账改动必须由一条不带 --diff-filter 的路径级 diff 认出来`);
+    assert.ok(!yml.includes('CHANGED_LEDGER=$(git diff --name-only --diff-filter='),
+      `${tag}CHANGED_LEDGER 不许带 --diff-filter：整本台账被删（D）同样是一次处置的消失`);
+    assert.ok(yml.includes('[ -n "$CHANGED_JSON" ] && [ -z "$CHANGED_LEDGER" ] && [ "${FOUND:-}" != "true" ]'),
+      `${tag}三个条件同时钉住，台账那一条是 -z（空才许走机器路由）`);
+    // 两句 warning 说的是两个方向，不许合并成一句：混投稿要人去查投稿，动台账要的是两名成员签。
+    assert.ok(yml.includes('这个 PR 动了处置台账'), `${tag}台账那一支要指名「处置是人工判断」`);
+    assert.ok(yml.includes('elif [ -n "$CHANGED_JSON" ]; then'), `${tag}混投稿那一支要退成 elif，不许被台账那支吃掉`);
   }
+});
+
+/* ---------------------------------------------------------------- kind 那一步逐字执行
+
+   上面那批断言读的是文本：它能钉住「这句话还写着」，钉不住「这条判据算得出正确的分类」。
+   分类错一格 = 要么 merge-index 少拦一次、要么机器人那条重建合不动，两种都静默。
+   所以这里把 workflow 里那段 bash 切出来、在有 origin 的临时仓库上**执行**
+   （不复制判据 —— 复制了就变成测试只钉住测试里那一份）。
+   起法与 runner 一致：`bash --noprofile --norc -e -o pipefail`（那个 -e 是 runner 给的）。
+   脚本与 GITHUB_OUTPUT 都落在被测树**之外**：复现这条闸的时候我第一版把 `--report` 写进仓库根，
+   下一个格子的 `git add -A` 就把报告当成了 PR 内容 ⇒ 四条对照组全红，而红的原因都不是它们要证的事。
+*/
+const KIND_STEP = '判定 PR 类型';
+
+/** 切出某一步 `run: |` 的脚本体（dedent 到列 0）。块尾只到下一步的 `- name:` / `- uses:`。 */
+function stepRunBody(wfText, name) {
+  const lines = wfText.replace(/\r\n/g, '\n').split('\n');
+  const start = lines.findIndex((l) => l.trim() === `- name: ${name}`);
+  assert.ok(start >= 0, `workflow 里必须存在名为「${name}」的步骤（改名要一起改这里）`);
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i += 1) {
+    if (/^ {6}- (?:name|uses): /.test(lines[i])) { end = i; break; }
+  }
+  let open = -1;
+  for (let i = start + 1; i < end; i += 1) if (/^\s*run: \|\s*$/.test(lines[i])) { open = i; break; }
+  assert.ok(open >= 0, `步骤「${name}」里必须有 run: | 块`);
+  const keyIndent = lines[open].length - lines[open].trimStart().length;
+  const body = [];
+  for (let i = open + 1; i < end; i += 1) {
+    const l = lines[i];
+    if (l.trim() !== '' && l.length - l.trimStart().length <= keyIndent) break;
+    body.push(l);
+  }
+  const nonBlank = body.filter((l) => l.trim());
+  assert.ok(nonBlank.length > 0, `步骤「${name}」的 run 块是空的`);
+  const indent = Math.min(...nonBlank.map((l) => l.length - l.trimStart().length));
+  return `${body.map((l) => l.slice(indent)).join('\n')}\n`;
+}
+
+const MOD = (id, vc) => ({
+  id,
+  name: id,
+  author: 'someone',
+  versions: [{ version: `v${vc}`, versionCode: vc, sha256: id.charCodeAt(0).toString(16).padEnd(64, '0'), zipUrl: `https://example.invalid/${id}-${vc}.zip`, size: 1 }],
+});
+const INDEX0 = { name: 'M', lastUpdate: 1, modules: [MOD('alpha', 1), MOD('beta', 2)] };
+const LEDGER0 = { schema: 'sukisu-dispositions-v1', lastUpdate: 1, dispositions: [] };
+const SEAL = { kind: 'revoke', reason: 'test-probe', by: 'https://github.com/SukiSU-Community/modules-repo/issues/33#issuecomment-6104846280', at: '2026-10-17T00:00:00Z', note: '探针处置', id: 'beta' };
+
+/** 起一个「有 origin 的仓库」：先按 shape.base 落 main，再按 shape.pr 落 PR 分支。 */
+function makeKindRepo(shape) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kind-step-'));
+  const repo = path.join(root, 'repo');
+  execFileSync('git', ['init', '-q', '--bare', 'origin.git'], { cwd: root, encoding: 'utf8' });
+  execFileSync('git', ['clone', '-q', path.join(root, 'origin.git'), 'repo'], { cwd: root, encoding: 'utf8' });
+  const g = (args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
+  g(['config', 'user.email', 't@example.invalid']);
+  g(['config', 'user.name', 't']);
+  g(['config', 'core.autocrlf', 'false']);
+  const ctx = {
+    put: (rel, obj) => {
+      const p = path.join(repo, rel);
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, `${JSON.stringify(obj, null, 2)}\n`, 'utf8');
+    },
+    rm: (rel) => fs.rmSync(path.join(repo, rel), { force: true }),
+    // 内容一个字节不改、只把缩进与模块顺序换掉 —— derive 看不出差别，kind 看得出
+    churn: () => {
+      const cur = JSON.parse(fs.readFileSync(path.join(repo, 'json/modules.json'), 'utf8'));
+      const out = { lastUpdate: cur.lastUpdate, modules: [...cur.modules].reverse(), name: cur.name };
+      fs.writeFileSync(path.join(repo, 'json/modules.json'), `${JSON.stringify(out, null, 4)}\n`, 'utf8');
+    },
+  };
+  g(['checkout', '-q', '-b', 'main']);
+  ctx.put('json/modules.json', INDEX0);
+  ctx.put('json/dispositions.json', LEDGER0);
+  ctx.put('pending/alpha/1.json', MOD('alpha', 1));
+  if (shape.base) shape.base(ctx);
+  g(['add', '-A']);
+  g(['commit', '-qm', 'base']);
+  g(['push', '-q', '-u', 'origin', 'main']);
+  const baseSha = g(['rev-parse', 'refs/remotes/origin/main']);
+  g(['checkout', '-q', '-b', 'pr']);
+  shape.pr(ctx);
+  g(['add', '-A']);
+  g(['commit', '-qm', 'pr']);
+  return { root, repo, baseSha };
+}
+
+/** 在指定仓库里执行 kind 那一步，返回它写进 GITHUB_OUTPUT 的键。 */
+function runKindStep({ root, repo }, js, found = 'false') {
+  // 反斜杠路径在 bash 里不是「Windows 路径」，是一个含反斜杠的相对文件名 —— 脚本按相对名找不到、
+  // `>> $GITHUB_OUTPUT` 也会往 cwd 里造一个怪名字的文件。两个路径都换成斜杠形式。
+  const fwd = (p) => p.replace(/\\/g, '/');
+  const sh = fwd(path.join(root, 'kind-step.sh'));
+  const out = fwd(path.join(root, 'gh-output'));
+  fs.writeFileSync(sh, js, 'utf8');
+  fs.writeFileSync(out, '', 'utf8');
+  let code = 0;
+  let stream = '';
+  try {
+    const r = execFileSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', sh], {
+      cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, GITHUB_OUTPUT: out, BASE_REF: 'main', FOUND: found },
+    });
+    stream = `${r.stdout}${r.stderr}`;
+  } catch (e) {
+    code = e.status ?? 1;
+    stream = `${String(e.stdout || '')}${String(e.stderr || '')}`;
+  }
+  const kv = {};
+  for (const l of fs.readFileSync(out, 'utf8').split('\n').filter(Boolean)) {
+    const i = l.indexOf('=');
+    if (i > 0) kv[l.slice(0, i)] = l.slice(i + 1);
+  }
+  return { ...kv, code, stream };
+}
+
+const KIND_SHAPES = [
+  { name: 'ledger-add-churn-index', expect: 'false', why: '台账加一条 + 索引只改缩进与键序（复现里走通的那格）',
+    pr: ({ put, churn }) => { put('json/dispositions.json', { ...LEDGER0, dispositions: [SEAL] }); churn(); } },
+  { name: 'ledger-add-rebuild-index', expect: 'false', why: '台账加一条 + 索引照推导删掉那个模块',
+    pr: ({ put }) => {
+      put('json/dispositions.json', { ...LEDGER0, dispositions: [SEAL] });
+      put('json/modules.json', { ...INDEX0, modules: INDEX0.modules.filter((m) => m.id !== 'beta') });
+    } },
+  { name: 'ledger-del-churn-index', expect: 'false', why: '台账删一条（解除封禁）+ 索引只改缩进与键序',
+    base: ({ put }) => put('json/dispositions.json', { ...LEDGER0, dispositions: [SEAL] }),
+    pr: ({ put, churn }) => { put('json/dispositions.json', LEDGER0); churn(); } },
+  { name: 'ledger-only', expect: 'false', why: '只改台账、索引一个字节不动（#35 关掉的那格）',
+    pr: ({ put }) => put('json/dispositions.json', { ...LEDGER0, dispositions: [SEAL] }) },
+  { name: 'mode-a-consume', expect: 'true', why: '机器人那条：改了索引 + 消费掉 pending，台账不动 ⇒ 必须照旧进机器路由',
+    pr: ({ put, rm }) => { put('json/modules.json', { ...INDEX0, modules: [...INDEX0.modules, MOD('alpha', 2)] }); rm('pending/alpha/1.json'); } },
+  { name: 'index-only', expect: 'true', why: '手抄一份索引：分类仍是索引 PR，拦它的是下一步 derive，不是这一步',
+    pr: ({ put }) => put('json/modules.json', { ...INDEX0, modules: INDEX0.modules.filter((m) => m.id !== 'beta') }) },
+  { name: 'submission-plus-index', expect: 'false', found: 'true', why: '投稿 PR 里顺手带索引改动 ⇒ 按扫描结论走',
+    pr: ({ put }) => { put('json/modules.json', { ...INDEX0, modules: [...INDEX0.modules, MOD('gamma', 1)] }); put('pending/gamma/1.json', MOD('gamma', 1)); } },
+];
+
+test('kind 逐字执行：四格台账形状留在人工合并，机器人那格照旧进机器路由', () => {
+  const js = stepRunBody(fs.readFileSync(WF_MAIN, 'utf8'), KIND_STEP);
+  assert.ok(js.includes('CHANGED_LEDGER'), '切出来的必须是含台账判据的那一步（切片切错就是空跑）');
+  assert.ok(js.includes('BASE_SHA="$(git rev-parse "origin/$BASE_REF")"'), '切出来的必须真去解析 origin/<base>，不是拿 env 里现成的 sha');
+  for (const s of KIND_SHAPES) {
+    const r = runKindStep(makeKindRepo(s), js, s.found || 'false');
+    assert.equal(r.code, 0, `${s.name}：这一步不该自己红（分类失败和判据失败是两件事）\n${r.stream}`);
+    assert.equal(r.index_pr, s.expect, `${s.name}（${s.why}）期望 index_pr=${s.expect}，实得 ${r.index_pr}\n${r.stream}`);
+    assert.match(r.base_sha || '', /^[0-9a-f]{40}$/, `${s.name}：base_sha 要解析成 40 位，否则后面两条 diff 都在比空气`);
+  }
+});
+
+test('变异哨兵：摘掉 [ -z "$CHANGED_LEDGER" ] 那一格，churn 形状立刻回到机器路由（证明牙在这一句上）', () => {
+  const js = stepRunBody(fs.readFileSync(WF_MAIN, 'utf8'), KIND_STEP);
+  const mutated = js.replace('[ -z "$CHANGED_LEDGER" ] && ', '');
+  assert.notEqual(mutated, js, '替换点漂了 —— kind 那一步的条件形状改了，要一起改这里');
+  const shape = KIND_SHAPES.find((s) => s.name === 'ledger-add-churn-index');
+  const before = runKindStep(makeKindRepo(shape), js);
+  const after = runKindStep(makeKindRepo(shape), mutated);
+  assert.equal(before.index_pr, 'false', '现行判据下这一格必须留在人工合并');
+  assert.equal(after.index_pr, 'true', '摘掉台账那一条后它要翻回 true —— 不翻说明上面那批断言是空跑的');
 });
 
 // 下架的生效速度实际由 CDN 的 TTL 决定，不是由 main 决定：实测索引 PR #34 把索引推空之后
