@@ -2094,6 +2094,9 @@ test('上限就是静态自己那一个数，不新发明；产物里逐条留�
 test('截断之后复验仍然逐字：送出去那一段引得到，落在未送部分外面判造假', () => {
   const body = `echo one\n${Array.from({ length: 4000 }, (_, i) => `echo ${i}`).join('\n')}\necho tail`;
   const b = buildBrief({ report: R, entries: [file('s.sh', body)], maxBytes: DEFAULT_MAX_BRIEF_BYTES });
+  // 先确认这一发真的被截过 —— 否则「越界判造假」在「整条都送出去了」的世界上也成立，
+  // 那一格就成了永绿的假成功（变异 A 就是这么被抓住的）。
+  assert.equal(b.shapes.textClipped, 1, '夹具：这条必须是被截断的那一类');
   const sent = b.corpus.get('s.sh');
   assert.equal(sent[0], 'echo one');
   assert.equal(verifyQuotes({ findings: [{ file: 's.sh', line: 1, quote: 'echo one' }] }, b.corpus).ok, true);
