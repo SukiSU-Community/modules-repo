@@ -20,7 +20,19 @@
 
 import fs from 'node:fs';
 
-export const DISPOSITIONS_SCHEMA = 'sukisu-dispositions-v1';
+export const DISPOSITIONS_SCHEMA = 'sukisu-dispositions-v2';
+/**
+ * v2 相对 v1 只多了两个**可选**字段（`subject` / `evidence`），v1 的条目是 v2 的子集。
+ * 所以读的一侧两个都认，写的一侧只写 v2 —— 而 `json/dispositions.json` 里现有的 5 条历史
+ * 记录仍然是 v1，不改它们：改一份已经公示过的台账数据，等于用一次「迁移」的名义动处置本身。
+ *
+ * 这三份字符串的集合必须与 Worker（`contrib/worker/src/dispositions.ts`）和公示页
+ * （modules-site `public/scripts/api.js`）**同集合**：Worker 那份遇未知 schema 抛错、
+ * 调用侧按放行处理 —— 只升两侧的话，Worker 会静默停止拦截被拒收的包。
+ * 钉子：modules-site `tools/selftest.mjs` 与 `worker/src/dispositions.test.ts` 各自跨仓比一次。
+ */
+export const LEGACY_DISPOSITIONS_SCHEMAS = ['sukisu-dispositions-v1'];
+export const KNOWN_DISPOSITIONS_SCHEMAS = [DISPOSITIONS_SCHEMA, ...LEGACY_DISPOSITIONS_SCHEMAS];
 export const DEFAULT_DISPOSITIONS_FILE = 'json/dispositions.json';
 
 /** 处置种类。两个都是「挡住」，区别在挡住的是内容还是人。 */
@@ -48,6 +60,14 @@ export const REASONS = [
 
 const SHA256_RE = /^[0-9a-fA-F]{64}$/;
 const UID_RE = /^[0-9]{4,12}$/;
+/**
+ * v2 的 `evidence[].file`：只许指向 §8 固化 job 写出来的那个形状。
+ * 写成整串正则而不是「以 evidence/ 开头」是因为这个值会被人当成链接渲染 ——
+ * 允许 `../` 或绝对 URL 就等于让台账条目把公示页的点击导向仓库之外。
+ */
+const EVIDENCE_FILE_RE = /^evidence\/[0-9a-f]{64}\.json$/;
+/** `subject.username` 是身份快照里抄来的昵称，不是给人自由发挥的字段。 */
+const USERNAME_MAX = 64;
 /**
  * 必须带时区偏移（Z 或 ±hh:mm）。
  * 处置记录回答的是「什么时候下的处置」，而 `Date.parse('2026-10-11 00:00:00')` 按**本机时区**
@@ -78,8 +98,8 @@ export function parseDispositions(raw, ctx = '<memory>') {
     // 这里不能当空台账放过：读不懂 == 不知道现在拉着哪些东西。
     fail('台账必须是对象（{ schema, dispositions: [] }）', ctx);
   }
-  if (raw.schema !== DISPOSITIONS_SCHEMA) {
-    fail(`未知 schema：${JSON.stringify(raw.schema)}（本版本只认 ${DISPOSITIONS_SCHEMA}）`, ctx);
+  if (!KNOWN_DISPOSITIONS_SCHEMAS.includes(raw.schema)) {
+    fail(`未知 schema：${JSON.stringify(raw.schema)}（本版本认 ${KNOWN_DISPOSITIONS_SCHEMAS.join(' / ')}）`, ctx);
   }
   if (!Array.isArray(raw.dispositions)) {
     fail('dispositions 必须是数组', ctx);
@@ -128,7 +148,66 @@ function normalizeOne(d, ctx) {
   if (hasSha) norm.sha256 = d.sha256.trim().toLowerCase();
   if (hasUid) norm.coolapkUid = d.coolapkUid.trim();
   if (hasVc) norm.versionCode = Number(d.versionCode);
+  // v2 的两个可选字段。**不参与匹配** —— 命中与否仍然只看上面那四个选择器，
+  // 这里加了字段就加判据等于悄悄改作用域。
+  if (d.subject !== undefined) norm.subject = normalizeSubject(d.subject, ctx);
+  if (d.evidence !== undefined) norm.evidence = normalizeEvidence(d.evidence, ctx);
+  // 一个人两处名字必须是一个：条目按 coolapkUid 拉黑、人卡按 subject 聚合，
+  // 两边不一致就是「把甲的处置挂到乙的头像下面」——公示页不会红，只会指着错的人。
+  if (norm.subject && norm.coolapkUid && norm.subject.coolapkUid !== norm.coolapkUid) {
+    fail('subject.coolapkUid 与条目选择器 coolapkUid 不一致：要么少写了选择器，要么处置挂错了人', ctx);
+  }
   return norm;
+}
+
+/**
+ * `subject` —— 被处置人的聚合键（人卡按它分组，spec §7.2.7 / §13.4）。
+ * 只认 `coolapkUid`（必填）+ `username`（可选，投稿那一刻快照里的昵称）。
+ * 不给 uid 就不叫 subject：空对象会让每个人卡都聚到同一个空键下。
+ */
+function normalizeSubject(raw, ctx) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    fail('subject 必须是对象（{ coolapkUid, username? }）', ctx);
+  }
+  const uid = isNonEmptyString(raw.coolapkUid) ? raw.coolapkUid.trim() : '';
+  if (!uid || !UID_RE.test(uid)) fail(`subject.coolapkUid 必须是 4~12 位数字，收到 ${JSON.stringify(raw.coolapkUid)}`, ctx);
+  const out = { coolapkUid: uid };
+  if (raw.username !== undefined && raw.username !== null) {
+    const name = String(raw.username).trim();
+    if (!name) fail('给了 subject.username 就不能是空串（没抓到昵称就别带这个键）', ctx);
+    if (name.length > USERNAME_MAX) fail(`subject.username 超过 ${USERNAME_MAX} 字符，收到 ${name.length}`, ctx);
+    out.username = name;
+  }
+  return out;
+}
+
+/**
+ * `evidence` —— §8 固化 job 写出来的那些文件的指针。
+ * 空数组不算「没有证据」而算「固化过了但什么都没捞到」，这两种状态不许写成同一个形状。
+ */
+function normalizeEvidence(raw, ctx) {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    fail('evidence 给了就必须是非空数组（没有要固化到的证据就整个别带这个键）', ctx);
+  }
+  return raw.map((item, i) => {
+    const c = `${ctx} evidence[${i}]`;
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) fail('evidence 的每一项必须是对象', c);
+    const file = isNonEmptyString(item.file) ? item.file.trim() : '';
+    if (!EVIDENCE_FILE_RE.test(file)) {
+      fail(`evidence.file 必须是 evidence/<64 位十六进制 sha256>.json，收到 ${JSON.stringify(item.file)}`, c);
+    }
+    const out = { file };
+    if (item.pr !== undefined && item.pr !== null) {
+      const pr = Number(item.pr);
+      if (!Number.isInteger(pr) || pr < 1) fail(`evidence.pr 必须是正整数（承载它的 Issue/PR 号），收到 ${JSON.stringify(item.pr)}`, c);
+      out.pr = pr;
+    }
+    if (item.at !== undefined && item.at !== null) {
+      if (!AT_RE.test(String(item.at).trim())) fail(`evidence.at 必须是带时区的 ISO 8601，收到 ${JSON.stringify(item.at)}`, c);
+      out.at = new Date(String(item.at).trim()).toISOString();
+    }
+    return out;
+  });
 }
 
 /**

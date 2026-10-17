@@ -92,7 +92,10 @@ test('正常下架：写台账 -> 调 build-index 重算 -> 索引里那条真�
   assert.equal(rc, 0, io.out.join('\n') + '\n' + io.out.join('\n'));
 
   const ledger = JSON.parse(fs.readFileSync(s.ledgerPath, 'utf8'));
-  assert.equal(ledger.schema, 'sukisu-dispositions-v1');
+  // 写入侧升 v2 是把整份文件的 schema 头一起换掉的（沙箱里那份是 v1 的历史台账）。
+  // 这条断言钉的是「写出来的下一份台账必须是 v2」，而 v1 条目仍然读得动由
+  // `dispositions.test.mjs` 那组兼容用例负责 —— 两边的分工别在一处重复。
+  assert.equal(ledger.schema, 'sukisu-dispositions-v2');
   assert.equal(ledger.dispositions.length, 1);
   assert.equal(ledger.dispositions[0].id, 'mod_x');
   assert.equal(ledger.dispositions[0].kind, 'revoke');
