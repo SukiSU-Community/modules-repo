@@ -3,9 +3,11 @@
  * revoke.mjs —— 下处置的唯一入口（下架 revoke / 拉黑 deny）。
  *
  * 它存在的理由是一条不变式：**json/modules.json 只能由 build-index 从 pending + 台账推导**。
- * 所以这个脚本只做两件事：
+ * 所以这个脚本只做三件事：
  *   1. 往 json/dispositions.json 追加一条**有署名、有时间、有分类**的处置记录；
- *   2. 用子进程调 scripts/build-index.mjs 重算索引（不自己写索引 —— 免得这里成为第二份写路径）。
+ *   2. 用 §8 固化（harvest-evidence.mjs）把被处置那一包的证据落成 `evidence/<sha256>.json`，
+ *      并给这条记录带上 `subject` / `evidence`（拿不到证据就退成不带这两个键，见那条注释）；
+ *   3. 用子进程调 scripts/build-index.mjs 重算索引（不自己写索引 —— 免得这里成为第二份写路径）。
  * 然后打印该走的分支/PR 步骤。索引最终对不对，由 CI 的 derive（verify-index-pr）说了算，
  * 不由这个脚本说了算 —— 它的作者也是人，人也会写错。
  *
@@ -24,6 +26,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { DISPOSITIONS_SCHEMA, REASONS, loadDispositions, parseDispositions } from './dispositions.mjs';
+import { harvest, ledgerFieldsFrom } from './harvest-evidence.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(__dirname, '..');
@@ -90,7 +93,7 @@ export function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith('--')) continue;
     const k = a.slice(2);
-    if (k === 'dry-run') { o['dry-run'] = true; continue; }
+    if (k === 'dry-run' || k === 'no-harvest') { o[k] = true; continue; }
     const v = argv[i + 1];
     if (v === undefined || v.startsWith('--')) { o[k] = true; continue; }
     o[k] = v;
@@ -99,7 +102,7 @@ export function parseArgs(argv) {
   return o;
 }
 
-export function main(argv = process.argv.slice(2), io = console, deps = {}) {
+export async function main(argv = process.argv.slice(2), io = console, deps = {}) {
   const flags = parseArgs(argv);
   const now = deps.now ? deps.now() : new Date();
   const ledgerFile = path.resolve(ROOT, flags.ledger || 'json/dispositions.json');
@@ -108,7 +111,7 @@ export function main(argv = process.argv.slice(2), io = console, deps = {}) {
   const usage = `用法: node scripts/revoke.mjs --id <id> [--version-code <n>] [--sha256 <64hex>] [--uid <酷安UID>]
           --kind revoke|deny --reason ${REASONS.join('|')}
           --by https://github.com/<owner>/<repo>/issues/<n>#issuecomment-<id>
-          [--note <公示说明>] [--verify <复核命令>] [--dry-run]`;
+          [--note <公示说明>] [--verify <复核命令>] [--dry-run] [--no-harvest]`;
   if (!flags.id && !flags.sha256 && !flags.uid) {
     io.error(`[revoke] 必须至少给一个选择器（--id / --sha256 / --uid）。\n${usage}`);
     return 2;
@@ -158,18 +161,81 @@ export function main(argv = process.argv.slice(2), io = console, deps = {}) {
     return 4;
   }
 
+  // ---- §8 证据固化：在写台账之前，把「当初审核过的那一包」落成 evidence/<sha256>.json。
+  // 顺序是有意的：台账里那条 `evidence[].file` 必须指向**同一条 PR 里真的写出来的文件**，
+  // 反过来说，固化没跑成功时这条记录就退回「没有附件的处置」（schema v2 的两个字段都是可选的），
+  // 而不是写一个指空文件的指针 —— 后者会被 verify-index-pr 的互指认判红，等于把处置卡在 PR 外面。
+  const harvestSelectors = {
+    ...(normalized.id ? { id: normalized.id } : {}),
+    ...(normalized.versionCode !== undefined ? { versionCode: normalized.versionCode } : {}),
+    ...(normalized.sha256 ? { sha256: normalized.sha256 } : {}),
+    ...(normalized.coolapkUid ? { coolapkUid: normalized.coolapkUid } : {}),
+  };
+  let harvested = null;
+  if (flags['no-harvest']) {
+    io.log('[revoke] --no-harvest：跳过 §8 固化，这条处置不带 subject / evidence');
+  } else {
+    try {
+      const run = deps.harvest || harvest;
+      harvested = await run({ cwd: ROOT, selectors: harvestSelectors, deps: deps.harvestDeps || {} });
+    } catch (e) {
+      io.error(`[revoke] 固化这一步跑挂了：${String((e && e.message) || e)}`);
+      harvested = null;
+    }
+    if (harvested && !harvested.ok) {
+      io.error(`[revoke] 没固化到证据：${harvested.whyEmpty}`);
+      io.error(`  这条处置照写（evidence 是可选字段），但事后要补回来：\n`
+        + `    node scripts/harvest-evidence.mjs ${Object.entries(harvestSelectors).map(([k, v]) => `--${k === 'coolapkUid' ? 'uid' : k === 'versionCode' ? 'version-code' : k} ${v}`).join(' ')} --write`);
+      harvested = null;
+    }
+  }
+  let finalEntry = normalized;
+  if (harvested) {
+    const fields = ledgerFieldsFrom(harvested, now);
+    finalEntry = { ...normalized, ...fields };
+    // 带上新字段再走一遍同一份校验：脚本这里不能比 CI 松（上面那句注释的同一条理由）。
+    try {
+      [finalEntry] = parseDispositions({ schema: DISPOSITIONS_SCHEMA, dispositions: [finalEntry] }, 'revoke.mjs 固化后的条目');
+    } catch (e) {
+      io.error(`[revoke] 固化带出来的 subject / evidence 不合格，拒写：${e.message}`);
+      return 5;
+    }
+    for (const n of harvested.notes) io.log(`[revoke] 固化注意：${n}`);
+    io.log(`[revoke] 固化到 ${harvested.files.length} 份证据（扫了 ${harvested.scanned} 条 pending 提交）`);
+  }
+
   const next = {
     schema: DISPOSITIONS_SCHEMA,
     lastUpdate: now.getTime(),
-    dispositions: [...list, normalized],
+    dispositions: [...list, finalEntry],
   };
   const text = `${JSON.stringify(next, null, 2)}\n`;
 
   io.log(`[revoke] 准备写入 ${path.relative(ROOT, ledgerFile)}：新增 1 条（现有 ${list.length} 条）`);
-  io.log(`  ${JSON.stringify(normalized)}`);
+  io.log(`  ${JSON.stringify(finalEntry)}`);
   if (flags['dry-run']) {
     io.log('[revoke] --dry-run：没写任何文件，也没重算索引');
     return 0;
+  }
+
+  // 证据文件落在台账之前：文件名是它自己字节的哈希，已存在且同内容就跳过（同一份内容必然同名），
+  // 已存在但**内容不同**必须停下来问人 —— 那是有人在改一份已经被人引用过的证据。
+  if (harvested) {
+    // 证据落在**仓库根**（白名单与互指认都按 `evidence/**` 这个根相对路径判），
+    // --evidence-dir 只是给单测留的接缝：它不改变台账里写的路径，只改变落在哪儿。
+    const evidenceRoot = flags['evidence-dir'] ? path.resolve(ROOT, String(flags['evidence-dir'])) : ROOT;
+    for (const f of harvested.files) {
+      const abs = path.join(evidenceRoot, ...f.path.split('/'));
+      if (fs.existsSync(abs)) {
+        const cur = fs.readFileSync(abs);
+        if (cur.equals(f.bytes)) { io.log(`[revoke] ${f.path} 已存在且逐字节一致，跳过`); continue; }
+        io.error(`[revoke] ${f.path} 已存在但内容不同 —— 同名不同物只有一种解释：有人改过证据。停下来问人，不覆盖。`);
+        return 6;
+      }
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, f.bytes);
+      io.log(`[revoke] 已写 ${path.relative(ROOT, abs)}`);
+    }
   }
 
   fs.mkdirSync(path.dirname(ledgerFile), { recursive: true });
@@ -189,9 +255,12 @@ export function main(argv = process.argv.slice(2), io = console, deps = {}) {
 
   io.log('');
   io.log('[revoke] 文件已改好，还没有提交。下一步（索引对不对由 CI 的 derive 判定，不由这个脚本判定）：');
-  io.log(`  git checkout -b revoke/${normalized.id || normalized.sha256?.slice(0, 12) || normalized.coolapkUid}`);
-  io.log('  git add json/dispositions.json json/modules.json');
-  io.log('  git commit -m "chore(dispose): revoke ' + (normalized.id || normalized.sha256 || normalized.coolapkUid) + '"');
+  const what = finalEntry.id || finalEntry.sha256?.slice(0, 12) || finalEntry.coolapkUid;
+  io.log(`  git checkout -b revoke/${what}`);
+  // 证据文件必须和台账**同一条 PR**：verify-index-pr 的白名单只在「这条 PR 同时改了台账」时
+  // 才放行 evidence/**，而互指认那一步要求台账引用的文件真的在 head 上。漏掉这一格 = PR 直接红。
+  io.log('  git add json/dispositions.json json/modules.json' + (finalEntry.evidence ? ' evidence/' : ''));
+  io.log('  git commit -m "chore(dispose): revoke ' + what + '"');
   io.log('  git push -u origin HEAD && gh pr create --title "chore(dispose): 下架 …" --body "…"');
   io.log('  然后看 approve 是否绿：它会重算一遍并逐字段比对（verify-index-pr 的台账驱动模式）。');
   io.log('  ⚠️ 动了台账的 PR 不算索引重建，它换了一道准入：需要**两名不同的人**在本 PR 评论**首行**写');
@@ -204,5 +273,6 @@ export function main(argv = process.argv.slice(2), io = console, deps = {}) {
 
 const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (invokedDirectly) {
-  process.exitCode = main();
+  // main 现在是 async（§8 固化要读 git 历史与 PR 评论），所以退出码要等它。
+  process.exitCode = await main();
 }
