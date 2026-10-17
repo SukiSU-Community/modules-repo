@@ -16,12 +16,13 @@ import {
   buildBrief, callModel, parseVerdict, verifyQuotes, foldQuote, toFindings, raiseLevel, main,
   SYSTEM_PROMPT, STATUS_VALUES, MODULE_WRITABLE_STATUSES, MIN_MAX_TOKENS, QCA_BASE,
   sanitizeUntrusted, BUDGET_BASIS, QFMODEL_MAX_INPUT_TOKENS, DEFAULT_MAX_BRIEF_BYTES,
+  TEXT_FEED_CAP_BYTES, MAX_SHAPED_ROWS, fitTextEntry,
   EVENT_PAGE_SIZE, MAX_EVENT_PAGES, MAX_RAW_EXCERPT, UNTRUSTED_MARK, OVER_BUDGET_REASON_CODES,
   PROMPT_SHA256, NON_TEXT_MARK, FORENSICS_LINE_CAP, FORENSICS_IMPORT_CAP,
   DEFAULT_TIMEOUT_MS,
 } from './ai-review.mjs';
 import { detectBinary, trimSnippet } from './risk-rules.mjs';
-import { scanZip, isCliEntry, isNonTextContent, readZip } from './scan.mjs';
+import { scanZip, isCliEntry, isNonTextContent, readZip, MAX_SCAN_BYTES_PER_ENTRY } from './scan.mjs';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const FIXDIR = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
@@ -332,9 +333,10 @@ test('prompt 第 3 条把「可引用的两面」写死：② 逐行原文 + ③
 });
 
 test('被预算略掉的 ③ 条目不许进 corpus：略掉的东西模型根本没看到，引用它必须是造假', () => {
-  // 900 B 这一档实测：② 的那篇放得下、③ 那一行放不下（needed=1143 B）⇒ omitted 里只有 big.so。
+  // 900 → 1200 B 这一档是 ㉚ 之后重测的：② 的节标题长了约 230 B（它现在还要交代「未送部分」），
+  // 同一对夹具的临界档跟着上移。实测 needed=1395 B：≤1000 两篇都略，1100~1300 只略 big.so，≥1400 一条都不略。
   const elf = Buffer.concat([Buffer.from(ELF8), Buffer.alloc(4096, 0x90)]);
-  const b = buildBrief({ report: R, maxBytes: 900,
+  const b = buildBrief({ report: R, maxBytes: 1200,
     entries: [file('a.sh', 'echo hi\n'), { name: 'big.so', size: 900000, content: elf.toString('utf8'), head: elf }] });
   assert.deepEqual(b.omitted.map((o) => o.name), ['big.so'], `这一档要略掉的正是那枚 ③ 条目（实测 omitted=${b.omitted.map((o) => o.name)}）`);
   assert.equal(b.corpus.has('big.so'), false, 'corpus.set 必须在预算判断之后：先登记再判预算 = 让模型引用没送出的东西');
@@ -1191,9 +1193,14 @@ test('F4b：over-budget 的文案说「需要」多少字节，不是说「装�
     fetchImpl: async () => { called += 1; throw new Error('不该走到网络'); } });
   assert.equal(r.status, 'over-budget');
   assert.equal(called, 0);
-  // 评审实测的误导形态：报 704/2400 而真实需要 60001 B
-  assert.ok(r.payload.brief.neededBytes > 60000, `neededBytes 要接近整包尺寸，实测=${r.payload.brief.neededBytes}`);
+  // 评审实测的误导形态：报 704/2400 而真实需要更多 ⇒ 「需要」那一列永远按**完整装配**算。
+  // ㉚ 之后这一档的完整装配是「截过的」：那条 60,001 B 的单行现在只送到上限，
+  // 所以这里钉的是两件事 —— neededBytes 仍然远大于 byteSize，且**截断这件事本身进了产物**。
+  assert.ok(r.payload.brief.neededBytes > TEXT_FEED_CAP_BYTES,
+    `neededBytes 要按整条送满的量级算，实测=${r.payload.brief.neededBytes}`);
   assert.ok(r.payload.brief.neededBytes > r.payload.brief.byteSize, '「需要」必须大于「装下的」，否则复核会以为差一点点');
+  assert.deepEqual(r.payload.brief.shaped.map((s) => [s.name, s.bytes, s.lineCut]),
+    [['payload.json', 60001, true]], '超上限的条目要在产物里逐条留下「原文多少 / 送了多少 / 是不是连第一行都没送满」');
   assert.match(r.payload.reason, /需要 \d+ B/);
   assert.doesNotMatch(r.payload.reason, /装不进预算（\d+ \/ \d+ B/, '旧口径（byteSize / maxBytes）会把人工复核带偏');
   assert.match(r.payload.reason, /未标定|uncalibrated/, '文案里带上预算依据');
@@ -2038,6 +2045,99 @@ test('M1-11 一次判定只读一次 zip：送出去的那一份 = 复验用的�
   assert.equal(calls, 1, `zip 必须只读一次（实测读了 ${calls} 次）—— 第二次读就是第二套口径`);
   assert.equal(r.status, 'ok', `引用的原文与送出去的那一份同源才该采信：status=${r.status} reason=${r.payload.reason || ''}`);
   assert.equal(r.payload.findings.length, 1, '结论要落到加严的那一条上，而不是整份不采信');
+});
+
+/* -------------------------------------------------- ㉚ 进料形状：超上限的条目只送到行边界
+   这一组钉的是「AI 看到的原文范围逐条目地不小于静态读到的范围」这条不变量的另一面：
+   省下来的字节来自**静态本来就没读到的那一段**，不是来自把读到的东西藏起来。 */
+
+test('fitTextEntry 的三条边界：不超限原样、按行边界切、第一行就超限则按字节切第一行', () => {
+  const small = fitTextEntry('a\nb\n');
+  assert.equal(small.clipped, false);
+  assert.deepEqual(small.lines, ['a', 'b', '']);
+
+  const cap = 40;
+  const lines = Array.from({ length: 20 }, (_, i) => `l${i}_${'x'.repeat(8)}`);
+  const mid = fitTextEntry(lines.join('\n'), cap);
+  assert.equal(mid.clipped, true);
+  assert.equal(mid.lineCut, false);
+  assert.ok(Buffer.byteLength(mid.lines.join('\n'), 'utf8') <= cap, '整行前缀的原文字节必须不超过上限');
+  assert.equal(mid.droppedLines, mid.totalLines - mid.lines.length);
+  // 「能装下的最大整数行」而不是随手切一半：再多拿一行确实就越界了
+  assert.ok(Buffer.byteLength(lines.slice(0, mid.lines.length + 1).join('\n'), 'utf8') > cap);
+
+  const monster = fitTextEntry('z'.repeat(300), 100);
+  assert.equal(monster.lineCut, true, '压缩产物：第一行本身就超上限时要退化成按字节切');
+  assert.equal(monster.lines.length, 1);
+  assert.ok(Buffer.byteLength(monster.lines[0], 'utf8') <= 100);
+  assert.doesNotMatch(monster.lines[0], /\uFFFD$/, '按字节切不许留半个字符');
+
+  assert.equal(fitTextEntry('', 100).clipped, false, '空内容不是「被截断」');
+});
+
+test('上限就是静态自己那一个数，不新发明；产物里逐条留下字节账', () => {
+  assert.equal(TEXT_FEED_CAP_BYTES, MAX_SCAN_BYTES_PER_ENTRY,
+    '进料上限复用 MAX_SCAN_BYTES_PER_ENTRY —— 换掉静态那一个，这一层要跟着动，不许两处各自漂');
+  const body = Array.from({ length: 4000 }, (_, i) => `echo ${i}`).join('\n');
+  const b = buildBrief({ report: R, entries: [file('service.sh', body)], maxBytes: DEFAULT_MAX_BRIEF_BYTES });
+  assert.equal(b.shapes.textClipped, 1);
+  assert.equal(b.shaped.length, 1);
+  const rec = b.shaped[0];
+  assert.equal(rec.name, 'service.sh');
+  assert.ok(rec.bytes > TEXT_FEED_CAP_BYTES && rec.sentBytes <= TEXT_FEED_CAP_BYTES, JSON.stringify(rec));
+  assert.equal(rec.lineCut, false);
+  // 头里要写着未送多少行 —— 模型不看报告，它只看 ② 那一节
+  assert.match(b.text, /未送 \d+ 行/);
+  assert.match(b.text, /静态对它也只读到/);
+});
+
+test('截断之后复验仍然逐字：送出去那一段引得到，落在未送部分外面判造假', () => {
+  const body = `echo one\n${Array.from({ length: 4000 }, (_, i) => `echo ${i}`).join('\n')}\necho tail`;
+  const b = buildBrief({ report: R, entries: [file('s.sh', body)], maxBytes: DEFAULT_MAX_BRIEF_BYTES });
+  const sent = b.corpus.get('s.sh');
+  assert.equal(sent[0], 'echo one');
+  assert.equal(verifyQuotes({ findings: [{ file: 's.sh', line: 1, quote: 'echo one' }] }, b.corpus).ok, true);
+  // 未送的那一行（最后一行）现在不在 corpus 里 —— 引它必须是 line 越界，不是「算它对了」
+  const beyond = sent.length + 1;
+  const bad = verifyQuotes({ findings: [{ file: 's.sh', line: beyond, quote: 'echo tail' }] }, b.corpus);
+  assert.equal(bad.ok, false);
+  assert.equal(bad.bad[0].reason, 'line 越界');
+});
+
+test('㉚ 买到的那一格：越界的唯一原因是若干条超上限的原文时，形状改完发得出去（常数没动）', () => {
+  const fat = (n) => Array.from({ length: n }, (_, i) => `k${i}: "${'y'.repeat(24)}",`).join('\n');
+  const entries = [
+    ...Array.from({ length: 8 }, (_, i) => file(`assets/chunk-${i}.js`, fat(1000))),   // 8 × ~31 KB
+    file('service.sh', 'echo hi\n'),
+  ];
+  const raw = entries.reduce((s, e) => s + Buffer.byteLength(e.content, 'utf8'), 0);
+  assert.ok(raw > DEFAULT_MAX_BRIEF_BYTES, `夹具：全量原文 ${raw} B 本来就越过 ${DEFAULT_MAX_BRIEF_BYTES}`);
+  const b = buildBrief({ report: R, entries, maxBytes: DEFAULT_MAX_BRIEF_BYTES });
+  assert.equal(b.shapes.textClipped, 8);
+  assert.equal(b.omitted.length, 0, '一条都不该被略掉');
+  assert.equal(b.overBudget, false, `改完形状要装得下：needed=${b.neededBytes} / 预算 ${DEFAULT_MAX_BRIEF_BYTES}`);
+  assert.equal(b.byteSize <= DEFAULT_MAX_BRIEF_BYTES, true, 'F4c 那条硬上界不许因为改形状而失效');
+});
+
+test('形状改完仍然装不下的那一类照旧红 —— 这不是放宽，常数与判据表达式都没动', () => {
+  const fat = Array.from({ length: 1000 }, (_, i) => `k${i}: "${'y'.repeat(24)}",`).join('\n');
+  const entries = Array.from({ length: 20 }, (_, i) => file(`assets/big-${i}.js`, fat));  // 20 × 上限
+  const b = buildBrief({ report: R, entries, maxBytes: DEFAULT_MAX_BRIEF_BYTES });
+  assert.equal(b.overBudget, true);
+  assert.ok(b.neededBytes > DEFAULT_MAX_BRIEF_BYTES);
+  assert.ok(b.omitted.length > 0, '装不下仍然整条记进 omitted，不许截半凑上');
+  assert.deepEqual([...new Set(b.omitted.map((o) => o.reason))], ['over-budget:text']);
+  assert.equal(b.byteSize <= DEFAULT_MAX_BRIEF_BYTES, true, '红的那一发也不许把装配尺寸顶过预算');
+  assert.ok(b.shaped.length <= MAX_SHAPED_ROWS, `发不出去时清单仍受上限约束（实测 ${b.shaped.length}）`);
+});
+
+test('shaped 清单有上限：条目再多也只列 MAX_SHAPED_ROWS 条，剩下的报条数', () => {
+  const fat = Array.from({ length: 100 }, (_, i) => `line ${i} ${'w'.repeat(300)}`).join('\n');
+  const entries = Array.from({ length: MAX_SHAPED_ROWS + 5 }, (_, i) => file(`nested/f${i}.sh`, fat));
+  const b = buildBrief({ report: R, entries, maxBytes: DEFAULT_MAX_BRIEF_BYTES });
+  assert.equal(b.shaped.length, MAX_SHAPED_ROWS, '清单本身进产物与 PR 评论，不许无界');
+  assert.equal(b.shapes.textClipped, MAX_SHAPED_ROWS + 5, '但计数要说真数，不能被清单上限一起吃掉');
+  assert.equal(b.shapes.shapedDropped, 5);
 });
 
 
