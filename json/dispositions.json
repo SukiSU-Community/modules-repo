@@ -41,6 +41,14 @@
       "at": "2026-10-11T03:02:33.247Z",
       "note": "流水线验证留下的探针包，理由见 by 指向的评论",
       "id": "e2e_probe_p04"
+    },
+    {
+      "kind": "revoke",
+      "reason": "other",
+      "by": "https://github.com/SukiSU-Community/modules-repo/issues/33#issuecomment-6104846280",
+      "at": "2026-10-17T09:50:00Z",
+      "note": "署名形状的验证探针：指向的模块不存在于索引也没有 pending",
+      "id": "e2_seal_probe_nonexistent"
     }
   ]
 }
