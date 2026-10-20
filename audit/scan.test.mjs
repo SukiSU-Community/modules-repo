@@ -16,10 +16,11 @@ import {
   scoreRisk, decide, countsTowardRisk, SEVERITY_ORDER, CATEGORY_LABEL,
   inspectStructure, unsafePathReason, detectBinary, checkCoverage, checkUnread, checkBinaries,
   MAX_TEXT, MAX_ENTRIES, MAX_RATIO,
+  dexSurfaceSeverity, DEX_SURFACE_LIVE_CATEGORIES,
   EXEC_BUNDLED_FILE, EXEC_INDIRECT, PROP_BOOT_SPOOF, buildLineContexts,
 } from './risk-rules.mjs';
 import { scanZip, classify, renderMarkdown, renderJSON, redactText, mask, resolveChangeType, hasShebang, CANONICAL_SCRIPTS, FLASH_ENTRY_POINTS, readZip, resolveBundledTargets, resolveBundledRefs, normalizeRefPath, EXEC_UNRESOLVED_ADVICE, EXEC_UNPINNED_ADVICE, SCAN_TARGET_BUCKETS } from './scan.mjs';
-import { makeModuleZip, moduleProp, scanToReport } from './fixtures.mjs';
+import { makeModuleZip, moduleProp, scanToReport, makeDex } from './fixtures.mjs';
 
 // ---------------------------------------------------------------------------
 // 辅助：命中判定
@@ -6440,3 +6441,187 @@ test('T6.3·新落点漏走中和也必须红：报告里带注入记号的原�
   assert.ok(body.includes('&lt;/details&gt;&lt;zz9&gt;'), '中和过的落点必须还在正文里看得见');
   assert.ok(renderJSON(r).includes(T63_MARK), 'JSON 面仍然必须是原文（这一格也不许把中和漏过去）');
 });
+
+// ===========================================================================
+// 第五十批：dex / ZIP 的端到端。这一段测的全是"接上了没有"，不是解析器本身 ——
+// 解析器的每一格拒绝由 audit/dex-forensics.test.mjs 守，这里守的是三件事：
+//   ① 串面真的喂进了既有规则（判据只有一份，所以命中必须来自 CONTENT_RULES 而不是新写的一条）；
+//   ② 定档换算只按证据类型分岔，且**同一条字面值在两面各得各的档位**（不许互相污染）；
+//   ③ 读不出来 / 读不完的每一格仍然往严走，一条都不放宽。
+// ===========================================================================
+
+const DEXE_BYTES = readFileSync(new URL('./fixtures/d8-minimal.dex', import.meta.url));
+const DEXE_COPY = 'cp /data/system/packages.list /data/local/tmp/';
+const dexeAt = (r, file, ruleId) => r.findings.filter((f) => f.file === file && f.ruleId === ruleId);
+
+test('DXE-01 同一句字面值：写在 customize.sh 里是 high，躺在 dex 常量池里是 info —— 两面的账不许互相污染', async () => {
+  const zip = makeModuleZip({
+    id: 'dexe_split',
+    files: [['customize.sh', `#!/system/bin/sh\n${DEXE_COPY}\n`], ['classes.dex', DEXE_BYTES]],
+  });
+  const r = await scanToReport(zip, { changeType: 'first' });
+  const fromScript = dexeAt(r, 'customize.sh', 'WRITE_SYSTEM_VENDOR');
+  const fromDex = dexeAt(r, 'classes.dex', 'WRITE_SYSTEM_VENDOR');
+  assert.equal(fromScript.length, 1, '脚本面那条一字没动（本轮不许碰既有规则的行为）');
+  assert.equal(fromScript[0].severity, 'high');
+  assert.equal(fromDex.length, 1, 'dex 面那条也得看得见 —— 降档不是删证据');
+  assert.equal(fromDex[0].severity, 'info', '常量池不承诺"这一行会被跑"，所以执行型在这里不定档');
+  assert.equal(countsTowardRisk(fromDex[0]), false);
+  assert.equal(r.counts.high, 1, `参与定级的 high 只能来自脚本那一发，实得 ${r.counts.high}`);
+});
+
+test('DXE-01b 只有干净 dex 的包仍然 medium 且不开自动放行 —— 这一层永远不用来放宽（§0.7）', async () => {
+  const zip = makeModuleZip({ id: 'dexe_only', files: [['classes.dex', DEXE_BYTES]] });
+  const r = await scanToReport(zip, { changeType: 'first' });
+  assert.equal(r.counts.high, 0, '执行型三面全被降成 info，所以一枚 high 都不该有');
+  assert.equal(r.riskLevel, 'medium');
+  assert.equal(r.decision.action, 'block', '含 dex 的包不许因为这层"读出来了"就自动放行');
+  assert.equal(r.decision.needsHumanReview, true);
+});
+
+test('DXE-02 存在型证据从常量池里也抓到了：档位由那条规则自己定，行号落在串序号范围内', async () => {
+  const zip = makeModuleZip({ id: 'dexe_ip', files: [['classes.dex', DEXE_BYTES]] });
+  const r = await scanToReport(zip, { changeType: 'first' });
+  const ip = dexeAt(r, 'classes.dex', 'HARDCODED_IP');
+  assert.equal(ip.length, 1, '硬编码公网 IP 藏在 dex 里，改前这一格彻底不可见（binaries 不喂文本规则）');
+  assert.equal(ip[0].severity, 'medium', '存在型的判据与包的位置无关：customize.sh 里是 medium，这里也是');
+  assert.ok(ip[0].snippet.includes('203.0.113.9'), `命中必须来自那枚真常量，实得 ${ip[0].snippet}`);
+  const row = r.binaryForensics.find((x) => x.name === 'classes.dex');
+  assert.ok(ip[0].line >= 1 && ip[0].line <= row.dexSurface.lines,
+    `行号是串序号（1..${row.dexSurface.lines}），复核者按它去找第几条串：实得 ${ip[0].line}`);
+  const fetch = dexeAt(r, 'classes.dex', 'NETWORK_FETCH');
+  assert.ok(fetch.length >= 1 && fetch.every((f) => f.severity === 'low'), '外联清单保持原判据档位');
+  assert.ok(r.findings.filter((f) => f.file === 'classes.dex')
+    .every((f) => (r.binaries || []).some((b) => b.name === 'classes.dex')), 'INV-B：finding 的条目名必须在 binaries 清单里');
+});
+
+test('DXE-03 登记带 dex 读数，但串池本体与 NUL 都不许进产物（T57-15 那根钉子的 dex 版）', async () => {
+  const zip = makeModuleZip({ id: 'dexe_report', files: [['classes.dex', DEXE_BYTES]] });
+  const r = await scanToReport(zip, { changeType: 'first' });
+  const row = r.binaryForensics.find((x) => x.name === 'classes.dex');
+  assert.equal(row.kind, 'DEX');
+  assert.equal(row.outcome, 'DEX_READ');
+  assert.equal(row.stringsDecoded, 33, '人看得见这一层读出了多少条串');
+  assert.equal(row.dexVersion, '035');
+  assert.equal(row.dexSurface.lines, 33);
+  const json = JSON.stringify(r);
+  assert.equal(/"strings"\s*:/.test(json), false, '串池是规则的输入面，不是产物面');
+  assert.equal(json.includes('\u0000'), false, '产物里不许有裸 NUL');
+  assert.ok(json.length < 200_000, `报告只能有 KB 量级，实得 ${json.length} B`);
+});
+
+test('DXE-04 ZIP 容器：头 512 字节全是 ASCII 的 stored jar 不再靠"NUL 恰好出现"判类型，也不许被当文本逐行扫', async () => {
+  const jar = Buffer.concat([Buffer.from('PK\u0003\u0004', 'latin1'), Buffer.from('A'.repeat(600), 'latin1')]);
+  assert.equal(detectBinary(jar.subarray(0, 512)).id, 'ZIP',
+    '这一格改前是 null：条目能不能被认出是二进制，取决于前 512 字节里恰好有没有 NUL');
+  const files = readZip(makeModuleZip({ id: 'dexe_zip', files: [['assets/payload.jar', jar]] })).files;
+  const cls = classify(files);
+  assert.ok(cls.binaries.some((f) => f.name === 'assets/payload.jar'), '必须落 binaries，不许留在 others 里被"逐行扫过"');
+  assert.equal(cls.others.some((f) => f.name === 'assets/payload.jar'), false);
+  const r = await scanToReport(makeModuleZip({ id: 'dexe_zip2', files: [['assets/payload.jar', jar]] }), { changeType: 'first' });
+  const row = r.binaryForensics.find((x) => x.name === 'assets/payload.jar');
+  assert.equal(row.outcome, 'ZIP_CONTAINER', '本轮明说"未展开"，不许退成 NO_RECORD 那种像没接线的读数');
+  assert.match(row.summary, /未展开/);
+  assert.equal(r.counts.high, 0);
+  assert.equal(r.riskLevel, 'medium', '容器未展开 = 未审查，往严走');
+});
+
+test('DXE-05 dexSurfaceSeverity 是一份具名谓词：存在型原样、执行型降 info、已 info 不动、脏入参不抛', () => {
+  const keep = [
+    { ruleId: 'HARDCODED_IP', category: 'network', severity: 'medium' },
+    { ruleId: 'PRIVACY_EMAIL', category: 'privacy', severity: 'info' },
+    { ruleId: 'SUSPICIOUS_DOMAIN', category: 'network', severity: 'info' },
+  ];
+  for (const f of keep) assert.equal(dexSurfaceSeverity(f), f, '原样返回（同对象，不改形状）');
+  for (const f of [
+    { ruleId: 'WRITE_SYSTEM_VENDOR', category: 'root', severity: 'high' },
+    { ruleId: 'RM_RF_MUTABLE', category: 'dangerous', severity: 'medium' },
+    { ruleId: 'MODDIR_RUNTIME_WRITE', category: 'execution', severity: 'high' },
+  ]) {
+    const g = dexSurfaceSeverity(f);
+    assert.equal(g.severity, 'info', `${f.ruleId} 是执行型：常量池不承诺它会被跑`);
+    assert.equal(f.severity, f.severity, '入参不许被就地改掉');
+    assert.equal(g.ruleId, f.ruleId, '只换 severity，ruleId / file / line / snippet 一个字都不动');
+  }
+  for (const bad of [null, undefined, 0, 'x', {}]) assert.doesNotThrow(() => dexSurfaceSeverity(bad));
+  // 这份名单本身是一格口径：只许有 network / privacy 两类参与定级
+  assert.deepEqual([...DEX_SURFACE_LIVE_CATEGORIES].sort(), ['network', 'privacy']);
+});
+
+test('DXE-06 串面没喂全时并进这个条目自己那句话，不许在同一个文件上再发一条覆盖度记录（§0.7 第 367 行那个病）', async () => {
+  // 300 条 × 4,300 字符：每条都被单串上限截过，总面超过 1 MiB 预算 ⇒ 尾部必然 dropped>0。
+  // 这一格的反面是"截了但不说"，那等于把一张被读短的表念成读全了。
+  // `total` 那一垫是必需的：1.29 MB 几乎全 ASCII 的池子可打印比例过 0.85，会被 Task 4 当成
+  // polyglot 收进逐行扫描面，那时这一格测的是 DXE-07（互斥）而不是这里的 dropped。
+  // 所以夹具既垫零字节，又当场断言它没落到扫描面上 —— 起法本身也是被测面。
+  const many = Array.from({ length: 300 }, (_, i) => `p${i}-${'z'.repeat(4300)}.example.invalid`);
+  const zip = makeModuleZip({
+    id: 'dexe_capped',
+    files: [['classes.dex', makeDex({ entries: many, total: 3 * 1024 * 1024 })]],
+  });
+  const r = await scanToReport(zip, { changeType: 'first' });
+  const row = r.binaryForensics.find((x) => x.name === 'classes.dex');
+  assert.equal(row.surfaceSkipped, undefined, '前提：这一枚不许本来就在逐行扫描面上，否则下面全是空断言');
+  assert.ok(row.dexSurface.dropped > 0, `预算吃紧时 dropped 必须非零，实得 ${JSON.stringify(row.dexSurface)}`);
+  assert.equal(row.dexSurface.lines + row.dexSurface.dropped, 300, '喂进去的 + 丢掉的 == 池子条数');
+  const sb = dexeAt(r, 'classes.dex', 'STRUCT_BINARY');
+  assert.equal(sb.length, 1, '一个条目一条登记：定级力就在这条上（medium，参与定级）');
+  assert.match(sb[0].message, /一个字都没喂/, '没喂全必须在这个条目自己那句话里说出来');
+  assert.ok(sb[0].message.includes(String(row.dexSurface.dropped)),
+    `文案要念得出丢了多少条：${sb[0].message}`);
+  assert.ok(sb[0].message.includes('这一层的读数是不完整的'));
+  const cov = dexeAt(r, 'classes.dex', 'AUDIT_COVERAGE_TRUNCATED');
+  assert.equal(cov.length, 1, '这一条来自 checkCoverage（条目本身 > MAX_TEXT），本轮不许在同一文件上并出第二条');
+  assert.equal(cov.some((f) => /串面|串池/.test(f.message)), false, `覆盖度那条讲的是报告内嵌，不该被挪来讲串面：${cov.map(x=>x.message)}`);
+  assert.equal(r.riskLevel, 'medium', '没喂全照样往严走，一条都不放宽');
+});
+
+test('DXE-07 已经在逐行扫描面上的条目必须让串面让位：只许发一份身份，全报告不许同规则同文件同行两次', async () => {
+  // 与 DXE-06 是同一枚字节、两种档：那一格垫了零所以比例不过线，这一格不垫 —— 1.29 MB 几乎
+  // 全 ASCII 的池子过 `POLYGLOT_MIN_PRINTABLE`，Task 4 已经把它推进 feed 逐行扫过一遍了。
+  // 两条路都喂 = 同一条规则在同一个文件上命中两次 = counts 变胖，而 counts 是直接写进
+  // 公开评论「命中统计」的那一行（scan.mjs 里 907-909 那段讲的正是这个病）。
+  const many = Array.from({ length: 300 }, (_, i) => `p${i}-${'z'.repeat(4300)}.example.invalid`);
+  const r = await scanToReport(makeModuleZip({
+    id: 'dexe_polyglot', files: [['classes.dex', makeDex({ entries: many })]],
+  }), { changeType: 'first' });
+  const row = r.binaryForensics.find((x) => x.name === 'classes.dex');
+  assert.equal(row.outcome, 'DEX_READ', '让位不等于读不出：dex 结构那一份仍然照报');
+  assert.equal(row.surfaceSkipped, 'polyglot', '被谁顶掉要落在登记上，不许静默');
+  assert.match(row.summary, /本来就在逐行扫描面上/, '句子要说得出为什么没摊：顶掉的原因不是"读不出来"');
+  assert.equal(row.dexSurface, undefined, '顶掉了就不许留一份看着像"读过串面"的统计');
+  // 全局重复计数闸：任何一条规则在同一个文件的同一行至多出现一次。
+  const seen = new Map();
+  for (const f of r.findings) {
+    const k = `${f.ruleId}@${f.file}@${f.line}`;
+    seen.set(k, (seen.get(k) || 0) + 1);
+  }
+  const dup = [...seen.entries()].filter(([, n]) => n > 1);
+  assert.deepEqual(dup, [], `同一条规则在同一个文件的同一行不许出现两次：${JSON.stringify(dup)}`);
+});
+
+test('DXE-08 ELF 改名成 classes.dex 的档位只许增不许减；dex 魔数但不是认过的形状 ⇒ 口径不许说成"非 DEX"', async () => {
+  // ① 改名那一格：classify 的魔数闸在前，所以这枚 ELF 的 id 是 'ELF'、走 ELF 解析器，
+  //    危险族检查照跑 —— 本轮新加的分派绝不许因为文件名叫 classes.dex 就走 dex 那条宽路。
+  const elf = readFileSync(new URL('./fixtures/arm64-v8a.so', import.meta.url));
+  const r = await scanToReport(makeModuleZip({ id: 'dexe_rename', files: [['classes.dex', elf]] }),
+    { changeType: 'first' });
+  const row = r.binaryForensics.find((x) => x.name === 'classes.dex');
+  assert.equal(row.kind, 'ELF', '类型按字节判，不按投稿者写的名字判');
+  assert.equal(row.importCount, 86, '真 ELF 改名成 classes.dex 后导入表必须一个数都不少（改前实测 86）');
+  assert.ok(['ELF_FAMILY', 'ELF_FAMILIES'].includes(row.outcome), `必须走 ELF 那套分派，实得 ${row.outcome}`);
+  assert.equal(r.riskLevel, 'high', '这一枚在改前就是 high，本轮不许因为新增 dex 层而把它降下来');
+  // ② 形状不合表那一格：detectBinary 只看头 4 字节，解析器要认版本三位数字。
+  //    所以 `dex\nABCD` 会带 id 'DEX' 交进来、再被解析器判成"不是我管的"，落 NOT_ELF。
+  const notQuite = Buffer.concat([Buffer.from('dex\nABCD', 'latin1'), Buffer.alloc(0x80, 0x41)]);
+  const r2 = await scanToReport(makeModuleZip({ id: 'dexe_shape', files: [['classes.dex', notQuite]] }),
+    { changeType: 'first' });
+  const row2 = r2.binaryForensics.find((x) => x.name === 'classes.dex');
+  assert.equal(row2.outcome, 'NOT_ELF');
+  const f2 = r2.findings.find((f) => f.file === 'classes.dex');
+  assert.equal(f2.severity, 'medium', '带 dex 魔数但形状不合表 ⇒ 仍按未审查登记，不许退成低档');
+  assert.match(f2.message, /静态取证不适用/);
+  assert.equal(/非 ELF 也非 DEX/.test(f2.message), false, '这枚条目确实带 dex 魔数，句子不许把它说成"非 DEX"');
+});
+
+

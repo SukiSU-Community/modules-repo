@@ -24,6 +24,7 @@
 // 本文件不许再写一遍 64。
 
 import { capabilitySymbols, CAPABILITY_IMPORT_CAP } from './elf-forensics.mjs';
+import { DEX_SURFACE_LINE_MAX } from './dex-forensics.mjs';
 
 export const SEVERITY_ORDER = { info: 0, low: 1, medium: 2, high: 3 };
 
@@ -1816,9 +1817,9 @@ export function unsafePathReason(name) {
 
 /**
  * 只靠前 16 字节判断是不是二进制负载。
- * 这里刻意不猜“像不像源码”，只认确定的可执行格式 + “开头就出现 NUL” 这一条：
- * 前者说明模块在往设备上塞机器码（静态行级规则对它无效），后者能抓住
- * 把 ELF 改名成 .txt / .json 规避扩展名分类的低级伪装。
+ * 这里刻意不猜“像不像源码”，只认确定的可执行格式 + 确定的容器格式 + “开头就出现 NUL” 这一条：
+ * 前者说明模块在往设备上塞机器码（静态行级规则对它无效），中间那条说明塞了一整层还没展开的包，
+ * 后者能抓住把 ELF 改名成 .txt / .json 规避扩展名分类的低级伪装。
  * @param {Uint8Array} head
  * @returns {{ id: string, why: string }|null}
  */
@@ -1838,6 +1839,11 @@ export function detectBinary(head) {
   ];
   if (MACHO.some((m) => m.every((v, i) => u(i) === v))) return { id: 'MACHO', why: 'Mach-O / fat 二进制（含 Java class 头）' };
   if (u(0) === 0x64 && u(1) === 0x65 && u(2) === 0x78 && u(3) === 0x0a) return { id: 'DEX', why: 'Android DEX' };
+  // ZIP 容器（apk / jar / 嵌套 zip）。这一条补的是「靠运气判类型」那格：在它之前，一枚 jar 能不能
+  // 落到 binaries 桶，取决于**前 512 字节里恰好有没有 NUL** —— 条目名是投稿者写的、压缩方式是他选的，
+  // 于是「把载荷装成 store 方式的 jar，让头 512 字节全是 ASCII」就能把它送回文本扫描面（那里一条
+  // 规则也读不懂它，却会留下一句「已逐行扫过、0 命中」）。容器一律按「未展开」处理，见 ZIP_CONTAINER。
+  if (u(0) === 0x50 && u(1) === 0x4b && u(2) === 0x03 && u(3) === 0x04) return { id: 'ZIP', why: 'ZIP 容器（apk / jar / 嵌套 zip）' };
   for (let i = 0; i < Math.min(b.length, 512); i++) if (b[i] === 0x00) return { id: 'NUL', why: '开头即含 NUL，不是文本' };
   return null;
 }
@@ -2099,8 +2105,151 @@ function lookupForensics(forensicsByName, key) {
     : { hit: false, rec: undefined };
 }
 
+// ---------------------------------------------------------------------------
+// 第五十批：dex —— 串表面的定档分岔 + 取证结论。判档只住在这一个文件里（硬约束 3 的下游那一半）。
+// ---------------------------------------------------------------------------
+
 /**
- * 一个二进制条目的取证分派（工单 §2 那张五行表 + §5 那一格超限）。纯函数，不碰 zip、不读常量表。
+ * dex 的常量池摊成"一串一行"喂进行级规则之后，同一个命中该按多重？
+ *
+ * 划线按**证据类型**，不按文件类型：
+ *   · 存在型（category `network` / `privacy`）：一个裸 IP、一个可疑 TLD、一个躺在常量池里的 token。
+ *     这类判据的事实内容是「这个包里有这么个字面值」，与它会不会被执行无关 —— 同一个 `1.2.3.4:8080`
+ *     写在 customize.sh 里和写在 dex 池里，对这条判据是同一件事 ⇒ 原判据的 severity 照旧。
+ *   · 执行型（category `dangerous` / `execution` / `root`，那 20 条）：它们敢定到 high 的前提是
+ *     **「这一行会被跑」**（脚本逐行执行、`.rc` 被 init 读、`sepolicy.rule` 被策略引擎读）。
+ *     常量池不承诺这一点 —— 一句 `rm -rf` 完全可能只是确认对话框里的文案。
+ *
+ * 把这条线摆出来的实测正是本仓自建的 Manager：它那枚 7,099,112 B 的 `classes.dex` 里躺着
+ * `cp /data/system/`（WRITE_SYSTEM_VENDOR, high）、`rm -rf`（RM_RF_MUTABLE, medium）、
+ * `base64 -d`（OBFUSCATED_DECODE_ONLY, medium）。执行型照搬 severity 的话，一个正经 root 管理器
+ * 会被自己界面上的字符串顶成 high —— 那正是 §0.7 之后反复念的那句「会让每一个正经包都亮灯的
+ * 判据没有信息量」。所以降成 **info** 而不是删掉证据 —— finding 仍然留在报告里（规则名、条目名、
+ * 第几条串都在），但别把"留下了证据"念成"人看得见原文"：按本仓既有纪律（计划 §0.7 末尾那条，
+ * 落成 info 的 finding 不许指望 quote 能在公开产物里逐字复验），`renderJSON` 会对不参与定级的
+ * finding 无条件打码 snippet。实测形状：`cp /data/system/packages.list /data/local/tmp/` 在公开
+ * JSON 里是 `cp /********tem/`，而 Markdown 那一面整条不出现。⇒ 要逐字复验得回包本身；
+ * 降下来的只是**档位**，公开面能说的只有「这个条目的第 N 条串上是这种形状」。
+ *
+ * 这一格和 §0.7 的硬边界是一枚钱的两面：dex 里的**名字**不许当链接期事实用（所以它永远不放宽），
+ * dex 里的**执行型字面值**也不许当执行证据用（所以它不升档）；只有与执行无关的存在型字面值参与定级。
+ * 判据本身仍然只有 `CONTENT_RULES` 那一份实现 —— 这里只改 severity 的取值口径，不重发任何 pattern，
+ * 也不在 scan.mjs 里后处理（fix6-F1 那个病：两套口径早晚会分叉）。
+ */
+export const DEX_SURFACE_LIVE_CATEGORIES = new Set(['network', 'privacy']);
+
+/**
+ * dex 记录里允许进登记的字段（白名单，逐条是**整数计数或版本串**，没有一条是字节面）。
+ * `strings` / `samples` 故意不在这里 —— 见 binaryForensicsRows 那段注释。
+ */
+const DEX_ROW_FIELDS = [
+  'dexVersion', 'fileSize', 'headerSize', 'mapOff',
+  'stringIdsSize', 'stringIdsOff', 'typeIdsSize', 'protoIdsSize',
+  'fieldIdsSize', 'methodIdsSize', 'classDefsSize', 'dataSize', 'dataOff',
+  'stringsDecoded', 'stringsFailed', 'stringsUnterminated', 'stringsSizeMismatch',
+  'stringIdsReadable', 'trailingBytes',
+];
+
+/**
+ * 单条命中的定档换算（纯函数，就地不改入参）。
+ * @param {{category?:string, severity?:string}|null} finding
+ * @returns {object} 原对象（存在型 / 已是 info）或换了 severity 的浅拷贝（执行型 → info）
+ */
+export function dexSurfaceSeverity(finding) {
+  if (!finding || typeof finding !== 'object') return finding;
+  if (DEX_SURFACE_LIVE_CATEGORIES.has(finding.category)) return finding;
+  if (finding.severity === 'info' || finding.severity == null) return finding;
+  return { ...finding, severity: 'info' };
+}
+
+/**
+ * 串面读数的完整度那一句话（挂在 DEX_READ 的文案里，**不另开一条 finding**）。
+ *
+ * 为什么并进这一条而不是补一条 `AUDIT_COVERAGE_TRUNCATED`：
+ *   1) ELF 那一侧的先例就是这样 —— `INPUT_CAPPED` 住在 binaryVerdict 的文案里，不在别处再发一条；
+ *   2) `dropped > 0` 蕴含串面 > 1 MiB，而串面字节不超过条目字节，所以那一枚条目必然同时 > 512 KB
+ *      = `MAX_TEXT` ⇒ checkCoverage 已经为同一个文件发过一条参与定级的截断记录了。在这里再发一条
+ *      就是计划 §0.7 第 367 行点名过的那个病：「同一个 .so/.dex 先被说一遍读不了，再被说一遍覆盖度不足」；
+ *   3) 定级力一分没少：这个条目本来就带一条 medium 的 `STRUCT_BINARY`（`countsTowardRisk` 为真），
+ *      而这句话让它**顺便说清**是没喂全，不是"读全了但没发现"。
+ * 三件必须说全的事：喂进多少行、丢了多少条一字没喂、多少条长串被截过。少报任何一件就是猜。
+ */
+function dexSurfaceNote(s) {
+  if (!s || !Number.isInteger(s.lines)) return '';
+  const dropped = Number.isInteger(s.dropped) ? s.dropped : 0;
+  const trimmed = Number.isInteger(s.trimmed) ? s.trimmed : 0;
+  const down = Number.isInteger(s.downgraded) ? s.downgraded : 0;
+  // 降了几条必须在这句话里报出来：不然「三面命中、两面被降档」看起来就像"这一层只读到两条"。
+  // 顺带把一条口径写准（实测过 renderJSON）：info 的 snippet 会被无条件打码，
+  // 所以降档之后**逐字复验不靠公开产物**，靠的是回包本身 —— 这句话别让下一轮误以为证据还在。
+  const tailDown = down > 0
+    ? `；另有 ${down} 条执行型命中按证据类型降成 info —— 降档不等于没命中，逐条在 findings 里，`
+      + '但 info 的字面值按既有纪律不进公开产物，要逐字复验得回包本身' : '';
+  if (dropped <= 0 && trimmed <= 0) return `（${s.lines} 行全量喂入${tailDown}）`;
+  const parts = [];
+  if (dropped > 0) parts.push(`${dropped} 条超出串面预算、一个字都没喂`);
+  if (trimmed > 0) parts.push(`${trimmed} 条长串截到 ${DEX_SURFACE_LINE_MAX} 后喂入`);
+  return `（只喂进 ${s.lines} 行，${parts.join('，')} —— 这一层的读数是不完整的，`
+    + '而 dex 的 string_ids 顺序不带「可疑的在前」这种语义，被丢掉的尾部与读过的头部同等可疑'
+    + `${tailDown}）`;
+}
+
+/** dex 取证那几格的读数口径（人看的句子），与 ELF 那一套分开，不复用「导入表」这个词。 */
+const dexRead = (rec) => `dex（v${rec.dexVersion}，串 ${rec.stringsDecoded}/${rec.stringIdsSize}`
+  + (Number.isInteger(rec.stringIdsReadable) ? `（表只读到前 ${rec.stringIdsReadable} 项）` : '')
+  + `，类 ${rec.classDefsSize}，方法 ${rec.methodIdsSize}，字段 ${rec.fieldIdsSize}）`;
+
+function dexVerdict(b, rec) {
+  const name = String(b && b.name ? b.name : '');
+  const registerOnly = '按未审查的字节码登记：来源与校验和必须在 module.prop/描述里说明。';
+
+  if (rec.parseError) {
+    return {
+      outcome: 'DEX_PARSE_ERROR', severity: 'medium', families: [],
+      message: `${name}：有 dex 魔数，但读不出串表（${rec.parseError}）`
+        + '：按未审查的字节码登记，读不出不等于没有。',
+      extraAdvice: ` ${registerOnly}`,
+    };
+  }
+  if (rec.inputCapped) {
+    const entryBytes = Number(b && b.bytes) || Number(rec.bytes) || 0;
+    const fedBytes = Number(rec.rawBytes) || Number(rec.bytes) || 0;
+    // 两个来源要说清：`rawBytes` 在 == 条目被取证字节上限截过；不在 == 条目自己就比它声明的小
+    // （zip 里塞了一枚被截短的 dex）。两种都是"输入不完整"，但只有前者能怪上限。
+    const reason = rec.rawBytes ? `dex 条目 ${entryBytes} B 超过取证字节上限，本次只喂进 ${fedBytes} B`
+      : `dex 条目只有 ${fedBytes} B，而它自己声明 file_size=${rec.fileSize} B`;
+    return {
+      outcome: 'DEX_INPUT_CAPPED', severity: 'medium', families: [],
+      message: `${name}：${reason} —— 后半段的串一个字都没读到：按未审查的字节码登记。`,
+      extraAdvice: ` ${registerOnly}`,
+    };
+  }
+  const s = rec.surface || {};
+  const tail = rec.stringsFailed > 0 ? `；${rec.stringsFailed} 条串不是合法 MUTF-8（不计入可读面）` : '';
+  const untail = rec.stringsUnterminated > 0
+    ? `；${rec.stringsUnterminated} 条串跑到输入末尾还没遇见终止符（半截串不算读到了）` : '';
+  const mismatch = rec.stringsSizeMismatch > 0
+    ? `；${rec.stringsSizeMismatch} 条串的声明长度与实读长度不一致（按到 NUL 收口那一条为准）` : '';
+  const empty = rec.stringIdsSize > 0 && rec.stringsDecoded === 0
+    ? '；一条串都没解出来，可读面是空的' : '';
+  // 串面被顶掉那一格：顶掉的原因要说得出（在扫描面上的哪条路），不许只留一个 skip 标记在登记里。
+  const skipped = rec.surfaceSkipped
+    ? `；串池没有单独摊平 —— 这个条目本来就在逐行扫描面上（${rec.surfaceSkipped === 'polyglot'
+      ? '整块可读，走的是 polyglot 扩面' : '被包内引用升级进来'}），再摊一遍会在同一个文件上发两条同规则的命中`
+    : '';
+  return {
+    outcome: 'DEX_READ', severity: 'medium', families: [],
+    message: `${name}：${dexRead(rec)} —— 串池摊成文本喂进了既有规则${skipped ? '' : dexSurfaceNote(s)}${tail}${untail}${mismatch}${empty}${skipped}。`
+      + '这一层的名字只是**引用面**：dex 里出现过 ≠ 会被调用，不是 ELF 那种链接期事实，'
+      + '所以它既不升档也不给任何放宽。',
+    extraAdvice: ' 要读它的逻辑只能交人工反编译（jadx / dexdump）；本流水线不解 dalvik 字节码，'
+      + '也不判断某条串是否真被用到。',
+  };
+}
+
+/**
+ * 一个二进制条目的取证分派（工单 §2 那张五行表 + §5 那一格超限 + 第五十批的 dex / ZIP 两格）。
+ * 纯函数，不碰 zip、不读常量表。
  * @param {{name?:string,id?:string,why?:string,bytes?:number}} b checkBinaries 收到的那条
  * @param {{hit:boolean,rec?:object|null}} found lookupForensics 的结果
  * @returns {{outcome:string,severity:string,message:string,families:string[],extraAdvice?:string}}
@@ -2111,12 +2260,28 @@ function binaryVerdict(b, found) {
   const baseMessage = `${name} 是二进制负载（${why}），静态行级规则无法审查`;
   const registerOnly = '按未审查的二进制登记：来源与校验和必须在 module.prop/描述里说明。';
 
+  // ZIP 容器那一格排在 `found.hit` 之前：本轮**不展开**容器（拍板的射程），所以扫描器根本不会
+  // 为它建取证记录 —— 走下面那条 `!found.hit` 就成「没接线」，而"没接线"是这套分派里最坏的一种
+  // 静默：报告念起来像"分支没生效"，人看不见是"故意没展开"。
+  if (b && b.id === 'ZIP') {
+    return {
+      outcome: 'ZIP_CONTAINER', severity: 'medium', families: [],
+      message: `${name}：${why}，本轮未展开 —— 里面每一条字节仍然没被读过，行级规则对它无效。`,
+      extraAdvice: ` ${registerOnly} 它是 apk / jar 时，先核 module.prop 与描述里有没有说明来源和校验和 ——`
+        + '模块往自己目录里塞一整枚 apk，等于把判断权交给 apktool。',
+    };
+  }
+
   // 第一行之前那一格：没接线 / 查不中 == 今天，逐字节相同（T57-01 的向后兼容钉子）。
   if (!found.hit) return { outcome: 'NO_RECORD', severity: 'medium', message: baseMessage, families: [] };
 
-  // 表①：非 ELF（forensics 返回 null —— dex / apk / ttf / png…）。
+  // 表①：解析器回 null（`elf-forensics` 与 `dex-forensics` 都不是它）。这一格同时兜住一种边角：
+  //   `detectBinary` 只看头 4 字节，所以 `dex\nABCD` 这种"带 dex 魔数但版本不合表形状"的条目
+  //   会带着 id 'DEX' 交进来、被 dex 解析器判成 null 落在这里 —— 文案只能说"不是 ELF、静态取证
+  //   不适用"，不许说"非 DEX"（它确实带 dex 魔数，那是可核对的事实，DXE-08 数着这句）。
   // 口径纪律（§2.7）：这不是「读不了」，是「不归静态取证管」。写成读不动就把
   // 「看不见」与「看不清」并成了一格，而这两本的账完全不同。
+  // （dex 以前落在这格里、和 ttf/png 同列；第五十批起它有自己那一格，见 dexVerdict。）
   if (found.rec === null || found.rec === undefined) {
     return {
       outcome: 'NOT_ELF', severity: 'medium', families: [],
@@ -2127,6 +2292,8 @@ function binaryVerdict(b, found) {
   }
 
   const rec = found.rec;
+  if (rec.kind === 'DEX') return dexVerdict(b, rec);
+
   // 表⑤（§5 那一格，排在最前）：超过取证字节上限的条目只留下了前缀。
   // 前缀**自己解析成功了也不算证完** —— 尾部没读到的东西能装下任何能力，
   // 所以这一格只能说「输入不完整」，永远不许念成「取证成功、0 危险族」。
@@ -2257,6 +2424,15 @@ export function binaryForensicsRows(binaries = [], forensicsByName = null) {
       if (rec.parseError) row.parseError = rec.parseError;
       if (rec.inputCapped) row.inputCapped = true;
       if (Number.isInteger(rec.rawBytes)) row.rawBytes = rec.rawBytes;
+      // 第五十批：dex 的登记字段走**白名单**，不整份摊平。理由和 ELF 那几行不一样：
+      // dex 记录上挂着 `strings`（整池串体，一枚真 dex 是几十万条）与 `samples`，
+      // 它们是给规则吃的输入面，不是给人贴进 PR 评论的产物面 —— 用 `Object.assign` 图省事
+      // 就等于把 raw 的字节面换个名字放进报告（T57-15 那根钉子防的就是这件事）。
+      if (rec.kind === 'DEX') {
+        for (const k of DEX_ROW_FIELDS) if (rec[k] !== undefined) row[k] = rec[k];
+        if (rec.surface) row.dexSurface = rec.surface;
+        if (rec.surfaceSkipped) row.surfaceSkipped = rec.surfaceSkipped;
+      }
     }
     return row;
   });

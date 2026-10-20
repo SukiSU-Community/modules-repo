@@ -156,9 +156,16 @@ function assertFailClosed(kv, msg = '') {
 /** AI 步在 workflow 里的步骤名（改名要一起改这里 —— extractStep 会带着这句话红）。 */
 const AI_STEP = 'AI 安全员复核';
 
-/** triage 的 import 候选要命中真判据实现，就得把 base 里那一份（含它的依赖）装进临时 cwd。 */
+/** triage 的 import 候选要命中真判据实现，就得把 base 里那一份（含它的依赖）装进临时 cwd。
+ *  清单由目录现读，不写死：第五十批新增 audit/dex-forensics.mjs 时，下面那份手写的四元素清单
+ *  让这套 e2e 直接红在 `Cannot find module …/dex-forensics.mjs`（risk-rules 现在 import 它）。
+ *  手抄清单的毛病不是"多一行"，是**新增一个判据模块时它不会提醒任何人**：CI 里跑的是仓内真文件、
+ *  这套 e2e 跑的是拷贝出去的那一份，两边对不齐就等于测了另一套代码。测试文件（*.test.mjs）
+ *  仍然排除在外 —— 它们不是被 import 的实现，装进临时 cwd 只会多几份噪声。 */
 const MODULE_SRC = path.resolve(import.meta.dirname, '../audit');
-const MODULE_FILES = ['ai-review.mjs', 'scan.mjs', 'risk-rules.mjs', 'elf-forensics.mjs'];
+const MODULE_FILES = fs.readdirSync(MODULE_SRC)
+  .filter((f) => f.endsWith('.mjs') && !f.endsWith('.test.mjs'))
+  .sort();
 
 /** 把「真正被 CI 执行的那份 raiseLevel」装到 <dir>/<at>/ 下（默认 audit/，另一种落地形态是 contrib/audit/）。 */
 function installModule(dir, at = 'audit') {

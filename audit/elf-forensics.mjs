@@ -58,8 +58,22 @@ const LAYOUT = {
 const DT_NULL = 0n;
 const DT_NEEDED = 1n;
 
-/** 字符串扫描上限：文件比这大就只扫前 8 MiB，并用 stringsPartial 明说。 */
-export const STRING_SCAN_LIMIT = 8 * 1024 * 1024;
+/**
+ * 字符串扫描上限：文件比这大就只扫前 16 MiB，并用 stringsPartial 明说。
+ *
+ * 为什么是 16 MiB 而不是原来那个 8 MiB（2026-10-20 第五十批，dex 取证层接线的同一轮里改的）：
+ *   这个数同时是 `scan.MAX_FORENSICS_BYTES`（那边一字引用这里，「上限只许有一份」由 T57-14 钉着），
+ *   所以它管的是「一枚二进制条目能留下多少原始字节」。8 MiB 在只解 ELF 的年代够用，但真包里的
+ *   dex 比它大：计划 §0.7 那枚 `classes.dex` 是 **8,602,872 B**、HMA-OSS 的 `manager.apk` 是
+ *   **10,227,349 B**，两枚都卡在 8 MiB 之上 ⇒ 就算 dex 解析器写出来了，第一发就会对自己最大的
+ *   真样本报「后半段一个字都没读到」。抬到 16 MiB 之后：语料里已知的最大条目（10.2 MB）留得完，
+ *   而它仍是 `MAX_ENTRY_UNCOMPRESSED`（64 MiB）的 1/4 —— 那条闸的作用没被抹掉。
+ *   内存代价照实说：`readZip` 本来就把整条目解成一份完整 Buffer 才交给 `toFileEntry`
+ *   （见 scan.mjs §5 那段），所以上限抬高一倍只是「留着的拷贝」变长，不是峰值翻倍。
+ *   ELF 侧的影响：语料里最大 ELF 1,101,232 B（Zygisk-Assistant），远在 8 MiB 之内 ⇒ 本轮抬数
+ *   **不改变任何一枚真 ELF 的读法**，这条不对称是刻意的，别让"顺手调大"变成隐性放宽。
+ */
+export const STRING_SCAN_LIMIT = 16 * 1024 * 1024;
 const SAMPLE_CAP = 4096;    // 样本**条数**上限。只限制样本，绝不限制 total。
 const IOC_SAMPLE_CAP = 8;   // 每个桶最多 8 条 `offset: 串`
 /**
