@@ -16,7 +16,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   forensics, dexStringSurface, DEX_HEADER_SIZE, DEX_VERSIONS,
-  DEX_STRING_SAMPLE_CAP, DEX_SURFACE_LINE_MAX, DEX_SURFACE_MAX_BYTES,
+  DEX_STRING_SAMPLE_CAP, DEX_STRING_SAMPLE_LEN, DEX_SURFACE_LINE_MAX, DEX_SURFACE_MAX_BYTES,
 } from './dex-forensics.mjs';
 import { MAX_SCAN_BYTES_PER_ENTRY } from './scan.mjs';
 // dex 的起法只有 fixtures.mjs 那一份。这里再抄一份，两边的宽松程度早晚会分叉 ——
@@ -362,6 +362,53 @@ test('DX-24 真夹具上做 24 处单字节翻转：永不抛；要么读出来�
     assert.ok(Number.isInteger(r.stringsDecoded), `翻转@${at}：读出来就必须有可数的串数`);
   }
   assert.ok(seen.refused + seen.ok > 0, '这一组翻转必须至少留下一格读数，否则测试是空跑的');
+});
+
+test('DX-25 串池平铺不变量：相邻两条 string_data_item 之间既不留缝也不重叠，且 off 指的就是条目起点', () => {
+  // 这条是**解码器自己**的验收，不是格式的验收。两半各管一件事，少一半都会漏：
+  //   ① 平铺（前一条读完的下一字节 == 后一条的起点）。`string_data_item = uleb128(utf16_size) + payload + 0x00`，
+  //      池子是一段连续区，所以缝和重叠都只可能是解码器读错长度造成的。
+  //      ⚠️ 光有 ① 是**永绿**的：把 `off` 记成条目末尾，相邻关系照样成立（下一项的起点正是上一项的末尾）——
+  //      2026-10-21 实测这一发变异 26/26 全绿，所以必须加 ②。
+  //   ② `off` 处那一字节必须是本条串的 uleb128 长度前缀，且它解出来的值 == 这条串的 UTF-16 码元数
+  //      （JS 的 `String.length` 数的就是码元，与被截过样本的情况互斥，故只在未截断时断言）。
+  // 2026-10-21 对一枚真 dex（7,099,112 B / 23,213 条）手工量过 ①：0 缝、0 重叠。
+  const buf = FIX('d8-minimal.dex');
+  const rec = forensics(buf, 'classes.dex');
+  assert.ok(rec && !rec.parseError, '夹具本身必须先读得出来');
+  assert.equal(rec.strings.length, rec.stringsDecoded,
+    '夹具必须小于一枚真池子到不被样本上限截断，否则这条不变量量的是样本而不是池子');
+
+  const readUleb = (ofs) => {
+    let v = 0, shift = 0, p = ofs;
+    for (;;) {
+      assert.ok(p < buf.length, `偏移 ${ofs}：uleb128 读到缓冲区外`);
+      const b = buf[p];
+      v += (b & 0x7f) * 2 ** shift; shift += 7; p++;
+      if (b < 0x80) return { v, bytes: p - ofs };
+      assert.ok(shift <= 28, `偏移 ${ofs}：uleb128 超过 5 字节`);
+    }
+  };
+  const itemEnd = (ofs) => {
+    const { bytes } = readUleb(ofs);
+    let q = ofs + bytes;                              // payload 起点
+    while (q < buf.length && buf[q] !== 0x00) q++;    // MUTF-8 里 U+0000 写成 c0 80，裸 0x00 只可能是终止符
+    assert.ok(q < buf.length, `偏移 ${ofs}：这条串没有终止符`);
+    return q + 1;
+  };
+
+  assert.ok(rec.strings[0].off >= DEX_HEADER_SIZE, '第一条串也必须排在 0x70 头之后');
+  for (let i = 0; i < rec.strings.length; i++) {
+    const x = rec.strings[i];
+    if (x.s.length < DEX_STRING_SAMPLE_LEN) {
+      assert.equal(readUleb(x.off).v, x.s.length,
+        `第 ${i} 条（off ${x.off}）：${JSON.stringify(x.s)} 的长度前缀对不上 —— off 不是条目起点`);
+    }
+    if (i + 1 < rec.strings.length) {
+      assert.equal(rec.strings[i + 1].off, itemEnd(x.off),
+        `第 ${i} 条（off ${x.off}）与第 ${i + 1} 条之间应当严丝合缝（少读或多读一字节都会在这里现形）`);
+    }
+  }
 });
 
 

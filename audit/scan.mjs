@@ -38,20 +38,21 @@ import { forensics as dexForensics, dexStringSurface } from './dex-forensics.mjs
 /**
  * Task 5.7：二进制条目原始字节的保留上限（工单 §5 第 2 条那个「专门的字节上限」）。
  *
- * 为什么取这个数（= STRING_SCAN_LIMIT = 8 MiB，不是随手挑的）：
- *   1) 取证模块自己就只看到 8 MiB —— `elf-forensics.analyze()` 的 strings 那一步扫的是
+ * 为什么取这个数（= `STRING_SCAN_LIMIT`，数字只住在那一处，这里一字引用它）：
+ *   1) 取证模块自己就只看到那么多字节 —— `elf-forensics.analyze()` 的 strings 那一步扫的是
  *      `min(buf.length, STRING_SCAN_LIMIT)`。留得比这更多，多出来的那些字节一个都不会被读到，
  *      所以这个上限永远不是「少读了」的原因，只可能是「少留了」的原因，而那正是我们要它做的。
- *   2) 它是 MAX_ENTRY_UNCOMPRESSED（64 MiB）的 1/8。拿 64 MiB 当这个闸等于没有闸：
+ *   2) 它是 MAX_ENTRY_UNCOMPRESSED（64 MiB）的 1/4。拿 64 MiB 当这个闸等于没有闸：
  *      投稿者塞一枚 64 MiB 的「ELF」就能把 CI 的解析时间与内存端走（工单 §5 明令禁止复用那个上限）。
  *   3) 上限存在的真正理由是**可证性**：超过它的条目必须留下一句「只读了前 N 字节」，
  *      否则一枚 20 MiB 的 .so 会在前缀上解析成功，被念成「读到 N 个导入，无一落在危险族」——
- *      那是把「我们只看了 8 MiB」说成「它什么都不干」（§5 末段那一格，T57-09 / T57-14 压着）。
+ *      那是把「我们只看了前 N 字节」说成「它什么都不干」（§5 末段那一格，T57-09 / T57-14 压着）。
  *
  * 实现口径（照实写，别让注释比代码乐观）：`raw` 是已解压 Buffer 的 subarray **视图**，
  * 与既有的 `head` 同一个 ArrayBuffer ⇒ 它本身不多占字节；`raw` 只在 detectBinary 命中处保留，
  * 文本条目一律 `raw: null`（§5.1 那条「不许把文本条目的内存翻倍」）。
- * 实测参照：本轮常驻的真 ELF 最大 983,624 B（device_faker 的 arm64-v8a.so），离上限一个数量级。
+ * 实测参照（钉 tag 的语料，2026-10-21 复现）：最大 ELF 983,624 B（device_faker 的 arm64-v8a.so）、
+ * 最大 dex 889,000 B（HMA-OSS 的 classes.dex），都离上限一个数量级。
  */
 export const MAX_FORENSICS_BYTES = STRING_SCAN_LIMIT;
 // ---------------------------------------------------------------------------
