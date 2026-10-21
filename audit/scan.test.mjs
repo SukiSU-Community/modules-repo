@@ -18,6 +18,7 @@ import {
   MAX_TEXT, MAX_ENTRIES, MAX_RATIO,
   dexSurfaceSeverity, DEX_SURFACE_LIVE_CATEGORIES,
   EXEC_BUNDLED_FILE, EXEC_INDIRECT, PROP_BOOT_SPOOF, buildLineContexts,
+  MALICE_RULE_IDS,
 } from './risk-rules.mjs';
 import { scanZip, classify, renderMarkdown, renderJSON, redactText, mask, resolveChangeType, hasShebang, CANONICAL_SCRIPTS, FLASH_ENTRY_POINTS, readZip, resolveBundledTargets, resolveBundledRefs, normalizeRefPath, EXEC_UNRESOLVED_ADVICE, EXEC_UNPINNED_ADVICE, SCAN_TARGET_BUCKETS } from './scan.mjs';
 import { makeModuleZip, moduleProp, scanToReport, makeDex } from './fixtures.mjs';
@@ -41,6 +42,46 @@ function assertHit(ruleId, text, msg) {
 function assertNoHit(ruleId, text, msg) {
   const h = hits(ruleId, text);
   assert.equal(h.length, 0, `${ruleId} 不应命中：${msg || text} —— 实际命中 ${JSON.stringify(h)}`);
+}
+
+// ---------------------------------------------------------------------------
+// ①-b 两轴的结论尺子（2026-10-21 第二发：分流调用点已换轴）
+// ---------------------------------------------------------------------------
+// 下面这两个 helper 是给「整包结论」那批旧用例用的。旧写法是
+//   assert.equal(r.decision.action, 'block') / assert.notEqual(r.decision.action, 'auto-approve')
+// 它断的是**等级轴的副产品**（medium/high ⇒ 不自动放行），不是任何一条检测能力 ——
+// 等级、findings 落点、counts 那些断言在这里一条没动。§1 第 3 条量过这件事：
+// 那批 high 里有一批匹配的就是 root 模块的正当功能本身，拿它当拦截条件等于把生态全灭。
+// 换轴后的形状由 audit/malice-axis.test.mjs 逐条钉（11 个名单成员各一枚独占证人 + 每条降档一枚反例），
+// 这里只钉本地这一发：判决按名单走，而**名单外的读数不许静默**（§10 / §3.2 ②：
+// 「降档后从读者眼前消失」是唯一不可接受的形状）。两个 helper 都断字面量，不互相推导。
+const MALICE_SET = new Set(MALICE_RULE_IDS);
+const annOf = (r) => [...new Set([
+  ...(r.annotation?.capabilities || []),
+  ...(r.annotation?.coverageGaps || []),
+  ...(r.annotation?.contextQuestions || []),
+])];
+/** 名单成员说话 ⇒ 不上架，而且必须点名是哪几条拦的。 */
+function assertBlockedByList(r, ids, msg = '') {
+  for (const id of ids) assert.ok(MALICE_SET.has(id), `${msg}${id} 不在名单里，用例却按「名单拦的」写：改用例或改定案表`);
+  assert.equal(r.malice.malicious, true, `${msg}判据说没命中名单：${JSON.stringify(r.malice.hits)}`);
+  assert.equal(r.decision.axis, 'malice', `${msg}decision 没站在新轴上：${JSON.stringify(r.decision)}`);
+  assert.equal(r.decision.action, 'block', `${msg}名单成员说话就必须不上架（实测 ${r.decision.action}）`);
+  for (const id of ids) {
+    assert.ok(r.malice.hits.some((h) => h.source === 'static' && h.ruleId === id),
+      `${msg}拦它的必须点名是 ${id}，实际 hits=${JSON.stringify(r.malice.hits.map((h) => h.ruleId))}`);
+  }
+}
+/** 名单外 ⇒ 上架（或按待拍/撤销那一档转人工），且每一条读数都还在标注里点名。 */
+function assertListedOutside(r, ids, msg = '', wantAction = 'auto-approve') {
+  for (const id of ids) assert.ok(!MALICE_SET.has(id), `${msg}${id} 在名单里，用例却按「名单外」写：定案表改了要重新过一轮`);
+  assert.equal(r.malice.malicious, false, `${msg}名单外的形状被判成命中：${JSON.stringify(r.malice.hits)}`);
+  assert.equal(r.decision.action, wantAction, `${msg}实测 ${r.decision.action} / ${r.decision.reason}`);
+  const ann = annOf(r);
+  for (const id of ids) {
+    assert.ok(ann.includes(id), `${msg}${id} 不再拦上架之后必须还在标注里点名（§10「不许静默」）：`
+      + `annotation=${JSON.stringify(r.annotation)}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -122,13 +163,22 @@ test('OBFUSCATED_DECODE_ONLY：仅解码未执行命中 medium', () => {
   assertNoHit('OBFUSCATED_DECODE_ONLY', 'base64 image.png > out.txt'); // 无 -d，纯编码
 });
 
-test('WRITE_SYSTEM_VENDOR：直接写 /system 命中 high；$MODPATH 覆盖层不命中', () => {
+test('WRITE_SYSTEM_VENDOR：直接写 /system 命中 high；只有「目标挂在覆盖层下」才豁免', () => {
   assert.equal(assertHit('WRITE_SYSTEM_VENDOR', 'cp busybox /system/xbin/bb')[0].severity, 'high');
   assertHit('WRITE_SYSTEM_VENDOR', 'mount -o rw,remount /system');
   assertHit('WRITE_SYSTEM_VENDOR', 'echo "ro.foo=1" >> /system/build.prop');
-  // 标准覆盖层写法
+  assertHit('WRITE_SYSTEM_VENDOR', 'remount rw'); // 这一支里没有分串路径：「没找到可豁免的东西」不等于豁免
+  // 标准覆盖层写法：那一分串紧跟在模块目录之后 ⇒ 豁免（绝对路径那一支同形）
   assertNoHit('WRITE_SYSTEM_VENDOR', 'cp -f busybox $MODPATH/system/xbin/bb');
   assertNoHit('WRITE_SYSTEM_VENDOR', 'mkdir -p $MODPATH/system/app/Foo');
+  assertNoHit('WRITE_SYSTEM_VENDOR', 'cp -f busybox /data/adb/modules/foo/system/xbin/bb');
+  // 整行注释照旧豁免（旧 exclude 里 `^\s*#` 那一支语义一字未动，留着是为了下一轮别顺手改掉）
+  assertNoHit('WRITE_SYSTEM_VENDOR', '# cp x /system/app/x');
+  // ⚠ 旧实现拿整行判豁免，下面三发当时全部 0 命中。「源在包内、目标在真分区」恰是这条规则最该
+  // 说话的那一发，而 "$MODPATH" 这七个字符是投稿者想写就能写的 —— 形态特征当豁免就是逃逸道。
+  assertHit('WRITE_SYSTEM_VENDOR', 'cp "$MODPATH/engines.bin" /system/app/Foo/engines.bin');
+  assertHit('WRITE_SYSTEM_VENDOR', 'ui_print "$MODPATH"; cp x /system/app/x');
+  assertHit('WRITE_SYSTEM_VENDOR', 'cp x /system/app/x # $MODPATH 只在注释里');
 });
 
 test('SELINUX_DISABLE：setenforce 0 命中 high，setenforce 1 不命中', () => {
@@ -492,7 +542,11 @@ test('缺少 module.prop 的 zip 报 META_PROP_MISSING 且不低于 medium', () 
   const r = scanZip(p, { changeType: 'first' });
   assert.ok(r.findings.some((f) => f.ruleId === 'META_PROP_MISSING'));
   assert.notEqual(r.riskLevel, 'low', '缺少 module.prop 不应判 low');
-  assert.equal(r.decision.needsHumanReview, true);
+  // 换轴接线（2026-10-21）：旧断言是 `needsHumanReview === true`，那是「medium ⇒ 人工」这条等级轴
+  // 的副产品。META_* 那一族按 §3.2 ③ 全部 ≤ medium 且**不在拦截名单里** ⇒ 今天上架并标注。
+  // 「不低于 medium」这条检测结论一个字没动，它仍然会拦住「把缺 module.prop 判成 low」那种改动。
+  assertListedOutside(r, ['META_PROP_MISSING'], '缺少 module.prop：');
+  assert.equal(r.decision.needsHumanReview, false, '名单外 ⇒ 不再转人工');
 });
 
 // ---------------------------------------------------------------------------
@@ -669,7 +723,11 @@ test('端到端：把 ELF 改名成 config.js 也只能落到「二进制」，�
   ]);
   const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
   assert.notEqual(r.riskLevel, 'low', '二进制负载不应判 low');
-  assert.equal(r.decision.needsHumanReview, true);
+  // 换轴接线（2026-10-21）：旧断言 `needsHumanReview === true` 断的是等级轴。
+  // §3.2 ③ 把 STRUCT_BINARY 明确归到**能力/覆盖轴**（它是动态档位，S3-A 危险族驱动），
+  // device_faker 那 2 条 high 就是它 —— 「带二进制的包」不是「做了用户没同意的事」。
+  // 这一发改的只有判决方向；「改名成 .js 也只能落到二进制、不许当成脚本放过」那两行照旧在。
+  assertListedOutside(r, ['STRUCT_BINARY'], 'ELF 改名成 config.js：');
   assert.ok(r.findings.some((f) => f.ruleId === 'STRUCT_BINARY' && f.file === 'config.js'),
     JSON.stringify(r.findings.map((f) => f.ruleId)));
   assert.deepEqual(r.binaries.map((b) => b.name), ['config.js']);
@@ -717,11 +775,20 @@ test('端到端：payload 藏在行级规则输入上限之后 ⇒ 记账而不�
     `实扫字节必须贴住上限（UTF-8 码点边界最多回退 3 B），实际 ${big.scanBytes} / 上限 ${CAP29}`);
   assert.ok(big.bytes > big.scanBytes * 10, `样本要在上限之外留出一大段，实际 ${big.bytes} B`);
   assert.equal(r.riskLevel, 'medium', '旧期望 high（载荷命中）→ 新期望 medium：等级只能由截断记录撑起来');
-  assert.ok(r.findings.some((f) => f.ruleId === 'AUDIT_COVERAGE_TRUNCATED'), '看不全本身也要报，挡住自动放行');
+  assert.ok(r.findings.some((f) => f.ruleId === 'AUDIT_COVERAGE_TRUNCATED'), '看不全本身也要报，且必须在标注里点名');
   const cov = r.findings.find((f) => f.ruleId === 'AUDIT_COVERAGE_TRUNCATED');
   assert.equal(cov.file, 'customize.sh', '记录必须指名是哪个条目');
   assert.match(cov.message, /只喂进前/, '记录必须写出实际喂进规则多少字节');
-  assert.notEqual(r.decision.action, 'auto-approve', '读到一半永远换不到自动放行');
+  // 换轴接线（2026-10-21）：旧断言 `notEqual(action,'auto-approve')`（「读到一半永远换不到自动放行」）
+  // 是 §0.2 那条拍板的**直接对立面**，所以它今天必须红：
+  //   「没看全」的包怎么办 → 上架但标注覆盖不全 ⇒ 覆盖度不再等于拦截力。
+  // 牙留着的地方：等级仍是 medium（截断记录照旧参与定级，不许塌成 low）、记录照旧指名条目与字节数、
+  // 并且 AUDIT_COVERAGE_TRUNCATED 必须在 annotation.coverageGaps 里点名 —— 从「拦人」换成「不许静默」。
+  // ⚠ 这一改打开的格子要照实说：把载荷写到 24KB 上限之后，静态层读不到它，新模型下它就上架了。
+  //   §0.2 拍的是接受这件事，§3 那条「分片进料做成一格真活」是它的前置任务，本轮没做。
+  assertListedOutside(r, ['AUDIT_COVERAGE_TRUNCATED'], '载荷藏在行级规则输入上限之后：');
+  assert.equal(r.annotation.coverageGaps.includes('AUDIT_COVERAGE_TRUNCATED'), true,
+    '「没看全」必须进覆盖不全那一格，这是这条包被上架时唯一带着的说法');
   assert.match(renderMarkdown(r), /包结构与审核覆盖度/);
   assert.match(renderMarkdown(r), /报告只内嵌前/);
 });
@@ -789,7 +856,15 @@ test('T2.9-②：载荷落在上限之后 ⇒ 记 AUDIT_COVERAGE_TRUNCATED，且
   assert.match(cov[0].snippet, new RegExp(`${size}.*${CAP29}|${size}`), 'snippet 要带上原始/实扫字节两个数');
   assert.notEqual(r.findings.length, 0, '载荷被上限挡住时，findings 不能归零');
   assert.notEqual(r.riskLevel, 'low', '「读到一半」不等于「干净」');
-  assert.notEqual(r.decision.action, 'auto-approve', '上限不许开出一条自动放行的门');
+  // 旧断言是 `notEqual(action,'auto-approve')`（「上限不许开出一条自动放行的门」）。
+  // 这一格是 §0.2 那条拍板的**正面碰撞点**，所以它今天必须红：
+  //   「没看全」的包怎么办 → 上架但标注覆盖不全 ⇒ 覆盖度不再等于拦截力。
+  // 留在用例里的牙：上限生效（SELINUX_DISABLE 不命中）、记账指名条目与两个字节数、等级不塌成 low、
+  // 以及现在多出来的这一条 —— AUDIT_COVERAGE_TRUNCATED 必须进 annotation.coverageGaps，
+  // 因为它是这一发被上架时**唯一带着的说法**。
+  // ⚠ 这条改动打开的格子要照实记：把载荷写到 24 KB 上限之后就脱离静态层。§0.2 那句
+  //   「同时必须把分片进料做成一格真活」是它的前置任务，**不在本发范围内**。
+  assertListedOutside(r, ['AUDIT_COVERAGE_TRUNCATED'], 'T2.9-②：');
 });
 
 test('T2.9 硬边界：任何进入扫描面的条目形状，载荷挪到上限之后都只能换来更严的结论', () => {
@@ -814,7 +889,10 @@ test('T2.9 硬边界：任何进入扫描面的条目形状，载荷挪到上限
     const cov = r.findings.filter((f) => f.ruleId === 'AUDIT_COVERAGE_TRUNCATED' && f.file === name);
     assert.equal(cov.length, 1, `${name}：超限必须记账，实际 ${JSON.stringify(r.findings.map((f) => f.ruleId))}`);
     assert.notEqual(r.riskLevel, 'low', `${name}：只读到前缀就判 low 等于「读到一半 = 干净」`);
-    assert.notEqual(r.decision.action, 'auto-approve', `${name}：上限之后不许通向自动放行`);
+    // 换轴接线（2026-10-21）：旧断言「上限之后不许通向自动放行」是等级轴的副产品（§0.2 已拍掉）。
+    // 这张表测的是**覆盖面**：五种进面形状都必须记账、都不许塌成 low —— 这两件事照旧逐条断。
+    // 结论那一格按新轴走，并且要求它在标注里点名（覆盖不全必须是看得见的说法，不是静默的放行）。
+    assertListedOutside(r, ['AUDIT_COVERAGE_TRUNCATED'], `${name}：`);
   }
   // module.prop 走的是 propEntry 那条独立通道（不在扫描面上时也要记账）
   const bigProp = CLEAN_PROP + pad29(LINES_BEFORE29 + 1) + 'setenforce 0\n' + pad29(1500);
@@ -822,7 +900,8 @@ test('T2.9 硬边界：任何进入扫描面的条目形状，载荷挪到上限
   const r2 = scanZip(p2, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
   assert.ok(r2.findings.some((f) => f.ruleId === 'AUDIT_COVERAGE_TRUNCATED' && f.file === 'module.prop'),
     'module.prop 走 propFindings 通道时同样要记截断');
-  assert.notEqual(r2.decision.action, 'auto-approve');
+  // 同上一条：旧期望是「不许 auto-approve」（等级轴），§0.2 拍掉之后覆盖不全是标注。
+  assertListedOutside(r2, ['AUDIT_COVERAGE_TRUNCATED'], 'module.prop 通道：');
 });
 
 test('T2.9：上限就是报告里写的那个阈值，且它低于报告内嵌上限才有意义', () => {
@@ -904,7 +983,8 @@ test('T2.9 方向②续：被引用升级进来的大条目同样受上限约束
   assert.equal(row.bytes, payload.length, '清单行的原大小就是条目字节数');
   assert.equal(row.scanBytes, CAP29, `实扫字节必须正好砍在上限上，实际 ${row.scanBytes}`);
   assert.equal(row.scanCapped, true, '被上限砍过就要标成截断，不许安静');
-  assert.notEqual(r.decision.action, 'auto-approve');
+  // 旧期望「不许 auto-approve」同样是等级轴的副产品（§0.2 已拍掉）：这一发只有截断记账在说话。
+  assertListedOutside(r, ['AUDIT_COVERAGE_TRUNCATED'], '升级条目超限：');
   assert.notEqual(r.riskLevel, 'low');
 });
 
@@ -1725,7 +1805,16 @@ test('F4 端到端：只在 system.prop 里写 boot 状态的模块不再被判 
     files: [['module.prop', moduleProp('eval.t2c')], ['system.prop', 'ro.boot.verifiedbootstate=green\n']] }));
   assert.ok(r.findings.some((f) => f.ruleId === 'PROP_BOOT_SPOOF'), JSON.stringify(r.findings));
   assert.equal(r.riskLevel, 'high');
-  assert.equal(r.decision.action, 'block', 'high 只可能是不自动合入（block），不是拒绝投稿');
+  // 换轴接线（2026-10-21，旧期望 `action === 'block'`）：PROP_BOOT_SPOOF 是 §3 右列 / §13.6
+  // 「降档 + 给 AI 一道上下文题」那一族的成员，不在上架拦截名单里 ⇒ 等级不再拦它。
+  // 这一发没有传 opts.changeType ⇒ changeType 是 unknown，落的是新轴上那条**待拍保守分支**
+  // （§13 第 2 条「要不要给 update 另加一道」未拍，不许自行默认成放行），所以期望是 request-review；
+  // 同一形状带 changeType:'first' 时落 auto-approve，那一格由 fix3-P8 / fix4-P12 与
+  // malice-axis.test.mjs 的端到端那几发钉。
+  assertListedOutside(r, ['PROP_BOOT_SPOOF'], '只在 system.prop 里写 boot 状态：', 'request-review');
+  assert.match(r.decision.reason, /无法判定是首次收录还是版本更新/, r.decision.reason);
+  assert.ok(r.annotation.contextQuestions.includes('PROP_BOOT_SPOOF'),
+    '它必须进 §6 那道上下文题的输入清单，否则降档就等于把这一族从 AI 眼前也删掉了');
 });
 
 // —— 扫描面：sepolicy.rule / *.rc / *.te / 有 shebang 的无后缀条目 ——
@@ -1957,7 +2046,14 @@ test('fix2-P3：向模块目录写出/解包 + 执行同名条目必须升级（
   const eb = r.findings.find((f) => f.ruleId === 'EXEC_BUNDLED_FILE');
   assert.match(eb.snippet, /helper\.sh/, '报告要指名造成升级的那条引用');
   assert.equal(r.riskLevel, 'high');
-  assert.equal(r.decision.action, 'block');
+  // ── 2026-10-21 换轴接线的直接后果（旧期望：`block`）─────────────────────────────
+  // 依据 §3.2 ② 末段：`EXEC_BUNDLED_FILE` 与 `MODDIR_RUNTIME_WRITE` 这两发「正经模块的日常形状」
+  // 归**能力/覆盖轴**（`CAPABILITY_RULE_IDS`），§13.5 拍的 11 条名单里没有它们；
+  // §0.1 的取严取的是「静态名单 ∪ AI 恶意结论」这一件事，等级不再是判决。
+  // 牙没少：这一发上面三条（两条读数各自都在、snippet 指名 helper.sh、等级 high）与末尾两条
+  // （MODDIR_RUNTIME_WRITE 的 file/line）一字未动 —— 换掉的只有结论那一半，
+  // 补上的是 §10 那句「降档后不许静默」；下面 fix8-E 那条反向哨兵（撤销过 ⇒ request-review）照旧。
+  assertListedOutside(r, ['EXEC_BUNDLED_FILE', 'MODDIR_RUNTIME_WRITE'], 'fix2-P3：');
 
   // 反向哨兵：没有写出证据的常规多脚本模块照旧撤销（不许把 P3 变成「凡引用皆 high」）
   const ok = await scanToReport(makeModuleZip({ id: 'eval.f2p3ok', files: [
@@ -2212,7 +2308,7 @@ test('fix3-P7：定档取最大时 snippet 跟着最重的那个匹配走（HARD
   assert.ok(!/10\.0\.0\.1/.test(h[0].snippet), '不许把最左的低档匹配写成风险本体');
 });
 
-test('fix3-P7 端到端：两行 echo decoy 组成的 service.sh 不再被判 low、不再自动放行', async () => {
+test('fix3-P7 端到端：两行 echo decoy 组成的 service.sh 不再被判 low（结论那一半改由名单说，§13.6 降档）', async () => {
   const r = await scanToReport(makeModuleZip({ id: 'eval.f3p7', files: [
     ['module.prop', moduleProp('eval.f3p7')],
     ['service.sh', `#!/system/bin/sh\n${P7_BOOT_DECOY}\n${P7_LIVE_DECOY}\n`],
@@ -2220,7 +2316,15 @@ test('fix3-P7 端到端：两行 echo decoy 组成的 service.sh 不再被判 lo
   const hi = r.findings.filter((f) => f.severity === 'high');
   assert.equal(hi.length, 2, JSON.stringify(r.findings.map((f) => `${f.ruleId}@${f.line}:${f.snippet}`)));
   assert.equal(r.riskLevel, 'high');
-  assert.equal(r.decision.action, 'block', '旧行为实测 low → auto-approve');
+  // ── 2026-10-21 换轴接线的直接后果（旧期望：`block`）─────────────────────────────
+  // 这一发的两条 high 是 `VERIFIED_BOOT_SPOOF` 与 `MAGISK_POLICY_LIVE`，正是 §13.6 拍的那一族
+  // （同形那 5 条走「降档 + 给 AI 一道上下文题」；§3.2 ② 的成员表已把这两条算进去）。
+  // 本用例的真身是**检出强度**：decoy 顶不掉真语句那件事由上面 `hi.length === 2` 与下面那条
+  // snippet 循环钉着，两句一字未动；只有「不许自动放行」这半句是等级轴的副产品，按 §0.1 换掉。
+  // 该记住的一点：fix3 之前这里是 `low / auto-approve`（两条 high 一条都没扫出来），今天字节面
+  // 又回到 `auto-approve` —— 但**结论不再当证人**：`2 条 high + 等级 high + snippet 不指 decoy`
+  // 这三句才是这一发的牙，摘掉 P7 那两支左边界它们当场红。
+  assertListedOutside(r, ['VERIFIED_BOOT_SPOOF', 'MAGISK_POLICY_LIVE'], 'fix3-P7 端到端：');
   for (const f of hi) assert.ok(!/^\s*echo\b/.test(f.snippet), `证据指名了 decoy 而不是真命令：${f.snippet}`);
 });
 
@@ -2280,7 +2384,13 @@ test('fix3-P8 端到端：sepolicy.rule 里一行 typepermissive su; 不再被�
   assert.equal(f.line, 3, '注释行与 dontaudit 行都不许占用行号');
   assert.equal(f.severity, 'high');
   assert.equal(r.riskLevel, 'high');
-  assert.equal(r.decision.action, 'block');
+  // ── 2026-10-21 换轴接线的直接后果（旧期望：`block`）─────────────────────────────
+  // §13.6 拍「同形那三条走降档 + 上下文题」时，§3.2 ② 明写成员表要补 `SELINUX_TYPE_PERMISSIVE`
+  // （第一轮那张表漏了它）⇒ 它住在 `CONTEXT_QUESTION_RULE_IDS` 里，不在 §13.5 那 11 条名单里。
+  // 强度断言（file / line 3 / severity high / 等级 high / Markdown 里看得见这条）一字未动；
+  // 换掉的只有结论那一半，并且 assertListedOutside 多要求一句「它必须出现在标注里」
+  // （实测 capabilities 与 contextQuestions 两格都点到它 —— §13.6 那半句「给 AI 一道上下文题」的落点）。
+  assertListedOutside(r, ['SELINUX_TYPE_PERMISSIVE'], 'fix3-P8 端到端：');
   assert.match(renderMarkdown(r), /SELINUX_TYPE_PERMISSIVE|关闭整个域/, 'Markdown 里要看得见这条结论');
 });
 
@@ -2345,7 +2455,13 @@ test('fix3-P9 端到端：只在 system.prop 里写 ro.debuggable=1 的模块不
   assert.deepEqual(f.map((x) => x.line), [1, 2], '行号要逐行对上，人工复核才找得到是哪两行');
   assert.ok(r.counts.medium >= 2, '两条 medium 必须参与定级：' + JSON.stringify(r.counts));
   assert.equal(r.riskLevel, 'medium', 'medium —— 与脚本侧同档');
-  assert.equal(r.decision.action, 'block', '旧行为实测 low → auto-approve');
+  // ── 2026-10-21 换轴接线的直接后果（旧期望：`block`）─────────────────────────────
+  // `PROP_SECURITY_WEAKEN` 是 medium，而 §3 右列把「一切 medium」连同它自己那句理由一起拍给了
+  // 能力/覆盖轴（§0.1 的名单只有 11 条，§13.5 定案表里没有它）⇒ 名单外 ⇒ 上架 + 标注。
+  // 这一发的牙全在强度那一半，一字未动：两条 medium 的**条数**、`[1,2]` 的**行号**、
+  // `counts.medium >= 2` 的**参与定级**、整包 `medium` 的**档位**；下面那段反向哨兵（换成正经键
+  // 必须回到 low）也照旧。摘掉 PROP_SECURITY_WEAKEN 那条规则，红的还是这些句子。
+  assertListedOutside(r, ['PROP_SECURITY_WEAKEN'], 'fix3-P9 端到端：');
   // 反向哨兵：同一份夹具把四个键换成机型与图形开关，必须回到 low 并自动放行
   const ok = await scanToReport(makeModuleZip({ id: 'eval.f3p9ok', files: [
     ['module.prop', moduleProp('eval.f3p9ok')],
@@ -2454,7 +2570,12 @@ test('fix4-P12 端到端：post-fs-data.sh 里 printf >> policy 的模块不再�
   assert.equal(f.severity, 'high');
   assert.equal(f.line, 2);
   assert.equal(r.riskLevel, 'high', '旧行为实测 low → auto-approve');
-  assert.equal(r.decision.action, 'block');
+  // ── 2026-10-21 换轴接线的直接后果（旧期望：`block`）─────────────────────────────
+  // §13.6 拍的成员表：`SELINUX_POLICY_RELAX` 在「同形那 5 条」里（§3.2 ② 给它记的是「无人守 ★」
+  // ⇒ 降档 + 上下文题），§13.5 那 11 条名单里没有它 ⇒ 名单外那一侧的形状。
+  // 强度那一半一个字没动：这条 high 必须在、行号必须是 2（printf 那一行）、整包 high；
+  // 换掉的只有结论，且它现在必须出现在标注的 capabilities + contextQuestions 两格里（实测两格都有）。
+  assertListedOutside(r, ['SELINUX_POLICY_RELAX'], 'fix4-P12 端到端：');
 });
 
 // —— P13：属性文件规则需要「脚本写出」这一支 ——
@@ -2536,7 +2657,12 @@ test('fix4-P13 端到端：customize.sh 里 printf >> system.prop 的模块不�
     ['PROP_BOOT_SPOOF@3:high', 'PROP_SECURITY_WEAKEN@4:medium'].sort(),
     JSON.stringify(r.findings.map((f) => `${f.ruleId}@${f.line}`)));
   assert.equal(r.riskLevel, 'high', '旧行为实测 low → auto-approve');
-  assert.equal(r.decision.action, 'block');
+  // ── 2026-10-21 换轴接线的直接后果（旧期望：`block`）─────────────────────────────
+  // 这一发说话的两条：`PROP_BOOT_SPOOF`（§13.6 补进上下文题成员表的那两条之一）与
+  // `PROP_SECURITY_WEAKEN`（medium，§3 右列「一切 medium」）⇒ 都不在 §13.5 的 11 条名单里。
+  // 强度断言原样：上面那条 `deepEqual(ruleId@line:severity)` 是这一发的本体（两条必须各自指对
+  // 行号与档位），加上整包 high —— 把 P13 那支「脚本写出」形态摘掉，红的是那两句，不是这一句。
+  assertListedOutside(r, ['PROP_BOOT_SPOOF', 'PROP_SECURITY_WEAKEN'], 'fix4-P13 端到端：');
   // 反向哨兵：同一形状写合法键，必须回到 low + auto-approve
   // （注意这里也写相对路径：`>> $MODDIR/…` 会被既有规则 MODDIR_RUNTIME_WRITE 判 high，与本条要证的不是同一件事）
   const ok = await scanToReport(makeModuleZip({ id: 'eval.f4p13ok', files: [
@@ -2579,7 +2705,9 @@ const ANCHOR_WITNESS = {
   },
   OBFUSCATED_DECODE_EXEC: { payload: 'echo $B64 | base64 -d | sh' },
   OBFUSCATED_DECODE_ONLY: { payload: 'echo $B64 | base64 -d > /data/local/tmp/out' },
-  WRITE_SYSTEM_VENDOR: { payload: 'echo x >> /system/etc/hosts' },
+  // 这条 witness 刻意选「源在覆盖层、目标在真分区」那一形：把 exclude 改回整行判豁免，
+  // 它就 0 命中，这张闭包表当场红 —— 锚点修法不是靠注释维持的（见 risk-rules.mjs 里 overlayOnlyMatch）。
+  WRITE_SYSTEM_VENDOR: { payload: 'cp "$MODPATH/busybox" /system/xbin/bb' },
   SELINUX_DISABLE: { payload: 'setenforce 0' },
   HOSTS_MODIFY: { payload: 'sed -i "s/^/#/" /system/etc/hosts' },
   SELINUX_POLICY_RELAX: { payload: 'allow su * * { execute };' },
@@ -2701,7 +2829,15 @@ test('fix4-P14 端到端：同一族的前缀写法一起进报告，不再靠�
     assert.ok(r.findings.some((f) => f.ruleId === id), `${id} 在前缀形态下仍然 0 命中：${JSON.stringify(ids)}`);
   }
   assert.equal(r.riskLevel, 'high');
-  assert.equal(r.decision.action, 'block');
+  // ── 2026-10-21 换轴接线的直接后果（旧期望：`block`）─────────────────────────────
+  // 这一发说的五条读数全在名单外：`SELINUX_POLICY_RELAX` / `PROP_BOOT_SPOOF` 属 §13.6 那 5 条
+  // 上下文题，`PROP_SECURITY_WEAKEN` 是 medium（§3 右列），`MODDIR_RUNTIME_WRITE` 属 §3.2 ② 末段
+  // 那两发「正经模块日常形状」。⇒ §0.1 的取严在这里没有可取的东西，上架 + 标注。
+  // 本用例守的是**锚点闭包**：上面那三句「每条规则自己都得说话」+ 行号 >= 3 的落点清单 + 整包 high，
+  // 一句没动；这正是 §3.2 ① 说的「别把这一族看不看得见押在一条邻居规则上」，邻居规则降档不许顶掉它。
+  assertListedOutside(r,
+    ['SELINUX_POLICY_RELAX', 'PROP_BOOT_SPOOF', 'PROP_SECURITY_WEAKEN', 'MODDIR_RUNTIME_WRITE'],
+    'fix4-P14 端到端：');
 });
 
 // ===========================================================================
@@ -3208,8 +3344,16 @@ test('反 P11 撤销钉：名单外文本已被扩面读掉，且读掉它撤销
     'payload.dat 本来就在 feed 上：没有升级证人，是记法变了，不是证人没了');
   assert.deepEqual(pin.revokedBundledRefs, [],
     '撤销没有发生：记录里一笔都不许有（有就等于把「读过即无罪」又写回扫描面）');
-  assert.notEqual(pin.decision.action, 'auto-approve',
-    '首次收录正是「撤销一旦成立就放行」落到的那一档 —— 这条线不许被任何扫描面改动推开');
+  // ── 2026-10-21 换轴接线的直接后果（旧期望：`notEqual(action,'auto-approve')`）──────────
+  // 旧那句「这条线不许被任何扫描面改动推开」守的其实是两件事，而它们现在分居两处：
+  //   ① **撤销不许反过来替载荷作证** —— 那由上面三句钉着（escalated 空 / revokedBundledRefs 空 /
+  //      payload.dat 真在 scripts 里逐行读过），一字未动；
+  //   ② **整包不许走自动通道** —— 那是等级轴的副产品，而这条 high 的 ruleId 是
+  //      `EXEC_BUNDLED_FILE`，§3.2 ② 末段明写它与 `MODDIR_RUNTIME_WRITE` 归能力/覆盖轴（§13.5 的
+  //      11 条名单没有它们）⇒ 按 §0.1 上架 + 标注，读数必须在标注里点名。
+  // fix8-E 那道「撤销过就不自动放行」的闸没有因此变松：它自己的证人就在下面那一发
+  // （payload.js/.sh/.lua 那三形仍断 `request-review`），摘掉 E 红的是那三形，不是这一发。
+  assertListedOutside(pin, ['EXEC_BUNDLED_FILE'], '反 P11：');
 });
 
 // ---------------------------------------------------------------------------
@@ -3275,7 +3419,13 @@ test('fix8-E 反证：payload.dat 那一格撤销并未发生，记录里不能�
   assert.equal(exec.length, 1, JSON.stringify(r.findings.map((f) => `${f.ruleId}/${f.severity}`)));
   assert.equal(exec[0].severity, 'high', '这条仍是 high —— E 不靠改等级闭洞');
   assert.equal(r.riskLevel, 'high', JSON.stringify(r.counts));
-  assert.equal(r.decision.action, 'block');
+  // ── 2026-10-21 换轴接线的直接后果（旧期望：`block`）─────────────────────────────
+  // 这一发的名字就说清了它的本体：「撤销并未发生，记录里不能凭空多出一笔」—— 那由下面
+  // escalated / scripts / revokedBundledRefs 三句钉着，加上上面「那条 high 还在、等级还是 high」，
+  // 全是一字未动。旧那句 block 是等级轴的副产品；`EXEC_BUNDLED_FILE` 按 §3.2 ② 末段归能力轴，
+  // 不在 §13.5 的 11 条名单里 ⇒ 名单外 ⇒ 上架 + 标注（读数必须在标注里点名）。
+  // 与上一发同一口径：fix8-E 的闸由 payload.js/.sh/.lua 那三形的 `request-review` 钉着。
+  assertListedOutside(r, ['EXEC_BUNDLED_FILE'], 'fix8-E 反证：');
   // Task 2.7（fix10-P11）换了这里 instrument 的对象，主张一字没动：
   // 「撤销没有发生 ⇒ 记录里不许有一笔」。发生过的读取代价现在落在 feed 上（载荷被逐行扫过），
   // 而不是落在 escalated 上 —— 后者只记「原本不在扫描面、因引用被拉进来的条目」，
@@ -5066,13 +5216,24 @@ test('T4-A3 正面（工单 §3 A3）：压线两侧 0.851 / 0.850 / 0.849 —�
   assert.deepEqual(t4all(rin), IN, '0.851 > 0.85 ⇒ 进面');
   assert.deepEqual(t4fed(rin), ['assets/edge.bin']);
   assert.equal(rin.riskLevel, 'high');
+  // ── 反向证人（本文件里这一发兼任）：命中名单的形状在新轴下**仍然 block** ──────────
+  // 0.851 那一侧的进面读数里有 `PIPE_TO_SHELL` 与 `SELINUX_DISABLE`，两条都在 §13.5 的 11 条名单
+  // （`MALICE_RULE_IDS`）里 ⇒ 按 §0.1「取严：任一命中就不上架」必须 block，而且必须点名是这两条拦的。
+  // 这一句同时是本文件那批「只断 block」旧写法的对照面：它断的是**名单拦的**，不是等级拦的。
+  // 有人偷偷把这两条退出名单 ⇒ 这里红（与 audit/malice-axis.test.mjs 的 11 枚独占证人是两码事）。
+  assertBlockedByList(rin, ['PIPE_TO_SHELL', 'SELINUX_DISABLE'], 'T4-A3 IN(0.851)：');
   // 反面那一格：0.849「没进扫描面」必须钉成可观测的反面，而不是只钉一个等级。
   const rout = await t4pkg('eval.t4a3out', 'assets/edge.bin', T4_SHAPE.out849);
   assert.deepEqual(t4all(rout), OUT, '0.849 没进面：内容规则一行都没读它（摘掉阈值 = 变异 M2，红在这一格与 B2）');
   assert.deepEqual(t4fed(rout), [], '未过阈值的条目不许出现在 feed 记账里');
   assert.deepEqual(rout.counts, { high: 0, medium: 1, low: 0, info: 0 }, '改前改后一字不变');
   assert.equal(rout.riskLevel, 'medium');
-  assert.equal(rout.decision.action, 'block');
+  // ── 2026-10-21 换轴接线的直接后果（旧期望：`block`）─────────────────────────────
+  // 0.849 那一侧的整包读数只有 `STRUCT_BINARY/medium`，而 §3.2 ③ 把它按轴归给能力/覆盖
+  // （`CAPABILITY_RULE_IDS`，动态档位那条正是 device_faker 那 2 条 high 的来源）⇒ 名单外。
+  // 这一发的本体是**阈值判据**（> 0.85 不是 >=），牙全在上面的 t4all / t4fed / counts 三句里：
+  // 把阈值写成 >=，0.850 那一格（下面 `req`）与这里都会当场红，与结论这句无关。
+  assertListedOutside(rout, ['STRUCT_BINARY'], 'T4-A3 OUT(0.849)：');
   // 阈值那一格本身：>= 会把 0.850 也捞进来 ⇒ 这一条专防「> 写成 >=」。
   const req = await t4pkg('eval.t4a3eq', 'assets/edge.bin', T4_SHAPE.eq850);
   assert.deepEqual(t4all(req), OUT, '恰好 0.850 不许进面（判据是严格大于）');
@@ -5122,7 +5283,12 @@ test('T4-B1 反面（工单 §0 / §3 B1）：Pixelify 两条 .descriptor 逐字
   ], '改前实测就是这两条；改后一条都不许多');
   assert.deepEqual(r.counts, { high: 0, medium: 2, low: 0, info: 0 });
   assert.equal(r.riskLevel, 'medium', '等级一字不变（改前 medium）');
-  assert.equal(r.decision.action, 'block', '结论一字不变（改前 block）');
+  // ── 2026-10-21 换轴接线的直接后果（旧「结论一字不变」那句期望 block）───────────────
+  // 「一字不变」锁的是**进料与读数**那两面：进面记账（polyglotFed 两条各自 1416/1076 字节、
+  // 比例、实扫字节、scanCapped）、两条 STRUCT_BINARY/medium 逐字、counts、等级 —— 上面四句一句没动。
+  // 结论这一面变了，而且这正是 §1 第 3 条 + §3.2 ③ 拍的那件事：`STRUCT_BINARY` 归能力轴（带二进制
+  // 的包必然吃它），名单外 ⇒ 上架 + 标注。§3.1 那句「误伤不再伤人，只让报告难看」说的就是这一格。
+  assertListedOutside(r, ['STRUCT_BINARY'], 'T4-B1：');
 });
 
 test('T4-B2 反面（工单 §3 B2）：真机器码（比例 0.3403）不许进 feed，报告清单与改前逐字一致', async () => {
@@ -5223,7 +5389,18 @@ test('T4-C3 不变量（工单 §2.3）：polyglot 走的仍是 24 KB 有界通�
   assert.deepEqual(t4fed(r), ['assets/big.bin']);
   assert.equal(t4fedRow(r, 'assets/big.bin').scanBytes, CAP29, '记账里的实扫字节必须正好砍在上限上');
   assert.equal(t4fedRow(r, 'assets/big.bin').scanCapped, true);
-  assert.notEqual(r.decision.action, 'auto-approve', '「读到一半」永远不等于「干净」');
+  // ── 2026-10-21 换轴接线的直接后果（旧期望：`notEqual(action,'auto-approve')`）──────────
+  // 依据 §0.2 原话「没看全的包怎么办 —— 上架但标注覆盖不全」，加 §5 的分档：这一发是
+  // `AUDIT_COVERAGE_TRUNCATED`（有界通道砍在 24 KB 上），属**没看全**那一档 ⇒ 上架并标注；
+  // §5 另一档「没跑成」（AI `failed`/`disabled`）仍不上架，那是分流那一步的 fail-closed 格，
+  // 与这一发无关，两档不许并（本文件的证人另有其人：audit.yml 的 writeFailClosed 由
+  // test/audit-triage.test.mjs 钉，这里没有翻它）。
+  // 「读到一半不等于干净」这句话现在由**记账**来证，不由结论来证：上面那五句（超限载荷一行都不许
+  // 多读、AUDIT_COVERAGE_TRUNCATED 恰好 1 条且 file/severity/message 里的两个字节数都在、
+  // 实扫字节正好砍在上限上、scanCapped=true）一字未动 —— 把有界通道改成整份喂进去，红的是第一句。
+  assertListedOutside(r, ['AUDIT_COVERAGE_TRUNCATED', 'STRUCT_BINARY'], 'T4-C3：');
+  assert.ok(r.annotation.coverageGaps.includes('AUDIT_COVERAGE_TRUNCATED'),
+    `「没看全」必须落在 coverageGaps 那一格里，不是混进能力清单：${JSON.stringify(r.annotation)}`);
 });
 
 test('T4-C4 不变量（工单 §2.4）：一份身份 —— 条目只在 binaries 清单里出现一次，且纯函数、去重键不变', async () => {
@@ -5455,7 +5632,13 @@ test('P10-C3 整包（工单 §2 硬约束 1）：降的是 severity，不是删
   assert.equal(r.counts.info, sd.length, '它们落进 counts.info，不落进 medium');
   assert.equal(r.counts.medium, 0, '降级不许凭空造出 medium，也不许把 info 记成 low');
   assert.equal(r.riskLevel, 'high', '整包等级由别的规则说话：info 再多也不抬，别的命中也不许因为降级而消失');
-  assert.equal(r.decision.action, 'block');
+  // ── 2026-10-21 换轴接线的直接后果（旧期望：`block`）─────────────────────────────
+  // 这一发顶等级的只有 `RM_RF_MUTABLE/high`（`rm -rf /data`），它不在 §13.5 的 11 条名单里，
+  // 属 §3 右列「能力/正当功能」那一侧；五条 `SUSPICIOUS_DOMAIN` 已被本轮降成 info，本来就不参与定级。
+  // ⇒ 名单外 ⇒ 上架 + 标注。本用例守的是 **P10 那次降severity 的形状**：五条一条不多不少、
+  // 五格全 info、countsTowardRisk 为 false、落进 counts.info 而不是 medium、去重键口径不变、
+  // 整包仍由别的规则说 high —— 六句一字未动。
+  assertListedOutside(r, ['RM_RF_MUTABLE', 'SUSPICIOUS_DOMAIN'], 'P10-C3：');
   const keys = r.findings.map((f) => `${f.ruleId}@${f.file}:${f.line}`);
   assert.equal(new Set(keys).size, keys.length, 'counts 去重键口径不变');
 });
@@ -5993,7 +6176,7 @@ test('T57-19 登记三键进 report.binaryForensics：名单与真实计数各�
   assert.equal(sharedT4.binaryForensicsRows(T57_BIN1, t57Map('zygisk/arm64-v8a.so', capped)).length, 1);
 });
 
-test('T57-20 S3-A Step 5 呈现面一字不变：不命中任何新名字的包，findings/decision/counts 与改前逐字节相同，登记只多出这三个键', async () => {
+test('T57-20 S3-A Step 5 呈现面一字不变：不命中任何新名字的包，findings/counts 与改前逐字节相同，登记只多出这三个键（decision 已重记到新轴）', async () => {
   // 这一发喂的是 hmaSmall（hma-arm64.so，24 个导入，UND 里没有任何名字命中族表）：
   // A 改的是族的进料，而这个包的新旧族集合都是空 ⇒ 它是「改前 == 改后」的那一枚证人。
   // 下面三个 sha 与两个字面量都是**在 d255937 的 audit/ 整份导出上实测**的（BASE 那一跑），不是从 HEAD 反推的。
@@ -6001,10 +6184,21 @@ test('T57-20 S3-A Step 5 呈现面一字不变：不命中任何新名字的包�
   assert.equal(T57_SHA1(Buffer.from(JSON.stringify(r.findings), 'utf8')),
     '30bb0eb161d43953e4e095e33f624d799eb63ccb', 'findings 逐字节不变（改前实测同一个 sha）');
   assert.deepEqual(r.counts, { high: 0, medium: 1, low: 0, info: 0 }, 'counts 一字不变');
+  // ── 2026-10-21 换轴接线的直接后果：这一格的 decision 基线**必须**重记 ────────────────
+  // 上面两句才是这一发要证的「S3-A Step 5 呈现面一字不变」（它守的是 capabilityImports 那格进料
+  // 换掉之后，findings 与 counts 逐字节不动）；旧那句 decision 字面量记的是**老轴**的判决
+  // （medium ⇒ block），而 §13.5 拍的是「上不上架只由 11 条名单 ∪ AI 恶意结论决定」。
+  // `STRUCT_BINARY` 按 §3.2 ③ 归能力/覆盖轴 ⇒ 这个包名单外。下面这份字面量是 2026-10-21 在
+  // 接线后的调用点上实测的（不是从老字面量推的）：字节面照旧的纪律不变，只是基线换了轴。
+  // 有人把调用点退回老轴 ⇒ 这句红；有人偷偷让 STRUCT_BINARY 获得拦截力 ⇒ 上面 findings 的 sha
+  // 不动而这一句红（判据那一格变了），两半各守各的，互不顶替。
   assert.deepEqual(r.decision, {
-    action: 'block', label: 'needs-human-review', needsHumanReview: true,
-    reason: '风险等级为 medium，需人工审核后方可合入索引',
-  }, 'decision 一字不变：本轮不可能让任何包变得更容易自动放行');
+    action: 'auto-approve', label: 'auto-approved', needsHumanReview: false, axis: 'malice',
+    reason: '未命中上架拦截名单（名单共 11 条 armed / 11 条定案）—— 等级不再决定上不上架；'
+      + '风险等级 medium 在本模型里只是标注输入，不再拦上架',
+  }, 'decision 站在新轴上：本轮之后它不再由等级决定；findings/counts 那两句才是 Step 5 的惰性证人');
+  assert.ok(annOf(r).includes('STRUCT_BINARY'),
+    `名单外不等于从读者眼前消失（§10）：${JSON.stringify(r.annotation)}`);
   assert.equal(r.riskLevel, 'medium');
 
   const row = t57Row(r, 'zygisk/arm64-v8a.so');
@@ -6040,7 +6234,13 @@ test('T57-10 device_faker 那两枚真 ELF ⇒ high，report.binaryForensics 的
   assert.equal(cli.entryBytes, 485944);
   assert.deepEqual(r.counts, { high: 2, medium: 1, low: 0, info: 0 });
   assert.equal(r.riskLevel, 'high');
-  assert.equal(r.decision.action, 'block');
+  // ── 2026-10-21 换轴接线的直接后果（旧期望：`block`）─────────────────────────────
+  // device_faker 这两条 high 全是 `STRUCT_BINARY` 的动态档位，§3.1 末段与 §3.2 ③ 点名的正是这一格
+  // （「device_faker 那 2 条 high 全是 STRUCT_BINARY 危险族读数」⇒ 它按轴归能力，走标注）；
+  // §13.5 那 11 条名单里没有它 ⇒ 名单外 ⇒ 上架 + 标注。
+  // 强度那一半全在：两条 high 的落点与档位、importCount 86/70、families 集合、entryBytes、
+  // counts{high:2,medium:1}、等级 high、字节面不进产物 —— 一句没动。
+  assertListedOutside(r, ['STRUCT_BINARY'], 'T57-10 df2：');
   // 字节面没进产物（§5.3 的第一格）
   assert.equal(JSON.stringify(r).includes('not a raw byte Buffer'), false);
 });
@@ -6052,7 +6252,11 @@ test('T57-11 HMA 那枚小 ELF（24 导入、0 族）⇒ medium，message 说得
   assert.deepEqual(t57Row(r, 'zygisk/arm64-v8a.so').families, []);
   assert.equal(t57Row(r, 'zygisk/arm64-v8a.so').importCount, 24);
   assert.deepEqual(r.counts, { high: 0, medium: 1, low: 0, info: 0 });
-  assert.equal(r.decision.action, 'block');
+  // ── 2026-10-21 换轴接线的直接后果（旧期望：`block`）─────────────────────────────
+  // 与 T57-10 同一条依据：这发整包只有一条 `STRUCT_BINARY/medium`，§3.2 ③ 归能力轴 ⇒ 名单外。
+  // 这一发的本体是**取证读数进得了人话**：message 里那句「读到 24 个导入」、families 为空是
+  // 证出来的、importCount === 24、档位 medium —— 四句一字未动（forensics 的字节口径漂了红在这些句子）。
+  assertListedOutside(r, ['STRUCT_BINARY'], 'T57-11 hmaSmall：');
 });
 
 test('T57-12 非 ELF 两形（真 PNG / PNG 头 + ELF 体）⇒ medium，口径里不许出现「读不了」「无法解析」', async () => {
@@ -6179,10 +6383,22 @@ test('INV-A 接线是活的：自动那一份 vs 手动不传 map 的那一份�
   assert.equal(wiredHigh, 3, '全批实测 3 条 high：df2 两枚真 ELF + detach-arm32 一枚');
 });
 
-test('INV-B 永不开自动放行：每个 binaries 条目恰好一条参与定级的 STRUCT_BINARY，档位 ∈ {medium, high}', async () => {
+test('INV-B 开关自动通道的只有名单（等级不再当那道闸）：每个 binaries 条目恰好一条参与定级的 STRUCT_BINARY，档位 ∈ {medium, high}', async () => {
   for (const id of T57_BATCH) {
     const r = await t57Run(id);
-    assert.notEqual(r.decision.action, 'auto-approve', `${id}：含二进制的包永远不许落到自动通道`);
+    // ── 2026-10-21 换轴接线的直接后果（旧期望：每发都 `notEqual(action,'auto-approve')`）──────
+    // 旧那句「含二进制的包永远不许落到自动通道」守的是**等级轴**（带二进制的包必吃 STRUCT_BINARY
+    // ⇒ 永远不落自动通道）。§3.2 ③ 已把 STRUCT_BINARY 按轴归给能力/覆盖（device_faker 那两条 high
+    // 就是它），§13.5 的 11 条名单里没有它 ⇒ 它不再有拦上架的权力（§0.1 的取严只取名单 ∪ AI 恶意）。
+    // 所以这一发改成**逐发按名单自己算**：这一批里 `polyglotReal` 的载荷自己写着 `curl … | sh` 与
+    // `setenforce 0`（PIPE_TO_SHELL + SELINUX_DISABLE，两条都在名单里）⇒ 仍然 block，而且必须由
+    // 那两条点名拦它 —— 这一发因此兼任本文件的反向证人；其余四发只说 STRUCT_BINARY ⇒ 上架 + 标注。
+    // 强度那一半一字未动：binaries ↔ STRUCT_BINARY 按条目名逐条对账、countsTowardRisk 必须为真、
+    // 档位 ∈ {medium, high}、条数下限。有人把 STRUCT_BINARY 偷偷写进名单 ⇒ 走上面那条分支，
+    // 而 `r.malice.malicious` 与 hits 的点名会立刻红（名单成员表另有 malice-axis.test.mjs 的牙）。
+    const armed = [...new Set(r.findings.filter((f) => MALICE_SET.has(f.ruleId)).map((f) => f.ruleId))].sort();
+    if (armed.length) assertBlockedByList(r, armed, `${id}：`);
+    else assertListedOutside(r, ['STRUCT_BINARY'], `${id}：`);
     const sb = t57Struct(r);
     assert.deepEqual(r.binaries.map((b) => b.name).slice().sort(), sb.map((f) => f.file),
       `${id}：按条目名逐条对账，不是数总数`);
@@ -6623,5 +6839,3 @@ test('DXE-08 ELF 改名成 classes.dex 的档位只许增不许减；dex 魔数�
   assert.match(f2.message, /静态取证不适用/);
   assert.equal(/非 ELF 也非 DEX/.test(f2.message), false, '这枚条目确实带 dex 魔数，句子不许把它说成"非 DEX"');
 });
-
-

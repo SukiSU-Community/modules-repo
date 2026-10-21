@@ -15,6 +15,7 @@ import { pathToFileURL } from 'node:url';
 import {
   PLEDGE_VERSIONS, proofPrefixFor, checkPendingProof, checkActor, main,
   derivePendingScope, isIngestedPendingPath,
+  OWNERSHIP_VIAS, canonicalProofSet, proofPrefixForSet, PROOF_PREFIX_LEN_V2,
 } from '../scripts/verify-pending-proof.mjs';
 
 // ── 期望值由测试自己用 node:crypto 算，不从被测函数取 ──
@@ -159,6 +160,202 @@ test('sha256 不是 64 位小写十六进制 → 拒（大写、短、非十六�
   const v = checkPendingProof(entry({ versions: [{ versionCode: 1 }] }));
   assert.equal(v.ok, false);
   assert.match(v.error, /sha256/);
+});
+
+/* ------------------------------------------------ bio-set：v2 集合口令（§15 / §17.5） */
+// 这批用例是 2026-10-21 与 Worker「一次投稿多模块」那一条**同一轮**加的：Worker 侧一旦让
+// pending 的 ownership.via 出现 'bio-set'，这一侧只认 'bio' 就会把批量投稿开出来的 PR 全拒。
+// 老那批发 'bio' 的用例期望值一个字没动 —— 换代次序是「读的一侧扩成旧值 ∪ 新值」，不是换掉旧值。
+
+const SET_ZIP_1 = ZIP_A;
+const SET_ZIP_2 = '2898d907fba3a01bbe9e078e73fb9c20c33a69fc322d062c61e826f2798e3621';
+const SET_ZIP_3 = 'f1e2d3c4b5a69788796a5b4c3d2e1f0011223344556677889900aabbccddeeff';
+
+/** 期望值由测试自己算（与上面 wantPrefix 同一条纪律：不从被测函数取）。 */
+const wantSetPrefix = (items) => {
+  const cmp = (x, y) => (x < y ? -1 : x > y ? 1 : 0);
+  const canon = [...items].sort((a, b) => (a.id === b.id ? cmp(a.zipSha, b.zipSha) : cmp(a.id, b.id)))
+    .map((i) => `${i.id}:${i.zipSha}`).join(',');
+  return createHash('sha256').update(`sukisu-proof-v2:${canon}`, 'utf8').digest('hex').slice(0, 12);
+};
+
+/** 批量投稿写出的一枚 pending：Worker 形状（sha 在 versions[0]），via='bio-set'，前缀是整套共用的那枚。 */
+const setEntry = (id, sha, prefix) => entry({
+  id,
+  versions: [{ version: 'v1', versionCode: 1, sha256: sha, size: 10, time: 1791600000000 }],
+  ownership: { nonce: 'abc123', proofPrefix: prefix, via: 'bio-set', verifiedAt: 2 },
+});
+
+const setBatch = (prefix = undefined) => {
+  const items = [
+    { id: 'aaa', zipSha: SET_ZIP_1 },
+    { id: 'kkk', zipSha: SET_ZIP_2 },
+    { id: 'mmm', zipSha: SET_ZIP_3 },
+  ];
+  const p = prefix ?? wantSetPrefix(items);
+  return { prefix: p, batch: items.map((i) => setEntry(i.id, i.zipSha, p)), items };
+};
+
+test('bio-set：一枚集合口令覆盖整套 —— 三条各带同一 12 位前缀，逐条复算都过', () => {
+  const { batch, prefix } = setBatch();
+  assert.equal(prefix.length, 12, 'v2 前缀长度是 12（§15 第 4 条：从 8 位扩到 12 位）');
+  assert.equal(OWNERSHIP_VIAS.includes('bio'), true, "旧值 'bio' 不许在这一轮退役（换代次序第一条）");
+  assert.equal(OWNERSHIP_VIAS.includes('bio-set'), true);
+  for (const e of batch) {
+    assert.deepEqual(checkPendingProof(e, { batch }), { ok: true }, e.id);
+  }
+});
+
+test('bio-set：投递顺序不是判据 —— 声明集按 id 升序，乱序递同样复算通过', () => {
+  const { batch } = setBatch();
+  const shuffled = [batch[2], batch[0], batch[1]];
+  for (const e of shuffled) assert.deepEqual(checkPendingProof(e, { batch: shuffled }), { ok: true }, e.id);
+  // canon 本身是排序不变得到的：把这条钉住，别让「按调用方给的顺序拼」混进来
+  const a = canonicalProofSet([{ id: 'kkk', zipSha: SET_ZIP_2 }, { id: 'aaa', zipSha: SET_ZIP_1 }]);
+  const b = canonicalProofSet([{ id: 'aaa', zipSha: SET_ZIP_1 }, { id: 'kkk', zipSha: SET_ZIP_2 }]);
+  assert.equal(a, b);
+  assert.equal(a, `aaa:${SET_ZIP_1},kkk:${SET_ZIP_2}`, '规范串的逐字形状：id:sha 用逗号连接');
+});
+
+test('bio-set：两代前缀长度互不通用 —— 8 位前缀走 v2 被拒，12 位前缀走 v1 同样被拒', () => {
+  // 攻击形状：拿一条 v1 单枚口令的产物改个 via 冒充「这套是我一整套投的」。
+  const one = setEntry('aaa', SET_ZIP_1, wantPrefix('aaa', SET_ZIP_1));
+  const v = checkPendingProof(one, { batch: [one] });
+  assert.equal(v.ok, false);
+  assert.match(v.error, /12 位小写十六进制/);
+
+  // 反方向：拿一枚真的 12 位集合前缀走 v1 那支 —— v1 的 8 位复算对不上，也是拒。
+  const { batch, prefix } = setBatch();
+  const back = { ...batch[0], ownership: { ...batch[0].ownership, via: 'bio' } };
+  const w = checkPendingProof(back, { batch: [back] });
+  assert.equal(w.ok, false);
+  assert.match(w.error, /8 位小写十六进制/);
+  assert.equal(prefix.length, 12);
+});
+
+test('bio-set：判不了集合就是拒 —— 没有 ctx.batch 时不降级成形状检查', () => {
+  const { batch } = setBatch();
+  // 少了调用方给的这一批：这一支只剩「12 个十六进制字符」那一句，等于没有 (a) 层。
+  const noCtx = checkPendingProof(batch[0]);
+  assert.equal(noCtx.ok, false);
+  assert.match(noCtx.error, /ctx\.batch|同批/);
+});
+
+test('bio-set：枚数不是判据，整套的字节才是 —— N=1 合法，而三枚的前缀只递一枚复算必不通过', () => {
+  // §15「口令 v2 一套一串、长度恒 19 与枚数无关」：单枚批量（manifest 带 1 枚）走的还是集合口令。
+  const one = [{ id: 'aaa', zipSha: SET_ZIP_1 }];
+  const p1 = wantSetPrefix(one);
+  const e1 = setEntry('aaa', SET_ZIP_1, p1);
+  assert.deepEqual(checkPendingProof(e1, { batch: [e1] }), { ok: true },
+    'N=1 的一套必须过：把它当「少于 2 枚不是一套」拒掉，就会把单枚批量投稿全拒');
+
+  // 反方向：这一枚的前缀本来是三枚那套算的 ⇒ 整套少两枚就算出另一个前缀 ⇒ 拒（少递那一格）。
+  const { batch } = setBatch();
+  const alone = checkPendingProof(batch[0], { batch: [batch[0]] });
+  assert.equal(alone.ok, false);
+  assert.match(alone.error, /复算不符/);
+  assert.match(alone.error, /这套共 1 枚/, '文案要把复算用的枚数交出来，否则运维分不清「拆开投」与「口令算错」');
+  // 只补回一枚（少递）同样红：整套的 3 枚缺一枚都不是同一套
+  const two = checkPendingProof(batch[0], { batch: batch.slice(0, 2) });
+  assert.equal(two.ok, false);
+  assert.match(two.error, /proofPrefix/);
+});
+
+test('bio-set：换整套里任何一枚的字节就换整套 —— 一枚换成兄弟那枚的包，那一枚与它的兄弟都对不上', () => {
+  const { batch } = setBatch();
+  const swapped = batch.map((e, i) => (i === 1
+    ? setEntry(e.id, SET_ZIP_3, batch[0].ownership.proofPrefix) // 内容换了，前缀照抄不动
+    : e));
+  for (const e of swapped) {
+    const v = checkPendingProof(e, { batch: swapped });
+    assert.equal(v.ok, false, e.id);
+    assert.match(v.error, /proofPrefix/);
+  }
+  // 反过来证一次：真的按换掉后的整套算前缀，就能过（挡住「实现把复算写死成永远不过」那种假安全）
+  const fixed = wantSetPrefix([{ id: 'aaa', zipSha: SET_ZIP_1 }, { id: 'kkk', zipSha: SET_ZIP_3 }, { id: 'mmm', zipSha: SET_ZIP_3 }]);
+  const okBatch = [setEntry('aaa', SET_ZIP_1, fixed), setEntry('kkk', SET_ZIP_3, fixed), setEntry('mmm', SET_ZIP_3, fixed)];
+  for (const e of okBatch) assert.deepEqual(checkPendingProof(e, { batch: okBatch }), { ok: true }, e.id);
+});
+
+test('bio-set：声明集不起来的那些形状各拒一次（重复 id / 成员带两个 sha / 成员缺 id）', () => {
+  const { prefix } = setBatch();
+  const dup = [setEntry('aaa', SET_ZIP_1, prefix), setEntry('aaa', SET_ZIP_2, prefix)];
+  assert.match(checkPendingProof(dup[0], { batch: dup }).error, /重复|id/);
+
+  const twoShas = [
+    setEntry('aaa', SET_ZIP_1, prefix),
+    setEntry('kkk', SET_ZIP_2, prefix),
+    { ...setEntry('mmm', SET_ZIP_3, prefix), versions: [{ versionCode: 1, sha256: SET_ZIP_3 }, { versionCode: 2, sha256: SET_ZIP_1 }] },
+  ];
+  const v = checkPendingProof(twoShas[0], { batch: twoShas });
+  assert.equal(v.ok, false, '一枚口令只覆盖一枚包：成员带两个 sha 时无法重建声明集');
+  assert.match(v.error, /2 个 sha256|一枚口令只覆盖一枚包/);
+
+  const noId = [setEntry('aaa', SET_ZIP_1, prefix), { ...setEntry('kkk', SET_ZIP_2, prefix), id: '  ' }];
+  assert.match(checkPendingProof(noId[0], { batch: noId }).error, /id/);
+});
+
+test('bio-set：未知 via 一律拒 —— 扩的是白名单，不是「未知取值当放行」', () => {
+  const { batch } = setBatch();
+  for (const via of ['bio-set-v3', 'Bio', 'bio ', '', null, 'self_report']) {
+    const e = { ...batch[0], ownership: { ...batch[0].ownership, via } };
+    const v = checkPendingProof(e, { batch });
+    assert.equal(v.ok, false, JSON.stringify(via));
+    assert.match(v.error, /ownership/, JSON.stringify(via));
+  }
+});
+
+test('bio-set：CLI 走真目录 —— 整批三枚 → 0；把其中一枚换成别的包 → 1 且点名那一枚', () => {
+  const dir = mk('vpp-set-ok-');
+  let dir2;
+  try {
+    const { batch } = setBatch();
+    batch.forEach((e, i) => write(dir, `${['aaa', 'kkk', 'mmm'][i]}/1.json`, e));
+    assert.equal(main([dir], { log: quiet() }), 0, '整批进目录必须全过：批量投稿开出来的 PR 不能被判据拒掉');
+
+    dir2 = mk('vpp-set-bad-');
+    const broken = batch.map((e, i) => (i === 2
+      ? { ...e, versions: [{ versionCode: 1, sha256: '9'.repeat(64) }] } // 口令没换，字节换了
+      : e));
+    broken.forEach((e, i) => write(dir2, `${['aaa', 'kkk', 'mmm'][i]}/1.json`, e));
+    const log = quiet();
+    assert.equal(main([dir2], { log }), 1);
+    assert.match(allLogs(log), /mmm\/1\.json/);
+    assert.match(allLogs(log), /proofPrefix/);
+  } finally { rm(dir); rm(dir2); }
+});
+
+test('bio-set：与 Worker 那份实现逐字同算法（读得到 contrib/worker 时跨实现比一次）', (t) => {
+  const src = path.resolve(import.meta.dirname, '../../worker/src/proof.ts');
+  if (!fs.existsSync(src)) return t.skip('worker/src/proof.ts 不在这个 checkout 里');
+  // 必须在**子进程**里读那份 TS，不在本进程 import：本进程先 import proof.ts 会把 Node 的 TS
+  // 加载切到 strip-only，于是后面那条「Worker 真写出的 pending JSON 能过本步复算」就再也读不了
+  // worker/src/index.ts（parameter property 需要 transform）—— 拿一条用例的绿换另一条变 skip，
+  // 是比红更难看见的退化。2026-10-21 实测到这一步会 skip，所以改成起子进程。
+  const items = [
+    { id: 'mmm', zipSha: SET_ZIP_3 },
+    { id: 'aaa', zipSha: SET_ZIP_1 },
+    { id: 'kkk', zipSha: SET_ZIP_2 },
+  ];
+  let out;
+  try {
+    out = execFileSync(process.execPath, ['--input-type=module', '-e', [
+      `const m = await import(${JSON.stringify(pathToFileURL(src).href)});`,
+      `const items = ${JSON.stringify(items)};`,
+      'process.stdout.write(JSON.stringify({',
+      '  canon: m.canonicalProofSet(items),',
+      '  prefix: await m.proofPrefixV2(items),',
+      '  len: m.PROOF_PREFIX_LEN_V2,',
+      '}));',
+    ].join('\n')], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) {
+    return t.skip(`这个 Node 读不了 Worker 的 TS 源码：${String(e.stderr || e.message).slice(0, 120)}`);
+  }
+  const w = JSON.parse(out);
+  assert.equal(w.prefix, proofPrefixForSet(items),
+    '复算端与写入端算出两个前缀 = 线上每条批量投稿都会被拒，而单测全绿');
+  assert.equal(w.canon, canonicalProofSet(items), '规范串漂一个字，两侧对「同一套」就不是同一套');
+  assert.equal(w.len, PROOF_PREFIX_LEN_V2, '前缀长度这一格漂了：12 位是 §15 第 4 条拍定的值');
 });
 
 test('checkActor：来源不一致 → 拒；一致 → 过；空白名单/空 actor → 拒（fail closed）', () => {

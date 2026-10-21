@@ -32,6 +32,7 @@ import assert from 'node:assert/strict';
 
 import {
   RULES_BY_ID, countsTowardRisk, printableRatio, POLYGLOT_MIN_PRINTABLE, scoreRisk, decide,
+  MALICE_RULE_IDS,
 } from './risk-rules.mjs';
 import { classify, readZip } from './scan.mjs';
 import { makeModuleZip, scanToReport } from './fixtures.mjs';
@@ -92,6 +93,54 @@ function probe(ruleId, file, text) {
 const probeRead = (list) => list.map((f) => `${f.severity}@${f.line}`).sort();
 
 // ---------------------------------------------------------------------------
+// 两轴读数的公共尺子（2026-10-21 换轴接线之后）
+// ---------------------------------------------------------------------------
+const MALICE_SET = new Set(MALICE_RULE_IDS);
+/** 一份形状里「名单成员在说话」的那几条（就是拦它的那件事，不是等级）。 */
+const listedIn = (row) => [...new Set(row.expectSpots.map((s) => s.split('/')[0]).filter((id) => MALICE_SET.has(id)))].sort();
+/** 标注里点到的所有规则名（三格并起来看：能力 / 覆盖 / 上下文题）。 */
+const annotated = (r) => [...new Set([
+  ...(r.annotation?.capabilities || []),
+  ...(r.annotation?.coverageGaps || []),
+  ...(r.annotation?.contextQuestions || []),
+])];
+/**
+ * 一行表 = 一个声明（row.axis）+ 一次复算（名单自己）。两者一漂就红，这才是这张表换轴之后的牙：
+ *   以前有人把规则摘掉 ⇒ expectSpots 红；现在**还有人**把它偷偷进/退名单 ⇒ 这里红。
+ * 降档那一侧的验收形状是 §3.2 ② 那句「不许静默」：不上架了，读数还必须在 annotation 里点名。
+ */
+function assertAxis(row, r) {
+  assert.ok(row.axis === 'malice' || row.axis === 'annotation',
+    `${row.id} 缺 axis 这一格（'malice' | 'annotation'）：换轴之后每张表都要说自己站在哪根轴上`);
+  const listed = listedIn(row);
+  const derived = listed.length ? 'malice' : 'annotation';
+  assert.equal(row.axis, derived,
+    `${row.id} 声明的是 ${row.axis}，但真名单在这一发上说 ${derived ? 'malice' : 'annotation'}`
+    + `（名单成员：${JSON.stringify(listed)}；实测 ruleIds=${JSON.stringify(ruleIds(r))}）。`
+    + ' 有人把规则进/退了拦截名单 ⇒ 定案表要重新过一轮，不许只改名单不改表。');
+  if (row.axis === 'malice') {
+    assert.equal(r.malice.malicious, true,
+      `${row.id} 命中名单却说没命中：判据与名单漂了 ${JSON.stringify(r.malice.hits)}`);
+    assert.equal(r.decision.action, 'block',
+      `${row.id}：${JSON.stringify(listed)} 在名单里，就必须不上架（实测 ${r.riskLevel}/${r.decision.action}）`);
+    for (const id of listed) {
+      assert.ok(r.malice.hits.some((h) => h.source === 'static' && h.ruleId === id),
+        `${row.id}：拦它的应当点名是 ${id}，实际 hits=${JSON.stringify(r.malice.hits.map((h) => h.ruleId))}`);
+    }
+  } else {
+    assert.equal(r.malice.malicious, false,
+      `${row.id} 是名单外的形状（正当功能/假阳性），却被判成命中：${JSON.stringify(r.malice.hits)}`);
+    const ann = annotated(r);
+    for (const spot of row.expectSpots) {
+      const id = spot.split('/')[0];
+      assert.ok(ann.includes(id),
+        `${row.id}：${id} 不再拦上架之后必须**还在标注里点名**（§10「不许静默」）；annotation=${JSON.stringify(r.annotation)}`);
+    }
+  }
+  return { listed };
+}
+
+// ---------------------------------------------------------------------------
 // 表一 REGRESSION —— 今天拦得住的
 // 每行两个字段是硬的：
 //   expectSpots —— 这一行必须由**哪条规则**说话（V3 变异「摘掉规则」时红在这里，
@@ -113,6 +162,7 @@ const REGRESSION = [
     ]}),
     expectSpots: ['EXEC_BUNDLED_FILE/high@service.sh:2', 'PIPE_TO_SHELL/high@conf.json:2'],
     measured: 'high / block',
+    axis: 'malice', // PIPE_TO_SHELL 在名单里 ⇒ 拦它的不是等级
   },
   {
     id: 'REG-02',
@@ -124,7 +174,10 @@ const REGRESSION = [
       ['sepolicy.rule', 'allow su * fs:file { read write open execute }\n'],
     ]}),
     expectSpots: ['SELINUX_POLICY_RELAX/high@sepolicy.rule:1'],
-    measured: 'high / block',
+    measured: 'high / auto-approve（2026-10-21 换轴实测；换轴前是「high / block」）—— §3.1 量出来会翻档的两发之一：'
+      + '这一发的唯一证人是 SELINUX_POLICY_RELAX，而 §13.6 拍的是「降档 + 给 AI 一道上下文题」'
+      + '⇒ 它今天进 annotation.contextQuestions，不再进拦截名单。等级照旧 high、读数照旧在报告面上。',
+    axis: 'annotation',
   },
   {
     id: 'REG-03',
@@ -139,7 +192,11 @@ const REGRESSION = [
     ]}),
     expectSpots: ['MAGISK_POLICY_LIVE/high@service.sh:2', 'VERIFIED_BOOT_SPOOF/high@service.sh:3',
       'DEBUGGABLE_ENABLE/medium@service.sh:4'],
-    measured: 'high / block',
+    measured: 'high / auto-approve（2026-10-21 换轴实测；换轴前是「high / block」）—— §3.1 的另一发：'
+      + '说话的是 MAGISK_POLICY_LIVE / VERIFIED_BOOT_SPOOF / DEBUGGABLE_ENABLE，三条都不在名单里'
+      + '（§13.6 拍：前两条降档进上下文题，member 表按 §3.2 ② 补齐）。'
+      + '§3.1 那句「同一条规则不能既属拦截轴又属能力轴」就是这一发量出来的。',
+    axis: 'annotation',
   },
   {
     id: 'REG-04',
@@ -155,6 +212,7 @@ const REGRESSION = [
     ]}),
     expectSpots: ['DOWNLOAD_THEN_EXEC/high@service.sh:4'],
     measured: 'high / block（NETWORK_FETCH/low 只是背景噪声）',
+    axis: 'malice',
   },
   {
     id: 'REG-05',
@@ -175,6 +233,7 @@ const REGRESSION = [
         'NUL 填充把它压在阈值之下 ⇒ polyglot 通道不许接住它（这一格只能由引用解析负责）');
     },
     measured: 'high / block',
+    axis: 'malice', // PIPE_TO_SHELL 在名单里（§3.1 那句「REG-05 仍被拦只是因为明文带 curl|sh」）
   },
   {
     id: 'REG-06',
@@ -186,6 +245,7 @@ const REGRESSION = [
     // 两条都要：EXEC_BUNDLED_FILE 说「执行的是模块自带条目」，DOWNLOAD_THEN_EXEC 说「那个条目是远程落下来的」。
     expectSpots: ['DOWNLOAD_THEN_EXEC/high@service.sh:3', 'EXEC_BUNDLED_FILE/high@service.sh:3'],
     measured: 'high / block',
+    axis: 'malice',
   },
   {
     id: 'REG-07',
@@ -201,6 +261,7 @@ const REGRESSION = [
     ]}),
     expectSpots: ['DOWNLOAD_THEN_EXEC/high@customize.sh:4', 'EXEC_BUNDLED_FILE/high@customize.sh:4'],
     measured: 'high / block',
+    axis: 'malice',
   },
   {
     id: 'REG-08',
@@ -213,6 +274,7 @@ const REGRESSION = [
     ]}),
     expectSpots: ['PIPE_TO_SHELL/high@service.sh:2'],
     measured: 'high / block',
+    axis: 'malice',
   },
   {
     id: 'REG-09',
@@ -229,6 +291,7 @@ const REGRESSION = [
     ]}),
     expectSpots: ['DOWNLOAD_THEN_EXEC/high@customize.sh:5'],
     measured: 'high / block',
+    axis: 'malice',
   },
   {
     id: 'REG-10',
@@ -240,6 +303,7 @@ const REGRESSION = [
     ]}),
     expectSpots: ['PIPE_TO_SHELL/high@installer.sh:2'],
     measured: 'high / block',
+    axis: 'malice',
   },
   {
     id: 'REG-11',
@@ -260,6 +324,7 @@ const REGRESSION = [
         '一份身份：feed 里的条目不重复出现在 scripts 清单（Task 4 §2.4）');
     },
     measured: 'high / block',
+    axis: 'malice', // PIPE_TO_SHELL（明文那两行自己说话）在名单里
   },
   {
     id: 'REG-12',
@@ -279,15 +344,28 @@ const REGRESSION = [
         '撤销证人必须在（这条豁免没有把记账一起关掉）');
     },
     measured: 'high / block',
+    axis: 'malice', // PIPE_TO_SHELL 在名单里：豁免撤销的是 EXEC_BUNDLED_FILE，撤不掉载荷自己那一行
   },
 ];
 
-// 表一的每一条：断「不是自动通道」+ 断「这一轮的那条规则确实在说话」。
+// 表一的每一条：断「这一轮的那条规则确实在说话」+ 断「换轴之后它落在哪一根轴上」。
+//
+// ── 2026-10-21 第二发（换轴已接线）：这一张表的「拦得住」换了定义 ──────────────────────
+// 旧口径是「decision.action !== 'auto-approve'」，而那个 action 吃的是**风险等级**：
+// 只要包里有任何一条 high/medium 就不落自动通道。§1 第 3 条量过这件事——14 条 high 里有一批
+// 匹配的就是 root 模块的正当功能本身，用它当拦截条件等于把这个生态全灭。
+// 新口径（§2 / §13.5）由 `axis` 这一格声明、由下面那个函数**对MALICE_RULE_IDS复算一遍**：
+//   * axis:'malice'      ⇒ 名单成员说话 ⇒ block，且 r.malice.hits 里必须点到那一条；
+//   * axis:'annotation'  ⇒ 名单外 ⇒ auto-approve，但那几条读数必须**逐条**出现在 r.annotation 里
+//                          （§10：标注不许静默；「降档后从读者眼前消失」是 §3.2 ② 唯一的验收形状）。
+// 于是这张表的牙没有变少，反而多了一格：以前只有「规则摘掉 ⇒ 红」，现在「规则偷偷进/退名单 ⇒ 红」，
+// 因为 row.axis 是人写的定案，函数拿真名单去对，两边一漂就红。
+// REG-02 / REG-03 正是 §3.1 量出来会翻档的那两发（SELINUX_POLICY_RELAX、MAGISK_POLICY_LIVE/
+// VERIFIED_BOOT_SPOOF 都在降档那一侧）⇒ 它们今天从 block 翻成 auto-approve，是真生效的信号。
 for (const row of REGRESSION) {
   test(`T7-REG ${row.id} 拦得住：${row.name}`, async () => {
     const r = await run(row);
-    assert.notEqual(r.decision.action, 'auto-approve',
-      `${row.id} 今天必须不落自动通道；实测 ${r.riskLevel}/${r.decision.action} findings=${JSON.stringify(spots(r))}`);
+    assertAxis(row, r);
     for (const spot of row.expectSpots) {
       const ruleId = spot.split('/')[0];
       assert.ok(spots(r).includes(spot),
@@ -326,7 +404,8 @@ const SENTINELS = [
       ['customize.sh', body('cp $MODPATH/hosts.txt /data/adb/modules/$MODID/blockers.txt')],
       ['hosts.txt', '127.0.0.1 ads.example.com\n'],
     ]}),
-    measured: 'medium / block（HOSTS_MODIFY/medium + HARDCODED_IP/low）',
+    measured: 'medium / auto-approve（2026-10-21 换轴实测；换轴前是「medium / block（HOSTS_MODIFY/medium + HARDCODED_IP/low）」）'
+      + '—— 等级一字未动，HOSTS_MODIFY/medium + HARDCODED_IP/low 两条读数都还在；变的是「medium 不再是拦截条件」。',
   },
 ];
 
@@ -341,7 +420,16 @@ for (const row of SENTINELS) {
       assert.equal(r.riskLevel, 'medium', `${row.id} 封顶在 medium：实测 ${JSON.stringify(r.counts)}`);
       assert.ok(r.findings.some((f) => f.ruleId === 'HOSTS_MODIFY' && f.severity === 'medium'),
         `HOSTS_MODIFY 那一支必须在且是 medium：${JSON.stringify(spots(r))}`);
-      assert.notEqual(r.decision.action, 'auto-approve', `${row.id}：假阳性走人工，不许自动放行`);
+      // ── 2026-10-21 换轴接线的直接后果（旧期望：`notEqual(action,'auto-approve')`）──────────
+      // 这一格锁的从来是**上限**（加严不许把正经去广告模块抬到 high），不是「必须走人工」；
+      // 而旧写法里「走人工」是等级轴的副产品（medium ⇒ 不自动放行）。§0.2 拍掉等级轴之后
+      // 副产品没了：HOSTS_MODIFY 不在拦截名单里 ⇒ 这一发上架并标注。
+      // §3.1 把这件事写得很直白：「误伤不再伤人，只让报告难看」，所以去噪收窄不再是前置条件。
+      // 牙没少：等级封顶照旧，且这条读数必须在标注里点名 —— 从「拦人」换成「不许静默」。
+      assert.equal(r.decision.action, 'auto-approve',
+        `${row.id}：名单外的 medium 现在应当上架并标注（实测 ${r.decision.action}）`);
+      assert.ok(annotated(r).includes('HOSTS_MODIFY'),
+        `${row.id}：降成标注不等于从读者眼前消失：annotation=${JSON.stringify(r.annotation)}`);
     }
   });
 }
@@ -494,7 +582,8 @@ const KNOWN_MISS = [
     build: () => ({ id: 'eval.t7km7', files: [
       ['webroot/index.js', 'const PKG = "io.github.foo.ml";\n'],
     ]}),
-    measured: 'medium / block（残留 FP：无害的反向 DNS 名换不来包名豁免）',
+    measured: 'medium / auto-approve（2026-10-21 换轴实测；换轴前是「medium / block（残留 FP：无害的反向 DNS 名换不来包名豁免）」）'
+      + '—— 等级仍是 medium、SUSPICIOUS_DOMAIN/medium 那条残账照旧在报告面上，换的是它不再拦上架。',
   },
   {
     id: 'KM-8',
@@ -584,7 +673,13 @@ for (const row of KNOWN_MISS) {
       }
       case 'fp-stays-medium': {
         assert.equal(r.riskLevel, 'medium', `${row.id}：FP 残留的等级漂了：${JSON.stringify(r.counts)}`);
-        assert.equal(r.decision.action, 'block', `${row.id}：medium ⇒ 走人工；实测 ${r.decision.action}`);
+        // 2026-10-21 换轴接线：旧期望是 `action === 'block'`（medium ⇒ 走人工）。
+        // 这一条残账说的是「假阳性仍在等级里」，而换轴之后「在等级里」不再等于「不上架」：
+        // HARDCODED_IP / NETWORK_FETCH 这类背景噪声不在拦截名单里（§3.2 ③：一切 medium 归标注）
+        // ⇒ 今天落 auto-approve，但读数必须在 annotation 里点名，读者仍然看得见它。
+        assert.equal(r.decision.action, 'auto-approve',
+          `${row.id}：medium 残留现在是标注不是拦截；实测 ${r.decision.action}`);
+        assert.ok(annotated(r).length > 0, `${row.id}：降成标注后 annotation 是空的 ⇒ 静默：${JSON.stringify(r.annotation)}`);
         break;
       }
       default: assert.fail(`${row.id}：expect 未实现：${row.expect}`);
@@ -697,7 +792,7 @@ const NARROWING_WITNESSES = [
         'snippet 必须指名产生结论的那个匹配，不许是最左那个：' + JSON.stringify(hits[0]));
       assert.equal(r.riskLevel, 'medium');
     },
-    measured: 'medium / block，1 条 SUSPICIOUS_DOMAIN/medium，snippet=payload.xyz',
+    measured: 'medium / auto-approve（换轴实测，原 medium / block），1 条 SUSPICIOUS_DOMAIN/medium，snippet=payload.xyz',
   },
   {
     id: 'NW-5',
@@ -768,9 +863,18 @@ const NARROWING_WITNESSES = [
         '读过 ≠ 读过且无罪：可撤销面只认那五个桶 ⇒ 这一笔撤销不该发生');
       assert.deepEqual(spotOf(r, 'EXEC_BUNDLED_FILE'), ['high@customize.sh:2'],
         '那条 high 必须还在，且不许被 feed 撤走：' + JSON.stringify(spots(r)));
-      assert.equal(r.decision.action, 'block');
+      // 2026-10-21 换轴接线（旧期望：`action === 'block'`）：这一发的读数一条不落全在，
+      // 变的是「high 不再等于不上架」——EXEC_BUNDLED_FILE 按 §3.2 ② 归能力/覆盖轴。
+      // §3.1 那条边界就点名了这一发：「NW-8 那发（sh $MODPATH/conf.json，被执行的条目内容干净）
+      // 今天由它单独顶住，新模型下上架 —— **那一发本身该上**」。
+      // 牙留着的地方：那条 high 不许消失，而且它必须在 annotation 里点名（不许静默）。
+      assert.equal(r.decision.action, 'auto-approve',
+        `实测 ${r.decision.action}：EXEC_BUNDLED_FILE 不在拦截名单里 ⇒ 上架 + 标注`);
+      assert.ok(annotated(r).includes('EXEC_BUNDLED_FILE'),
+        `能力读数必须还在标注里：annotation=${JSON.stringify(r.annotation)}`);
     },
-    measured: 'high / block（conf.json 在 scripts 里，revokedBundledRefs 仍为空）',
+    measured: 'high / auto-approve（2026-10-21 换轴实测；换轴前是「high / block（conf.json 在 scripts 里，revokedBundledRefs 仍为空）」）'
+      + '—— conf.json 在 scripts 里、revokedBundledRefs 仍为空这两件事一字未变。',
   },
 ];
 

@@ -16,10 +16,12 @@
 #   2. 当前 monorepo（索引仓库在 contrib/repo/）  -> REPO_PREFIX=contrib/repo
 # 用 vars.MODULE_REPO_PREFIX 覆盖，或让下面的探测逻辑自己认。
 #
-# 决策矩阵（已定案）：
-#   低风险 + 首次收录        -> auto-approved，自动合入索引
-#   低风险 + 版本更新        -> needs-human-review，请求人工（不自动合入）
-#   中/高风险（任何变更类型）-> needs-human-review，阻止自动合入
+# 分流判据（2026-10-21 换轴：设计文档 §2 / §4 / §13.5；等级不再当判决）：
+#   命中上架拦截名单（**任一**包；静态 11 条 ∪ AI 恶意结论且引用逐字复验过）-> block，不进索引
+#   名单外的一切，含 root 模块正当功能本身那批 high                        -> auto-approved，自动合入索引
+#   不是首次收录（update / unknown）与「撤销过执行类发现」那两格              -> request-review，不自动合入
+#   等级、覆盖读数、能力读数在新模型里只是**标注**（随报告与评论公示），不再决定上不上架。
+#   措辞纪律：拦下说的是「命中名单」这件事，等级高不等于恶意；没命中也不代表「查过了没事」。
 #   审核不通过的内容绝不出现在正式索引里。
 #
 # AI 安全员（Task 6.1）：QCA 四件（QODER_PAT / QCA_AGENT_ID / QCA_AGENT_VERSION /
@@ -35,7 +37,9 @@
 # 五种状态（disabled / ok / failed / untrusted / over-budget）由 AI 步逐包写进
 # audit-out/ai-<zip basename>.status，由「分流决策」消费：failed / untrusted / over-budget
 # 各用自己那句串、整步红；ok 参与 raiseLevel 抬级；disabled 等级不动。
-# 判自动放行的地方全仓只有一处（分流决策里的 decide），这一步不产出 action。
+# 判自动放行的判据全仓只有一份（audit/risk-rules.mjs 的 classifyMalice + decide）：分流那一步 import 它，
+# 不在这里抄第二份；AI 步自己也不产出 action —— 它只写等级读数与那份「恶意结论 + 引用逐字复验结果」，
+# 名单上 AI 那一支的 ∪ 发生在分流（§0 第 1 条：静态 ∪ AI 恶意结论，两边都只有拒的权力）。
 
 name: Module Submission Audit
 
@@ -805,13 +809,18 @@ jobs:
           # 这里原本是 `ls -t audit-out/*.audit.json | head -n1` —— 只拿「时间戳最新的那一份报告」定级，
           # 而 publish 作业合的是**整条 PR**。于是一条含两份 pending 的 PR，只要最新那份判成 low+first，
           # 另一份哪怕 high 也会被一起 squash 合并进去；locate 打的 pending_count 从没被任何判据读过。
-          # 现在的判据是：auto-approve 只在**每一份**报告都是 low + first 时才成立；
-          # 等级取所有报告里最严的那个，module_id / reasons 按包汇总，让人看得出这条 PR 里到底有几个人投稿。
+          # 现在的判据分两格，方向都是「取严」：
+          #   ① 上不上架只看「有没有命中上架拦截名单」——**任一**包命中就 block（§0 第 1 条原话）；
+          #      一包都不命中，才把「等级 + 首次收录/版本更新 + 撤销覆盖度」交给 audit/risk-rules.mjs
+          #      里那份 decide()。等级与覆盖读数在新模型里是标注，不是判决。
+          #   ② 取最严这件事仍然按包汇总：等级取所有报告里最严的那个，module_id / reasons 逐包列出，
+          #      让人看得出这条 PR 里到底有几个人投稿 —— F16 那个洞不许因为换轴而重新打开。
           # 没有报告就不许定级（audit-out 为空 → 直接红），不许把「什么都没扫到」当成放行理由。
           #
           # AI 那一层（Task 6.1）在这一格消费，不在别处：五种状态要在这里产生五种不同的下游后果。
-          #   disabled      → 等级不动，文案是「未启用」那句；
-          #   ok            → 逐包 raiseLevel 抬级（只升不降），findings 并进 reasons；
+          #   disabled      → 等级不动，文案是「未启用」那句；名单上 AI 那一支没有读数（只有静态那半）；
+          #   ok            → 逐包 raiseLevel 抬级（只升不降），findings 并进 reasons，
+          #                   maliceVerdict 是名单 ∪ 的第二个来源（只有 malicious:true 且引用逐字复验过才加拒）；
           #   failed        → 本步 exit 1，「没跑成」那句；
           #   untrusted     → 本步 exit 1，「判据不可采信」那句（与 failed 不同串）；
           #   over-budget   → 本步 exit 1，「送不全」那句：不是它同意，是没看全。
@@ -866,12 +875,23 @@ jobs:
             const order={low:1,medium:2,high:3};
             // 读不懂的报告不是「低风险」。riskLevel 缺失或不在枚举里时按 high 排 ——
             // 否则排序比较器拿到 undefined 会当成「相等」，一份坏报告就能把整条 PR 顶到 low。
+            // 换轴之后这一格还要往上走一步：等级不再决定上不上架 ⇒ 「按 high 排」不再是任何人的护栏
+            // （一份缺 riskLevel 的报告在新模型里会因为「没命中名单」而被自动放行）。所以这里按
+            // 本步其余 fail-closed 闸的同一方向处理：整步红。等级读不出来 = 这份报告本身不完整，
+            // 「没命中名单」这个读数压根不存在，不许默认成它放过去。
             const riskOf=(x)=>(typeof x.riskLevel === "string" && order[x.riskLevel] !== undefined) ? x.riskLevel : "high";
             reports=names.map((f)=>({
               pkg:f.replace(/\.audit\.json$/,""),
               r:JSON.parse(fs.readFileSync(dir+"/"+f,"utf8")),
             }));
             const pkgs=reports.map((x)=>x.pkg);
+            for (const x of reports) {
+              const lv=x.r.riskLevel;
+              if (typeof lv !== "string" || order[lv] === undefined) {
+                fail(`报告 ${x.pkg}.audit.json 的 riskLevel 读不出来（${JSON.stringify(String(lv).slice(0,40))}）：`
+                  + "等级缺失或不在 low/medium/high 里 = 这份报告不完整，红；不许按「名单没命中」继续走");
+              }
+            }
 
             // ---- AI 状态：audit-out/ai-<zip basename>.status，一份一包（§0.2-3 不许 last-wins）
             // <zip basename> 与报告名同源：scan.mjs 写的就是 `<zip name>.audit.json`，含 .zip。
@@ -987,13 +1007,83 @@ jobs:
             w("ai_note",aiNote);
             w("reasons",reasons.join("；"));
 
-            // 决策矩阵：唯一可自动放行的是「每一份都低风险 + 首次收录」。
-            // AI 抬完级之后 action 一律由这里重算 —— 判自动放行全仓只许这一处。
-            const decide=(r,ct)=> (r==="low" && ct==="first")
-              ? { action:"auto-approve", label:"auto-approved", needs_human_review:"false" }
-              : { action: r==="low" ? "request-review" : "block", label:"needs-human-review", needs_human_review:"true" };
-            const d=decide(risk,changeType);
-            w("action",d.action); w("label",d.label); w("needs_human_review",d.needs_human_review);
+            // ── 分流判据：恶意行为轴（设计文档 §2 / §4 / §13.5；用户 2026-10-21 拍的四条）────────────
+            // 唯一决定上不上架的是「命中没命中上架拦截名单」，不是等级：命中 ⇒ block；名单外的一切
+            // （含 root 模块正当功能本身那批 high）⇒ 由 audit/risk-rules.mjs 里那份 decide() 定处置，
+            // 而那份 decide() 同时还守着 update/unknown 与 fix8-E（撤销过）这两格 —— 换轴绕不过去。
+            //
+            // 判据只许有一份 ⇒ 这里 import 真实现，不在 YAML 里抄第二份 classifyMalice/decide。
+            // 为什么不选「直接读报告里那格 decision」：scan.mjs 跑在 AI **之前**，那份 decision 的
+            // aiMalice 恒为 null（scan.mjs 自己写着「恶意通道的 ∪ 发生在 audit.yml 分流决策这一格」），
+            // 读它等于在接线这一格把 §0 第 1 条里「∪ AI 恶意结论」那半支取消掉；那半支只有拒的权力，
+            // 取消它只会让名单比定案的更窄 —— 方向是放宽，所以这一格必须自己把 ∪ 补全。
+            const RR_CANDS=["audit/risk-rules.mjs","contrib/audit/risk-rules.mjs"];
+            const rrHit=RR_CANDS.find((c)=>fs.existsSync(c));
+            if (!rrHit) fail(`读不到上架拦截名单的判据实现（已尝试：${RR_CANDS.join(", ")}）：`
+              + "拿不到 classifyMalice/decide 就不许定级，更不许「退化成按等级判」");
+            const { classifyMalice, decide } = await import(pathToFileURL(path.resolve(rrHit)).href);
+            if (typeof classifyMalice !== "function" || typeof decide !== "function") {
+              fail(`${rrHit} 没同时导出 classifyMalice 与 decide：名单与处置不在我们 import 的那一份里`);
+            }
+            // 逐包判名单，取严在 YAML 这一层聚合（与 risk 取最严、changeTypeOf 同一层、同一口径）。
+            // 两道 fail-closed，方向与本步其余闸一致（红 = 不放行，不是「按名单外处理」）：
+            //   ① 报告里没有 malice 那一格 ⇒ 这份报告不是带名单判据的扫描器写的，「未命中」这个读数
+            //      压根不存在，不许默认成它放过去；
+            //   ② 状态是 ok 而产物里没有 maliceVerdict ⇒ 名单上 AI 那一支没有读数，这一发跑的其实是
+            //      比定案更窄的名单 —— 正是「代码换了、接线没换」那个形状，红。
+            const maliceOf=(x)=>{
+              const m=x.r.malice;
+              if (!m || typeof m!=="object" || Array.isArray(m) || typeof m.malicious!=="boolean") {
+                fail(`报告 ${x.pkg}.audit.json 里没有 malice 那一格（或它的 malicious 不是布尔）：静态扫描`
+                  + "没跑上架拦截名单的判据 ⇒ 这里没有「未命中名单」这个读数，不许按名单外放过去");
+              }
+              const hasVerdict=ai[x.pkg]==="ok";
+              if (hasVerdict) {
+                const v=art[x.pkg].maliceVerdict;
+                if (!v || typeof v!=="object" || Array.isArray(v) || typeof v.malicious!=="boolean") {
+                  fail(`AI 产物 ai-${x.pkg}.json 的状态是 ok，却没有 maliceVerdict 那一格：名单上 AI 那一支`
+                    + "没有读数 ⇒ 这一发跑的是比定案更窄的名单，不许把它读成「AI 说了不是」");
+                }
+              }
+              const cm=classifyMalice(x.r.findings, hasVerdict ? art[x.pkg].maliceVerdict : null);
+              if (!cm || typeof cm.malicious!=="boolean") {
+                fail(`classifyMalice(${x.pkg}) 没给出布尔读数：判据换了形状，接线跟上之前不许定级`);
+              }
+              if (m.malicious===true && cm.malicious===false) {
+                fail(`报告 ${x.pkg}.audit.json 自述命中上架拦截名单，而用同一份判据重算它自己的 findings 说不命中：`
+                  + "findings 与它的 malice 那格对不上 = 判据收到的东西不全，不许按「没命中」放过去");
+              }
+              return cm;
+            };
+            const malices=reports.map((x)=>({pkg:x.pkg, m:maliceOf(x)}));
+            const hitPkgs=malices.filter((x)=>x.m.malicious);
+            // 取严（§0 第 1 条原话「任一命中就不上架」）：**任一**包命中就 block ——
+            // 不是「全部命中」，也不是「取最严那一份报告」。AI 那一支只往 hits 里加（§2 的不变量）。
+            const malice=hitPkgs.length ? {
+              malicious:true,
+              hits:hitPkgs.flatMap((x)=>(Array.isArray(x.m.hits)?x.m.hits:[]).map((h)=>({pkg:x.pkg,...h}))),
+              basis:[...new Set(hitPkgs.flatMap((x)=>(Array.isArray(x.m.basis)?x.m.basis:[])))],
+              reason:hitPkgs.map((x)=>`${reports.length>1?`${x.pkg}: `:""}${x.m.reason||"命中上架拦截名单"}`).join("；"),
+            } : {
+              malicious:false, hits:[],
+              basis:[...new Set(malices.flatMap((x)=>(Array.isArray(x.m.basis)?x.m.basis:[])))],
+              reason:`${reports.length>1?`${reports.length} 份报告逐包判过，没有一份命中：`:""}${(malices[0]&&malices[0].m.reason)||"未命中上架拦截名单"}`,
+            };
+            // fix8-E（撤销过执行类发现 ⇒ 机器不替它作证）在新轴上照旧生效：判据住在 decide() 的第三参里，
+            // 这里只按 scan.mjs 同一个口径把 revokedBundledRefs 汇成输入；多包汇总次数 ⇒ 只会更严不会更松。
+            const revoked=reports.flatMap((x)=>(Array.isArray(x.r.revokedBundledRefs)?x.r.revokedBundledRefs:[]));
+            const coverage={ revokedCount:revoked.length,
+              revokedEntries:[...new Set(revoked.map((e)=>e&&e.resolvedEntry).filter((s)=>typeof s==="string"&&s))] };
+            const d=decide(risk,changeType,coverage,malice);
+            // 命中名单却给出非 block ⇒ 「取严」这一格在被改宽。红，不猜。
+            if (malice.malicious && d.action!=="block") {
+              fail(`名单命中而 decide() 给出的处置是 ${JSON.stringify(String(d.action).slice(0,32))}：`
+                + "「取严：任一命中就不上架」在被改宽，这一步不许放行");
+            }
+            // 这里一个「放行」的字面量都不写：action / label 全部来自 import 进来的那份判据，
+            // needs_human_review 反过来写（认不出 false 就是 true）—— 未知形状一律按不放行。
+            w("action",d.action); w("label",d.label);
+            w("needs_human_review", d.needsHumanReview===false ? "false" : "true");
             })().catch((e)=>{
               // 判据自己出问题 = 红。兜成「按静态结论继续」等于把这道闸交给故障。
               const m=`分流决策异常：${e && e.message ? e.message : String(e)}`;
@@ -1388,7 +1478,10 @@ jobs:
                 await github.rest.issues.createLabel({
                   owner: context.repo.owner, repo: context.repo.repo,
                   name: l, color: l === 'auto-approved' ? '0e8a16' : 'd93f0b',
-                  description: l === 'auto-approved' ? '静态扫描低风险且为首次收录，自动放行' : '需人工审核',
+                  // 这句是**打在 PR 上的说法**，必须与分流那一步真实的判据同一句话：
+                  // 换轴之后拿到 auto-approved 的原因是「名单里没有它」，不是「等级低」——
+                  // 写成「低风险且首次收录」就是假陈述（正当功能的 high 也在这格里）。
+                  description: l === 'auto-approved' ? '未命中上架拦截名单，由一次可复验的机器运行判定自动放行（未经人工审核）' : '需人工审核',
                 });
               }
             }
