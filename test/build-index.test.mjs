@@ -6,7 +6,7 @@ import path from 'node:path';
 import {
   buildIndex, normalizeEntry, isApproved,
   collectPendingFiles, markApproved, parseArgs, main,
-  APPROVAL_FIELD, APPROVED_STATUS, HUMAN_APPROVED_STATUS,
+  APPROVAL_FIELD, APPROVED_STATUS, APPROVED_STATUSES,
 } from '../scripts/build-index.mjs';
 import { validateIndex } from '../scripts/validate-index.mjs';
 
@@ -137,8 +137,31 @@ test('补充：未通过审核的条目被忽略，且手写的快捷写法不�
   // 有章但没署名：追责链回答不了「谁批的」，与没有章等价
   assert.equal(isApproved({ [APPROVAL_FIELD]: { status: APPROVED_STATUS } }), false, '无主章不该算通过');
   assert.equal(isApproved({ [APPROVAL_FIELD]: { status: APPROVED_STATUS, by: '   ' } }), false);
-  // 人工放行走同一个字段，但 status 不同、且必须署名
-  assert.equal(isApproved({ [APPROVAL_FIELD]: { status: HUMAN_APPROVED_STATUS, by: 'gh:yufeng-liang@1234' } }), true);
+  // 人工放行那一档（`human-approved`）已随「本站只有机器审核」删掉：走同一个字段、
+  // 同样署名的旧章，现在一律不算通过。它的失效方向见下面那条专门钉它的用例。
+  assert.equal(isApproved({ [APPROVAL_FIELD]: { status: 'human-approved', by: 'gh:yufeng-liang@1234' } }), false,
+    'human-approved 已经不是放行状态');
+});
+
+test('人工档已删：残留的 human-approved 章按「没批准」处理，不进索引（fail-closed 方向）', () => {
+  // 这一条钉的是删代码那一步的**读取侧后果**：main 上若还躺着一枚 2026-10-21 之前盖的
+  // `human-approved` 章，它必须退化成「没有章」，而不是继续生效。方向要说清 ——
+  // 保守 = 不放行；反过来（继续认它）等于用一条已经不存在的授权路径把包送进索引。
+  assert.deepEqual(APPROVED_STATUSES, [APPROVED_STATUS], '放行状态只有一个，不许有第二档');
+  const stale = entry({
+    audit: { status: 'human-approved', by: 'gh:yufeng-liang@1234', at: '2026-10-18T00:00:00.000Z', risk: 'low' },
+  });
+  assert.equal(isApproved(stale), false);
+  const { index, stats } = buildIndex({ index: emptyIndex, entries: [stale] });
+  assert.equal(index.modules.length, 0, '那一条不该进索引');
+  assert.equal(stats.approved, 0, '不该算「通过审核」');
+  assert.equal(stats.skipped, 1, '要计成 skipped —— 否则「什么都没发生」看不出来');
+
+  // 反面控制：同一份夹具换成机器章就必须放行。少了这一句，上面四条在
+  // 「isApproved 永远返回 false」的变异下也会全绿（那就是空跑）。
+  const ci = entry();
+  assert.equal(isApproved(ci), true);
+  assert.equal(buildIndex({ index: emptyIndex, entries: [ci] }).index.modules.length, 1);
 });
 
 test('补充：zipUrl 为空的条目被判非法，不写进索引', () => {

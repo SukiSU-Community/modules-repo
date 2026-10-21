@@ -22,17 +22,19 @@
  * 因此台账必须参与推导（它由 build-index 从 head 上读），而**不能**塞进 json/modules.json
  * 的某个顶层键：normalizeIndex 只比 name + modules，藏在索引里的东西等于免检。
  *
- * 但「这条 PR 该不该走机器路由」不由本脚本决定 —— 它只在被调用时回答「索引是不是推导出来的」。
+ * 但「这次 PR 该不该走机器路由」不由本脚本决定 —— 它只在被调用时回答「索引是不是推导出来的」。
  * 台账那条路今天有两道闸：
  *   ① 上游 audit.yml 的 kind 步按路径名单独认一次 json/dispositions.json 的改动（不带
  *      --diff-filter，所以整本被删也算），台账进过 diff 就不进机器路由；
- *   ② 本脚本的台账驱动分支要求人的署名：两个**对这个仓库有 write/admin** 的人在这条 PR 的
- *      评论里各留一枚 #human-approved（标记与人数复用 publish-from-main 的 findHumanApprovals /
- *      REQUIRED_SIGNERS，不在这里另起一套），且每条**新增或改动**的处置，它的 by 要能回访成
- *      一条真评论、而作者就是那两个人之一。「谁算签核人」在 CI 里查的是
- *      GET /repos/{o}/{r}/collaborators/{login}/permission，**不是** author_association：
- *      那个字段按请求者算，workflow token 读维护者只回 CONTRIBUTOR（2026-10-17 canary #58/#59
- *      线上实测），照旧吃它就等于谁也数不到 —— 实测表在 signerTrust 上面。
+ *   ② 本脚本的台账驱动分支要求**机器章**：台账里每条新增或改动的处置，它的 `by` 要写成
+ *      `ci:audit@<sha>`，那一枚 sha 必须是这条 PR 上的提交（`git rev-list base..head` 列得出它），
+ *      且在那一枚提交上这条处置的实体已经以 `ci:audit@pending` 的形状等着盖章、实体与 head 上的
+ *      逐字节相同，最后这一枚提交还要在本次运行给出的复核结论里判「成立」
+ *      （逐字定位到归档包 + AI 复核；四条判据逐条写在 judgeLedgerSeal 上面）。
+ *   换代说明：② 原先要的是两名有 write/admin 的人在这条 PR 评论首行各留一枚 #human-approved。
+ *   owner 2026-10-21 拍「本站只有机器审核」，而那一支的正向支在生产上从来不可达（有写权限的人
+ *   只有 1 个，要求 2 个）。旧的「谁算签核人」探针读数（不吃 author_association、逐个查
+ *   permission）留在 git 历史里，换回人工时先读那一段。
  * 为什么必须有②：B 的判据是「重算结果与 PR 里的索引一致」，而一致是攻击者自己就能做出来的
  * —— 他手上和我们有同一份 build-index.mjs（公开仓库）。2026-10-17 本地复现打出的四格全是这个形状。
  * 另：normalizeIndex 只比 name + modules，所以索引里别的顶层键不过这道判定；要往索引里放新事实
@@ -53,11 +55,11 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { buildIndex, markApproved, collectPendingFiles } from './build-index.mjs';
-import { findPrForCommit, assertMergeApproved, approvalBy, findHumanApprovals, REQUIRED_SIGNERS, HUMAN_APPROVAL_MARKER } from './publish-from-main.mjs';
+import { findPrForCommit, assertMergeApproved, approvalBy } from './publish-from-main.mjs';
 import { DEFAULT_DISPOSITIONS_FILE, EVIDENCE_FILE_RE, parseDispositions } from './dispositions.mjs';
-// `by` 的形状只在写入端校验过（revoke.mjs 的 PROOF_URL_RE）。CI 这一侧要复核同一条形状，
+// `by` 的形状只在写入端定义过一次（revoke.mjs 的 MACHINE_SEAL_RE）。CI 这一侧要复核同一条形状，
 // 就复用那一个常量，不在这里再拼一份正则 —— 两份形状迟早漂，而漂了的那一份是没人看的判定。
-import { PROOF_URL_RE } from './revoke.mjs';
+import { MACHINE_SEAL_RE, SEAL_PENDING_BY, MACHINE_SEAL_PREFIX } from './revoke.mjs';
 
 /** 索引重建 PR 允许碰的文件。白名单外的任何改动都判「这不是重建，是夹带」。 */
 export const ALLOWED_INDEX_PR_PATHS = ['json/modules.json', DEFAULT_DISPOSITIONS_FILE];
@@ -232,19 +234,16 @@ export function judgeIndexPr(input) {
   if (diffs.length) {
     return fail('PR 里的索引与推导结果不一致：\n  - ' + diffs.join('\n  - '), { diffs, evidences });
   }
-  // 动了台账就必须要人的署名。位置在内容比对**之后**：先写索引的人更该先知道自己的索引算错了，
-  // 而这一条不会因为顺序变松 —— 两道闸都在红的那一侧，攻击者做出来的「自洽索引」仍然过不了署名。
-  // 为什么内容一致还不够：B 的判据是「重算结果与 PR 里的索引一致」，而一致是攻击者自己做得出来的
-  // —— 他手上和我们有同一份 build-index.mjs（公开仓库）。2026-10-17 本地复现打出的四格全是这个形状。
-  // 要的不是「算得对」，是「有人签过」：两名 OWNER/MEMBER 的 #human-approved，
-  // 且每条新增/改动的处置的 by 要回访成其中一个真评论（判据复用 publish-from-main，不另起一套）。
+  // 动了台账就必须要机器章。位置在内容比对**之后**：先写索引的人更该先知道自己的索引算错了，
+  // 而这一条不会因为顺序变松 —— 两道闸都在红的那一侧，攻击者做出来的「自洽索引」仍然过不了章。
+  // 要的不是「算得对」，是「有一次运行把这条处置的证据钉死了」（四条判据写在 judgeLedgerSeal 上面）。
   if (ledgerChanged) {
     if (!seal) {
-      return fail('这个 PR 动了处置台账，但没拿到署名证据（调用方没给 --pr，取不到这条 PR 的人工签）'
-        + ' —— 缺证据按不合格处理，不按「没有台账」处理');
+      return fail('这个 PR 动了处置台账，但没拿到机器章的证据（调用方没给 --base/--reviews，'
+        + '列不出这条 PR 的提交或取不到复核结论）—— 缺证据按不合格处理，不按「没有台账」处理');
     }
     if (!seal.ok) {
-      return fail(`这个 PR 动了处置台账，而署名不合格：${seal.reason}`, { seal });
+      return fail(`这个 PR 动了处置台账，而机器章不合格：${seal.reason}`, { seal });
     }
   }
 
@@ -252,7 +251,7 @@ export function judgeIndexPr(input) {
     return {
       ok: true,
       reason: `索引与推导一致（台账驱动：按 ${dispositions.length} 条处置记录重算，未消费投稿；`
-        + `署名为 ${(seal.signers || []).map((s) => `${s.login}(${s.trust || s.assoc})`).join('、')}）`,
+        + `机器章 ${(seal.sealed || []).length} 枚，指向 ${(seal.sealed || []).map((s) => s.sha.slice(0, 12)).join('、') || '无'}）`,
       evidences,
       consumed: [],
       seal,
@@ -294,172 +293,161 @@ export function ledgerTouched(baseList = [], headList = []) {
   return { added, changed, removed, any: added.length + changed.length + removed.length > 0 };
 }
 
-/** 把 `by` 那条证据链接拆成 owner/repo/issue/commentId；形状不对返回 null。 */
-export function parseProofUrl(url) {
-  const s = String(url || '').trim();
-  if (!PROOF_URL_RE.test(s)) return null;
-  const m = /^https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/issues\/(\d+)#issuecomment-(\d+)$/.exec(s);
-  if (!m) return null;
-  return { owner: m[1], repo: m[2], issue: Number(m[3]), id: Number(m[4]), url: s };
+/**
+ * 拆机器章。两种合法形状，含义相反：
+ *   `ci:audit@<40hex>` ⇒ 已盖章，指向这条 PR 上的某一枚 commit；
+ *   `ci:audit@pending` ⇒ 实体已写下、章还没盖（台账 PR 的第一枚提交就是这个形状）。
+ * 其余任何文字（旧的评论 URL、`gh:<login>@…`、自由文本）返回 null —— 认不出来就是没盖章。
+ */
+export function parseSeal(by) {
+  const s = String(by || '').trim();
+  if (s === SEAL_PENDING_BY) return { pending: true, sha: '', text: s };
+  if (!MACHINE_SEAL_RE.test(s)) return null;
+  return { pending: false, sha: s.slice(MACHINE_SEAL_PREFIX.length).toLowerCase(), text: s };
 }
 
 const described = (d) => (d.id ? `id=${d.id}` : d.sha256 ? `sha256=${String(d.sha256).slice(0, 12)}` : `coolapkUid=${d.coolapkUid}`);
 
 /**
- * 纯判定：这批台账改动够不够「两个人签过，且下处置的人就是签名的人」。
- * 证据（签名列表、每条 by 解析到的评论）都在外面取好了传进来 —— 这个函数不发请求，
- * 所以每一条失效方向都能被单测逐字打到。
+ * 一条处置的**实体** = 除了「谁下的章、什么时候下的」以外的全部字节。
  *
- * 信任的锚点只取一处：`signers` 来自 findHumanApprovals（按 login 去重、要求标记在首行），
- * 而**它吃什么算可信身份**由调用环境决定：人工路吃 author_association ∈ {OWNER,MEMBER}，
- * CI 路吃 `collaborators/{login}/permission` ∈ {admin,write} —— 因为前者是按请求者算的字段，
- * workflow token 读同一条评论只能拿到 CONTRIBUTOR（canary #58/#59 实测），照旧吃它就等于谁也数不到。
- * 逐条 `by` 那次请求只回答两件事：那条评论**存在**，且它的**作者在这条 PR 上签过**。
+ * 盖章那一枚提交只许改 `by`，所以比较的是这个投影而不是整条记录。时间也在投影之外，
+ * 理由要说清：`at` 是写下实体的时间，重写一遍它就变 —— 而「章指向的那一枚提交上的实体
+ * == head 上的实体」这条判据必须只跟内容有关，不然 C2 只是补一个章也会被判「动了实体」。
  */
-export function judgeLedgerSeal({ touched, signers = [], resolved = {}, require = REQUIRED_SIGNERS } = {}) {
-  const who = signers.map((s) => `${s.login}(${s.trust || s.assoc})`).join('、') || '一个都没有';
-  if (!touched || !touched.any) {
-    return { ok: true, reason: '台账内容没有实质改动（只动了 lastUpdate 一类的元数据）', signers, touched };
-  }
-  if (signers.length < require) {
-    return {
-      ok: false,
-      reason: `动了 ${touched.added.length} 条新增 / ${touched.changed.length} 条改动 / ${touched.removed.length} 条删除，`
-        + `而这条 PR 上只有 ${signers.length} 名有写权限的人签了（${who}），少于要求的 ${require} 名`
-        + '（要签请在评论**首行**写 #human-approved，且签的人得对这个仓库有 write/admin，见 GOVERNANCE.md）',
-      signers, touched,
-    };
-  }
-  const signed = new Set(signers.map((s) => String(s.login).toLowerCase()));
-  const bad = [];
-  for (const d of [...touched.added, ...touched.changed.map((c) => c.to)]) {
-    const p = parseProofUrl(d.by);
-    if (!p) {
-      bad.push(`${described(d)} 的 by 不是点得开的评论链接（${JSON.stringify(d.by)}）`);
-      continue;
-    }
-    const r = resolved[p.url];
-    if (!r) { bad.push(`${described(d)} 的 by 没有取证结果（${p.url}）`); continue; }
-    if (!r.ok) { bad.push(`${described(d)} 的 by 回访不到那条评论：${r.reason}`); continue; }
-    if (!r.login) { bad.push(`${described(d)} 的 by 那条评论没有作者，无从对署名`); continue; }
-    if (!signed.has(String(r.login).toLowerCase())) {
-      bad.push(`${described(d)} 的 by 署名是 ${r.login}，而这个人没有在这条 PR 上签 #human-approved`);
-    }
-  }
-  if (bad.length) {
-    return { ok: false, reason: `有 ${bad.length} 条处置的署名对不上：\n  - ` + bad.join('\n  - '), signers, touched };
-  }
-  const note = touched.removed.length ? `；其中 ${touched.removed.length} 条删除没有 by 可查，由上面那两名签核人的签覆盖` : '';
-  return {
-    ok: true,
-    reason: `${touched.added.length + touched.changed.length} 条新增/改动的 by 全部回访得到，作者都在 ${who} 之中${note}`,
-    signers, touched,
-  };
-}
-
-async function getJson(url, token, deps = {}) {
-  const f = deps.fetch || globalThis.fetch;
-  const res = await f(url, {
-    headers: {
-      'user-agent': 'modules-repo-verify-index-pr',
-      accept: 'application/vnd.github+json',
-      ...(token ? { authorization: `Bearer ${token}` } : {}),
-    },
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
-}
-
-/**
- * CI 里「谁写得动这个仓库」的唯一可信来源 —— 逐个查仓库权限，不吃 author_association。
- *
- * 探针（canary #59，全程用 workflow 的 `github.token`，公开仓）实测：
- *   维护者            → HTTP 200 `permission=admin`
- *   一个不存在的协作者（octocat）  → HTTP 200 `permission=read`   ← **不是 404**
- *   一个 bot（dependabot[bot]）   → HTTP 200 `permission=none`
- *   整张 `/collaborators` 表      → HTTP 200 但 **0 条**（列不出来，只能逐个问）
- *   `/orgs/{owner}/memberships/{login}` → **403 "Resource not accessible by integration"**
- *   `/orgs/{owner}/members/{login}`     → 404（不是公开成员）
- * 两条反直觉的都在这：判据必须是**权限等级**而不是「HTTP 200 就是协作者」（非协作者也回 200），
- * 而 org 那一层在这个 token 下问不到。任何读不到（403/404/5xx/网络）一律按不可信处理。
- */
-export const TRUSTED_REPO_PERMISSIONS = new Set(['admin', 'write']);
-
-export async function signerTrust({
-  owner, repo, comments = [], apiBase = 'https://api.github.com', token = '', deps = {},
-} = {}) {
-  const api = String(apiBase).replace(/\/$/, '');
-  const isMarker = (c) => String((c && c.body) || '').trim().split('\n', 1)[0].trim().startsWith(HUMAN_APPROVAL_MARKER);
-  const out = new Map();
-  for (const c of (Array.isArray(comments) ? comments : [])) {
-    if (!isMarker(c)) continue;                     // 不是签核评论的作者就不花钱查
-    const login = String((c && c.user && c.user.login) || '');
-    if (!login || out.has(login)) continue;
-    try {
-      const j = await getJson(`${api}/repos/${owner}/${repo}/collaborators/${encodeURIComponent(login)}/permission`, token, deps);
-      const permission = String((j && j.permission) || '').toLowerCase();
-      out.set(login, { ok: TRUSTED_REPO_PERMISSIONS.has(permission), permission });
-    } catch (e) {
-      out.set(login, { ok: false, permission: '', why: '查不到仓库权限：' + String(e.message || e) });
-    }
+export function dispositionSubstance(d = {}) {
+  const out = {};
+  for (const k of Object.keys(d).sort()) {
+    if (k === 'by' || k === 'at') continue;
+    out[k] = d[k];
   }
   return out;
 }
 
+/** 选择器相同的处置算同一条（与 revoke.mjs 的 sameSelectors 同一把尺）。 */
+const sameSelectors = (a, b) => ['id', 'versionCode', 'sha256', 'coolapkUid']
+  .every((k) => String(a[k] ?? '') === String(b[k] ?? ''));
+
 /**
- * 取这条 PR 的处置署名证据：评论列表 → 逐个查仓库权限 → findHumanApprovals → 逐条 by 回访那条评论。
+ * 纯判定：这批台账改动够不够「一次运行把每条处置的证据钉死了」。
+ * 证据（这条 PR 有哪些 commit、每一枚 commit 上的台账、每一枚的复核结论）都在外面取好了
+ * 传进来 —— 这个函数不发请求、不跑 git，所以每一条失效方向都能被单测逐字打到。
  *
- * 用的是 `github.token`，与 pending 那条批准证据同一个身份；三个端点今天都在 CI 里读过
- * （`issues/{n}/comments`、`issues/comments/{id}`、`collaborators/{login}/permission`，
- * 见 canary #58/#59 的日志）。取不到时全是红，不是放行。
+ * 四条判据，缺一不可，各自挡的是不同的东西：
+ *   ① `by` 是 `ci:audit@<40hex>` 而不是别的形状 —— 挡「自由文本冒充署名」。
+ *   ② 那一枚 commit 必须是**这条 PR 上的**（base..head 可达）—— 挡「指一枚别处已经绿了的
+ *      commit 借它的绿」。
+ *   ③ 那一枚 commit 上，同样选择器的处置实体已经在那里等着盖章（`by` 是待盖值），
+ *      且实体与 head 上的逐字节相同 —— 挡「章挂到一条当时还不存在的处置上」，
+ *      也就是把 C2 的判定说成 C1 的判定。
+ *   ④ 那一枚 commit 要有**复核结论**且结论是成立 —— 这才是章的实质内容：逐字定位到了
+ *      归档包里、AI 复核判了成立。结论文件不存在 ⇒ 一条都不算成立（宁红不绿）。
+ *
+ * 删除（撤销处置）不在这里放行：台账里没有 restore 这一种，删一条 revoke 并不能让模块复活
+ * （spec §9 已复核），所以「删除」必须由那条路自己实现，不能靠章覆盖。
  */
-export async function ledgerSealEvidence({
-  owner, repo, prNumber, baseLedger = [], headLedger = [],
-  apiBase = 'https://api.github.com', token = '', require = REQUIRED_SIGNERS, deps = {},
+export function judgeLedgerSeal({ touched, prCommits = [], ledgerAt = {}, reviews = {}, readErrors = {} } = {}) {
+  if (!touched || !touched.any) {
+    return { ok: true, reason: '台账内容没有实质改动（只动了 lastUpdate 一类的元数据）', sealed: [] };
+  }
+  const onPr = new Set((Array.isArray(prCommits) ? prCommits : []).map((s) => String(s).toLowerCase()));
+  const bad = [];
+  const sealed = [];
+  if (touched.removed.length) {
+    bad.push(`有 ${touched.removed.length} 条处置被删掉：撤销处置要走 restore（spec §9 还没实现），`
+      + '台账里没有这一种，删记录既不会让模块复活，也不该由章覆盖');
+  }
+  for (const d of [...touched.added, ...touched.changed.map((c) => c.to)]) {
+    const who = described(d);
+    const s = parseSeal(d.by);
+    if (!s) { bad.push(`${who} 的 by 不是机器章（要 ${MACHINE_SEAL_PREFIX}<40 位十六进制>，收到 ${JSON.stringify(d.by)}）`); continue; }
+    if (s.pending) { bad.push(`${who} 还挂着待盖值 ${SEAL_PENDING_BY}：这条处置的章没盖上`); continue; }
+    if (!onPr.has(s.sha)) { bad.push(`${who} 的章指向 ${s.sha.slice(0, 12)}，那一枚 commit 不在这条 PR 上`); continue; }
+    const at = ledgerAt[s.sha];
+    if (!at) {
+      bad.push(`${who} 的章指向 ${s.sha.slice(0, 12)}，那一枚提交上的台账读不出来`
+        + (readErrors[s.sha] ? `（${readErrors[s.sha]}）` : '（没给出原因）'));
+      continue;
+    }
+    const prior = at.find((x) => sameSelectors(x, d));
+    if (!prior) { bad.push(`${who} 的章指向 ${s.sha.slice(0, 12)}，而那条提交上还没有这条处置的实体`); continue; }
+    if (parseSeal(prior.by) === null || parseSeal(prior.by).pending !== true) {
+      bad.push(`${who} 指向的那条提交上，同一条处置的 by 是 ${JSON.stringify(prior.by)} 而不是 ${SEAL_PENDING_BY}`);
+      continue;
+    }
+    if (stableStringify(dispositionSubstance(prior)) !== stableStringify(dispositionSubstance(d))) {
+      bad.push(`${who} 的实体与章指向的那条提交上的不一致：章只许盖在**当时就写好**的那一条上`);
+      continue;
+    }
+    const rv = reviews[s.sha];
+    if (!rv) { bad.push(`${who} 的章指向 ${s.sha.slice(0, 12)}，而这次运行没有给出复核结论（逐字复验 / AI 复核那一步没跑）`); continue; }
+    if (rv.ok !== true) { bad.push(`${who} 的复核结论不成立：${rv.reason || rv.summary || '没写理由'}`); continue; }
+    sealed.push({ sha: s.sha, summary: rv.summary || '' });
+  }
+  if (bad.length) {
+    return { ok: false, reason: `台账的机器章有 ${bad.length} 处不合格：\n  - ` + bad.join('\n  - '), touched, sealed };
+  }
+  return {
+    ok: true,
+    reason: `${sealed.length} 条新增/改动的处置全部带着本 PR 上的机器章，章指向的那枚提交上实体已在、`
+      + '且复核结论成立',
+    touched, sealed,
+  };
+}
+
+/**
+ * 取机器章的证据：这条 PR 有哪些 commit + 每一枚章指向的提交上的台账长什么样。
+ *
+ * 全程只读 git，不发网络请求 —— 换代前人签那一版要打三个 API（评论列表、逐条回访评论、
+ * 逐个查仓库权限），而其中「谁算签核人」那个来源本身按请求者会变（author_association 在
+ * workflow token 下退化成 CONTRIBUTOR，canary #58/#59）。换成绑 commit 之后，判据要的
+ * 两样东西仓库里都有，红绿不再取决于身份字段怎么算。
+ *
+ * `deps.prCommits` / `deps.ledgerAt` 是给单测换接口用的；不给就跑真 git。
+ * 任何一步读不出来都写成「读不出来」交回 judgeLedgerSeal 判红，不静默当成空数组。
+ */
+export function ledgerSealEvidence({
+  cwd, baseRef, headRef = 'HEAD', dispFile = DEFAULT_DISPOSITIONS_FILE,
+  baseLedger = [], headLedger = [], reviews = {}, deps = {},
 } = {}) {
   const touched = ledgerTouched(baseLedger, headLedger);
   if (!touched.any) {
-    return { ok: true, reason: '台账内容没有实质改动（只动了 lastUpdate 一类的元数据）', signers: [], touched };
+    return { ok: true, reason: '台账内容没有实质改动（只动了 lastUpdate 一类的元数据）', sealed: [], prCommits: [], touched };
   }
-  const n = Number(prNumber);
-  if (!Number.isInteger(n) || n <= 0) {
-    return { ok: false, reason: `取不到这条 PR 的编号（--pr ${JSON.stringify(prNumber)}），没法查人工签`, touched };
-  }
-  const api = String(apiBase).replace(/\/$/, '');
-  let comments;
-  try {
-    const data = await getJson(`${api}/repos/${owner}/${repo}/issues/${n}/comments?per_page=100`, token, deps);
-    comments = Array.isArray(data) ? data : [];
-  } catch (e) {
-    return { ok: false, reason: `拿不到 PR #${n} 的评论：${String(e.message || e)}`, touched };
-  }
-  const trust = await signerTrust({ owner, repo, comments, apiBase: api, token, deps });
-  const sig = findHumanApprovals(comments, require, (login) => {
-    const t = trust.get(login);
-    if (!t) return '没查到这个人的仓库权限（签名评论的作者不在待查名单里？）';
-    if (t.ok) return true;
-    return t.why || `仓库权限是 ${t.permission || '无'}，不到 write`;
+  const listCommits = deps.prCommits || ((base, head) => git(cwd, ['rev-list', `${base}..${head}`])
+    .split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
+  const readLedger = deps.ledgerAt || ((sha) => {
+    const r = readJsonAt(cwd, sha, dispFile);
+    if (!r.present) return [];                       // 那枚提交上还没有台账文件 == 实体不可能在，正常判红
+    if (r.error) return null;                        // 读得出文件读不懂 ⇒ null ⇒ judgeLedgerSeal 报「读不出来」
+    return parseDispositions(r.json, `${sha.slice(0, 12)} 上的台账`);
   });
-  for (const s of sig.signers) {
-    const t = trust.get(s.login) || {};
-    s.trust = 'permission=' + (t.permission || '未知');
+  let prCommits;
+  try {
+    prCommits = listCommits(baseRef, headRef);
+  } catch (e) {
+    return { ok: false, reason: `列不出这条 PR 的提交（${String((e && e.stderr) || e.message || e).trim().split('\n')[0]}）`, touched };
   }
-  const resolved = {};
+  const ledgerAt = {};
+  const readErrors = {};
   for (const d of [...touched.added, ...touched.changed.map((c) => c.to)]) {
-    const p = parseProofUrl(d.by);
-    if (!p || resolved[p.url]) continue;   // 形状不对的交给 judgeLedgerSeal 报错，这里不重复判
+    const s = parseSeal(d.by);
+    if (!s || s.pending || ledgerAt[s.sha] !== undefined) continue;
     try {
-      const c = await getJson(`${api}/repos/${p.owner}/${p.repo}/issues/comments/${p.id}`, token, deps);
-      resolved[p.url] = { ok: true, login: (c && c.user && c.user.login) || '', assoc: String((c && c.author_association) || '').toUpperCase(), id: c && c.id };
+      ledgerAt[s.sha] = readLedger(s.sha);
     } catch (e) {
-      resolved[p.url] = { ok: false, reason: String(e.message || e) };
+      // 读不出来与「那上面没有这条实体」是两种结论：前者的原因必须留在判定文字里，
+      // 否则生产上只剩一句「读不出来」，没人知道是 git 抖了还是那本台账真坏了。
+      ledgerAt[s.sha] = null;
+      readErrors[s.sha] = String((e && e.message) || e).trim().split('\n')[0];
     }
   }
   return {
-    ...judgeLedgerSeal({ touched, signers: sig.signers, resolved, require }),
-    resolved,
-    trust: Object.fromEntries([...trust].map(([k, v]) => [k, { ok: v.ok, permission: v.permission, why: v.why || null }])),
-    signerCount: sig.signers.length,
+    ...judgeLedgerSeal({ touched, prCommits, ledgerAt, reviews, readErrors }),
+    prCommits,
+    ledgerAt,
+    reviews,
+    readErrors,
   };
 }
 
@@ -525,14 +513,14 @@ export function commitThatAdded(cwd, ref, file) {
 export async function attestPath({ cwd, baseRef, file, apiBase, token, owner, repo, mainBranch }) {
   const sha = commitThatAdded(cwd, baseRef, file);
   if (!/^[0-9a-f]{40}$/i.test(sha)) return { ok: false, reason: `找不到把它带上 ${baseRef} 的提交` };
-  const { pr, checks = [], comments = [] } = await findPrForCommit({ apiBase, token, owner, repo, sha, mainBranch, log: { log() {}, error() {} } });
-  const v = assertMergeApproved({ pr, checks, comments, mainBranch });
+  const { pr, checks = [] } = await findPrForCommit({ apiBase, token, owner, repo, sha, mainBranch, log: { log() {}, error() {} } });
+  const v = assertMergeApproved({ pr, checks, mainBranch });
   if (!v.ok) return { ok: false, reason: `${v.reason}（引入提交 ${sha.slice(0, 12)}）`, commitSha: sha };
   return {
     ok: true,
     // 章的文字复用 approvalBy，不在这里再拼一遍：这个文件的存在理由就是「和盖审核章
-    // 用的是同一个判据，不另起一套」。自己拼一份的结果是人工双签放行的条目在这里永远
-    // 对不上 —— 那条 pending 会既进不了索引、又没人说为什么。
+    // 用的是同一个判据，不另起一套」。自己拼一份的结果是两边迟早漂，而漂了的那一份
+    // 是没人看的判定 —— 那条 pending 会既进不了索引、又没人说为什么。
     by: approvalBy({ owner, repo, evidence: v.evidence }),
     at: new Date().toISOString(),
     commitSha: sha,
@@ -540,6 +528,42 @@ export async function attestPath({ cwd, baseRef, file, apiBase, token, owner, re
     headSha: v.evidence.headSha,
     kind: v.kind,
   };
+}
+
+/**
+ * 复核结论文件的形状：`{ "<40 位十六进制 sha>": { ok: true|false, summary?, reason? } }`。
+ *
+ * 它是章的**实质内容** —— 一次运行对这一枚提交上的处置做过逐字定位与 AI 复核之后留下的读数。
+ * 只认 sha 键（不是 sha 的键一律丢掉）：否则「顺手写一个 `latest` 指向最新结论」就会变成
+ * 一枚谁都能引用的万能章。
+ */
+export function parseReviews(doc) {
+  const out = {};
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return out;
+  for (const [k, v] of Object.entries(doc)) {
+    if (!/^[0-9a-f]{40}$/.test(k)) continue;
+    if (!v || typeof v !== 'object' || Array.isArray(v)) continue;
+    out[k] = { ok: v.ok === true, summary: typeof v.summary === 'string' ? v.summary : '', reason: typeof v.reason === 'string' ? v.reason : '' };
+  }
+  return out;
+}
+
+/**
+ * 读那份文件。读不到 / 读不懂 ⇒ 返回空对象，一条都不算成立。
+ * 这一格必须是**默认拒绝**：上游那一步（逐字复验 / AI 复核）没跑成时台账 PR 应当红，
+ * 而不是拿一个缺失的文件替它说「都通过了」。
+ */
+export function readReviews(file, log = console) {
+  if (typeof file !== 'string' || !file) {
+    log.error('[verify-index-pr] 没给 --reviews：动了台账就等于有处置要复核，而复核结论只能来自那一步运行');
+    return {};
+  }
+  try {
+    return parseReviews(JSON.parse(fs.readFileSync(path.resolve(file), 'utf8')));
+  } catch (e) {
+    log.error(`[verify-index-pr] 复核结论文件读不懂（${String((e && e.message) || e)}）—— 按一条都没复核处理`);
+    return {};
+  }
 }
 
 export function parseArgs(argv) {
@@ -561,9 +585,10 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   if (opts.help || !opts.base || !opts.owner || !opts.repo) {
     log.log(`用法: node verify-index-pr.mjs --base <baseRef> --owner <o> --repo <r>
        [--pending-dir pending] [--index-file json/modules.json] [--dispositions-file json/dispositions.json]
-       [--cwd <dir>] [--report <file>] [--pr <PR 编号>]
+       [--cwd <dir>] [--report <file>] [--reviews <复核结论 JSON 文件>]
    判定当前工作树里的索引是否等于「base 内容 + 被本 PR 消费的已批准条目 + head 上的处置台账」的推导结果。
-   动了处置台账时必须给 --pr：那一条分支要额外查两个有仓库写权限的人的 #human-approved，而签是在 PR 的评论里。`);
+   动了处置台账时必须给 --reviews：那一条分支要逐条核机器章，而章的实质内容是**这一次运行给出的
+   复核结论**（逐字定位到归档包 + AI 复核）。没有结论文件 = 一条都没复核 = 全红。`);
     return opts.help ? 0 : 2;
   }
   const cwd = opts.cwd ? path.resolve(opts.cwd) : process.cwd();
@@ -688,28 +713,31 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   const settled = new Map();
   for (const p of deletedPaths) settled.set(p, await attest(p));
 
-  // 动了台账 → 先取人的署名。取不到证据（没给 --pr、评论读不到、by 回访不到）一律按不合格处理，
-  // 不按「这条 PR 没动台账」处理 —— 后者等于让一次网络抖动变成一次放行。
+  // 动了台账 → 先取机器章的证据（这条 PR 有哪几枚提交 + 章指向的那枚提交上的台账长什么样）。
+  // 取不到证据（列不出提交、那枚提交上的台账读不出、没有复核结论）一律按不合格处理，
+  // 不按「这条 PR 没动台账」处理 —— 后者等于让一次读失败变成一次放行。
   let seal = null;
   if (ledgerChanged) {
+    const reviews = deps.reviews !== undefined ? deps.reviews : readReviews(opts.reviews, log);
     seal = deps.seal !== undefined
       ? deps.seal
-      : await ledgerSealEvidence({
-        owner: opts.owner, repo: opts.repo, prNumber: opts.pr,
-        baseLedger: baseDispositions, headLedger: dispositions, apiBase, token, deps,
+      : ledgerSealEvidence({
+        cwd, baseRef, headRef, dispFile, reviews,
+        baseLedger: baseDispositions, headLedger: dispositions, deps,
       });
-    // 每条 by 的回访结果各打一行：判定只看「全部对得上」，而生产上最需要看见的是
-    // 单条评论读不读得到（workflow token 能不能取 issues/comments/{id} 就靠这几行说话）。
-    for (const [url, r] of Object.entries(seal.resolved || {})) {
-      (r.ok ? log.log : log.error).call(log, '[verify-index-pr] by 回访 ' + url + ' → '
-        + (r.ok ? `${r.login || '(这条评论没有作者)'}(${r.assoc || '未知身份'})` : `读不到：${r.reason}`));
+    // 每一枚盖上了的章各打一行，章指向的那枚提交上的复核结论也各打一行：
+    // 判定只看「全部对得上」，而生产上最需要看见的是哪一枚章、凭哪一次复核变绿的。
+    for (const s of seal.sealed || []) {
+      log.log(`[verify-index-pr] 机器章 ${s.sha} → 复核成立${s.summary ? `（${s.summary}）` : ''}`);
     }
-    // 每个签核评论的作者查到的仓库权限也各打一行 —— 这一格是「谁算签核人」的唯一来源，
-    // 而它换过一次（author_association 在 workflow token 下会退化成 CONTRIBUTOR）。
-    for (const [login, t] of Object.entries(seal.trust || {})) {
-      (t.ok ? log.log : log.error).call(log, '[verify-index-pr] 署名可信度 ' + login
-        + ' → permission=' + (t.permission || '无') + ' 可信=' + (t.ok ? 'yes' : 'no')
-        + (t.why ? '（' + t.why + '）' : ''));
+    for (const [sha, r] of Object.entries(reviews)) {
+      (r && r.ok ? log.log : log.error).call(log, `[verify-index-pr] 复核结论 ${sha} → ok=${r && r.ok ? 'yes' : 'no'}`
+        + (r && (r.summary || r.reason) ? `：${r.summary || r.reason}` : ''));
+    }
+    if (!Object.keys(reviews).length) {
+      log.error('[verify-index-pr] 这次运行一个复核结论都没有（没给 --reviews，或那份文件读不懂）'
+        + ' —— 动了台账的 PR 因此必然红。这是设计内的默认拒绝：逐字复验与 AI 复核那一步没跑成，'
+        + '就不许有人替它说「成立」。');
     }
   }
 
@@ -730,15 +758,13 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   report.seal = seal ? {
     ok: seal.ok,
     reason: seal.reason,
-    signers: (seal.signers || []).map((s) => ({ login: s.login, assoc: s.assoc, trust: s.trust || null, id: s.id })),
-    signerCount: seal.signerCount ?? (seal.signers || []).length,
-    trust: seal.trust || null,
+    // 章钉在哪一枚提交上、那一枚的复核结论是什么 —— 这两格是「凭什么绿」的全部信息，
+    // 少了它们，report 就只剩一句「机器章成立」，跟没有证据一样不可复验。
+    sealed: (seal.sealed || []).map((s) => ({ sha: s.sha, summary: s.summary || '' })),
+    prCommits: seal.prCommits || null,
+    readErrors: Object.keys(seal.readErrors || {}).length ? seal.readErrors : null,
     touched: seal.touched
       ? { added: seal.touched.added.length, changed: seal.touched.changed.length, removed: seal.touched.removed.length }
-      : null,
-    resolved: seal.resolved
-      ? Object.fromEntries(Object.entries(seal.resolved)
-        .map(([u, r]) => [u, { ok: r.ok, login: r.login || null, assoc: r.assoc || null, reason: r.reason || null }]))
       : null,
   } : null;
   report.changedPaths = changedPaths;

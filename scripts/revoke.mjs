@@ -32,34 +32,56 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(__dirname, '..');
 
 /**
- * 处置指针的规范形态：**浏览器里点得开的永久链接**。
+ * 处置指针的规范形态：**机器章 = `ci:audit@<这一条台账 PR 的 head commit sha>`**。
  *
- * 为什么不是 `gh:<login>@issuecomment-<id>`（这是第一版随手写的形状）：GitHub 的评论 id
- * 单独拼不出 URL，必须知道它挂在哪个 issue 上 —— 只有 id 的指针在公示页上是一段死文本，
- * 谁都得自己去搜。实测过：`api.github.com/repos/<repo>/issues/comments/<id>` 会回 html_url，
- * 但那是要求访问者自己去查的东西，不该出现在「点一下就能看证据」这一步。
+ * 换代过程（两版，都是被平台逼的，不是审美）：
+ *   1. `gh:<login>@issuecomment-<id>` —— 评论 id 单独拼不出 URL，公示页上是一段死文本。
+ *   2. `https://github.com/<o>/<r>/issues/<n>#issuecomment-<id>` —— 点得开了，但它把「谁看过」
+ *      当成了下架的凭据。人工双签已取消（owner 2026-10-21：只有机器审核），而这根凭据的正向支
+ *      在生产上从来不可达：有 write 权限的人只有 1 个，要求的签数是 2（2026-10-17 实测）。
+ *   3. 现在这一版：`by` 指向**这一次把这条记录带上 head 的运行**。它不是「有个有名的人看过」的
+ *      替身，而是「有一次运行把证据钉死了」的指针 —— 回访路径是
+ *      `gh api repos/<o>/<r>/commits/<sha>/check-runs`，看 `approve` 在这一枚 sha 上的结论。
+ *
+ * 绑 commit 而不是绑 run-id：run-id 在写入之后才存在（台账条目是推分支时写的，那一次 audit run
+ * 是这条 PR 自己触发的），拿它当 `by` 就成了先有鸡还是先有蛋。绑 sha 不需要二次编辑条目，
+ * 可回访性一字不损。
  *
  * 校验放在**写入端**而不是 dispositions.mjs 的通用校验里：台账里已经有 5 条旧形状的记录，
  * 让校验器拒收旧记录 = 读不懂台账 = 推导停住 = 索引冻死（那条失效方向是设计好的），
  * 而写入端收紧只影响以后下的处置。
  */
-export const PROOF_URL_RE = /^https:\/\/github\.com\/[^/\s]+\/[^/\s]+\/issues\/\d+#issuecomment-\d+$/;
+export const MACHINE_SEAL_PREFIX = 'ci:audit@';
+export const MACHINE_SEAL_RE = /^ci:audit@[0-9a-f]{40}$/;
+
+/**
+ * 「实体已经写下、章还没盖上」时 `by` 里放的那一个值。
+ *
+ * 为什么需要它：`by` 绑的是 commit，而一条处置**自己所在的那个提交**的 sha 要等提交完成才知道，
+ * 写进条目就变成自哈希循环（永远算不出）。所以台账 PR 走两枚提交：
+ *   C1 = 处置实体 + 证据文件，`by` 填下面这个显式的待盖值；
+ *   C2 = 只把这一枚待盖值换成 `ci:audit@<C1>`，别的字节一个都不动。
+ * 判定端（verify-index-pr 的 judgeLedgerSeal）因此能问出一件有内容的问题：
+ * 「你指的那一枚 commit 上，这条处置的实体就已经在等着盖章了吗？」—— 而不是让 `by`
+ * 退化成「随便指一枚绿的 commit」。待盖值本身**不是**一枚章：带着它进台账 PR 的 head 就是红。
+ */
+export const SEAL_PENDING_BY = `${MACHINE_SEAL_PREFIX}pending`;
 
 /**
  * 组一条处置记录。
  *
- * `by` 必须是**别人能回访、且在浏览器里点得开**的证据链接，不是「admin 说的」。
+ * `by` 是**这一次把这条记录带上 head 的运行**的机器章，不是「admin 说的」。
  * 无主章在追责链上是零价值 —— 与 pending 章 isApproved() 同一条理由，
  * 而处置比放行更需要留名：放行错了顶多多一个包，下架错了是把别人的作品抹掉。
  */
 export function buildDisposition(flags, now = new Date()) {
   const kind = flags.kind || 'revoke';
   const by = String(flags.by || '').trim();
-  if (!PROOF_URL_RE.test(by)) {
+  if (by !== SEAL_PENDING_BY && !MACHINE_SEAL_RE.test(by)) {
     throw new Error(
-      '--by 必须是点得开的 GitHub 证据链接（https://github.com/<owner>/<repo>/issues/<n>#issuecomment-<id>），'
-      + `收到 ${JSON.stringify(flags.by)}。评论 URL 的拿法：在 issue 里发完说明后点那条评论的时间戳，`
-      + '或 GET api.github.com/repos/<owner>/<repo>/issues/comments/<id> 取 html_url。'
+      `--by 必须是机器章 ${MACHINE_SEAL_PREFIX}<40 位十六进制的 head commit sha>，或者第一枚提交用的 ${SEAL_PENDING_BY}，收到 ${JSON.stringify(flags.by)}。`
+      + 'sha 的拿法见本文件 MACHINE_SEAL_RE 上面那段：先以 ' + SEAL_PENDING_BY
+      + ' 提交实体与证据，再在第二枚提交里把它换成那一枚提交的 sha（人工双签已取消，见 GOVERNANCE.md）。'
     );
   }
   const d = {
@@ -110,7 +132,7 @@ export async function main(argv = process.argv.slice(2), io = console, deps = {}
 
   const usage = `用法: node scripts/revoke.mjs --id <id> [--version-code <n>] [--sha256 <64hex>] [--uid <酷安UID>]
           --kind revoke|deny --reason ${REASONS.join('|')}
-          --by https://github.com/<owner>/<repo>/issues/<n>#issuecomment-<id>
+          --by ${MACHINE_SEAL_PREFIX}<这条台账 PR 的 head commit sha>
           [--note <公示说明>] [--verify <复核命令>] [--dry-run] [--no-harvest]`;
   if (!flags.id && !flags.sha256 && !flags.uid) {
     io.error(`[revoke] 必须至少给一个选择器（--id / --sha256 / --uid）。\n${usage}`);
@@ -125,7 +147,7 @@ export async function main(argv = process.argv.slice(2), io = console, deps = {}
     return 2;
   }
   if (!flags.by || flags.by === true) {
-    io.error(`[revoke] --by 不能为空：下了处置必须留下点得开的证据链接。\n${usage}`);
+    io.error(`[revoke] --by 不能为空：下了处置必须留下可以回访的机器章。\n${usage}`);
     return 2;
   }
 
@@ -263,11 +285,11 @@ export async function main(argv = process.argv.slice(2), io = console, deps = {}
   io.log('  git commit -m "chore(dispose): revoke ' + what + '"');
   io.log('  git push -u origin HEAD && gh pr create --title "chore(dispose): 下架 …" --body "…"');
   io.log('  然后看 approve 是否绿：它会重算一遍并逐字段比对（verify-index-pr 的台账驱动模式）。');
-  io.log('  ⚠️ 动了台账的 PR 不算索引重建，它换了一道准入：需要**两名不同的人**在本 PR 评论**首行**写');
-  io.log('     #human-approved，且签的人得对这个仓库有 write/admin（CI 逐个查 permission，见 GOVERNANCE 第 7 节），');
-  io.log('     要能回访成这两人之一的真评论 —— 所以 --by 必须是你们其中一人真发过的评论，不是「admin 说的」。');
-  io.log('     签齐 ⇒ merge-index 自动合并在 main 上，并立刻 purge CDN；签不齐 ⇒ approve 红，什么都不合。');
-  io.log('     判据在 scripts/verify-index-pr.mjs（复用 publish-from-main 的 REQUIRED_SIGNERS=2），见 GOVERNANCE.md 第 2 节。');
+  io.log('  ⚠️ 动了台账的 PR 不算索引重建，它换了一道准入：这条处置要**两枚提交**才能盖上机器章。');
+  io.log('     C1 用 --by ' + SEAL_PENDING_BY + ' 写下实体与证据；C2 只把这一枚待盖值换成 `ci:audit@<C1 的 sha>`。');
+  io.log('     判定端会回到 C1 那枚提交核对「实体当时就在等盖章」，所以 by 不能随便指一枚绿的提交。');
+  io.log('     C2 之后 approve 仍然要红着，除非这一条 run 真的跑完了逐字复验与 AI 复核并给出成立结论；');
+  io.log('     那一步没跑（没有 --reviews 文件）就是红 —— 红比「绿着等人来点」安全。判据在 scripts/verify-index-pr.mjs。');
   return 0;
 }
 

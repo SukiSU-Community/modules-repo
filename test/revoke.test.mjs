@@ -11,13 +11,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { main, parseArgs, sameSelectors, buildDisposition } from '../scripts/revoke.mjs';
+import { main, parseArgs, sameSelectors, buildDisposition, SEAL_PENDING_BY, MACHINE_SEAL_RE } from '../scripts/revoke.mjs';
 import { buildIndex } from '../scripts/build-index.mjs';
 
 const SHA = (c) => c.repeat(64);
-// 指针必须是浏览器里点得开的永久链接（带 issue 号），旧形状 gh:<login>@issuecomment-<id>
-// 单独拼不出 URL —— 见 revoke.mjs 里 PROOF_URL_RE 的注释。
-const BY = 'https://github.com/o/r/issues/33#issuecomment-123456';
+// 处置指针现在是**机器章**：`ci:audit@<这一条台账 PR 上的某一枚 commit 的 sha>`。
+// 旧的两版（`gh:<login>@issuecomment-<id>` 与浏览器里点得开的评论 URL）都随「本站只有机器审核」
+// 退场 —— 形状与理由写在 revoke.mjs 的 MACHINE_SEAL_RE 上面。
+const SEAL_SHA = 'ab'.repeat(20);                     // 40 位十六进制的夹具 sha
+const BY = `ci:audit@${SEAL_SHA}`;
 
 function sandbox({ ledger = null, modules = [] } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'revoke-'));
@@ -137,7 +139,7 @@ test('同样选择器重复下处置 → 退出 4，不写第二条', async () =
   const s = sandboxWithModule();
   await run(s, ['--id', 'mod_x', '--kind', 'revoke', '--reason', 'test-probe', '--by', BY]);
   const before = fs.readFileSync(s.ledgerPath, 'utf8');
-  const { rc, io } = await run(s, ['--id', 'mod_x', '--kind', 'revoke', '--reason', 'malware', '--by', 'https://github.com/o/r/issues/9#issuecomment-777'], capture());
+  const { rc, io } = await run(s, ['--id', 'mod_x', '--kind', 'revoke', '--reason', 'malware', '--by', `ci:audit@${'cd'.repeat(20)}`], capture());
   assert.equal(rc, 4);
   assert.match(io.out.join('\n'), /已经有同样选择器的记录/);
   assert.equal(fs.readFileSync(s.ledgerPath, 'utf8'), before, '重复下处置不许往台账里堆矛盾记录');
@@ -182,33 +184,37 @@ test('parseArgs：--dry-run 是裸 flag，不吃下一个参数', () => {
 
 /* ------------------------------------------------------------ by 指针形状 */
 
-test('buildDisposition：只接受点得开的证据链接', () => {
+test('buildDisposition：只接受机器章 ci:audit@<40 位小写十六进制>，以及第一枚提交用的待盖值', () => {
   const d = buildDisposition({ reason: 'malware', by: BY, id: 'a' }, new Date('2026-10-11T00:00:00Z'));
   assert.equal(d.by, BY);
   assert.equal(d.at, '2026-10-11T00:00:00.000Z');
+  // 待盖值是台账 PR **第一枚提交**的合法形状：实体先写下，第二枚提交才换成 sha。
+  assert.equal(buildDisposition({ reason: 'malware', by: SEAL_PENDING_BY, id: 'a' }).by, SEAL_PENDING_BY);
+  // 而它**永远不算一枚章**：待盖值若能过形状正则，判定端就会把「还没盖」读成「已盖」。
+  assert.equal(MACHINE_SEAL_RE.test(SEAL_PENDING_BY), false);
 });
 
-test('buildDisposition：旧形状 gh:<login>@issuecomment-<id> 被拒 —— 它在浏览器里点不开', () => {
+test('buildDisposition：旧形状与手滑形状一律被拒 —— 它们要么点不开，要么根本不是章', () => {
   for (const bad of [
-    'gh:yufengliang@issuecomment-123456',
-    'https://github.com/o/r/issues/33',                 // 缺评论锚点：跳到 issue 顶部，看不到那条说明
-    'https://github.com/o/r/issues/33#issuecomment-x',
-    'https://evil.example.com/o/r/issues/33#issuecomment-1',
-    'http://github.com/o/r/issues/33#issuecomment-1',   // 明文不算
-    'https://github.com/o/r/pull/33#issuecomment-1',    // 只认 issues 路径（PR 评论也挂在 issues/<n> 下，写成 /pull/ 就是手打错了）
+    'gh:someone@issuecomment-123456',                       // 第 1 版：评论 id 单独拼不出 URL
+    'https://github.com/o/r/issues/33#issuecomment-123456', // 第 2 版：人工签，已随「只有机器审核」退场
+    `ci:audit@${'ab'.repeat(19)}`,                          // 38 位：短一截的 sha 不是 sha
+    `ci:audit@${'zz'.repeat(20)}`,                          // 非十六进制
+    `ci:audit@${'AB'.repeat(20)}`,                          // 大写：git 的 sha 一律小写，认大写就是给「手打过一次」留门
+    'ci:audit@head', 'ci:audit@', 'ci:audit', 'audit@' + SEAL_SHA,
     '',
   ]) {
-    assert.throws(() => buildDisposition({ reason: 'malware', by: bad, id: 'a' }), /issuecomment/, `${bad} 应该被拒`);
+    assert.throws(() => buildDisposition({ reason: 'malware', by: bad, id: 'a' }), /ci:audit@/, `${bad} 应该被拒`);
   }
 });
 
-test('main：--by 形状不对时退出 2 并告诉人 URL 怎么拿，绝不落盘', async () => {
+test('main：--by 形状不对时退出 2，并告诉人 sha 从哪儿来，绝不落盘', async () => {
   const s = sandbox();
   const lines = [];
   const io = { log: (m) => lines.push(String(m)), error: (m) => lines.push(String(m)) };
   const rc = await main(['--id', 'mod_x', '--reason', 'malware', '--by', 'gh:me@issuecomment-9', '--ledger', s.ledgerPath, '--index', s.indexPath], io);
   assert.equal(rc, 2);
-  assert.ok(lines.some((l) => l.includes('html_url')), '报错要顺手给出拿 URL 的办法');
+  assert.ok(lines.some((l) => l.includes(SEAL_PENDING_BY)), '报错要顺手给出两枚提交的写法，否则人只能瞎猜');
   assert.equal(fs.existsSync(s.ledgerPath), false, '一条都不该写下去');
   fs.rmSync(s.dir, { recursive: true, force: true });
 });

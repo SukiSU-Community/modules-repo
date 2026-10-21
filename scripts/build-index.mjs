@@ -11,7 +11,8 @@
  *   2. 同 id 已存在 -> 只追加新版本，不覆盖已存在的版本。
  *   3. id + versionCode 相同但 sha256 不同 -> 记为冲突，不覆盖，写进冲突清单交人工。
  *   4. id + versionCode 相同且 sha256 相同 -> 幂等跳过。
- *   5. verified 字段：自动放行的条目一律 false（人工复核后才置 true）。
+ *   5. verified 字段：原样跟随 pending（本站没有人工复核这一档，所以生产上它一直是 false；
+ *      要让它变真，得先把「谁有权置真」重新建出来，而不是由投稿者自己填）。
  *
  * 审核标记契约（与 contrib/audit/workflows/audit.yml 的唯一约定面）：
  *   APPROVAL_FIELD / APPROVED_STATUS 两个常量就是契约本身 —— audit.yml 的
@@ -40,15 +41,15 @@ const SHA256_RE = /^[0-9a-fA-F]{64}$/;
  *
  * audit.yml 的 publish 步骤在 pending JSON 里写入：
  *   { "audit": { "status": "auto-approved", "by": "ci:auto-approved", "at": "…", "risk": "low" } }
- * 人工放行写的是同一个字段、不同的 status：
- *   { "audit": { "status": "human-approved", "by": "gh:<login>@<reviewId>", … } }
+ * 这是**唯一**合法的 status：人工放行那一档（`human-approved`）已随「本站只有机器审核」删掉。
+ * 删它的安全方向要说清 —— 它只影响**读**：main 上若残留一枚 `human-approved` 的旧章，
+ * 现在会被当成没批准，那一条不会进索引（保守 = 不放行），而不是被当成章继续生效。
  *
  * 改这里必须同步改 contrib/audit/workflows/audit.yml 与本仓库 .github/workflows/audit.yml。
  */
 export const APPROVAL_FIELD = 'audit';
 export const APPROVED_STATUS = 'auto-approved';
-export const HUMAN_APPROVED_STATUS = 'human-approved';
-export const APPROVED_STATUSES = [APPROVED_STATUS, HUMAN_APPROVED_STATUS];
+export const APPROVED_STATUSES = [APPROVED_STATUS];
 
 /**
  * pending 条目是否为「审核通过」。**只认契约字段 `audit`**，且章上必须有人。
@@ -56,11 +57,11 @@ export const APPROVED_STATUSES = [APPROVED_STATUS, HUMAN_APPROVED_STATUS];
  * 以前这里还认两种快捷写法：`{ approved: true }` 与 `{ review: { approved: true } }`。
  * 它们等于一条绕过审核的后门 —— 任何人（包括将来招募来的贡献者）只要在
  * pending JSON 里手加一个字段，不需要改索引结构、不需要 CI 盖章，就能把包送进索引。
- * 「已收录模块的版本更新一律人工审核」这条核心防线会被它整个作废。
+ * 「这一层是唯一的准入」这件事会被它整个作废。
  *
  * 同理，`{ audit: { status: "auto-approved" } }` 这种**没有 by 的无主章**也不算通过：
  * 追责链要回答的是「谁批的」，一个不带署名的章和没有章等价。
- * （`by` 可外部复验 —— 那是 P4 双签要加严的地方，这里先把「有没有署名字段」钉住。）
+ * （`by` 必须可外部复验，判据在 publish-from-main.mjs 的 approvalBy。）
  */
 export function isApproved(raw) {
   if (!raw || typeof raw !== 'object') return false;
