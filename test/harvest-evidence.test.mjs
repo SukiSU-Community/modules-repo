@@ -303,6 +303,14 @@ const quiet = () => {
   return { out, log: (...a) => out.push(a.join(' ')), error: (...a) => out.push('! ' + a.join(' ')) };
 };
 
+/**
+ * revoke.mjs 的写入端只认机器章：`--by` 必须是 `ci:audit@<40 位小写十六进制的 head commit sha>`
+ * （或第一枚提交用的 `ci:audit@pending`）。人工双签已取消，旧的评论 URL 现在直接被
+ * buildDisposition 拒收（退出码 2）—— 那正是「已删的机制不许被数据复活」的形状。
+ * 下面三条接合用例要的是固化那几步的退出码，所以 `--by` 一律给章的形状。
+ */
+const SEAL_BY = `ci:audit@${'ab'.repeat(20)}`;
+
 test('revoke 接合：固化成功 ⇒ 台账条目带 subject/evidence，证据文件真落盘', async () => {
   const { dir, comments } = gitFixture();
   const h = await harvest({ cwd: dir, selectors: { id: 'mod_a' }, deps: gitDeps(dir, comments) });
@@ -310,11 +318,12 @@ test('revoke 接合：固化成功 ⇒ 台账条目带 subject/evidence，证据
   const io = quiet();
   const rc = await revokeMain(['--ledger', s.ledgerPath, '--index', s.indexPath, '--pending', s.pendingPath,
     '--evidence-dir', dir,
-    '--id', 'mod_a', '--kind', 'revoke', '--reason', 'malware', '--by', 'https://github.com/o/r/issues/3#issuecomment-1'],
+    '--id', 'mod_a', '--kind', 'revoke', '--reason', 'malware', '--by', SEAL_BY],
   io, { harvest: async () => h, now: () => new Date('2026-10-17T00:00:00Z') });
   assert.equal(rc, 0, io.out.concat(io.err).join('\n'));
   const ledger = JSON.parse(fs.readFileSync(s.ledgerPath, 'utf8'));
   const entry = ledger.dispositions[0];
+  assert.equal(entry.by, SEAL_BY, '落进台账的 by 就是那枚机器章，写入端不改形状');
   assert.equal(entry.subject.coolapkUid, '10086001');
   assert.equal(entry.evidence[0].file, h.files[0].path);
   const written = path.join(dir, ...h.files[0].path.split('/'));
@@ -327,7 +336,7 @@ test('revoke 接合：固化没东西 ⇒ 条目不带那两个键，并打出�
   const s = revokeSandbox();
   const io = quiet();
   const rc = await revokeMain(['--ledger', s.ledgerPath, '--index', s.indexPath, '--pending', s.pendingPath,
-    '--id', 'mod_a', '--kind', 'revoke', '--reason', 'malware', '--by', 'https://github.com/o/r/issues/3#issuecomment-1'],
+    '--id', 'mod_a', '--kind', 'revoke', '--reason', 'malware', '--by', SEAL_BY],
   io, { harvest: async () => ({ ok: false, files: [], notes: [], scanned: 3, whyEmpty: '3 条 pending 提交里没有一条命中' }) });
   assert.equal(rc, 0);
   const entry = JSON.parse(fs.readFileSync(s.ledgerPath, 'utf8')).dispositions[0];
@@ -346,7 +355,7 @@ test('revoke 接合：同名不同物的证据文件绝不覆盖，停下来问�
   const io = quiet();
   const rc = await revokeMain(['--ledger', s.ledgerPath, '--index', s.indexPath, '--pending', s.pendingPath,
     '--evidence-dir', dir,
-    '--id', 'mod_a', '--kind', 'revoke', '--reason', 'malware', '--by', 'https://github.com/o/r/issues/3#issuecomment-1'],
+    '--id', 'mod_a', '--kind', 'revoke', '--reason', 'malware', '--by', SEAL_BY],
   io, { harvest: async () => h, now: () => new Date('2026-10-17T00:00:00Z') });
   assert.equal(rc, 6, '内容哈希撞车只有一种解释：证据被人改过');
   assert.equal(fs.readFileSync(abs, 'utf8'), '有人改过的一份内容\n', '不许覆盖');

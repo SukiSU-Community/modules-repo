@@ -10,13 +10,8 @@ import { execFileSync } from 'node:child_process';
 
 import {
   APPROVE_CHECK_NAME,
-  HUMAN_APPROVAL_MARKER,
-  HUMAN_APPROVE_STATUS,
-  REQUIRED_SIGNERS,
-  TRUSTED_ASSOCIATIONS,
   checkConclusion,
   assertMergeApproved,
-  findHumanApprovals,
   approvalBy,
   approvalVerifyHint,
   stampEntry,
@@ -26,6 +21,9 @@ import {
   main,
 } from '../scripts/publish-from-main.mjs';
 import { isApproved } from '../scripts/build-index.mjs';
+// 机器章的形状从写入端 import，别在测试里手抄一遍：抄了就有第二份定义，
+// 而这两份漂移的方向一定是「测试还在钉旧形状、生产早就换了」。
+import { MACHINE_SEAL_PREFIX, SEAL_PENDING_BY } from '../scripts/revoke.mjs';
 
 const SHA = 'a'.repeat(40);
 const prOk = (over = {}) => ({
@@ -98,136 +96,103 @@ test('PR 本身不合法的一律拒：没 PR / 未合并 / base 不是 main / �
   }
 });
 
-test('标签和评论不是批准证据：只带 auto-approved 标签也拒', () => {
-  // 这条钉住设计取舍：labels 有 triage 权限就能加，评论正文投稿者能影响。
+test('标签、review、PR 正文都不是批准证据：只带 auto-approved 标签也拒', () => {
+  // 这条钉住设计取舍：labels 有 triage 权限就能加，review 是别人随手点的，
+  // body 是投稿者自己写的文本。批准的唯一来源是 check 结论，这里一条都不算。
   const v = assertMergeApproved({
-    pr: prOk({ labels: [{ name: 'auto-approved' }], body: 'CI says auto-approved ✅' }),
+    pr: prOk({
+      labels: [{ name: 'auto-approved' }],
+      body: 'CI says auto-approved ✅',
+      reviews: [{ state: 'APPROVED', user: { login: 'alice' } }],
+      review_comments: [{ body: '#human-approved' }],
+    }),
     checks: [],
     mainBranch: 'main',
   });
   assert.equal(v.ok, false);
+  assert.match(v.reason, /没有名为 approve 的 check/);
 });
 
-/* ------------------------------------------------------------ 人工双签放行 */
+/* ------------------------------------------------ 机器唯一路（人工双签已删）
 
-const sign = (id, login, assoc = 'MEMBER', body = `${HUMAN_APPROVAL_MARKER} 扫描器把调试打印判成可疑，人工看过没问题`) => ({
+   2026-10-21 owner 拍「本站只有机器审核」：head sha 上 `approve` 的结论是 success 就是批准，
+   不是 success（或根本没上报）就是不批准，**没有第二条路**。以前这里有一整套人工路
+   （两名 OWNER/MEMBER 在 PR 评论首行写 `#human-approved`，由有写权限的人红着合并），
+   它要求的两签在正向从来没数到过（有 write 权限的人只有 1 个），留着只是让文档可以声称有共治。
+   下面这批用例锁的是「删干净了」这件事 —— 而不是「少了一条路」：
+   已删的机制最坏的复活方式不是有人把代码写回来，是**数据看起来像还能用**。
+*/
+
+/** 已删标记：这里只作为**数据**出现，代码里已经没有它的常量了。 */
+const MARKER = '#human-approved';
+const humanComment = (id, login, assoc = 'MEMBER', body = `${MARKER} 扫描器把调试打印判成可疑，人工看过没问题`) => ({
   id, user: { login }, author_association: assoc, body,
 });
-const humanPr = (over = {}) => prOk({ merged_by: { login: 'yufeng-liang' }, ...over });
 const redApprove = [check(APPROVE_CHECK_NAME, 'failure')];
+const twoSigns = [humanComment(101, 'alice'), humanComment(102, 'bob', 'OWNER')];
 
-test('机器判红 + 两个不同 org 成员签名 + 人是合并者 → 人工路成立', () => {
+test('机器判红就是终点：approve 结论 failure ⇒ 不批准，理由点名结论，证据里没有人的位置', () => {
+  const v = assertMergeApproved({ pr: prOk(), checks: redApprove, mainBranch: 'main' });
+  assert.equal(v.ok, false);
+  assert.match(v.reason, /结论是 failure/, '理由要说清是哪一种坏：没上报 / 没跑完 / 结论不是 success 是三件事');
+  assert.match(v.reason, /不是 success/);
+  assert.match(v.evidence.machine, /结论是 failure/);
+  assert.equal(v.kind, undefined, '不批准时不该有任何 kind');
+  assert.equal('signers' in v.evidence, false, '证据里不许有「谁签的」这一格');
+  assert.equal('merged_by' in v.evidence, false, '也不许是「谁合的」');
+});
+
+test('approve 根本没上报 ⇒ 理由说「没有名为 approve 的 check」，不与「结论不对」混成一句', () => {
+  const v = assertMergeApproved({ pr: prOk(), checks: [check('audit', 'success')], mainBranch: 'main' });
+  assert.equal(v.ok, false);
+  assert.match(v.reason, /没有名为 approve 的 check/);
+  assert.match(v.reason, /没上报/);
+  assert.doesNotMatch(v.reason, /结论是/, '这条的理由里没有结论那半句：混了人就去找错的键');
+  assert.match(v.evidence.machine, /保护规则看不见/);
+});
+
+test('已删的人工双签不许被数据复活：评论里写满 #human-approved、人是合并者，照样拒', () => {
+  // 这一条是这批用例的核心。assertMergeApproved 现在只有一条路，`comments` 与
+  // `requireSigners` 这两个参数已经不存在 —— 它们还**传得进去**（JS 不嫌多余的键），
+  // 所以唯一的证明方式是传进去之后结论仍然是拒。残留的 marker 检查若有半条，这里就绿了。
   const v = assertMergeApproved({
-    pr: humanPr(),
+    pr: prOk({ merged_by: { login: 'yufeng-liang' } }),
     checks: redApprove,
-    comments: [sign(101, 'alice'), sign(102, 'bob', 'OWNER')],
     mainBranch: 'main',
+    comments: [...twoSigns, humanComment(103, 'carol', 'OWNER')],
+    requireSigners: 2,
+  });
+  assert.equal(v.ok, false, '三条 OWNER/MEMBER 的签名评论也补不上那一格');
+  assert.match(v.reason, /本站只有机器审核/);
+  assert.doesNotMatch(v.reason, /双签|人工放行|人工签只有/, '理由不许还教人走那条已经不存在的路');
+  assert.ok(!JSON.stringify(v.evidence).includes('alice'), '签名人的名字不该进证据');
+});
+
+test('机器路优先且是唯一路：approve 是 success 时不把人算进章里', () => {
+  const v = assertMergeApproved({
+    pr: prOk({ merged_by: { login: 'yufeng-liang' } }),
+    checks: [check(APPROVE_CHECK_NAME, 'success')],
+    comments: twoSigns,
   });
   assert.equal(v.ok, true);
-  assert.equal(v.kind, 'human');
-  assert.deepEqual(v.evidence.signers.map((s) => s.login), ['alice', 'bob']);
-  assert.match(v.reason, /人工合并/);
+  assert.equal(v.kind, 'ci', '绿的 approve 才是唯一的批准来源');
+  assert.equal('signers' in v.evidence, false, '章上不把人算进去');
 });
 
-test('只有一签不够；同一个人发十条也还是一签', () => {
-  const one = assertMergeApproved({ pr: humanPr(), checks: redApprove, comments: [sign(1, 'alice')] });
-  assert.equal(one.ok, false);
-  assert.match(one.reason, /人工签只有 1 个/);
-  assert.match(one.reason, /少于要求的 2 个不同的人/);
-  const same = assertMergeApproved({
-    pr: humanPr(), checks: redApprove,
-    comments: [sign(1, 'alice'), sign(2, 'alice'), sign(3, 'ALICE')],
-  });
-  assert.equal(same.ok, false, '大小写不同的同名也是同一个人');
-  assert.equal(same.evidence.signers.length, 1);
+test('章只有一枚形状：approvalBy 恒为 ci:approve#<o>/<r>PR<n>@<12hex>，verify 恒指向 commits/<headSha>/pulls', () => {
+  const evidence = { pr: 7, headSha: SHA, checkName: APPROVE_CHECK_NAME, conclusion: 'success' };
+  const expected = `ci:approve#o/rPR7@${SHA.slice(0, 12)}`;
+  assert.equal(approvalBy({ owner: 'o', repo: 'r', evidence }), expected);
+  // kind 参数已删：喂它一个人路形状（kind:'human' + signers），输出必须是同一枚章。
+  assert.equal(
+    approvalBy({ owner: 'o', repo: 'r', kind: 'human', evidence: { ...evidence, kind: 'human', signers: [{ login: 'alice', commentId: 101 }] } }),
+    expected, '第二枚章（评论 id 那种）的形状不许回来'
+  );
+  assert.ok(isApproved({ audit: { status: 'auto-approved', by: expected } }), 'build-index 认这枚章');
+  assert.equal(approvalVerifyHint({ owner: 'o', repo: 'r', evidence }), `gh api repos/o/r/commits/${SHA}/pulls`);
+  assert.doesNotMatch(approvalVerifyHint({ owner: 'o', repo: 'r', evidence }), /comments/, '复验路径不再指向评论');
 });
 
-test('签核人身份不够就不算：CONTRIBUTOR / NONE / 空都拒', () => {
-  for (const assoc of ['CONTRIBUTOR', 'NONE', 'COLLABORATOR', '']) {
-    const v = assertMergeApproved({
-      pr: humanPr(), checks: redApprove, comments: [sign(1, 'alice', assoc), sign(2, 'bob', assoc)],
-    });
-    assert.equal(v.ok, false, `${assoc} 不该算签`);
-    assert.match(v.reason, /一条 #human-approved 人工签都没有/);
-  }
-});
-
-test('标记必须在第一行开头：讨论里夹一句不算签', () => {
-  const v = assertMergeApproved({
-    pr: humanPr(), checks: redApprove,
-    comments: [sign(1, 'alice', 'MEMBER', '我看了一下，' + HUMAN_APPROVAL_MARKER + ' 应该没问题'), sign(2, 'bob')],
-  });
-  assert.equal(v.ok, false);
-});
-
-test('红着被 bot 合并 → 人工路也拒：那是保护配置被改了，不是有人放行', () => {
-  const v = assertMergeApproved({
-    pr: humanPr({ merged_by: { login: 'github-actions[bot]' } }),
-    checks: redApprove,
-    comments: [sign(1, 'alice'), sign(2, 'bob')],
-  });
-  assert.equal(v.ok, false);
-  assert.match(v.reason, /org\/ruleset 被改到允许/);
-});
-
-test('查不到是谁合的 → 拒（人工放行不留名等于没有放行）', () => {
-  const v = assertMergeApproved({
-    pr: humanPr({ merged_by: undefined }), checks: redApprove, comments: [sign(1, 'alice'), sign(2, 'bob')],
-  });
-  assert.equal(v.ok, false);
-  assert.match(v.reason, /查不到是谁合的/);
-});
-
-test('机器路优先：approve 是 success 时不把人算进章里', () => {
-  const v = assertMergeApproved({
-    pr: humanPr(), checks: [check(APPROVE_CHECK_NAME, 'success')], comments: [sign(1, 'alice'), sign(2, 'bob')],
-  });
-  assert.equal(v.kind, 'ci');
-  assert.equal(v.evidence.signers, undefined);
-});
-
-test('人工章写的是评论 id，任何人能回访；verify 指向那些评论', () => {
-  const v = assertMergeApproved({
-    pr: humanPr(), checks: redApprove, comments: [sign(101, 'alice'), sign(102, 'bob')],
-  });
-  const by = approvalBy({ owner: 'o', repo: 'r', evidence: v.evidence });
-  assert.equal(by, `human-approved#o/rPR7@${SHA.slice(0, 12)}/c101+c102`);
-  assert.ok(isApproved({ audit: { status: HUMAN_APPROVE_STATUS, by } }), 'build-index 认这个章');
-  const hint = approvalVerifyHint({ owner: 'o', repo: 'r', evidence: v.evidence });
-  assert.equal(hint, 'gh api repos/o/r/issues/comments/101 && gh api repos/o/r/issues/comments/102');
-});
-
-test('findHumanApprovals：非签名评论直接跳过，不参与判定也不报错', () => {
-  const r = findHumanApprovals([
-    { id: 1, user: { login: 'x' }, author_association: 'MEMBER', body: '普通讨论' },
-    null,
-    { body: HUMAN_APPROVAL_MARKER },
-    sign(9, 'alice', 'MEMBER'),
-  ]);
-  assert.equal(r.signers.length, 1);
-  assert.equal(r.enough, false);
-});
-
-test('findHumanApprovals：第三个参数换「谁算签核人」的来源，默认值一位不动（人工路照旧吃 assoc）', () => {
-  const comments = [sign(9, 'alice', 'CONTRIBUTOR'), sign(10, 'bob', 'MEMBER')];
-
-  // 默认：assoc 说了算 —— 这条就是人在本地拿自己的 token 跑 publish-from-main 时的形状。
-  const dflt = findHumanApprovals(comments);
-  assert.deepEqual(dflt.signers.map((s) => s.login), ['bob']);
-  assert.equal(dflt.rejected[0].why, '身份是 CONTRIBUTOR，不是 OWNER/MEMBER');
-
-  // 传入判定：assoc 整个不参与，返回字符串就当拒绝理由写进 rejected。
-  // CI 那条路必须这样用 —— workflow token 读维护者只回 CONTRIBUTOR（canary #58/#59 实测），
-  // 吃 assoc 等于永远数不到签；它查的是 collaborators/{login}/permission。
-  const byWrite = new Set(['alice']);
-  const r = findHumanApprovals(comments, 2, (login) => (byWrite.has(login) ? true : '这个人对这个仓库没有写权限'));
-  assert.deepEqual(r.signers.map((s) => s.login), ['alice'], '数到的是权限名单里的人，跟 assoc 无关');
-  assert.deepEqual(r.rejected.map((x) => x.why), ['这个人对这个仓库没有写权限']);
-
-  // 没给第三个参数时，不许有人顺手把可信名单写成「谁都能签」：predicate 返回 true 之外的一切都算拒绝。
-  const sloppy = findHumanApprovals(comments, 2, () => undefined);
-  assert.equal(sloppy.signers.length, 0);
-});
 
 /* -------------------------------------------------------------- 章的内容 */
 
@@ -295,12 +260,19 @@ const fakeLog = () => { const out = []; return { out, log: (...a) => out.push(a.
 
 function stubFetch(handler) {
   const orig = globalThis.fetch;
+  const urls = [];
   globalThis.fetch = async (url, init) => {
-    const res = handler(String(url), init);
+    const u = String(url);
+    urls.push(u);
+    const res = handler(u, init);
     if (res === null) return { ok: false, status: 404, json: async () => ({}) };
     return { ok: true, status: 200, json: async () => res };
   };
-  return () => { globalThis.fetch = orig; };
+  // 返回的仍然是「还原」这个函数（现有用例都写 finally { restore() }），
+  // 但带上这次桩收到过哪些 URL —— 断言「某一次请求根本没有发生」只有靠这个才做得到。
+  const restore = () => { globalThis.fetch = orig; };
+  restore.urls = urls;
+  return restore;
 }
 
 // 三个端点的 URL 长得互相包含（.../commits/<sha>/pulls 也含 "/pulls"），
@@ -310,6 +282,9 @@ function stubFetch(handler) {
 // 返回形状按 GitHub 的真实响应来：`/commits/{sha}/pulls` 是**裸数组**。
 // 之前这里返回 `{ pull_requests: [...] }`，和被测代码的同一个误解正好对上，
 // 于是 31 条测试全绿、线上第一次真调用就判成「提交没有关联 PR」而拒绝盖章。
+//
+// 评论那一条分支留着是故意的：人工双签删掉之后生产代码不该再来敲这扇门，
+// 而「该不该敲」这件事只能由收到请求的桩说了算（见下面那条 URLs 断言）。
 function stubApi({ pullList, pr, checkRuns, comments }) {
   return stubFetch((url) => {
     if (url.includes('/check-runs')) return { check_runs: checkRuns || [] };
@@ -416,39 +391,69 @@ test('findPrForCommit：多个关联 PR 时选 base 对的那一个，判定不�
   } finally { restore(); }
 });
 
-test('findPrForCommit 会取 PR 评论 —— 人工签的证据来源，漏取就等于人工放行永远不成立', async () => {
+test('findPrForCommit 不再取 PR 评论 —— 那次多余的 API 调用真的没了（人工签的证据源断开）', async () => {
+  // 桩里**备着**两条签名评论：代码不来取，就该一次请求都不发。
+  // 这条钉的是「取证据的那一步整个删掉了」，而不只是「取了但不用」—— 后者意味着
+  // 每次盖章还多打一次 issues/<n>/comments，而那个接口的内容已经没有任何判据读它。
   const restore = stubApi({
     pullList: PULL_LIST, pr: { ...PR_BODY, merged_by: { login: 'yufeng-liang' } },
-    checkRuns: [{ name: APPROVE_CHECK_NAME, conclusion: 'failure', status: 'completed' }],
-    comments: [sign(55, 'alice'), sign(56, 'bob')],
+    checkRuns: redApprove,
+    comments: twoSigns,
   });
   try {
     const r = await findPrForCommit({ apiBase: 'https://api.github.com', token: 't', owner: 'o', repo: 'r', sha: SHA, log: fakeLog() });
-    assert.equal(r.comments.length, 2);
-    const v = assertMergeApproved({ pr: r.pr, checks: r.checks, comments: r.comments });
-    assert.equal(v.ok, true);
-    assert.equal(v.kind, 'human');
+    assert.equal('comments' in r, false, '返回值里不许再带 comments 键');
+    assert.deepEqual(Object.keys(r).sort(), ['checks', 'others', 'pr']);
+    assert.deepEqual(restore.urls, [
+      `https://api.github.com/repos/o/r/commits/${SHA}/pulls`,
+      'https://api.github.com/repos/o/r/pulls/7',
+      `https://api.github.com/repos/o/r/commits/${SHA}/check-runs`,
+    ], '只该发这三次请求，顺序也是这三次');
+    assert.ok(!restore.urls.some((u) => /comments/.test(u)), `一次评论请求都不该发：${restore.urls.join(' | ')}`);
+    const v = assertMergeApproved({ pr: r.pr, checks: r.checks });
+    assert.equal(v.ok, false, '拿到的形状里没有任何人签可以补这一格');
+    assert.match(v.reason, /结论是 failure/);
   } finally { restore(); }
 });
 
-test('main：机器判红但人工双签齐 → 照样盖章，章上写的是评论 id', async () => {
-  const { pd, f } = pendingFixture();
-  const report = path.join(pd, '..', 'report.json');
+test('main：批准成立时报告里 kind 恒为 ci，章上写的是 check 结论而不是评论 id', async () => {
+  const { dir, pd, f } = pendingFixture();
+  const report = path.join(dir, 'report.json');
   const restore = stubApi({
     pullList: PULL_LIST, pr: { ...PR_BODY, merged_by: { login: 'yufeng-liang' } },
-    checkRuns: [{ name: APPROVE_CHECK_NAME, conclusion: 'failure', status: 'completed' }],
-    comments: [sign(55, 'alice'), sign(56, 'bob')],
+    checkRuns: APPROVED, comments: twoSigns,
   });
   const log = fakeLog();
   try {
     const rc = await main(['--pending', pd, '--sha', SHA, '--owner', 'o', '--repo', 'r', '--changed', f, '--report', report], { log, token: 't' });
-    assert.equal(rc, 0, '人工路成立时不该返回失败');
+    assert.equal(rc, 0, log.out.join('\n'));
     const stamped = JSON.parse(fs.readFileSync(f, 'utf8'));
-    assert.match(stamped.audit.by, /^human-approved#o\/rPR7@a{12}\/c55\+c56$/);
-    assert.match(stamped.audit.verify, /issues\/comments\/55/);
+    assert.equal(stamped.audit.by, `ci:approve#o/rPR7@${SHA.slice(0, 12)}`);
+    assert.equal(stamped.audit.verify, `gh api repos/o/r/commits/${SHA}/pulls`);
     const r = JSON.parse(fs.readFileSync(report, 'utf8'));
-    assert.equal(r.kind, 'human', '报告要能看出这次是人工放行，不是流水线批的');
-    assert.match(log.out.join('\n'), /人工双签/);
+    assert.equal(r.ok, true);
+    assert.equal(r.kind, 'ci', '批准只有一种来源，报告里就不该出现第二种 kind');
+    assert.doesNotMatch(log.out.join('\n'), /人工双签|#human-approved/, '日志里不许再宣传那条已删的路');
+  } finally { restore(); }
+});
+
+test('main：机器判红 + 两条签名评论 ⇒ 退出 1、一个字节不改，那句解释不再教人写标记', async () => {
+  const { pd, f } = pendingFixture();
+  const before = fs.readFileSync(f, 'utf8');
+  const restore = stubApi({
+    pullList: PULL_LIST, pr: { ...PR_BODY, merged_by: { login: 'yufeng-liang' } },
+    checkRuns: redApprove,
+    comments: [...twoSigns, humanComment(57, 'carol', 'OWNER')],
+  });
+  const log = fakeLog();
+  try {
+    const rc = await main(['--pending', pd, '--sha', SHA, '--owner', 'o', '--repo', 'r', '--changed', f], { log, token: 't' });
+    assert.equal(rc, 1, '三个人签了也不补这一格：本站只有机器审核');
+    assert.equal(fs.readFileSync(f, 'utf8'), before, '未获批准时一个字节都不许改');
+    assert.equal(isApproved(JSON.parse(fs.readFileSync(f, 'utf8'))), false);
+    const text = log.out.join('\n');
+    assert.match(text, /本站只有机器审核/);
+    assert.doesNotMatch(text, /#human-approved|双签/, '给投稿者看的文案里留着一条走不通的官方路径，比没有文案更糟');
   } finally { restore(); }
 });
 
@@ -642,7 +647,7 @@ test('kind 只把「索引真的变了且没动台账」的 PR 认成索引 PR',
       `${tag}CHANGED_LEDGER 不许带 --diff-filter：整本台账被删（D）同样是一次处置的消失`);
     assert.ok(yml.includes('[ -n "$CHANGED_JSON" ] && [ -z "$CHANGED_LEDGER" ] && [ "${FOUND:-}" != "true" ]'),
       `${tag}三个条件同时钉住，台账那一条是 -z（空才许走机器路由）`);
-    // 两句 warning 说的是两个方向，不许合并成一句：混投稿要人去查投稿，动台账要的是两名成员签。
+    // 两句 warning 说的是两个方向，不许合并成一句：混投稿要人去查投稿，动台账要的是机器章。
     assert.ok(yml.includes('这个 PR 动了处置台账'), `${tag}台账那一支要指名「处置是人工判断」`);
     assert.ok(yml.includes('elif [ -n "$CHANGED_JSON" ]; then'), `${tag}混投稿那一支要退成 elif，不许被台账那支吃掉`);
   }
@@ -654,7 +659,7 @@ test('kind 只把「索引真的变了且没动台账」的 PR 认成索引 PR',
    接线最容易出的错不是判据写错，是**顺序**：approve 里那句「没有投稿内容 ⇒ 无批准事项」
    会给一枚绿勾，而绿勾是会被点的 —— #53 那条 canary 在线上的读数就是这个形状。
 */
-test('接线：kind 导出 ledger_pr，derive 两条路由都跑并取署名，approve 的台账支排在「无批准事项」之前', () => {
+test('接线：kind 导出 ledger_pr，derive 两条路由都跑并核机器章，approve 的台账支排在「无批准事项」之前', () => {
   for (const f of AUDIT_COPIES) {
     const yml = fs.readFileSync(f, 'utf8');
     const tag = `${path.basename(f)}：`;
@@ -663,15 +668,19 @@ test('接线：kind 导出 ledger_pr，derive 两条路由都跑并取署名，a
     assert.ok(yml.includes('ledger_pr: ${{ steps.kind.outputs.ledger_pr }}'), `${tag}job output 少了 ledger_pr，approve 读到的永远是空`);
     assert.ok(yml.includes('ledger_sealed: ${{ steps.derive.outputs.sealed }}'), `${tag}job output 少了 ledger_sealed，同上`);
     assert.ok(yml.includes("if: steps.kind.outputs.index_pr == 'true' || steps.kind.outputs.ledger_pr == 'true'"),
-      `${tag}derive 必须在两条路由上都跑 —— 署名就取在那一次调用里`);
-    // 两处调用（derive 与 merge-index 的重推导）都要带 --pr：
-    // 少了第二处，签名只在 derive 查过一次，而那次绑的是 head sha —— base 变了要重算正是它的存在理由。
-    assert.equal(yml.split('--pr "$PR_NUMBER"').length - 1, 2, `${tag}两处 verify-index-pr 调用都要带 --pr`);
-    assert.ok(yml.includes('PR_NUMBER: ${{ github.event.pull_request.number }}'), `${tag}两处都要有 PR_NUMBER 这个 env`);
+      `${tag}derive 必须在两条路由上都跑 —— 机器章就核在那一次调用里`);
+    // 两处调用（derive 与 merge-index 的重推导）都要带 --reviews：那份复核结论文件就是章的**实质内容**。
+    // 少了第二处，台账类 PR 在合并那一步退成「内容对得上就合」，而那一步绑的是 head sha ——
+    // base 变了要重算正是它存在的理由，不能当成已经查过。
+    assert.equal(yml.split('--reviews "$REVIEWS_FILE"').length - 1, 2, `${tag}两处 verify-index-pr 调用都要带 --reviews`);
+    assert.equal(yml.split('REVIEWS_FILE="ledger-reviews.json"').length - 1, 2, `${tag}两处都要自己声明复核结论文件的路径（两个 job 不共享工作区）`);
+    // 旧的接缝：--pr 是给 verify-index-pr 取人工双签用的，那条路已删。留着它等于给复活留门。
+    assert.ok(!yml.includes('--pr "$PR_NUMBER"'), `${tag}--pr "$PR_NUMBER" 是人工签那条接缝，不许回来`);
+    assert.ok(yml.includes('PR_NUMBER: ${{ github.event.pull_request.number }}'), `${tag}合并那一步要靠 PR_NUMBER 决定合哪条，缺了得先红`);
     // sealed 读的是 report 里的字段，不是那一步的退出码 —— 退出码 0 只说明「索引算得对」。
     assert.ok(yml.includes('if (r.seal && r.seal.ok) { sealed = true; }'), `${tag}sealed 要从 report.seal.ok 取`);
 
-    const step = yml.slice(yml.indexOf('只批准「低风险'));
+    const step = yml.slice(yml.indexOf('只批准「未命中拦截名单的首次收录'));
     assert.ok(step.length > 0, `${tag}approve 那一步的名字被改了，这段切片会静默变空`);
     const iDisp = step.indexOf('if [ "${DISPOSITION:-}" = "hit" ]');
     const iIndex = step.indexOf('if [ "${INDEX_PR:-}" = "true" ]');
@@ -683,22 +692,30 @@ test('接线：kind 导出 ledger_pr，derive 两条路由都跑并取署名，a
     assert.ok(iDisp < iLedger, `${tag}台账支不许排在「无批准事项」之后`);
     assert.ok(iLedger < iFound, `${tag}台账支必须排在「没有投稿内容 ⇒ 无批准事项」之前（#53 线上读到的就是那枚绿勾）`);
     const ledgerBranch = step.slice(iLedger, iFound);
-    assert.ok(ledgerBranch.includes('${LEDGER_SEALED:-}'), `${tag}台账支要读 derive 取来的署名结论`);
+    assert.ok(ledgerBranch.includes('${LEDGER_SEALED:-}'), `${tag}台账支要读 derive 核出来的机器章结论`);
     assert.ok(/exit 0/.test(ledgerBranch) && ledgerBranch.includes('exit 1'),
-      `${tag}台账支两面都要写：签齐 exit 0，签不齐 exit 1`);
-    assert.ok(ledgerBranch.includes('::error::'), `${tag}签不齐那句必须是 ::error:: 而不是普通输出`);
+      `${tag}台账支两面都要写：章齐 exit 0，章不齐 exit 1`);
+    assert.ok(ledgerBranch.includes('::error::'), `${tag}章不齐那句必须是 ::error:: 而不是普通输出`);
+    // 给投稿者/维护者看的两句要求要写当前的形状：照旧文案去凑「两名签」只会一直红。
+    assert.ok(ledgerBranch.includes('ci:audit@'), `${tag}台账支要把机器章的形状写进报错（当前值 ${MACHINE_SEAL_PREFIX}<40hex>）`);
+    assert.ok(ledgerBranch.includes(SEAL_PENDING_BY), `${tag}台账支要写出第一枚提交用的待盖值`);
+    assert.doesNotMatch(ledgerBranch, /#human-approved|双签|两名[^。\n]{0,12}(签|放行)/,
+      `${tag}已删的人工双签不许还以指令形式出现在这里`);
   }
 });
 
-test('接线：merge-index 的重推导也带 --pr，且缺 PR_NUMBER 时先红再谈合', () => {
+test('接线：merge-index 的重推导也核机器章（带 --reviews），且缺 PR 上下文时先红再谈合', () => {
   for (const f of AUDIT_COPIES) {
     const code = fs.readFileSync(f, 'utf8').split(/\r?\n/).filter((l) => !/^\s*#/.test(l)).join('\n');
     const at = code.indexOf('  merge-index:');
     const next = code.slice(at + 2).search(/^ {2}[A-Za-z_-]+:$/m);
     const job = next < 0 ? code.slice(at) : code.slice(at, at + 2 + next);
-    assert.ok(job.includes('--pr "$PR_NUMBER"'), `${path.basename(f)}：重推导不带 --pr，台账类 PR 会在合并这一步退成「内容对得上就合」`);
-    assert.ok(job.includes('拿不到 PR 编号'), `${path.basename(f)}：PR_NUMBER 为空要红，不能空着继续判`);
-    assert.ok(job.indexOf('--pr "$PR_NUMBER"') < job.indexOf('gh pr merge'), '带署名的那次重推导必须排在合并之前');
+    assert.ok(job.includes('--reviews "$REVIEWS_FILE"'), `${path.basename(f)}：重推导不核机器章，台账类 PR 会在合并这一步退成「内容对得上就合」`);
+    assert.ok(job.includes('REVIEWS_FILE="ledger-reviews.json"'), `${path.basename(f)}：这一步得自己声明复核结论文件，两个 job 之间不共享工作区`);
+    assert.ok(!job.includes('--pr "$PR_NUMBER"'), `${path.basename(f)}：--pr 那条人工签接缝不许回来`);
+    assert.ok(job.includes('if [ -z "${PR_NUMBER:-}" ]') && job.includes('没东西可合'),
+      `${path.basename(f)}：PR_NUMBER 为空要红，不能空着继续判`);
+    assert.ok(job.indexOf('--reviews "$REVIEWS_FILE"') < job.indexOf('gh pr merge'), '核机器章的那次重推导必须排在合并之前');
   }
 });
 
@@ -748,7 +765,9 @@ const MOD = (id, vc) => ({
 });
 const INDEX0 = { name: 'M', lastUpdate: 1, modules: [MOD('alpha', 1), MOD('beta', 2)] };
 const LEDGER0 = { schema: 'sukisu-dispositions-v1', lastUpdate: 1, dispositions: [] };
-const SEAL = { kind: 'revoke', reason: 'test-probe', by: 'https://github.com/SukiSU-Community/modules-repo/issues/33#issuecomment-6104846280', at: '2026-10-17T00:00:00Z', note: '探针处置', id: 'beta' };
+// 夹具里的 by 用**当前合法的机器章形状**。kind 那一步只看路径、不看凭据，
+// 所以拿一枚「看着就合格」的章去做形状，才测得出它到底有没有越权分类这条 PR。
+const SEAL = { kind: 'revoke', reason: 'test-probe', by: `${MACHINE_SEAL_PREFIX}${'ab'.repeat(20)}`, at: '2026-10-17T00:00:00Z', note: '探针处置', id: 'beta' };
 
 /** 起一个「有 origin 的仓库」：先按 shape.base 落 main，再按 shape.pr 落 PR 分支。 */
 function makeKindRepo(shape) {
@@ -911,7 +930,7 @@ test('approve 必须依赖 selftest，且上游不 success 时自己判红（不
     // PR 直接被 gh pr merge 合进了 main。所以 approve 必须 always 跑，并且自己判红。
     assert.match(job, /^ {4}if: always\(\)$/m, 'approve 必须 always 跑：skip 等于放行');
     assert.match(job, /needs: \[audit, selftest\]/);
-    const gate = code.slice(code.indexOf('上游没过检就没有批准资格'), code.indexOf('只批准「低风险'));
+    const gate = code.slice(code.indexOf('上游没过检就没有批准资格'), code.indexOf('只批准「未命中拦截名单的首次收录'));
     assert.match(gate, /AUDIT_RESULT: \$\{\{ needs\.audit\.result \}\}/, '要读 needs.*.result，不是 outputs');
     assert.match(gate, /SELFTEST_RESULT: \$\{\{ needs\.selftest\.result \}\}/);
     assert.match(gate, /!= "success"/, '非 success（红/跳过/取消）都要 exit 1');
@@ -1179,32 +1198,41 @@ test('workflow 不许内联台账匹配逻辑（判据只能有一份实现）',
 
 const GOVERNANCE_FILE = path.resolve(import.meta.dirname, '../GOVERNANCE.md');
 
-test('GOVERNANCE.md 存在，且写的就是当前这套双签判据', () => {
-  // 给投稿者看的文案指向这份文件。它一旦和 assertMergeApproved 脱节，
+test('GOVERNANCE.md 存在，且写的就是当前这套机器章判据（不许还承诺两签放行）', () => {
+  // 给投稿者看的文案指向这份文件。它一旦和 assertMergeApproved / judgeLedgerSeal 脱节，
   // 就等于告诉别人一条走不通的官方路径 —— 比没有文档更糟。
   // 下面每个值都从代码里 import，改代码不改文档会直接红。
   assert.ok(fs.existsSync(GOVERNANCE_FILE), 'GOVERNANCE.md 必须存在：报错文案指着它');
   const doc = fs.readFileSync(GOVERNANCE_FILE, 'utf8');
 
-  assert.ok(doc.includes(HUMAN_APPROVAL_MARKER), `文档要写当前的标记 ${HUMAN_APPROVAL_MARKER}`);
-  assert.ok(doc.includes(HUMAN_APPROVE_STATUS), `文档要写人工章的状态值 ${HUMAN_APPROVE_STATUS}`);
-  assert.equal(REQUIRED_SIGNERS, 2, '文档正文写的是「两个不同的人」，改这个数必须连文档一起改');
-  assert.ok(doc.includes('两个不同的人'), '几签要说人话写出来');
-  for (const assoc of TRUSTED_ASSOCIATIONS) {
-    assert.ok(doc.includes(assoc), `签核资格要列出 ${assoc}（当前白名单：${[...TRUSTED_ASSOCIATIONS].join('/')}）`);
-  }
-  assert.ok(doc.includes('红着被 bot 合并') || doc.includes('[bot]'),
-    '「机器人合的不算人工放行」是这条路成立的前提，文档不能漏');
-  assert.match(doc, /gh api repos\/[^\s]+\/issues\/comments\//, '要给出可复制的复验命令');
-  assert.match(doc, /不是正式渠道/, '申诉入口要写明哪里不算数');
+  assert.match(doc, /^# 治理与机器章（GOVERNANCE）\r?$/m, '标题要写的是机器章，不是双签（\r? 是因为这份文件用 CRLF）');
+  assert.ok(doc.includes('本站没有人工审核'), '这条是整份文件的前提，必须写在脸上');
+  assert.ok(doc.includes('这里没有人可以签你进来'), '申诉那一节要把「没有人能签你进来」说清');
+
+  // 章的形状从写入端 import：文档里写的必须就是代码认的那一枚。
+  assert.ok(doc.includes(MACHINE_SEAL_PREFIX), `文档要写当前的章形状 ${MACHINE_SEAL_PREFIX}<40hex>`);
+  assert.ok(doc.includes(SEAL_PENDING_BY), `第一枚提交用的待盖值 ${SEAL_PENDING_BY} 是两枚提交那一段的核心`);
+  assert.ok(doc.includes('judgeLedgerSeal'), '四条判据的实现处要点名到函数，否则文档指向的是一段不存在的代码');
+  assert.match(doc, /gh api repos\/[^\s]+\/commits\/[^\s]+\/check-runs/, '要给出可复制的复验命令（回访的是 check，不是评论）');
+  assert.ok(doc.includes('不是正式渠道'), '申诉入口要写明哪里不算数');
+
+  // 反面：已删机制不许以任何「照着做就成」的形状留下。
+  // 「两个不同的人」这四个字今天只许出现在否定句 / 历史句里，所以这里比的是指令形状，不是这个词。
+  assert.doesNotMatch(doc, /#human-approved/, '已删标记不许留在治理文档里：那是给人照做的指令');
+  assert.doesNotMatch(doc, /双签|人工签/, '本站没有这一档，文档不许把它写成一条可走的路');
+  assert.doesNotMatch(doc, /^\|\s*签核人/m, '「签核人」那一档已从角色表删掉，不许回来');
+  assert.doesNotMatch(doc, /首行写|各写一次/, '教人怎么签的句式一条都不许留');
 });
 
-test('审核判红那条给投稿者看的报错，指向的文件和标记都必须是真实的', () => {
-  // 这句文案在 shell 里，插值不到 JS 常量，所以只能反过来用 import 的值查文本。
+test('审核判红那条给投稿者看的报错，指向的文件和说法都必须是真实的', () => {
+  // 这句文案在 shell 里，插值不到 JS 常量，所以只能反过来查文本：
+  // 它必须指向 GOVERNANCE.md，且说法要与「本站只有机器审核」一致 ——
+  // 教投稿者去凑两名签名，等于给一条永远红着的 PR 指一条不存在的路。
   for (const f of AUDIT_COPIES) {
     const line = fs.readFileSync(f, 'utf8').match(/::error::[^\n]*不满足自动放行条件[^\n]*/);
     assert.ok(line, `${path.basename(f)} 里必须留着那条报错`);
     assert.ok(line[0].includes('GOVERNANCE.md'), '报错指向的必须是治理文档，不是「README/GOVERNANCE.md」这种空位');
-    assert.ok(line[0].includes(HUMAN_APPROVAL_MARKER), `报错里教人写的标记必须等于 ${HUMAN_APPROVAL_MARKER}`);
+    assert.ok(line[0].includes('本站只有机器审核'), `报错要说当前的话：${line[0]}`);
+    assert.doesNotMatch(line[0], /#human-approved|双签|两名/, '已删的人工双签不许还写在这句话里');
   }
 });
