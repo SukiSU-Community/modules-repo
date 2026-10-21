@@ -381,7 +381,20 @@ export const OBFUSCATED_DECODE_ONLY = makeLineRule({
   exclude: /^(?=.*\b(?:base64|xxd|uudecode|openssl\s+enc|busybox\s+base64)\b)(?=.*(?:\|\s*(?:sh|bash|ash)\b|\beval\b)).*$/, // 已由 OBFUSCATED_DECODE_EXEC 报 high
 });
 
-const MODULE_OWN_DIR = /\$MODDIR|\$MODPATH|\$MOD\b|\$\{MODPATH\}|\$\{MODDIR\}|^\s*#/;
+// 豁免只能由**这条匹配自己**的位置决定，不能由「这一行里有没有 $MODPATH 那七个字符」决定。
+// 旧写法是 `exclude: /\$MODDIR|\$MODPATH|…|^\s*#/`（整行判），于是
+// `cp "$MODPATH/engines.bin" /system/app/Foo/engines.bin` 这种「源在覆盖层、目标在真分区」的
+// 载荷 0 命中 —— 而 `$MODPATH` 是投稿者想写就能写的形态特征，拿它当豁免内容规则就是逃逸道。
+const PARTITION_SEG = /\/(?:system|vendor|product|system_ext|odm)\//g;
+const OVERLAY_HEAD = /(?:\$MODPATH|\$MODDIR|\$MOD\b|\$\{MODPATH\}|\$\{MODDIR\}|\/data\/adb\/modules(?:_update)?\/[^\s"'`;|&)]*)$/;
+
+function overlayOnlyMatch(text) {
+  const hits = [...String(text).matchAll(PARTITION_SEG)];
+  // 匹配里没有分串路径 ⇒ 这一支说的不是路径（`\bremount\b` / `mount -o rw`）：那是真重挂载，
+  // 不许因为「没找到可豁免的东西」就被当成覆盖层放过。
+  if (hits.length === 0) return false;
+  return hits.every((h) => OVERLAY_HEAD.test(text.slice(0, h.index)));
+}
 
 export const WRITE_SYSTEM_VENDOR = makeLineRule({
   anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
@@ -391,7 +404,8 @@ export const WRITE_SYSTEM_VENDOR = makeLineRule({
   title: '直接写入或重挂载 /system、/vendor 分区',
   advice: 'Magisk/KernelSU 模块应通过 $MODPATH/system 覆盖层修改，不得直接写真实分区；直接写会破坏 dm-verity 与 OTA。',
   pattern: /(?:\btouch\b|\bcp\b|\bmv\b|\bdd\b|\bmkdir\b|\bsed\s+-i\b|\btee\b|>>?)[^\n]*\/(?:system|vendor|product|system_ext|odm)\/|\bmount\b[^\n]*-o[^\n]*\b(?:rw|remount)\b|\bremount\b|\bmount\s+-o\s+rw[^\n]*\/(?:system|vendor)\b/,
-  exclude: MODULE_OWN_DIR, // $MODPATH/system/... 是标准覆盖层写法
+  // 注释行那支语义照旧（`^\s*#`），分串那一支换成按匹配判
+  exclude: (m, line) => /^\s*#/.test(line) || overlayOnlyMatch(m[0]),
 });
 
 export const SELINUX_DISABLE = makeLineRule({
@@ -2467,6 +2481,164 @@ export function scoreRisk(findings) {
   return { level, counts, reasons };
 }
 
+// ---------------------------------------------------------------------------
+// 恶意行为轴（设计文档 §2 / §3.2 / §13.5）—— 唯一决定「上不上架」的那一格
+// ---------------------------------------------------------------------------
+//
+// 换的是什么轴：旧分流吃的是**风险等级**（`high` 的字面含义是「有这个能力」，而 root 模块的
+// 正当功能本身就长得像能力），于是「用它当拦截条件 = 这个生态几乎全灭」（§1 第 3 条）。
+// 新分流吃的是**恶意定性**：一张小而可证的规则名单，命中 ⇒ 不上架；名单外的一切 ⇒ 上架 + 标注。
+//
+// 名单不是文案，是 §3.2 那张定案表（用户 2026-10-21 拍：按 §3.2 末尾那张表定案，11 条）。
+// 每一条都必须在 audit/malice-axis.test.mjs 里有一枚「这个形状命中并 block」的夹具证人；
+// 名单外的高等级规则一律退成标注（`summarizeCoverage`），它们不再有拦上架的权力。
+//
+// 取严规则（§0.1）：静态名单 ∪ AI 恶意结论，**两边都只有拒的权力，永远没有放的权力**。
+// 这条在本文件里的实现形态是：classifyMalice 的返回值只能把 action 推向 block，
+// 而 AI 那一支只能往 hits 里加，不能减。
+export const MALICE_LIST = Object.freeze([
+  { id: 'PIPE_TO_SHELL', armed: true, note: '把网络/管道里的字节直接喂给 shell：用户不可能同意这件事（§3 左列）' },
+  { id: 'DOWNLOAD_THEN_EXEC', armed: true, note: '下载后执行 —— 载荷不在包内，审核面看不到最终执行的是什么' },
+  { id: 'DOWNLOAD_TO_MODULE_EXEC', armed: true, note: '下载进模块目录再执行。§3.2 ①：它自己的独立读数仍未量到，由 DOWNLOAD_THEN_EXEC 顶住；留着不替它作证，也不降它' },
+  { id: 'OBFUSCATED_DECODE_EXEC', armed: true, note: '解码 + 执行同链：编码就是为了让审核面读不到载荷' },
+  { id: 'SELINUX_DISABLE', armed: true, note: 'setenforce 0 / 写 enforce：全局关掉 MAC，影响的是设备上所有应用，不是这个模块自己' },
+  { id: 'EXEC_INDIRECT', armed: true, note: '§3.2 ①：射程是「说不清执行的是谁」那一档（变量钉得住时会被 applyBundledRefVerdicts 处置掉），KM-1/KM-4 两发确实由它顶住，不是装饰' },
+  { id: 'WRITE_SYSTEM_VENDOR', armed: true, note: '§3.2 ① + §13.5 已闭环：这条原先诚实标成 rule-silent，因为旧 exclude 拿整行判豁免 —— 一行里出现 $MODPATH 就整行沉默，`cp "$MODPATH/x" /system/app/x` 0 命中，等于一个 token 缴械一条 high。锚点判据现已改按**这条匹配自身的分串位置**判（overlayOnlyMatch，本轮从 p6 分支 08d3563 移植进本副本），豁免只剩「目标那一截确实挂在覆盖层下」与整行注释两支。两枚证人：scan.test.mjs 里那一发的 8 个形状（含三发旧实现 0 命中的）+ ANCHOR_WITNESS 换成 `cp "$MODPATH/busybox" /system/xbin/bb` —— 把 exclude 改回整行判，那张闭包表当场红。换轴已接线（scan.mjs 的 decide 调用点传第四参 + audit.yml 分流读名单）。' },
+  { id: 'STRUCT_SYMLINK', armed: true, note: '§3.2 ③：打包作弊四条款项本身就是 high，且没有正当用法（安装以 root 运行）⇒ 进恶意行为轴，不进上下文题那一族' },
+  { id: 'STRUCT_UNSAFE_PATH', armed: true, note: '绝对路径/穿越写法的条目：安装时落点不由审核面决定' },
+  { id: 'STRUCT_DUPLICATE_NAME', armed: true, note: '重名条目：解包顺序决定谁覆盖谁，审核结论对不上被安装的那一份' },
+  { id: 'STRUCT_ZIP_BOMB', armed: true, note: '压缩比异常：故意让逐行审核读不完，本身就是绕闸动作' },
+]);
+
+/** 名单里「今天真的有拦截力」的那几条（armed=true）。scan/分流只认这个集合。 */
+export const MALICE_RULE_IDS = Object.freeze(
+  MALICE_LIST.filter((m) => m.armed).map((m) => m.id),
+);
+/** 定案了但因判据缺陷而暂不 armed 的那几条 —— 缺席要自己证出来，不许静默省略。 */
+export const MALICE_DEFERRED = Object.freeze(
+  MALICE_LIST.filter((m) => !m.armed).map((m) => ({ id: m.id, closesWhen: m.closesWhen })),
+);
+
+/**
+ * 「同形那一族」= 能力与恶意长得一样的那 5 条（§13.6 拍：降档 + 给 AI 一道上下文题）。
+ * 它们不再有拦上架的权力，但必须被点名交给 §6 那条通道 —— 这张表就是那道「上下文题」的输入清单。
+ * §3.2 ② 明确成员表要补 `SELINUX_TYPE_PERMISSIVE` 与 `PROP_BOOT_SPOOF`（第一轮那张表漏了）。
+ */
+export const CONTEXT_QUESTION_RULE_IDS = Object.freeze([
+  'PROP_BOOT_SPOOF', 'VERIFIED_BOOT_SPOOF', 'MAGISK_POLICY_LIVE',
+  'SELINUX_POLICY_RELAX', 'SELINUX_TYPE_PERMISSIVE',
+]);
+
+/** 纯能力/正当功能那一族：只标注，不进上下文题（§3.2 ② 末段：「无人守」在这里不等于有洞）。 */
+export const CAPABILITY_RULE_IDS = Object.freeze([
+  'EXEC_BUNDLED_FILE', 'MODDIR_RUNTIME_WRITE', 'STRUCT_BINARY',
+]);
+
+/** 覆盖度那一组：§3.2 ③ 拍的「保持标注」（AUDIT_COVERAGE_METADATA 由 scan.mjs 直接产出）。 */
+export const COVERAGE_RULE_IDS = Object.freeze([
+  'STRUCT_ENCRYPTED', 'STRUCT_RATIO', 'STRUCT_ENTRY_COUNT', 'STRUCT_UNSUPPORTED_METHOD',
+  'STRUCT_UNREADABLE', 'AUDIT_COVERAGE_TRUNCATED', 'AUDIT_COVERAGE_METADATA',
+]);
+
+/** 命中名单之外的其它规则里，档位仍然计入等级的那些（标注用）。 */
+const MALICE_SET = new Set(MALICE_RULE_IDS);
+
+/**
+ * 恶意定性：静态名单 ∪ AI 恶意结论。返回 { malicious, hits, basis, reason }。
+ *
+ * 三条硬性质，都有用例钉着：
+ *  1. **只有拒的权力**：这个函数不会返回「放行」这件事本身 —— 它只说「有没有人做了用户不可能同意的事」，
+ *     放不放行由 decide() 判；而 AI 那一支只允许往 hits 里加（§2 保留的不变量）。
+ *  2. **读不懂 = 拒，不是跳**（与本仓 verify-pending-proof 同一条口径）：findings 不是数组时
+ *     按 malicious=true 处理 —— 分流这一格最怕的是「判据没收到东西于是说不说话」。
+ *  3. AI 的恶意结论必须带**已逐字复验**的证据（§6：复验不过整份落 untrusted，不采信、不猜）。
+ *     `aiMalice.malicious === true` 而 verified 为空 ⇒ 不采信（这条不能反过来变成「模型说什么就拦什么」）。
+ *
+ * @param {Array<{ruleId?:string}>|null|undefined} findings 同一份报告里的全部 finding
+ * @param {{malicious?:boolean, verified?:Array<{file?:string,line?:number,quote?:string}>}|null} [aiMalice]
+ */
+export function classifyMalice(findings, aiMalice = null) {
+  const hits = [];
+  if (!Array.isArray(findings)) {
+    return {
+      malicious: true,
+      hits: [{ source: 'unreadable', ruleId: '<findings 不是数组>', file: '', line: 0 }],
+      basis: ['unreadable-findings'],
+      reason: '恶意判据没有收到可判的发现清单（findings 不是数组）—— 判不了就不上架，fail-closed',
+    };
+  }
+  for (const f of findings) {
+    if (!f || typeof f !== 'object') continue;
+    if (typeof f.ruleId === 'string' && MALICE_SET.has(f.ruleId)) {
+      hits.push({ source: 'static', ruleId: f.ruleId, file: typeof f.file === 'string' ? f.file : '',
+        line: Number.isFinite(f.line) ? f.line : 0, message: typeof f.message === 'string' ? f.message : '' });
+    }
+  }
+  const basis = [];
+  if (hits.length) basis.push('static-malice-list');
+  if (aiMalice && typeof aiMalice === 'object' && aiMalice.malicious === true) {
+    const verified = Array.isArray(aiMalice.verified) ? aiMalice.verified.filter((e) => e && typeof e === 'object') : [];
+    if (verified.length) {
+      basis.push('ai-malice-verified');
+      for (const e of verified) {
+        hits.push({ source: 'ai', ruleId: 'AI_MALICE', file: typeof e.file === 'string' ? e.file : '',
+          line: Number.isFinite(e.line) ? e.line : 0, message: typeof e.quote === 'string' ? e.quote : '' });
+      }
+    } else {
+      // 引用没能在送出去的那份原文里逐字复验 ⇒ 整份不采信（§6）。它不拦，但它必须被记下来。
+      basis.push('ai-malice-unverified-not-adopted');
+    }
+  }
+  const uniq = [...new Set(hits.map((h) => h.source === 'ai' ? `ai:${h.file}:${h.line}` : `static:${h.ruleId}`))];
+  const names = [...new Set(hits.filter((h) => h.source === 'static').map((h) => h.ruleId))];
+  // 措辞纪律（计划 §2.7；scan.test.mjs 里那两条钉子读的就是 decision.reason，不许把它们改成放行）：
+  // **没命中**那一句里不许出现「恶意」——那是一条关于名单的读数，不是对投稿人的评价；
+  // 轴的名字仍然叫恶意行为轴（节标题与报告里「恶意行为链」那一行），只有**命中**的 reason 才点名它。
+  return {
+    malicious: hits.length > 0,
+    hits,
+    basis,
+    reason: hits.length
+      ? (names.length
+        ? `命中恶意行为链名单：${names.join('、')}（取严：任一命中就不上架）`
+        : 'AI 安全员给出恶意结论且引用在送出去的原文里逐字复验通过（取严：任一命中就不上架）')
+      : `未命中上架拦截名单（名单共 ${MALICE_RULE_IDS.length} 条 armed / ${MALICE_LIST.length} 条定案）—— 等级不再决定上不上架`,
+    distinct: uniq,
+  };
+}
+
+/**
+ * 能力/覆盖轴：只写结论，不影响上架（§2 第二轴、§10 标注）。
+ *
+ * 分成三格是因为 §10 要求「三个落点分开写，不要混」——这一函数产出的是**给机器读的那一份**，
+ * 由 scan.mjs 并进报告，再由呈现层拼成人读的那几句：
+ *   * `capabilities`：危险能力与正当功能同形的读数（含上下文题那一族）
+ *   * `coverage`：没看全的东西（截断、读不懂、加密、回退通道）⇒ 「覆盖不全」
+ *   * `contextQuestions`：上下文题那一族里今天真的露过面的那几条 ⇒ §6 那道题的输入
+ */
+export function summarizeCoverage(findings, extras = {}) {
+  const list = Array.isArray(findings) ? findings : [];
+  const pick = (set) => list.filter((f) => f && typeof f.ruleId === 'string' && set.has(f.ruleId));
+  const ctx = pick(new Set(CONTEXT_QUESTION_RULE_IDS));
+  const cap = pick(new Set(CAPABILITY_RULE_IDS));
+  const cov = pick(new Set(COVERAGE_RULE_IDS));
+  const others = list.filter((f) => f && typeof f.ruleId === 'string'
+    && !MALICE_SET.has(f.ruleId)
+    && !new Set([...CONTEXT_QUESTION_RULE_IDS, ...CAPABILITY_RULE_IDS, ...COVERAGE_RULE_IDS]).has(f.ruleId));
+  const count = (xs) => [...new Set(xs.map((f) => f.ruleId))].sort();
+  return {
+    axis: 'capability-coverage',
+    level: typeof extras.level === 'string' ? extras.level : null,
+    counts: extras.counts && typeof extras.counts === 'object' ? extras.counts : null,
+    capabilities: count([...cap, ...ctx, ...others]),
+    coverageGaps: count(cov),
+    contextQuestions: count(ctx),
+    /** 「没看全」与「没跑成」是两件事（§5，用户按推荐采纳）：后者由分流按 fail-closed 处理。 */
+    unreadTraced: typeof extras.unreadCount === 'number' ? extras.unreadCount : null,
+    humanReview: 'none — 本流水线不设人工审核这一格；结论由一次可复验的机器运行给出',
+  };
+}
+
 /**
  * 决策：结合风险等级与“首次收录 / 版本更新”
  * 已定案规则：低风险 + 首次收录 → 自动进索引；其余一律人工审。
@@ -2479,11 +2651,63 @@ export function scoreRisk(findings) {
  * 硬边界：本分支只把 auto-approve 翻成 request-review。medium/high 与 update/unknown 的
  * 返回值一字不改（它们本来就不是自动通道），所以这个参数不可能让任何包变得比原来更容易自动放行。
  * 措辞纪律见计划 §2.7：说的是「机器不替它作证」，不许写成可疑，不许把投稿人写成嫌犯。
+ *
+ * ── 2026-10-21 第四个参数：分流换轴（设计文档 §4 第三行、§13.5 定案）**已接线** ────────────
+ * 上面那段「低风险 + 首次收录 → 自动进索引；其余一律人工审」从这一行起只是**老轴**的说明：
+ * `malice` 缺省时逐字保留它（§14 那条 pin 约束要求判据先发、YAML 第二发，老轴是那一拍的落点，
+ * 也是任何调用方没接到判据时的保守默认 —— 不许有人把它当成第二份判据来用）。
+ * 生产调用点 `scan.mjs` 与 audit.yml 的「分流决策」都已传第四参 ⇒ 上不上架只由名单 ∪ AI 恶意结论决定。
+ *
+ * 新轴的形状（用户拍的四条，一条不许自己放宽）：
+ *   1. 命中名单（静态 ∪ AI 恶意）⇒ `block`。取严：任一命中就不上架。
+ *   2. 名单外的一切 —— 包括 root 模块正当功能那批 high（PROP_BOOT_SPOOF / VERIFIED_BOOT_SPOOF /
+ *      MAGISK_POLICY_LIVE / SELINUX_* / EXEC_BUNDLED_FILE / MODDIR_RUNTIME_WRITE）—— **不再拦上架**，
+ *      等级与命中读数退成标注（`summarizeCoverage`），由报告与 PR 评论呈现。
+ *   3. `update` / `unknown` 这一档维持 request-review：§13 第 2 条（要不要给版本更新另加一道）
+ *      标的是**待拍**，本函数不许自行默认。
+ *   4. fix8-E 那道「撤销过就不自动放行」在新轴上照旧生效（它只会更严）。
+ * 措辞纪律在四条之上还有一条：只有**命中**那一句可以说「恶意」，未命中的三条说的是「上架拦截名单」。
  * @param {'low'|'medium'|'high'} level
  * @param {'first'|'update'|'unknown'} changeType
  * @param {{ revokedCount?:number, revokedEntries?:string[] }|null} [coverage] 撤销覆盖度
+ * @param {ReturnType<typeof classifyMalice>|null} [malice] 恶意定性；undefined/显式 legacy ⇒ 走老轴
  */
-export function decide(level, changeType, coverage = null) {
+export function decide(level, changeType, coverage = null, malice = undefined) {
+  const useNewAxis = !!(malice && typeof malice === 'object' && typeof malice.malicious === 'boolean');
+  if (useNewAxis) {
+    // 1) 取严：任一命中就不上架。AI 那一支只加不减（§2 不变量）。
+    if (malice.malicious) {
+      return { action: 'block', label: 'needs-human-review', needsHumanReview: true,
+        axis: 'malice', basis: Array.isArray(malice.basis) ? malice.basis : [],
+        hits: Array.isArray(malice.hits) ? malice.hits : [],
+        reason: malice.reason || '命中恶意行为链名单，不上架' };
+    }
+    // 3) 不是首次收录 ⇒ 那一道还待拍，维持今天的行为（只更严不更松）。
+    if (changeType !== 'first') {
+      return { action: 'request-review', label: 'needs-human-review', needsHumanReview: true,
+        axis: 'malice',
+        reason: changeType === 'update'
+          ? '未命中上架拦截名单，但这是对已收录模块的版本更新 —— 「要不要给 update 另加一道」是 §13 第 2 条的待拍项，本轮不自行默认，维持转人工'
+          : '无法判定是首次收录还是版本更新（未提供索引），保守起见转人工' };
+    }
+    // 4) fix8-E：撤销过 ⇒ 机器不替它作证。
+    const revokedCount = coverage && Number(coverage.revokedCount) > 0 ? Number(coverage.revokedCount) : 0;
+    if (revokedCount > 0) {
+      const entries = (Array.isArray(coverage.revokedEntries) ? coverage.revokedEntries : [])
+        .filter((x) => typeof x === 'string' && x);
+      const shown = entries.length ? entries.join('、') : `共 ${revokedCount} 次撤销涉及的条目`;
+      const noun = entries.length > 1 ? '这些条目' : '该条目';
+      return { action: 'request-review', label: 'needs-human-review', needsHumanReview: true,
+        axis: 'malice',
+        reason: `未命中上架拦截名单，但它执行了模块自带的 ${shown}；${noun}已读且行级规则无命中，`
+          + '机器不替它作证，需人工确认' };
+    }
+    // 2) 名单外 ⇒ 上架 + 标注。「未经人工审核」这句话由 annotation 与呈现层落（§10）。
+    return { action: 'auto-approve', label: 'auto-approved', needsHumanReview: false, axis: 'malice',
+      reason: `${malice.reason || '未命中上架拦截名单'}；风险等级 ${level} 在本模型里只是标注输入，不再拦上架` };
+  }
+
+  // ── 老轴（等级 + changeType）：malice 缺省时逐字保留 ──
   if (level === 'low' && changeType === 'first') {
     const revokedCount = coverage && Number(coverage.revokedCount) > 0 ? Number(coverage.revokedCount) : 0;
     if (revokedCount > 0) {

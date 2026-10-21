@@ -27,6 +27,7 @@ import { spawnSync } from 'node:child_process';
 import {
   CONTENT_RULES, scanContent, checkMetadata, parseModuleProp,
   scoreRisk, decide, countsTowardRisk, CATEGORY_LABEL, SEVERITY_ORDER,
+  classifyMalice, summarizeCoverage, MALICE_RULE_IDS, MALICE_LIST,
   inspectStructure, checkCoverage, checkUnread, checkBinaries, detectBinary,
   binaryForensicsRows, printableRatio, POLYGLOT_MIN_PRINTABLE,
   dexSurfaceSeverity,
@@ -1070,7 +1071,24 @@ export function scanZip(zipPath, opts = {}) {
     revokedCount: revokedBundledRefs.length,
     revokedEntries: [...new Set(revokedBundledRefs.map((r) => r.resolvedEntry))],
   };
-  const decision = decide(level, changeType, decisionCoverage);
+  // ── 两轴分流（设计文档 §2 / §3.2 / §4 / §13.5）—— 2026-10-21 第二发：调用点已换轴 ─────
+  // 第一发（判据与名单）把 classifyMalice / summarizeCoverage / MALICE_RULE_IDS 落进 risk-rules.mjs，
+  // 但这一格仍走老轴（等级当判决），于是「正当功能的 high 不再拦上架」在生产上还没发生。
+  // 这一发把它翻过来：`decide(...)` 的第 4 参接上恶意定性，**上不上架只由「命中拦截名单否」决定**
+  //   * 命中 MALICE_RULE_IDS（11 条全 armed）∪ AI 恶意结论 ⇒ block；
+  //   * 名单外的一切（含 PROP_BOOT_SPOOF / VERIFIED_BOOT_SPOOF / MAGISK_POLICY_LIVE / SELINUX_* /
+  //     EXEC_BUNDLED_FILE / MODDIR_RUNTIME_WRITE 这些「正当功能本身就长得像能力」的 high）⇒ auto-approve，
+  //     等级与读数退成 `annotation`（能力/覆盖轴，只写结论）；
+  //   * `update` / `unknown` 与 fix8-E（撤销过）维持不放行 —— §13 第 2 条是**待拍**，本函数不自行默认。
+  // AI 那一支在这里恒为 null：AI 产物在这一格还不存在（scan 在 AI 之前跑），
+  // 恶意通道的 ∪ 发生在 audit.yml「分流决策」那一步（读 ai-<pkg>.json 的 maliceVerdict）。
+  // 为什么不在这里 import ai-review：判据只许有一份，而这一层的取严规则住在 classifyMalice 里。
+  const malice = classifyMalice(all, null);
+  const annotation = summarizeCoverage(all, {
+    level, counts,
+    unreadCount: Array.isArray(unread) ? unread.length : 0,
+  });
+  const decision = decide(level, changeType, decisionCoverage, malice);
 
   return {
     schema: 'module-audit-report/v1',
@@ -1147,6 +1165,12 @@ export function scanZip(zipPath, opts = {}) {
     riskReasons: reasons,
     changeType,
     decision,
+    // 两轴分流的两格新落点（§4 第三行把 decide() 拆成了「拦」与「标注」两件事）：
+    //   malice    = 恶意行为轴，唯一决定上不上架的那一份判据（本发的 decision 就是吃它定的）
+    //   annotation = 能力/覆盖轴，只写结论，不影响上架
+    // 名字刻意不叫 review/humanReview —— 这一条链上今天没有人工那一格。
+    malice,
+    annotation,
     warnings,
     durationMs: Date.now() - started,
   };
@@ -1255,6 +1279,20 @@ export function renderMarkdown(report) {
   // shown 来自 zip 的条目名 == 投稿者可控），所以这一行也要过中和。
   L.push(`- 依据：${inertMarkdown(report.decision.reason)}`);
   L.push(`- 命中统计：high ${report.counts.high} / medium ${report.counts.medium} / low ${report.counts.low} / info ${report.counts.info}`);
+  // ── 两轴的读数分开写（§10：三个落点别混；这一格是「索引仓库里的报告 → PR 评论」那一层）──
+  // 等级仍然念出来，因为它现在是**标注**而不是判决；不念就等于把量过的东西藏起来。
+  if (report.malice) {
+    const names = [...new Set((report.malice.hits || []).filter((h) => h.source === 'static').map((h) => h.ruleId))];
+    L.push(`- 恶意行为链：${report.malice.malicious ? `**命中** —— ${names.length ? names.join('、') : 'AI 恶意结论（引用已逐字复验）'}` : `未命中（名单共 ${MALICE_RULE_IDS.length} 条 armed / ${MALICE_LIST.length} 条定案）`}`);
+    const deferred = MALICE_LIST.filter((m) => !m.armed);
+    if (deferred.length) {
+      L.push(`  - 名单里今天不 armed 的：${deferred.map((m) => `${m.id}（判据缺陷未修，见 risk-rules 的 closesWhen）`).join('、')} —— 缺席读数自己报出来，不装成名单里没有`);
+    }
+  }
+  if (report.annotation) {
+    const a = report.annotation;
+    L.push(`- 标注（不影响上架）：危险能力 ${a.capabilities.length} 项${a.capabilities.length ? `（${a.capabilities.join('、')}）` : ''}；覆盖不全 ${a.coverageGaps.length} 项${a.coverageGaps.length ? `（${a.coverageGaps.join('、')}）` : ''}；上下文题 ${a.contextQuestions.length} 项${a.contextQuestions.length ? `（${a.contextQuestions.join('、')}）` : ''}`);
+  }
   L.push('');
 
   L.push('## 元数据');
@@ -1441,7 +1479,16 @@ export function renderMarkdown(report) {
 
   L.push('---');
   L.push('');
-  L.push(`_本报告由 \`contrib/audit/scan.mjs\` 生成；${report.decision.needsHumanReview ? '本模块**需要人工审核**后才可进入正式索引。' : '本模块可自动进入索引。'}_`);
+  // 这句话必须随轴走。分档判据取 decision 自己的形状，不取 reason 的正则：
+  // 未命中那几句里也含「名单」二字（「未命中上架拦截名单」），拿 /名单/ 当判据会把待拍那一档
+  // 念成「命中了名单」—— 那是替一个没命中的模块说一句指控，方向正好反了。
+  const wired = report.decision.axis === 'malice';
+  const hitList = wired && Array.isArray(report.decision.basis) && report.decision.basis.length > 0;
+  L.push(`_本报告由 \`contrib/audit/scan.mjs\` 生成；**未经人工审核** —— 上不上架由一次可复验的机器运行判定（判据：\`risk-rules.mjs\` 的上架拦截名单 ∪ AI 恶意结论，§2）；${report.decision.needsHumanReview
+    ? (wired
+      ? `本次机器判定**不上架**${hitList ? '（命中上架拦截名单或 AI 恶意结论）' : '（未命中名单，但这一档按 §13 的待拍项 / 撤销记账维持保守分支）'}。`
+      : '本次机器判定不放行；这一发的 decision 走的是老轴（调用点没传恶意定性）—— 生产调用点已接线，出现这句说明有人新增了调用点。')
+    : '本模块可自动进入索引，随附上面的能力与覆盖标注。'}_`);
   L.push('');
   return L.join('\n');
 }

