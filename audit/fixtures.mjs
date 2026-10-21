@@ -89,6 +89,74 @@ export function moduleProp(id) {
 }
 
 /**
+ * dex 的 uleb128 长度前缀（第五十批的两个测试文件共用，别再抄第二份）。
+ * 与 dex-forensics 的**读**侧实现是两件事：这里只负责把字节写成合法形状，读的那一份只有一个。
+ */
+export function dexUleb128(n) {
+  const out = [];
+  do { let b = n & 0x7f; n = n >>> 7; if (n) b |= 0x80; out.push(b); } while (n);
+  return Buffer.from(out);
+}
+
+/**
+ * 造一枚形状可控的 dex（第五十批：畸形路径的夹具）。
+ *
+ * 为什么这套起法住在 fixtures.mjs 而不是各自测试文件里：`dex-forensics.test.mjs` 守解析器的
+ * 每一格拒绝，`scan.test.mjs` 守"串面接没接线"。两处都要造 dex，而**起法宽松一档就会让另一边假绿**
+ * —— 比如偏移不通过 string_ids 表写、而是靠数据区里的坏字节，那测到的是另一个形状。
+ * 真字节另有其一：`fixtures/d8-minimal.dex`（d8 产的，守"读得出来"那一面）。
+ *
+ * @param {Array<string|Buffer|{raw:Buffer}>} entries string_data_item 那几项；给 Buffer 就是原样落字节
+ * @param {number|null} tableOfs null == 紧接 header；给定值用来造"整张表在缓冲区外"
+ * @param {Array<number|'auto'>} table 显式写 string_ids 表：'auto' == 用本项数据实际落点
+ * @param {(buf:Buffer)=>void} patch 全部写完后就地改字节
+ */
+export function makeDex(o = {}) {
+  const version = o.version ?? '035';
+  const entries = o.entries ?? ['probe'];
+  const tableLen = o.table ? o.table.length : entries.length;
+  const tableOff = o.tableOfs ?? 0x70;
+  const items = entries.map((e) => {
+    if (Buffer.isBuffer(e)) return e;
+    if (e && Buffer.isBuffer(e.raw)) return e.raw;
+    const s = String(e);
+    return Buffer.concat([dexUleb128(s.length), Buffer.from(s, 'utf8'), Buffer.from([0x00])]);
+  });
+  const dataOffs = [];
+  let cursor = tableOff + tableLen * 4;
+  for (const b of items) { dataOffs.push(cursor); cursor += b.length; }
+  // 缓冲区永远至少撑满 header：tableOfs 落在 header 里时 cursor 会比 0x70 小，
+  // 那时写 0x6c 那几个字段就抛在夹具里 —— 抛在夹具里就等于没测到被测面那一格。
+  const total = Math.max(o.total ?? cursor, 0x70);
+  const buf = Buffer.alloc(total);
+  buf.write(`dex\n${version}\u0000`, 0, 8, 'latin1');
+  buf.writeUInt32LE(o.fileSize ?? total, 0x20);
+  buf.writeUInt32LE(o.headerSize ?? 0x70, 0x24);
+  buf.writeUInt32LE(o.endian ?? 0x12345678, 0x28);
+  buf.writeUInt32LE(o.mapOff ?? total, 0x34);
+  buf.writeUInt32LE(o.stringIdsSize ?? tableLen, 0x38);
+  buf.writeUInt32LE(tableOff, 0x3c);
+  buf.writeUInt32LE(o.typeIdsSize ?? 0, 0x40);
+  buf.writeUInt32LE(o.protoIdsSize ?? 0, 0x48);
+  buf.writeUInt32LE(o.fieldIdsSize ?? 0, 0x50);
+  buf.writeUInt32LE(o.methodIdsSize ?? 0, 0x58);
+  buf.writeUInt32LE(o.classDefsSize ?? 0, 0x60);
+  buf.writeUInt32LE(o.dataSize ?? 0, 0x68);
+  buf.writeUInt32LE(o.dataOff ?? 0, 0x6c);
+  const tableArr = o.table
+    ? o.table.map((x, i) => (x === 'auto' ? dataOffs[i] : x))
+    : dataOffs;
+  tableArr.forEach((offv, i) => {
+    if (tableOff + i * 4 + 4 <= buf.length) buf.writeUInt32LE(offv >>> 0, tableOff + i * 4);
+  });
+  items.forEach((b, i) => {
+    if (dataOffs[i] + b.length <= buf.length) b.copy(buf, dataOffs[i]);
+  });
+  if (o.patch) o.patch(buf);
+  return buf;
+}
+
+/**
  * 造一个模块 zip 并写到临时目录，返回 zip 路径（scanZip 只吃路径）。
  * @param {{ id: string, files: Array<[string, string|Buffer]> }} opts
  * @returns {string} zip 路径

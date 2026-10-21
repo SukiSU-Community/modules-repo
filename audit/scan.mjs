@@ -29,27 +29,30 @@ import {
   scoreRisk, decide, countsTowardRisk, CATEGORY_LABEL, SEVERITY_ORDER,
   inspectStructure, checkCoverage, checkUnread, checkBinaries, detectBinary,
   binaryForensicsRows, printableRatio, POLYGLOT_MIN_PRINTABLE,
+  dexSurfaceSeverity,
   MAX_TEXT, MAX_ENTRY_UNCOMPRESSED, EXEC_BUNDLED_FILE, EXEC_INDIRECT, MODDIR_RUNTIME_WRITE, trimSnippet,
 } from './risk-rules.mjs';
 import { forensics, STRING_SCAN_LIMIT } from './elf-forensics.mjs';
+import { forensics as dexForensics, dexStringSurface } from './dex-forensics.mjs';
 
 /**
  * Task 5.7：二进制条目原始字节的保留上限（工单 §5 第 2 条那个「专门的字节上限」）。
  *
- * 为什么取这个数（= STRING_SCAN_LIMIT = 8 MiB，不是随手挑的）：
- *   1) 取证模块自己就只看到 8 MiB —— `elf-forensics.analyze()` 的 strings 那一步扫的是
+ * 为什么取这个数（= `STRING_SCAN_LIMIT`，数字只住在那一处，这里一字引用它）：
+ *   1) 取证模块自己就只看到那么多字节 —— `elf-forensics.analyze()` 的 strings 那一步扫的是
  *      `min(buf.length, STRING_SCAN_LIMIT)`。留得比这更多，多出来的那些字节一个都不会被读到，
  *      所以这个上限永远不是「少读了」的原因，只可能是「少留了」的原因，而那正是我们要它做的。
- *   2) 它是 MAX_ENTRY_UNCOMPRESSED（64 MiB）的 1/8。拿 64 MiB 当这个闸等于没有闸：
+ *   2) 它是 MAX_ENTRY_UNCOMPRESSED（64 MiB）的 1/4。拿 64 MiB 当这个闸等于没有闸：
  *      投稿者塞一枚 64 MiB 的「ELF」就能把 CI 的解析时间与内存端走（工单 §5 明令禁止复用那个上限）。
  *   3) 上限存在的真正理由是**可证性**：超过它的条目必须留下一句「只读了前 N 字节」，
  *      否则一枚 20 MiB 的 .so 会在前缀上解析成功，被念成「读到 N 个导入，无一落在危险族」——
- *      那是把「我们只看了 8 MiB」说成「它什么都不干」（§5 末段那一格，T57-09 / T57-14 压着）。
+ *      那是把「我们只看了前 N 字节」说成「它什么都不干」（§5 末段那一格，T57-09 / T57-14 压着）。
  *
  * 实现口径（照实写，别让注释比代码乐观）：`raw` 是已解压 Buffer 的 subarray **视图**，
  * 与既有的 `head` 同一个 ArrayBuffer ⇒ 它本身不多占字节；`raw` 只在 detectBinary 命中处保留，
  * 文本条目一律 `raw: null`（§5.1 那条「不许把文本条目的内存翻倍」）。
- * 实测参照：本轮常驻的真 ELF 最大 983,624 B（device_faker 的 arm64-v8a.so），离上限一个数量级。
+ * 实测参照（钉 tag 的语料，2026-10-21 复现）：最大 ELF 983,624 B（device_faker 的 arm64-v8a.so）、
+ * 最大 dex 889,000 B（HMA-OSS 的 classes.dex），都离上限一个数量级。
  */
 export const MAX_FORENSICS_BYTES = STRING_SCAN_LIMIT;
 // ---------------------------------------------------------------------------
@@ -981,15 +984,60 @@ export function scanZip(zipPath, opts = {}) {
   // 自动放行）；登记里 entryBytes 取条目自己、forensicsBytes 取记录，两者不一致时人看得见。
   const binList = binaries.map((b) => ({ name: b.name, id: b.binary.id, why: b.binary.why, bytes: b.size }));
   const forensicsByName = new Map();
+  const dexSurfaces = [];
   for (let i = 0; i < binaries.length; i++) {
     const b = binaries[i];
     // 没留住原始字节就**不登记**（不拿 content 去凑：utf8 串喂进 forensics 只会得到
     // 一条「字节已经毁了」的 parseError，看着像「这个二进制读不出名堂」，
     // 而那正是 §1 硬边界最怕的静默失效 —— 工单 §5 数过这一格）。
     if (!Buffer.isBuffer(b.raw) || b.raw.length === 0) continue;
-    const rec = forensics(b.raw, binList[i].name);
-    forensicsByName.set(binList[i].name,
-      rec && b.rawCapped ? { ...rec, inputCapped: true, rawBytes: b.raw.length } : rec);
+    // 第五十批：解析器按 detectBinary 已经算出来的 id 分派，而不是"两个都试一遍、谁返回 null
+    // 就归另一个管"。后者会把「本轮故意不解析」（ZIP）与「解析失败」（parseError）压成同一格，
+    // 而那两本的账完全不同 —— 沿用 §2.7 那条「看不见 ≠ 看不清」的纪律。
+    const isDex = b.binary.id === 'DEX';
+    const rec = isDex ? dexForensics(b.raw, binList[i].name) : forensics(b.raw, binList[i].name);
+    // `rec === null` 也要 set：那是「归 ELF 管但读到不是 ELF」的确定读数（NOT_ELF 那一格靠它），
+    // 不 set 就退成 NO_RECORD，报告念起来像"分支没接线"。
+    const stored = rec && b.rawCapped ? { ...rec, inputCapped: true, rawBytes: b.raw.length } : rec;
+    // 与「已经在逐行扫描面上」那一格**互斥**：Task 4 的 polyglot 扩面与 fix2-P5 的引用升级都可能
+    // 把同一个条目推进 feed，那时它已经被逐行扫过一遍了；再摊一遍串池喂进去，同一条规则就会在
+    // 同一个文件上命中两次 —— 而 `counts.high` 是直接写进公开评论「命中统计」的那一行（上面
+    // 907-909 那段讲的正是这个病）。判据取 `lineRuleNames`（谁在 feed 上）而不是只取 polyglotSet：
+    // 只防 polyglot 会漏掉被引用升级进来的那一支（本轮实测过，见 DXE-07）。
+    // 被顶掉的那一格必须留下名字，不许静默：`surfaceSkipped` 进登记、也进那句话。
+    if (isDex && stored && !stored.parseError) {
+      if (lineRuleNames.has(binList[i].name)) {
+        stored.surfaceSkipped = polyglotSet.has(b) ? 'polyglot' : 'escalated';
+      } else {
+        const s = dexStringSurface(stored);
+        stored.surface = { lines: s.lines, trimmed: s.trimmed, dropped: s.dropped, escaped: s.escaped };
+        if (s.text) dexSurfaces.push({ name: binList[i].name, text: s.text, stats: stored.surface });
+      }
+    }
+    forensicsByName.set(binList[i].name, stored);
+  }
+  // dex 串面进规则那一步，排在 checkBinaries / binaryForensicsRows **之前**：降了几条要能回写进
+  // 那个条目自己的登记句子（见下面 downgraded），而登记句子是这两行产出的。
+  //   * 判据仍然只有 `CONTENT_RULES` 那一份 —— 这里只把常量池摊平成规则看得见的形状；
+  //   * 定档换算只在 `dexSurfaceSeverity` 一个函数里（执行型 → info、存在型照原判据），
+  //     不在这里比 severity、不在此处新增第二条规则、也不在 scan 这一层后处理 severity（fix6-F1 的病）；
+  //   * 串面没喂全（dropped / trimmed）并进这个条目自己那句话，不另开一条 finding ——
+  //     理由与 ELF 的 `INPUT_CAPPED` 同形，见 risk-rules 的 dexSurfaceNote 那段。
+  // 为什么这里不复用 24 KB 那条 `lineRuleInput` 通道：实测同一枚真 dex 在 24 KB 预算下只喂得进
+  // 44 行、丢掉 23,169 条 —— 那一档是为「单条长行把回溯炸到分钟级」准备的，而串池是几万条短行。
+  // 对症的那一闸是单串上限（`DEX_SURFACE_LINE_MAX`），在 dexStringSurface 里落。
+  const dexFindings = [];
+  const downgradedByFile = new Map();
+  for (const d of dexSurfaces) {
+    for (const f0 of scanContent(d.name, d.text)) {
+      const f = dexSurfaceSeverity(f0);
+      if (f !== f0) downgradedByFile.set(d.name, (downgradedByFile.get(d.name) || 0) + 1);
+      dexFindings.push(f);
+    }
+  }
+  for (const d of dexSurfaces) {
+    const rec = forensicsByName.get(d.name);
+    if (rec && rec.surface) rec.surface.downgraded = downgradedByFile.get(d.name) || 0;
   }
   const binFindings = checkBinaries(binList, forensicsByName);
   const binaryForensics = binaryForensicsRows(binList, forensicsByName);
@@ -1005,7 +1053,8 @@ export function scanZip(zipPath, opts = {}) {
   }] : [];
 
   const all = [...findings, ...propFindings, ...metaFindings,
-    ...struct.findings, ...coverFindings, ...unreadFindings, ...binFindings, ...metadataFindings]
+    ...struct.findings, ...coverFindings, ...unreadFindings, ...binFindings, ...metadataFindings,
+    ...dexFindings]
     .filter((f) => f.severity != null)
     .sort((a, b) => {
       const d = SEVERITY_ORDER[b.severity] - SEVERITY_ORDER[a.severity];

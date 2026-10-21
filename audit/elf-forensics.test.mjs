@@ -16,12 +16,15 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { forensics, elfPeek, extractStrings } from './elf-forensics.mjs';
+import { forensics, elfPeek, extractStrings, STRING_SCAN_LIMIT } from './elf-forensics.mjs';
 
 const FIXDIR = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const fix = (n) => readFileSync(join(FIXDIR, n));
 
-const SCAN_LIMIT = 8 * 1024 * 1024;
+// 上限从这里现读，不写死字面量：第五十批把它从 8 MiB 抬到 16 MiB（为了让一枚 8.6 MB 的真 dex
+// 读得完，见 dex-forensics 与 scan 的那两段依据注释），而这一格的夹具尺寸是**跟着上限算的**。
+// 写死 8 MiB 的那一版在抬数之后当场变红 —— 红了才是对的：它说明这一格测的确实是"超过上限"。
+const SCAN_LIMIT = STRING_SCAN_LIMIT;
 const SENSITIVE = /^(p?open|read|write|close|execve|execl|exec[pl]|system|popen|fork|vfork|clone|posix_spawn|socket|connect|bind|listen|accept|send|recv|getaddrinfo|dlopen|dlsym|ptrace|mmap|mprotect|prctl|setns|unshare|chroot|mount|kill|sigaction|ioctl|__system_property_|android_|property_|syscall|unlink|chdir)/;
 const LIBS = ['liblog.so', 'libc.so'];
 
