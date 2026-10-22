@@ -673,7 +673,10 @@ test('接线：kind 导出 ledger_pr，derive 两条路由都跑并核机器章�
     // 少了第二处，台账类 PR 在合并那一步退成「内容对得上就合」，而那一步绑的是 head sha ——
     // base 变了要重算正是它存在的理由，不能当成已经查过。
     assert.equal(yml.split('--reviews "$REVIEWS_FILE"').length - 1, 2, `${tag}两处 verify-index-pr 调用都要带 --reviews`);
-    assert.equal(yml.split('REVIEWS_FILE="ledger-reviews.json"').length - 1, 2, `${tag}两处都要自己声明复核结论文件的路径（两个 job 不共享工作区）`);
+    // 三处声明：产结论的 report 步 + 读它的 derive + 合并前再读一次的 merge-index。
+    // 两个 job 不共享工作区，所以 merge-index 那一处是从 job output 解回来的，不是同一份文件。
+    assert.equal(yml.split('REVIEWS_FILE="ledger-reviews.json"').length - 1, 3, `${tag}report/derive/merge-index 三处都要自己声明复核结论文件的路径`);
+    assert.equal(yml.split('rm -f "$REVIEWS_FILE"').length - 1, 2, `${tag}两处都要先删：这个文件名在仓库根上，PR 自己就能塞一份同名的假结论进来`);
     // 旧的接缝：--pr 是给 verify-index-pr 取人工双签用的，那条路已删。留着它等于给复活留门。
     assert.ok(!yml.includes('--pr "$PR_NUMBER"'), `${tag}--pr "$PR_NUMBER" 是人工签那条接缝，不许回来`);
     assert.ok(yml.includes('PR_NUMBER: ${{ github.event.pull_request.number }}'), `${tag}合并那一步要靠 PR_NUMBER 决定合哪条，缺了得先红`);
@@ -701,6 +704,39 @@ test('接线：kind 导出 ledger_pr，derive 两条路由都跑并核机器章�
     assert.ok(ledgerBranch.includes(SEAL_PENDING_BY), `${tag}台账支要写出第一枚提交用的待盖值`);
     assert.doesNotMatch(ledgerBranch, /#human-approved|双签|两名[^。\n]{0,12}(签|放行)/,
       `${tag}已删的人工双签不许还以指令形式出现在这里`);
+  }
+});
+
+test('接线：复核结论的生产者挂在 ledger_pr 上，且跨 job 走 base64', () => {
+  for (const f of AUDIT_COPIES) {
+    const yml = fs.readFileSync(f, 'utf8');
+    const tag = `${path.basename(f)}：`;
+    const at = yml.indexOf('id: report');
+    assert.ok(at > 0, `${tag}台账 PR 的逐字复核没有生产者 —— 机器章第 ④ 条就永远是一句空话`);
+    const reportStep = yml.slice(at, yml.indexOf('- name:', at + 5));
+    assert.ok(/if: steps\.kind\.outputs\.ledger_pr == 'true'/.test(reportStep),
+      `${tag}复核步只该在台账 PR 上跑：别的 PR 没有下架要复核`);
+    assert.ok(reportStep.includes('verify-report-evidence.mjs'), `${tag}复核步要调那个脚本，不是把判据再手抄一遍`);
+    assert.ok(reportStep.includes('--base "$BASE_SHA"'), `${tag}对照物与索引都取 base，不是 PR 分支`);
+    assert.ok(reportStep.includes('--out "$REVIEWS_FILE"'), `${tag}结论要落成 derive 读得到的那个文件名`);
+    // 这一步自己**不判红**：不成立的事由 derive → approve 那条链去红，这里红一次会打断其余检查。
+    assert.ok(reportStep.includes('set +e') && !/exit "\$RC"/.test(reportStep),
+      `${tag}复核步不许把自己的退出码变成整条 run 的红`);
+    assert.ok(reportStep.includes('base64 -w0'), `${tag}结论要 base64 之后再进 GITHUB_OUTPUT（reason 里有投稿方可控的文字）`);
+    assert.ok(yml.includes('ledger_reviews_b64: ${{ steps.report.outputs.reviews_b64 }}'),
+      `${tag}job output 没接上，merge-index 读到的永远是空`);
+
+    const mi = yml.slice(yml.indexOf('  merge-index:'));
+    assert.ok(mi.includes('REVIEWS_B64: ${{ needs.audit.outputs.ledger_reviews_b64 }}'),
+      `${tag}合并前那一次重推导要拿到复核结论`);
+    assert.ok(mi.includes('base64 -d > "$REVIEWS_FILE"'), `${tag}要把 job output 解回 derive 用的那个文件名`);
+    assert.ok(mi.indexOf('base64 -d > "$REVIEWS_FILE"') < mi.indexOf('--reviews "$REVIEWS_FILE"'),
+      `${tag}解结论必须排在重推导之前，顺序反了这一次读的还是空文件`);
+    assert.doesNotMatch(mi, /REVIEWS_FILE="\$REVIEWS_FILE"|printf '%s' \$\{\{/,
+      `${tag}不许把 job output 直接拼进 shell`);
+    // kind 那句告警是台账 PR 的作者第一眼看到的话：照旧文案去凑「两名有写权限的人」只会一直红。
+    assert.doesNotMatch(yml, /人工判断|查签名人的仓库权限|两名有写权限/,
+      `${tag}kind 的台账告警还在教人来凑人工签名`);
   }
 });
 
@@ -1181,9 +1217,9 @@ test('两处 verify-index-pr 调用都要显式给 --dispositions-file（monorep
   const code = fs.readFileSync(WF_MAIN, 'utf8').split(/\r?\n/).filter((l) => !/^\s*#/.test(l)).join('\n');
   // 计数而不是解析整段调用：workflow 里靠反斜杠续行，跨行正则会贪心把两次调用并成一次。
   assert.equal((code.match(/verify-index-pr\.mjs/g) || []).length, 2, 'derive 与 merge-index 各一次重推导');
-  assert.equal((code.match(/--dispositions-file "\$DISPOSITIONS_FILE"/g) || []).length, 2,
-    '每次重推导都要显式给台账路径：默认值相对 cwd，contrib/repo 布局下会读错文件');
-  assert.equal((code.match(/DISPOSITIONS_FILE="\$\{PREFIX:\+\$PREFIX\/\}json\/dispositions\.json"/g) || []).length, 2);
+  assert.equal((code.match(/--dispositions-file "\$DISPOSITIONS_FILE"/g) || []).length, 3,
+    '三个读台账的调用（report/derive/merge-index）都要显式给台账路径：默认值相对 cwd，contrib/repo 布局下会读错文件');
+  assert.equal((code.match(/DISPOSITIONS_FILE="\$\{PREFIX:\+\$PREFIX\/\}json\/dispositions\.json"/g) || []).length, 3);
 });
 
 test('workflow 不许内联台账匹配逻辑（判据只能有一份实现）', () => {
