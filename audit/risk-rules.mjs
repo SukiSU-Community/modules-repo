@@ -675,8 +675,10 @@ export const MODDIR_RUNTIME_WRITE = makeLineRule({
  *   curl <url> -o /data/local/tmp/u → chmod 700 <同一路径> → /data/local/tmp/u &
  *   整包 findings 只有 NETWORK_FETCH/low ⇒ low + 首次收录 = **auto-approve**，
  *   这条链走的是机器人自动合并通道。管道写法（`curl … | sh`）一直由 PIPE_TO_SHELL 判 high/block，
- *   于是「同一件事换个写法就换一个结论」。这一条把落盘写法拉到同一档：high / block（转人工，
- *   不是任何自动拒绝 —— 判断权留给双签，与 PROP_BOOT_SPOOF 同一条取舍）。
+ *   于是「同一件事换个写法就换一个结论」。这一条把落盘写法拉到同一档：high / block。
+ *   （注释里那句「转人工、判断权留给双签，与 PROP_BOOT_SPOOF 同一条取舍」是 2026-10-14 写的，今天两处都换了：
+ *   本站已没有人可以签，而这两条规则各走了相反的一支 —— 本条在 `MALICE_LIST` 里 armed，命中即不上架；
+ *   PROP_BOOT_SPOOF 在名单外，只降为标注。同一条取舍换轴时不必同进同出，看的是 §3.2 那张定案表。）
  *
  * 为什么不用 makeLineRule：判据跨行（sink 在一行、执行在另一行），单行匹配看不见配对。
  * 对外形状仍与工厂一致：{ id, category, severity, title, advice, anchor, anchorSibling, pattern, scan }，
@@ -1397,6 +1399,9 @@ export const DEBUGGABLE_ENABLE = makeLineRule({
 // 人工队列，而这类模块在国内普遍存在（解锁 / bl 修复类）；假阳性来源正是那些合法改机模块，
 // 收益是关掉一条当前完全敞开的自动放行通道。定 high（转人工）而不是任何自动拒绝 ——
 // 让双签去承担判断，不让规则去承担结论。
+// 换轴之后（2026-10-21，见本文件 `MALICE_LIST` 与 `decide` 的第四条）这两句要按现在读：本站没有人
+// 可以签，而本条**不在**拦截名单里 ⇒ 它不再有拦上架的权力，high 只降为标注。当年那条取舍的
+// 一半留住了（规则不承担结论），另一半换了落点：结论由名单给，名单不给它这个权力。
 // fix2-P4a（真相二选一，这里选「不覆盖」）：本规则只覆盖四个 `ro.boot.*` 完整性键。
 // `persist.*` 与 `sys.usb.controller` 一类运行期键**不在**范围内 ——
 // 文案（title/message/advice）不许承诺覆盖它们（scan.test.mjs 有一致性锁），

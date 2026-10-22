@@ -93,7 +93,6 @@ node scripts/fetch-pending-zip.mjs pending/ --out-dir /tmp/zips \
 |---|---|---|---|
 | `APPROVAL_FIELD` | `audit` | `scripts/build-index.mjs` | `scripts/publish-from-main.mjs`（经 `markApproved`） |
 | `APPROVED_STATUS` | `auto-approved` | 同上 | 同上 |
-| `HUMAN_APPROVED_STATUS` | `human-approved` | 同上 | `scripts/publish-from-main.mjs`（人工双签路径，流程见 [GOVERNANCE.md](GOVERNANCE.md)） |
 | `APPROVE_CHECK_NAME` | `approve` | `scripts/publish-from-main.mjs` | `audit.yml` 的 job `name:` |
 
 自动放行时 pending 条目里的章长这样：
@@ -113,16 +112,16 @@ node scripts/fetch-pending-zip.mjs pending/ --out-dir /tmp/zips \
 `by` 必须是**别人也能复验的指针**，不是「ci 说过」这种自证：拿 PR 号 + head sha，
 任何人 `gh api .../check-runs?name=approve` 都能重跑这个判断。
 
-机器放行与人工双签是两种章，`by` 的形状不一样，`isApproved()` 都只认非空 `by`：
+两条路上盖的是两种章，`by` 的形状不一样，`isApproved()` 都只认非空 `by`：
 
 ```
 ci:approve#<owner>/<repo>PR<n>@<headSha12>
-human-approved#<owner>/<repo>PR<n>@<headSha12>/c<评论id>+c<评论id>
+ci:audit@<那一枚写下处置实体的 commit 的 40 位小写 sha>
 ```
 
-后者多出来的 `c<id>+c<id>` 是两名 OWNER/MEMBER 的签核评论 id，
-`gh api repos/<owner>/<repo>/issues/comments/<id>` 能逐条点开复验。
-谁有资格签、怎么签、签错了会怎样：见 [GOVERNANCE.md](GOVERNANCE.md)。
+前一枚回访的是**这次审核 run 在 head 上的 check**，后一枚回访的是**那条 commit 本身**：台账那条走的是
+两枚提交（第一枚写实体与证据、`by` 填待盖值，第二枚只把待盖值换成第一枚的 sha），四条判据、
+生产者在哪一步、这一枚章证明得了什么与证明不了什么：见 [GOVERNANCE.md](GOVERNANCE.md) 第 3 节。
 
 `isApproved()` **只认 `audit` 这一个字段**，且章上必须有人（`by` 非空）。
 以下写法一律不算通过：
@@ -584,8 +583,10 @@ node scripts/revoke.mjs --id <模块ID> [--version-code <n>] [--sha256 <64hex>] 
 
 `audit.yml` 的 `kind` 步只看 `json/modules.json` 有没有变。**以前看的是整个 `json/`**，
 于是删掉一条处置记录（把某人从黑名单里放出来）会被认成索引重建：它既不消费 pending，
-也不改变当前索引，推导必然「一致」→ `merge-index` 自动合。削弱处置不该由推导说了算，
-它是人工判断 —— 现在这类 PR 落到「无投稿内容」分支，绿了也要人合。
+也不改变当前索引，推导必然「一致」→ `merge-index` 自动合。削弱处置不该由推导说了算 ——
+它今天走的是第三条：`kind` 步单独认出动了 `json/dispositions.json` 的 PR，导出 `ledger_pr=true`，
+`derive` 那一步去核那条 PR 上的**机器章四条**（GOVERNANCE 第 3 节），四条全对才自动合，
+少任何一条 `approve` 直接红。它既不吃「推导一致」这条绿灯，也不等人来点。
 
 它真正的后果（被放行的模块重新出现在下一次重建里）本来就依赖有人把那条 pending 留着，
 这也正是 `--consume` 不删被台账挡下的 pending 的理由。
