@@ -280,6 +280,25 @@ export function readZip(zipPath, maxEntryBytes = MAX_ENTRY_UNCOMPRESSED) {
   return { files, entries, unread, source: 'builtin', warnings };
 }
 
+/**
+ * 取**一个条目**的原始字节（不是 utf8 串），给「按字节偏移复核」用。
+ *
+ * 为什么不能复用 `readZip`：它给的是 `content = bytes.toString('utf8')`，原始字节在解码那一刻
+ * 就已经毁了（Task 5.7 那条实测：一枚真 .so 从 13,480 B 解成 13,430 个字符，往返不相等）。
+ * 而举报的逐字复核问的是「这个条目第 N 到 N+L 个字节是不是那串」—— 那必须在字节上做。
+ * 上限与解压失败的方向都和 `readZip` 一致：读不出来说「读不出来」，不说「没有」。
+ *
+ * @returns {Buffer} @throws 条目不存在 / 加密 / 压缩方式不支持 / 超上限（err.overLimit=true）
+ */
+export function readZipEntryBytes(zipPath, name, limit = MAX_ENTRY_UNCOMPRESSED) {
+  const buf = readFileSync(zipPath);
+  const e = parseZip(buf).find((x) => x.name === name && !x.isDir);
+  if (!e) throw new Error(`归档里没有这个条目：${JSON.stringify(name)}`);
+  if (e.encrypted) throw new Error(`条目是加密的，解不出来：${name}`);
+  if (e.isSymlink) throw new Error(`条目是符号链接，按内容复核没有意义：${name}`);
+  return inflateEntry(buf, e, limit);
+}
+
 function readZipFallback(zipPath, warnings) {
   const names = listZipViaUnzip(zipPath);
   const files = [];

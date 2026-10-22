@@ -99,6 +99,11 @@ jobs:
       # 这两个必须分开导出 —— 合成一个就会退成「台账改动也算索引 PR」，那正是 2026-10-17 复现打穿的形状。
       ledger_pr: ${{ steps.kind.outputs.ledger_pr }}
       ledger_sealed: ${{ steps.derive.outputs.sealed }}
+      # 逐字复核的结论（`{ "<章指向的 commit>": {ok, summary|reason} }`）。
+      # 两个 job 不共享工作区，而 merge-index 那一次重推导同样要读它 —— 所以经 job output 传。
+      # 走 base64：reason 里有**投稿方可控的文字**（条目名、路径、错误第一行），
+      # 直接当 key=value 导出就等于给那条字符串一次往 GITHUB_OUTPUT 里再塞一个 output 的机会。
+      ledger_reviews_b64: ${{ steps.report.outputs.reviews_b64 }}
       # 处置台账（下架/黑名单）在 CI 侧的那一道：hit / clear（见 dispose 步）。
       disposition: ${{ steps.dispose.outputs.hit }}
       disposition_reason: ${{ steps.dispose.outputs.why }}
@@ -505,12 +510,46 @@ jobs:
           else
             echo "index_pr=false" >> "$GITHUB_OUTPUT"
             if [ -n "$CHANGED_LEDGER" ]; then
-              echo "::warning::这个 PR 动了处置台账（$CHANGED_LEDGER）—— 台账上的处置是人工判断：不认领索引重建，改由 derive 那一步逐个查签名人的仓库权限（write/admin 才算；签不齐 approve 直接红，见 GOVERNANCE.md）。"
+              echo "::warning::这个 PR 动了处置台账（$CHANGED_LEDGER）—— 台账上的每一条都是一次下架决定，不认领索引重建；改由 report/derive 两步分别核「逐字复核成立」与「机器章四条齐全」，任一不齐 approve 直接红（见 GOVERNANCE.md）。"
             elif [ -n "$CHANGED_JSON" ]; then
               echo "::warning::这个 PR 同时带投稿和索引改动 —— 索引改动不会被推导判定放行，投稿按扫描结论走。"
             fi
             echo "不是索引重建 PR（found=${FOUND:-<空>}，索引改动=${CHANGED_JSON:-无}，台账改动=${CHANGED_LEDGER:-无}）"
           fi
+
+      - name: 逐字复核举报证据（台账 PR）
+        id: report
+        # 机器章四条判据里的第 ④ 条由这一步产：结构四条谁都能凑齐（形状对、指向本 PR 的提交、
+        # 实体当时就在、字节没改），它们证的是「这条记录没被偷改」，证不了「引用的那段东西真在包里」。
+        # 而 owner 拍板 #3 的门槛正是后者：**实名 + 包内逐字定位到才下架**。
+        # 取包用的是 base 那份索引里的 zipUrl，不是证据记录里写的那一条 —— 否则有 write 的人
+        # 可以自己在 releases 传一枚 `<自算 sha>.zip` 再引用它，逐字节复核会全绿。
+        if: steps.kind.outputs.ledger_pr == 'true'
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.kind.outputs.base_sha }}
+          FORCE_PREFIX: ${{ vars.MODULE_REPO_PREFIX || '' }}
+        run: |
+          set -euo pipefail
+          PREFIX="$FORCE_PREFIX"
+          if [ -z "$PREFIX" ] && [ -d contrib/repo/pending ]; then PREFIX="contrib/repo"; fi
+          INDEX_FILE="${PREFIX:+$PREFIX/}json/modules.json"
+          DISPOSITIONS_FILE="${PREFIX:+$PREFIX/}json/dispositions.json"
+          SCRIPTS_DIR="${PREFIX:+$PREFIX/}scripts"
+          REVIEWS_FILE="ledger-reviews.json"
+          rm -f "$REVIEWS_FILE"
+          set +e
+          node "$SCRIPTS_DIR/verify-report-evidence.mjs" --base "$BASE_SHA" --head HEAD \
+            --index-file "$INDEX_FILE" --dispositions-file "$DISPOSITIONS_FILE" \
+            --out "$REVIEWS_FILE"
+          RC=$?
+          set -e
+          # 这一步自己**不判红**：不成立的事由 derive（读这份结论）→ approve（据此拒绝合并）那条链去红。
+          # 在这里红一次会把同一条 run 的其余检查一起打断，反而看不到「到底哪一格不成立」。
+          if [ -s "$REVIEWS_FILE" ]; then
+            echo "reviews_b64=$(base64 -w0 < "$REVIEWS_FILE")" >> "$GITHUB_OUTPUT"
+          fi
+          echo "[report-review] 退出码 ${RC}；结论文件 $([ -s "$REVIEWS_FILE" ] && echo 已写 || echo 没有)"
 
       - name: 验索引由 base 推导 + 核处置机器章（索引 PR 与台账 PR）
         id: derive
@@ -533,10 +572,10 @@ jobs:
           INDEX_FILE="${PREFIX:+$PREFIX/}json/modules.json"
           DISPOSITIONS_FILE="${PREFIX:+$PREFIX/}json/dispositions.json"
           SCRIPTS_DIR="${PREFIX:+$PREFIX/}scripts"
-          # 复核结论文件：章的**实质内容**就在这份文件里 —— 它写的是「本次运行对这一枚 commit 上的
-          # 处置做过逐字定位与 AI 复核，结论成立」。生产者目前还不存在（spec §12 Phase 3 的下一步：
-          # 台账 PR 自己那条 run 里的复核步）。文件不在 ⇒ verify-index-pr 按「一条都没复核」处理
-          # ⇒ 动了台账的 PR 必然红。这一格是设计内的默认拒绝：宁可台账这条路暂时走不通，
+          # 复核结论文件：章的**实质内容**就在这份文件里 —— 它写的是「上一步 report 对这一枚 commit
+          # 上的处置做过逐字定位，结论成立」。生产者是同一个 job 里紧挨着的前一步；它没跑、
+          # 或者一条结论都没产 ⇒ 这份文件不在，verify-index-pr 按「一条都没复核」处理 ⇒ 动了台账的
+          # PR 必然红。这一格是设计内的默认拒绝：宁可台账这条路暂时走不通，
           # 也不要在没有复核的情况下给它一枚绿勾。
           REVIEWS_FILE="ledger-reviews.json"
           set +e
@@ -1756,7 +1795,7 @@ jobs:
     needs: [audit, approve]
     # 两条机器路由，都要 index_derived（内容确由 base 推导），差别只在批准证据是哪一半：
     #   index_pr  —— 消费了有外部批准证据的 pending（投稿收录）
-    #   ledger_pr —— 动了处置台账，且 derive 取到了两名有写权限的人的签名（下架 / 拉黑 / 解封）
+    #   ledger_pr —— 动了处置台账，且 derive 那条链核全了机器章四条（含 report 那一步的逐字复核）
     # 两个 output 由 kind 步互斥地导出（台账进过 diff 就不可能是 index_pr），所以这里不必再防「两个都真」。
     # 写成 `index_pr || (ledger_pr && ledger_sealed)` 而不是把 ledger 那半并进第一个合取项：
     # 少了 ledger_sealed 这一格，自动合并就又回到「内容自洽就够了」那个被打穿的形状。
@@ -1804,6 +1843,7 @@ jobs:
           REPO: ${{ github.event.repository.name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           FORCE_PREFIX: ${{ vars.MODULE_REPO_PREFIX || '' }}
+          REVIEWS_B64: ${{ needs.audit.outputs.ledger_reviews_b64 }}
         run: |
           set -euo pipefail
           if [ -z "${BASE_REF:-}" ]; then
@@ -1829,10 +1869,19 @@ jobs:
           # 再取一次，用的仍是同一个脚本、同一套判据。不带它就是台账类 PR 在合并这一步退成
           # 「内容对得上就合」，而那一步的结论绑的是 head sha —— 恰好是这条重推导存在的理由
           # （base 变了要重算），不能当成已经查过。
-          # 两个 job 之间不共享工作区，所以复核结论要跨 job 传（artifact 或 job output）才算真到位；
-          # 生产者还没有（Phase 3 下一步），因此这里现在必然读不到文件 ⇒ 台账 PR 必然红 ⇒ 不合。
-          # 这一格是设计内的默认拒绝，不是漏接线：宁可这条路暂时走不通。
+          # 两个 job 不共享工作区 ⇒ 复核结论由 audit job 经 output 传过来（base64：那份 reason 里
+          # 有投稿方可控的文字，直接拼进 shell 就是注入点）。传不到就是空文件 ⇒ verify-index-pr
+          # 按「一条都没复核」处理 ⇒ 不合。宁可红，不要在结论缺席时假装看见过它。
           REVIEWS_FILE="ledger-reviews.json"
+          # 先删：这个文件名在仓库根上，PR 自己就能塞一份同名的假结论进来。
+          # 取不到 audit job 的结论时**必须**是「没有文件」，而不是「有 PR 带来的那份」。
+          rm -f "$REVIEWS_FILE"
+          if [ -n "${REVIEWS_B64:-}" ]; then
+            printf '%s' "${REVIEWS_B64}" | base64 -d > "$REVIEWS_FILE"
+            echo "复核结论已从 audit job 取回（$(wc -c < "$REVIEWS_FILE") 字节）"
+          else
+            echo "::warning::audit job 没有交出复核结论 —— 这一格按「没复核」处理，台账类 PR 在这里必然不合。"
+          fi
           node "$SCRIPTS_DIR/verify-index-pr.mjs" --base "$BASE_SHA" --head HEAD \
             --owner "$OWNER" --repo "$REPO" --pending-dir "$PENDING_DIR" \
             --index-file "$INDEX_FILE" --dispositions-file "$DISPOSITIONS_FILE" \
