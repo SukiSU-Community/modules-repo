@@ -20,10 +20,11 @@ import {
   parseArgs,
   main,
 } from '../scripts/publish-from-main.mjs';
-import { isApproved } from '../scripts/build-index.mjs';
+import { isApproved, APPROVED_STATUSES } from '../scripts/build-index.mjs';
 // 机器章的形状从写入端 import，别在测试里手抄一遍：抄了就有第二份定义，
 // 而这两份漂移的方向一定是「测试还在钉旧形状、生产早就换了」。
 import { MACHINE_SEAL_PREFIX, SEAL_PENDING_BY } from '../scripts/revoke.mjs';
+import { MAX_PACKAGES_PER_RUN } from '../scripts/verify-report-evidence.mjs';
 
 const SHA = 'a'.repeat(40);
 const prOk = (over = {}) => ({
@@ -1258,6 +1259,38 @@ test('GOVERNANCE.md 存在，且写的就是当前这套机器章判据（不许
   assert.doesNotMatch(doc, /双签|人工签/, '本站没有这一档，文档不许把它写成一条可走的路');
   assert.doesNotMatch(doc, /^\|\s*签核人/m, '「签核人」那一档已从角色表删掉，不许回来');
   assert.doesNotMatch(doc, /首行写|各写一次/, '教人怎么签的句式一条都不许留');
+
+  // ④ 的生产者已接线（2026-10-22），于是这一格有两种相反的漂移都咬得住：
+  // 一是文档还写着「生产者还没上线」（那会把一条已经能走的路读成不可达，比不写更害人，
+  // 因为公示页与这份文件是别人判断「这台机器会不会自己下架东西」的唯一依据）；
+  // 二是文档把 ④ 写成包含 AI（那一步今天只有字节核对，一次模型调用都没有）。
+  assert.doesNotMatch(doc, /今天还没有生产者|生产者还没接线/, '④ 的生产者已存在，这句会把走得通的路写成走不通');
+  const producer = path.resolve(import.meta.dirname, '../scripts/verify-report-evidence.mjs');
+  assert.ok(doc.includes('verify-report-evidence.mjs'), '第 3 节 ④ 要点名真正的生产者脚本，否则文档指向一段不存在的代码');
+  assert.ok(fs.existsSync(producer), '文档点名的生产者必须真的在这棵树里');
+  assert.doesNotMatch(doc, /复核成立[^。\n]*AI 复核/, '④ 今天不含 AI，不许把它写成两件事');
+
+  // 文档里那个「每轮上限」是 owner 拍「定时批量」时定价的那个数：它比 CI 一轮能复核的包数还大，
+  // 就等于每轮 cron 都开一条必然红的台账 PR。Worker 那一侧的同一条约束钉在 worker/ledger.test.ts，
+  // 这里只比这份检出里读得到的那一份。
+  const capInDoc = doc.match(/每轮上限 (\d+) 枚产物/);
+  assert.ok(capInDoc, '定时批量那一格要把每轮上限写在脸上，不能只说“按批”');
+  assert.ok(Number(capInDoc[1]) <= MAX_PACKAGES_PER_RUN,
+    `文档写的每轮上限 ${capInDoc[1]} > CI 一轮复核得动的 ${MAX_PACKAGES_PER_RUN} 包`);
+});
+
+test('README 的标记契约表不许写已经不存在的常量与章形', () => {
+  // 这一格是被 §11 那条「改代码必须同轮改文档」咬过第二次的位置：
+  // 表里列的是**常量名**，读者（人和下一次改这里的项目）都拿它当「写入方还有这一档」的证据。
+  // 人工双签整条支路删掉之后，表里那一行和那枚 `human-approved#…/c<id>+c<id>` 章形还留了一轮，
+  // 形状上像官方路径，实际正向一次也走不通 —— 和 GOVERNANCE 那句「不许承诺两签放行」是同一条纪律。
+  const doc = fs.readFileSync(path.resolve(import.meta.dirname, '../README.md'), 'utf8');
+  assert.doesNotMatch(doc, /human-approved|HUMAN_APPROVED/, '这枚章已经没有写入方了，文档不许还把它列进契约表');
+  assert.doesNotMatch(doc, /c<评论id>\+c<评论id>/, '两名签核评论 id 那枚章形不许还当作今天的形状展示');
+  for (const status of APPROVED_STATUSES) {
+    assert.ok(doc.includes(status), `isApproved 认的状态 ${status} 必须写在表里：它是两边的唯一约定面`);
+  }
+  assert.ok(doc.includes(MACHINE_SEAL_PREFIX), '台账那一枚章的形状要在 README 就点出来，不能只在 GOVERNANCE 里');
 });
 
 test('审核判红那条给投稿者看的报错，指向的文件和说法都必须是真实的', () => {
