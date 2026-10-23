@@ -33,12 +33,27 @@ import { execFileSync } from 'node:child_process';
 import { parseDispositions, DEFAULT_DISPOSITIONS_FILE } from './dispositions.mjs';
 import { ledgerTouched, parseSeal } from './verify-index-pr.mjs';
 import { assertDownloadUrl, downloadToBuffer, sha256Hex } from './fetch-pending-zip.mjs';
-import { readZipEntryBytes } from '../audit/scan.mjs';
+import { isNonTextContent, readZip, readZipEntryBytes } from '../audit/scan.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(__dirname, '..');
 
 export const REPORT_EVIDENCE_SCHEMA = 'sukisu-report-evidence-v1';
+
+/** 探针档认的是 §8 固化下来的审核证据（`harvest-evidence.mjs` 写的那个 schema）。 */
+export const PROBE_EVIDENCE_SCHEMA = 'sukisu-evidence-v1';
+
+/** 只有这个理由能走探针档；换别的理由一律回到举报证据那条路。 */
+export const PROBE_REASON = 'test-probe';
+
+/** 探针档的归档上限：这一档只收「几百字节的占位包」，64 KiB 是上限不是建议值。 */
+export const PROBE_MAX_PACKAGE_BYTES = 64 * 1024;
+
+/** 解压后所有条目合计的上限，挡压缩比异常的小包。 */
+export const PROBE_MAX_TOTAL_BYTES = 256 * 1024;
+
+/** 占位脚本里「不算做事」的整行。剥掉注释与空行后只许剩这些。 */
+export const PROBE_HARMLESS_LINES = new Set(['exit 0', 'exit', ':', 'true']);
 
 /** 索引文件：被下架的那一枚产物「现在用户能不能下到」由它回答。 */
 export const DEFAULT_INDEX_FILE = 'json/modules.json';
@@ -200,6 +215,90 @@ export function verifyReportEvidenceDoc(ev, { openPackage, readEntry }) {
 }
 
 /**
+ * 探针档的实质：**这枚包什么也不做**。
+ *
+ * ④ 的实质是「指控引用的那段原文真在这枚已上架的包里」。探针下架**没有指控** —— 也就没有
+ * 可引用的原文。拿一条编出来的举报去凑，等于简报 §9 的「假动作」；把 ④ 整个绕开，等于把
+ * 供应链红线拆了。这一档换的是**实质**，不是闸门：
+ *
+ *   1. 归档 ≤ PROBE_MAX_PACKAGE_BYTES、解压合计 ≤ PROBE_MAX_TOTAL_BYTES —— 「几百字节的占位包」；
+ *   2. 每个条目都是文本（`isNonTextContent` 不命中：没有 ELF/PE/Mach-O/DEX/ZIP 魔数、没有 NUL）；
+ *   3. 根上有 `module.prop`，它自报的 `id` / `versionCode` 与处置点名的那一条一致；
+ *   4. 除 `module.prop` 外，每个条目剥掉 `#` 注释与空行之后**只剩空操作**
+ *      （`exit 0` / `exit` / `:` / `true`）。
+ *
+ * 第 4 条是这一档能不能被滥用的全部：一个包只要真的会做事（写文件、改属性、起进程、装 .so），
+ * 就过不了这一格，也就拿不到探针章。所以「有 write 权限的人把真模块标成 test-probe 抹掉」
+ * 这条路走不通 —— 能过的包，抹掉它对用户的损害上限就是「少一个什么也不做的条目」。
+ *
+ * 这一层只吃 `readZip` 的产物，不下载、不碰路径，所以每条失效方向都能离线逐条打到。
+ */
+export function judgeProbePackage({ d = {}, size = 0, files = [], unread = [] } = {}) {
+  const who = d.id || '(无 id)';
+  const problems = [];
+  if (!Number.isInteger(size) || size <= 0) {
+    problems.push(`${who}：归档字节数不是正整数（收到 ${JSON.stringify(size)}）`);
+  } else if (size > PROBE_MAX_PACKAGE_BYTES) {
+    problems.push(`${who}：归档 ${size} 字节，超过探针档上限 ${PROBE_MAX_PACKAGE_BYTES} —— 这一档只收几百字节的占位包`);
+  }
+  if (unread.length) {
+    problems.push(`${who}：归档里 ${unread.length} 个条目解不出来（${unread.map((u) => u.name).join(', ')}）`
+      + ' —— 解不出来就不能说它「什么也不做」');
+  }
+  if (!files.length) problems.push(`${who}：归档里一个条目都没有`);
+  if (problems.length) return { ok: false, problems, checked: 0 };
+
+  let total = 0;
+  for (const f of files) {
+    total += Buffer.byteLength(String(f.content == null ? '' : f.content), 'utf8');
+    if (isNonTextContent(f)) problems.push(`${who} 的 ${f.name} 是二进制（或含 NUL）—— 探针档只收文本占位`);
+  }
+  if (total > PROBE_MAX_TOTAL_BYTES) {
+    problems.push(`${who}：解压后共 ${total} 字节，超过探针档上限 ${PROBE_MAX_TOTAL_BYTES}`);
+  }
+
+  const prop = files.find((f) => f.name === 'module.prop');
+  if (!prop) {
+    problems.push(`${who}：归档根上没有 module.prop —— 连「这是哪一枚模块」都说不出，不能按探针下`);
+  } else {
+    const fields = new Map();
+    for (const line of String(prop.content == null ? '' : prop.content).split('\n')) {
+      const eq = line.indexOf('=');
+      if (eq <= 0) continue;
+      fields.set(line.slice(0, eq).trim(), line.slice(eq + 1).trim());
+    }
+    const propId = fields.get('id');
+    if (!propId) {
+      problems.push(`${who} 的 module.prop 里没有 id= —— 探针包必须自报模块 id`);
+    } else if (String(propId) !== String(d.id)) {
+      problems.push(`${who} 的 module.prop 自报 id=${JSON.stringify(propId)}，与处置点名的 ${JSON.stringify(d.id)} 不是同一个`);
+    }
+    if (d.versionCode !== undefined && d.versionCode !== null) {
+      const pvc = fields.get('versionCode');
+      if (String(Number(pvc)) !== String(Number(d.versionCode))) {
+        problems.push(`${who} 的 module.prop 自报 versionCode=${JSON.stringify(pvc)}，与处置点名的 ${d.versionCode} 不一致`);
+      }
+    }
+  }
+
+  for (const f of files) {
+    if (f.name === 'module.prop') continue;
+    const acts = String(f.content == null ? '' : f.content).split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith('#'));
+    for (const line of acts) {
+      if (!PROBE_HARMLESS_LINES.has(line)) {
+        problems.push(`${who} 的 ${f.name} 里有一行不是空操作：${JSON.stringify(line.slice(0, 60))}`
+          + ' —— 探针档只收什么也不做的包');
+        break;
+      }
+    }
+  }
+  if (problems.length) return { ok: false, problems, checked: 0 };
+  return { ok: true, problems, checked: files.length };
+}
+
+/**
  * 复核一条台账 PR 的全部新增/改动处置 ⇒ `{ "<章指向的 commit>": {ok, summary|reason} }`。
  *
  * 归档按 sha256 只取一次（同一枚包可能被多条处置引用）。三个接口都能注入，因此这一层的
@@ -225,6 +324,9 @@ export async function reviewLedgerPr({
     return { path: p, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
   });
   const readEntry = deps.readEntry || ((zipPath, name) => readZipEntryBytes(zipPath, name, ENTRY_LIMIT));
+  // 探针档要看整包（条目名 + 全文），所以另开一个「读全部条目」的接缝；默认走同一份 zip 解析，
+  // 不在这里再写第二个解析器。
+  const readAll = deps.readAll || ((zipPath) => readZip(zipPath, ENTRY_LIMIT));
 
   let base, head;
   try {
@@ -251,9 +353,10 @@ export async function reviewLedgerPr({
     if (!acc.has(sha)) acc.set(sha, { problems: [], checked: 0 });
     acc.get(sha).problems.push(msg);
   };
-  const addChecked = (sha, n) => {
-    if (!acc.has(sha)) acc.set(sha, { problems: [], checked: 0 });
+  const addChecked = (sha, n, probe = 0) => {
+    if (!acc.has(sha)) acc.set(sha, { problems: [], checked: 0, probe: 0 });
     acc.get(sha).checked += n;
+    acc.get(sha).probe += probe;
   };
   const packages = new Map();
   const cleanups = [];
@@ -281,7 +384,10 @@ export async function reviewLedgerPr({
       continue;
     }
     const problems = [];
+    const isProbe = d.kind === 'revoke' && d.reason === PROBE_REASON;
     let reportDocs = 0;
+    let probeDocs = 0;
+    let probeTotal = 0;
     let checkedTotal = 0;
     for (const file of files) {
       let raw;
@@ -304,11 +410,19 @@ export async function reviewLedgerPr({
         problems.push(`${who} 的 ${file} 不是合法 JSON：${e.message}`);
         continue;
       }
-      if (doc.schema !== REPORT_EVIDENCE_SCHEMA) {
+      if (isProbe) {
+        // 探针档只认 §8 审核证据；举报证据反过来也不许冒充探针 —— 两条路互不走串。
+        if (doc.schema !== PROBE_EVIDENCE_SCHEMA) {
+          problems.push(`${who} 的 ${file} 的记录是 ${JSON.stringify(doc.schema)} 那一版，探针档只认 ${PROBE_EVIDENCE_SCHEMA}`);
+          continue;
+        }
+        probeDocs++;
+      } else if (doc.schema !== REPORT_EVIDENCE_SCHEMA) {
         problems.push(`${who} 的 ${file} 的记录是 ${JSON.stringify(doc.schema)} 那一版，这一步只复核举报证据`);
         continue;
+      } else {
+        reportDocs++;
       }
-      reportDocs++;
       const pkg = doc.package || {};
       // 记录指的是不是**处置点名的那一枚已发布产物**：id 与 sha 都要同一个。
       // 只比 sha 不够 —— 同一份字节可以被写成挂在另一个模块名下的一条证据，
@@ -341,23 +455,41 @@ export async function reviewLedgerPr({
         }
       }
       const handle = packages.get(sha);
-      const r = verifyReportEvidenceDoc(doc, {
-        openPackage: () => handle.bytes,
-        readEntry: (n) => readEntry(handle.path, n),
-      });
-      checkedTotal += r.checked;
+      let r;
+      if (isProbe) {
+        // 探针档：跳过「条目内逐字定位」，换成「这枚包什么也不做」的核对。取包与实算 sha256 在上面
+        // 已经走过一遍（地址来自 base 索引，不是证据里写的），这一格只判内容。
+        try {
+          const z = readAll(handle.path);
+          r = judgeProbePackage({ d, size: handle.bytes.length, files: z.files, unread: z.unread });
+        } catch (e) {
+          r = { ok: false, problems: [`读整包失败：${String((e && e.message) || e)}`], checked: 0 };
+        }
+        probeTotal += r.checked;
+      } else {
+        r = verifyReportEvidenceDoc(doc, {
+          openPackage: () => handle.bytes,
+          readEntry: (n) => readEntry(handle.path, n),
+        });
+        checkedTotal += r.checked;
+      }
       for (const p of r.problems) problems.push(`${who} 的 ${file}：${p}`);
     }
-    if (!reportDocs && !problems.some((p) => /上限/.test(p))) problems.unshift(`${who}：引用的证据文件里没有一份是举报证据 —— 逐字复核没有输入`);
+    if (!reportDocs && !probeDocs && !problems.some((p) => /上限/.test(p))) {
+      problems.unshift(`${who}：引用的证据文件里没有一份是这一档认的证据 —— 复核没有输入`);
+    }
     for (const p of problems) addProblem(s.sha, p);
-    if (!problems.length) addChecked(s.sha, checkedTotal);
+    if (!problems.length) addChecked(s.sha, checkedTotal, probeTotal);
   }
   for (const c of cleanups) { try { c(); } catch { /* 临时目录清不掉不影响结论 */ } }
   const reviews = {};
   for (const [sha, a] of acc) {
+    const parts = [];
+    if (a.checked) parts.push(`逐字复核：${a.checked} 段引用在归档里逐字节对上`);
+    if (a.probe) parts.push(`探针档：${a.probe} 条按「包内没有可执行内容」核对通过`);
     reviews[sha] = a.problems.length
       ? { ok: false, reason: a.problems.join('；') }
-      : { ok: true, summary: `逐字复核：${a.checked} 段引用在归档里逐字节对上` };
+      : { ok: true, summary: parts.join('；') || '复核通过' };
   }
   for (const [sha, r] of Object.entries(reviews)) if (!r.ok) notes.push(`${sha.slice(0, 12)} 不成立：${r.reason}`);
   return { reviews, notes, packagesUsed, touched };

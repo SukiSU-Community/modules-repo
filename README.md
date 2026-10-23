@@ -550,9 +550,16 @@ node --test test/build-index.test.mjs   # 只跑这一个文件
 ```bash
 node scripts/revoke.mjs --id <模块ID> [--version-code <n>] [--sha256 <64hex>] [--uid <酷安UID>] \
      --kind revoke|deny --reason <公示分类> \
-     --by https://github.com/<owner>/<repo>/issues/<n>#issuecomment-<id> \
+     --by ci:audit@<这条台账 PR 上 C1 的 40 位 sha> \
      --note "<给人看的说明>" [--verify <任何人都能跑的复核命令>] [--dry-run] [--no-harvest]
 ```
+
+`--by` 只能是机器章 `ci:audit@<40 位小写十六进制>`（或第一枚提交用的待盖值 `ci:audit@pending`）——
+评论永久链接那个旧形状已经退场，理由见 GOVERNANCE 第 3 节：章要指向「哪一次运行把证据钉死了」，
+而不是指向一条要人自己去查的评论。
+
+**`--reason test-probe` 必须同时给 `--sha256`**：探针档复核的是「这一枚具体的包什么也不做」
+（判据见 GOVERNANCE 3.1），只写 id 抹整个模块在这一档上没有可判的对象，写入端直接拒。
 
 ### 同一条命令还会固化证据（§8）
 
@@ -573,11 +580,29 @@ node scripts/revoke.mjs --id <模块ID> [--version-code <n>] [--sha256 <64hex>] 
 - 想跳过这一步用 `--no-harvest`（离线跑、或者这个克隆没有投稿历史时用）。
 - 证据文件与台账必须**同一条 PR**：`evidence/**` 只在「这条 PR 同时改了台账」时才算合法文件。
 
-`--by` 现在**必须**是浏览器里点得开的评论永久链接。旧形状 `gh:<login>@issuecomment-<id>`
-只有评论 id、没有 issue 号，而 GitHub 无法从评论 id 反查 URL（`api.github.com/repos/<o>/<r>/issues/comments/<id>`
-会回 `html_url`，但那是要求访问者自己去查的东西）。校验只加在**写入端**：让通用校验器拒收旧记录
-= 读不懂台账 = 推导停住 = 索引冻死，那条失效方向是设计好的。
-名字不再进台账 —— 谁下的处置看那条评论的作者，抄一份进台账就是引进一个会过期的字段。
+`--by` 的旧形状（评论永久链接、以及更早的 `gh:<login>@issuecomment-<id>`）都已退场，现在只收机器章
+`ci:audit@<40 位小写十六进制>`：它指向「哪一次运行把这条下架决定的证据钉死了」，用
+`gh api repos/<owner>/<repo>/commits/<sha>/check-runs` 就能复验。校验只加在**写入端**：让通用校验器
+拒收旧记录 = 读不懂台账 = 推导停住 = 索引冻死，那条失效方向是设计好的。
+名字不再进台账 —— 谁下的处置看那枚章，抄一份进台账就是引进一个会过期的字段。
+
+### 探针包（`reason=test-probe`）
+
+流水线自检会往真流水线上投几枚**几百字节、什么也不做**的包，用来验证「投稿 → 审核 → 合入 → 索引」
+整条链路还通着。它们投稿时走的与任何用户投稿一模一样，所以事后清理也必须走同一枚章、同一条台账 PR。
+
+这一档的复核判据与举报那条不同（`verify-report-evidence.mjs` 的 `judgeProbePackage`）：没有「指控引用的原文」
+可核，改判「这枚包里**什么也不做**」—— 归档与解压总量有上限、每个条目必须是文本、
+根上 `module.prop` 自报的 `id`/`versionCode` 必须与处置点名的一致、除 `module.prop` 外每条剥掉注释与空行后
+只剩 `exit 0` / `exit` / `:` / `true`。详细四条与「挡的是什么」见 `GOVERNANCE.md` 3.1。
+
+所以这一档必须点名产物：
+
+```bash
+node scripts/revoke.mjs --id <探针id> --version-code <n> --sha256 <64hex> \
+     --kind revoke --reason test-probe --by ci:audit@pending \
+     --note "流水线验证留下的探针包"
+```
 
 ### 为什么「只改台账」的 PR 不算索引 PR（一个被这次改动顺手关掉的洞）
 
