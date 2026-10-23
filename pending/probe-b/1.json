@@ -1,0 +1,54 @@
+{
+  "id": "probe-b",
+  "name": "Probe B",
+  "author": "probe",
+  "description": "Harmless upload probe module B. Does nothing.",
+  "versions": [
+    {
+      "version": "1.0",
+      "versionCode": 1,
+      "zipUrl": "https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/7d41145c42963d132130c5f24d6e8f0a9b8b958eb3a1c481e3485f8d5e9f0534.zip",
+      "size": 376,
+      "time": 1792762244965,
+      "sha256": "7d41145c42963d132130c5f24d6e8f0a9b8b958eb3a1c481e3485f8d5e9f0534"
+    }
+  ],
+  "source": "https://www.coolapk.com/feed/65432100",
+  "sourceCheck": {
+    "verdict": "unreadable",
+    "via": [],
+    "evidence": [],
+    "reason": "酷安应答读不懂（Unexpected token '<', \"<!DOCTYPE \"... is not valid JSON）"
+  },
+  "uploader": "彧祜",
+  "coolapkUid": "2781460",
+  "pledge": {
+    "version": "pledge-v1",
+    "atMs": 1792762244965
+  },
+  "ownership": {
+    "nonce": "z621gt",
+    "proofPrefix": "29e06374028f",
+    "via": "bio-set",
+    "verifiedAt": 1792762241665
+  },
+  "identity": {
+    "capturedAt": 1792762241665,
+    "username": "彧祜",
+    "displayUsername": "彧祜",
+    "level": 4,
+    "bio": "29e06374028f-z621gt",
+    "regdate": 1562571600,
+    "logintime": 1792761930,
+    "userAvatar": "http://avatar.coolapk.com/data/002/78/14/60_avatar_big.jpg?t=1733673716",
+    "userBigAvatar": "http://avatar.coolapk.com/data/002/78/14/60_avatar_big.jpg?t=1733673716",
+    "cover": "http://avatar.coolapk.com/cover/17/77/43/2781460_1777438636.jpg",
+    "follow": 203,
+    "fans": 24,
+    "be_like_num": 386
+  },
+  "storage": "github-release-asset",
+  "releaseTag": "assets-v1",
+  "assetName": "7d41145c42963d132130c5f24d6e8f0a9b8b958eb3a1c481e3485f8d5e9f0534.zip",
+  "submittedAt": "2026-10-23T13:30:44.965Z"
+}
