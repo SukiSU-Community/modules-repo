@@ -1,5 +1,40 @@
 {
   "name": "SukiSU-Ultra Modules",
-  "lastUpdate": 1791687752947,
-  "modules": []
+  "lastUpdate": 1792773895039,
+  "modules": [
+    {
+      "id": "probe-a",
+      "name": "Probe A",
+      "author": "probe",
+      "description": "Harmless upload probe module A. Does nothing.",
+      "versions": [
+        {
+          "version": "1.0",
+          "versionCode": 1,
+          "zipUrl": "https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/a0b65fd39ee4877fefea946f4564ee9d4976fde139539fcc5026f4c3ef8275dd.zip",
+          "size": 376,
+          "time": 1792762244965,
+          "sha256": "a0b65fd39ee4877fefea946f4564ee9d4976fde139539fcc5026f4c3ef8275dd"
+        }
+      ],
+      "verified": false
+    },
+    {
+      "id": "probe-b",
+      "name": "Probe B",
+      "author": "probe",
+      "description": "Harmless upload probe module B. Does nothing.",
+      "versions": [
+        {
+          "version": "1.0",
+          "versionCode": 1,
+          "zipUrl": "https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/7d41145c42963d132130c5f24d6e8f0a9b8b958eb3a1c481e3485f8d5e9f0534.zip",
+          "size": 376,
+          "time": 1792762244965,
+          "sha256": "7d41145c42963d132130c5f24d6e8f0a9b8b958eb3a1c481e3485f8d5e9f0534"
+        }
+      ],
+      "verified": false
+    }
+  ]
 }
