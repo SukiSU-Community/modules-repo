@@ -649,46 +649,54 @@ jobs:
           fi
           echo "扫描器：$SCANNER（PREFIX='${LOCATE_PREFIX:-<根>}'）"
 
-          # 声明的 id / version 取自本次变更的 pending 元数据（递归，Worker 写的是
-          # pending/<id>/<versionCode>.json，version 在 versions[].version 里）。
-          DECL_ID=""; DECL_VER=""
-          PFORM=$(find pending-changed -name '*.json' ! -name '.*' 2>/dev/null | head -n1 || true)
-          if [ -n "$PFORM" ] && [ -f "$PFORM" ]; then
-            # ⚠️ 原写法 `require(process.argv[1])` 读出空值的真根因（已实测，见回报）：
-            #   require() 拿到不带 "./" 前缀的相对路径时，会把它当成**裸模块名**去
-            #   node_modules 里解析，而不是当文件路径 —— 于是 MODULE_NOT_FOUND，
-            #   错误被 `2>/dev/null || true` 静默吞掉，DECL_ID/DECL_VER 就成了空字符串。
-            #   实测：加 "./" 前缀后可 require 成功；换 fs.readFileSync 则相对/绝对路径都稳。
-            #
-            #   附：node -e 的 process.argv 实测为 [node.exe, arg1, arg2...]，
-            #   即 argv[1] 就是第一个实参（不是 node 路径）。但为了不依赖具体约定，
-            #   这里统一取**最后一个实参** process.argv[process.argv.length-1]，
-            #   无论 argv[1] 还是 argv[2] 是第一个实参都能正确取到文件路径。
-            #
-            # 结构见 contrib/worker/src/index.ts buildPendingJson（与 PR #1 真实文件一致）：
-            #   顶层 id；版本在 versions[versions.length-1].version。
-            DECL_ID=$(node -e '
-              const fs=require("fs");
-              const j=JSON.parse(fs.readFileSync(process.argv[process.argv.length-1],"utf8"));
-              process.stdout.write(String(j.id||j.moduleId||""));
-            ' "$PFORM" 2>/dev/null || true)
-            DECL_VER=$(node -e '
-              const fs=require("fs");
-              const j=JSON.parse(fs.readFileSync(process.argv[process.argv.length-1],"utf8"));
-              const v=Array.isArray(j.versions)&&j.versions.length?j.versions[j.versions.length-1]:null;
-              process.stdout.write(String((v&&v.version)||j.version||j.versionName||""));
-            ' "$PFORM" 2>/dev/null || true)
-            echo "投稿声明：id=$DECL_ID version=$DECL_VER（来自 $PFORM）"
-            # 供应链红线：id 读不出来就判不了「首次收录 vs 版本更新」，
-            # 而规则是版本更新一律人工审 —— 读错会把更新误判成首次收录而自动放行。
-            # 所以宁可 fail closed：拿不到 id 就让流水线报错终止，不做无依据的自动放行。
-            if [ -z "$DECL_ID" ]; then
-              echo "::error::无法从 $PFORM 读出投稿 id，无法判定首次收录/版本更新，终止审核（不做自动放行）。"
-              exit 1
-            fi
-            if [ -z "$DECL_VER" ]; then
-              echo "::warning::无法从 $PFORM 读出投稿 version，变更类型判定可能退化为 unknown。"
-            fi
+          # 声明的 id / version 必须**逐包**配对（2026-10-23 修）：多包 PR 里每一枚包各有
+          # 自己的一份 pending 元数据，此前这里是 `find pending-changed … | head -n1` ——
+          # 整条 PR 只取第一份，再拿它当 zips.txt 里**所有**包的「表单声明」。单包正确，
+          # 多包必错：第二枚起会被静态报告判成 META_ID_MISMATCH（PR #73 实测：probe-b 的包内
+          # id 是 probe-b、被拿去比的却是第一份的 probe-a），等级被抬成 medium，标注全错。
+          #
+          # 配对来源是 locate 那一步已经落下的 audit-out/zips/manifest.json ——
+          # fetch-pending-zip.mjs 逐条写的，每条记录自带该 pending 的 id / version / versionCode
+          # 与它下载到手的 zip 路径，天然一对一。按 zip 的 basename 建表（不比全路径：
+          # 路径口径在别的脚本里被归一化过一次，basename 是两份产物唯一共享的那一格）。
+          #
+          # 手动触发（workflow_dispatch 直接给 zip）没有 pending、也没有 manifest，那一支保持
+          # 「不带声明」的老行为 —— 它不是投稿路径，不参与首次收录/版本更新的自动放行。
+          #
+          # 供应链红线照旧 fail closed：manifest 在、但这个包在表里配不上声明（或 id 读空），
+          # 就报错终止。绝不退化成「没有声明也照样扫」—— 那等于把「让声明消失」变成一种绕过。
+          # （历史踩坑留档：早先这里用 `node -e 'require(process.argv[1])'`，不带 "./" 前缀时
+          #  require() 把相对路径当裸模块名去 node_modules 里找，MODULE_NOT_FOUND 被
+          #  `2>/dev/null || true` 吞掉后 DECL_ID 静默变空串；现在的读法走 fs.readFileSync。）
+          declare -A DECL_ID_OF=() DECL_VER_OF=()
+          DECL_COUNT=0
+          if [ -f audit-out/zips/manifest.json ]; then
+            # 逐行读「basename <TAB> id <TAB> version」，只按 tab 切两刀
+            # （${VAR%%$'\t'*} / ${VAR#*$'\t'}），**不用 read 的 IFS 分列** —— tab 属于 IFS 里的
+            # 「空白」一类，bash 会把连续 tab 折叠成一个、把空字段整段吞掉：某份 pending 的 id
+            # 为空（或 version 为空夹在中间）时三元组会错位，空 id 那条反而拿到一个凑出来的
+            # declared-id，fail closed 就失效了。参数展开是逐刀切、不做空白折叠，空字段原样保留。
+            while IFS= read -r MZLINE; do
+              [ -z "$MZLINE" ] && continue
+              MZIP=${MZLINE%%$'\t'*}
+              [ -z "$MZIP" ] && continue
+              MZREST=${MZLINE#*$'\t'}
+              MID=${MZREST%%$'\t'*}
+              MVER=${MZREST#*$'\t'}
+              DECL_ID_OF["$MZIP"]="$MID"
+              DECL_VER_OF["$MZIP"]="$MVER"
+              DECL_COUNT=$((DECL_COUNT+1))
+            done < <(node -e '
+              const fs=require("fs"),path=require("path");
+              const recs=JSON.parse(fs.readFileSync(process.argv[process.argv.length-1],"utf8"));
+              for(const r of (Array.isArray(recs)?recs:[])){
+                if(!r||!r.zip) continue;
+                process.stdout.write([path.basename(String(r.zip)),String(r.id||""),String(r.version||"")].join("\t")+"\n");
+              }
+            ' audit-out/zips/manifest.json)
+            echo "逐包声明表：$DECL_COUNT 条（来源 audit-out/zips/manifest.json）"
+          else
+            echo "没有 manifest.json（手动触发 / 非投稿来源）：本次不带表单声明扫描。"
           fi
 
           : > audit-out/summary.md
@@ -702,8 +710,16 @@ jobs:
             [ -z "$ZIP" ] && continue
             [ -f "$ZIP" ] || { echo "::warning::$ZIP 不存在，跳过"; continue; }
             ARGS=(--out-dir audit-out --index "$INDEX")
-            [ -n "$DECL_ID" ] && ARGS+=(--declared-id "$DECL_ID")
-            [ -n "$DECL_VER" ] && ARGS+=(--declared-version "$DECL_VER")
+            # 逐包配对：只有本包自己的 pending 才配得上本包（见上面那段注释）。
+            ZBASE=$(basename "$ZIP")
+            PKG_ID="${DECL_ID_OF[$ZBASE]:-}"
+            PKG_VER="${DECL_VER_OF[$ZBASE]:-}"
+            if [ -f audit-out/zips/manifest.json ] && [ -z "$PKG_ID" ]; then
+              echo "::error::$ZBASE 在 manifest.json 里配不上投稿声明（或那份 pending 的 id 为空）—— 拿不到声明就判不了首次收录/版本更新，终止审核（不做自动放行）。"
+              exit 1
+            fi
+            [ -n "$PKG_ID" ] && ARGS+=(--declared-id "$PKG_ID")
+            [ -n "$PKG_VER" ] && ARGS+=(--declared-version "$PKG_VER")
             node "$SCANNER" "$ZIP" "${ARGS[@]}" --quiet | tee -a audit-out/summary.md
             GOT=$((GOT+1))
           done < zips.txt
