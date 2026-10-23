@@ -133,7 +133,8 @@ export async function main(argv = process.argv.slice(2), io = console, deps = {}
   const usage = `用法: node scripts/revoke.mjs --id <id> [--version-code <n>] [--sha256 <64hex>] [--uid <酷安UID>]
           --kind revoke|deny --reason ${REASONS.join('|')}
           --by ${MACHINE_SEAL_PREFIX}<这条台账 PR 的 head commit sha>
-          [--note <公示说明>] [--verify <复核命令>] [--dry-run] [--no-harvest]`;
+          [--note <公示说明>] [--verify <复核命令>] [--dry-run] [--no-harvest]
+          （--reason test-probe 必须带 --sha256：这一档按「这一枚包什么也不做」复核）`;
   if (!flags.id && !flags.sha256 && !flags.uid) {
     io.error(`[revoke] 必须至少给一个选择器（--id / --sha256 / --uid）。\n${usage}`);
     return 2;
@@ -144,6 +145,13 @@ export async function main(argv = process.argv.slice(2), io = console, deps = {}
   }
   if (!REASONS.includes(flags.reason)) {
     io.error(`[revoke] --reason 必须是公示分类之一（${REASONS.join(' / ')}），收到 ${JSON.stringify(flags.reason)}`);
+    return 2;
+  }
+  // 探针档（test-probe）走的是「这枚包什么也不做」那条复核：verify-report-evidence 要按 sha256
+  // 定位到 base 索引里的**那一枚产物**才谈得上判内容，所以这一档必须点名产物，不许只给 id。
+  if (flags.reason === 'test-probe' && !flags.sha256) {
+    io.error('[revoke] --reason test-probe 必须同时给 --sha256：探针档复核的是「这一枚具体包什么也不做」，'
+      + '只按 id 抹整个模块过不了台账 PR 的复核。');
     return 2;
   }
   if (!flags.by || flags.by === true) {

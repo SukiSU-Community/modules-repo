@@ -83,7 +83,7 @@ test('缺选择器 / 缺 by / reason 不在枚举 / version-code 没配 id → �
 
 test('--dry-run：把要写的条目说清楚，但不落盘、不重算索引', async () => {
   const s = sandboxWithModule();
-  const { rc, io } = await run(s, ['--id', 'mod_x', '--kind', 'revoke', '--reason', 'test-probe', '--by', BY, '--dry-run']);
+  const { rc, io } = await run(s, ['--id', 'mod_x', '--sha256', SHA('c'), '--kind', 'revoke', '--reason', 'test-probe', '--by', BY, '--dry-run']);
   assert.equal(rc, 0);
   assert.match(io.out.join('\n'), /--dry-run：没写任何文件/);
   assert.equal(fs.existsSync(s.ledgerPath), false);
@@ -92,7 +92,7 @@ test('--dry-run：把要写的条目说清楚，但不落盘、不重算索引',
 
 test('正常下架：写台账 -> 调 build-index 重算 -> 索引里那条真没了', async () => {
   const s = sandboxWithModule();
-  const { rc, io } = await run(s, ['--id', 'mod_x', '--kind', 'revoke', '--reason', 'test-probe', '--by', BY, '--note', '流水线探针包'], capture());
+  const { rc, io } = await run(s, ['--id', 'mod_x', '--sha256', SHA('c'), '--kind', 'revoke', '--reason', 'test-probe', '--by', BY, '--note', '流水线探针包'], capture());
   assert.equal(rc, 0, io.out.join('\n') + '\n' + io.out.join('\n'));
 
   const ledger = JSON.parse(fs.readFileSync(s.ledgerPath, 'utf8'));
@@ -135,11 +135,20 @@ test('只指到产物：抹那一条版本，模块与其它版本留着', async
   fs.rmSync(s.dir, { recursive: true, force: true });
 });
 
+test('test-probe 不带 --sha256 → 退出 2：探针档按「这一枚包什么也不做」复核，只给 id 过不了', async () => {
+  const s = sandboxWithModule();
+  const { rc, io } = await run(s, ['--id', 'mod_x', '--kind', 'revoke', '--reason', 'test-probe', '--by', BY]);
+  assert.equal(rc, 2);
+  assert.match(io.out.join('\n'), /test-probe 必须同时给 --sha256/);
+  assert.equal(fs.existsSync(s.ledgerPath), false, '拒写时不许建台账文件');
+  fs.rmSync(s.dir, { recursive: true, force: true });
+});
+
 test('同样选择器重复下处置 → 退出 4，不写第二条', async () => {
   const s = sandboxWithModule();
-  await run(s, ['--id', 'mod_x', '--kind', 'revoke', '--reason', 'test-probe', '--by', BY]);
+  await run(s, ['--id', 'mod_x', '--sha256', SHA('c'), '--kind', 'revoke', '--reason', 'test-probe', '--by', BY]);
   const before = fs.readFileSync(s.ledgerPath, 'utf8');
-  const { rc, io } = await run(s, ['--id', 'mod_x', '--kind', 'revoke', '--reason', 'malware', '--by', `ci:audit@${'cd'.repeat(20)}`], capture());
+  const { rc, io } = await run(s, ['--id', 'mod_x', '--sha256', SHA('c'), '--kind', 'revoke', '--reason', 'malware', '--by', `ci:audit@${'cd'.repeat(20)}`], capture());
   assert.equal(rc, 4);
   assert.match(io.out.join('\n'), /已经有同样选择器的记录/);
   assert.equal(fs.readFileSync(s.ledgerPath, 'utf8'), before, '重复下处置不许往台账里堆矛盾记录');
