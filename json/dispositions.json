@@ -1,6 +1,6 @@
 {
-  "schema": "sukisu-dispositions-v1",
-  "lastUpdate": 1791687753247,
+  "schema": "sukisu-dispositions-v2",
+  "lastUpdate": 1792779080800,
   "dispositions": [
     {
       "kind": "revoke",
@@ -41,6 +41,48 @@
       "at": "2026-10-11T03:02:33.247Z",
       "note": "流水线验证留下的探针包，理由见 by 指向的评论",
       "id": "e2e_probe_p04"
+    },
+    {
+      "kind": "revoke",
+      "reason": "test-probe",
+      "by": "ci:audit@55881d81bb9a92279eedd1555e29815bed51d6aa",
+      "at": "2026-10-23T18:11:11.730Z",
+      "note": "流水线验证留下的探针包，验证 2 枚批量投稿链路后下架",
+      "id": "probe-a",
+      "sha256": "a0b65fd39ee4877fefea946f4564ee9d4976fde139539fcc5026f4c3ef8275dd",
+      "versionCode": 1,
+      "subject": {
+        "coolapkUid": "2781460",
+        "username": "彧祜"
+      },
+      "evidence": [
+        {
+          "file": "evidence/6b55f15ac82ce6c2bcca7b4a66559aafadf9ab8fb3397c8a114c792833ffd7f3.json",
+          "pr": 73,
+          "at": "2026-10-23T18:11:11.730Z"
+        }
+      ]
+    },
+    {
+      "kind": "revoke",
+      "reason": "test-probe",
+      "by": "ci:audit@55881d81bb9a92279eedd1555e29815bed51d6aa",
+      "at": "2026-10-23T18:11:20.800Z",
+      "note": "流水线验证留下的探针包，验证 2 枚批量投稿链路后下架",
+      "id": "probe-b",
+      "sha256": "7d41145c42963d132130c5f24d6e8f0a9b8b958eb3a1c481e3485f8d5e9f0534",
+      "versionCode": 1,
+      "subject": {
+        "coolapkUid": "2781460",
+        "username": "彧祜"
+      },
+      "evidence": [
+        {
+          "file": "evidence/359eafd9053f51fd609fce44cbe11d3b20bc41ab3f3d97d1dcf94b836b13e8ff.json",
+          "pr": 73,
+          "at": "2026-10-23T18:11:20.800Z"
+        }
+      ]
     }
   ]
 }

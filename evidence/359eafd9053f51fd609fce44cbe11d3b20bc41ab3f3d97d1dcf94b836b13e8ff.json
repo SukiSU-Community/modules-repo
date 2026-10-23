@@ -1,0 +1,202 @@
+{
+  "schema": "sukisu-evidence-v1",
+  "capturedBy": "scripts/harvest-evidence.mjs",
+  "integrity": {
+    "algorithm": "sha256-of-file-bytes",
+    "note": "文件名 = 本文件字节的 SHA-256。字节定义：JSON.stringify(对象,null,2) + 一个换行，UTF-8。"
+  },
+  "subject": {
+    "coolapkUid": "2781460",
+    "username": "彧祜"
+  },
+  "package": {
+    "id": "probe-b",
+    "versionCode": 1,
+    "sha256": "7d41145c42963d132130c5f24d6e8f0a9b8b958eb3a1c481e3485f8d5e9f0534",
+    "size": 376,
+    "zipUrl": "https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/7d41145c42963d132130c5f24d6e8f0a9b8b958eb3a1c481e3485f8d5e9f0534.zip",
+    "releaseTag": "assets-v1",
+    "assetName": "7d41145c42963d132130c5f24d6e8f0a9b8b958eb3a1c481e3485f8d5e9f0534.zip",
+    "source": "https://www.coolapk.com/feed/65432100",
+    "submittedAt": "2026-10-23T13:30:44.965Z"
+  },
+  "pending": {
+    "path": "pending/probe-b/1.json",
+    "commitSha": "a5961c1a7f9ff75cf51d1d5cdf9e93dc0ac31e40",
+    "commitSubject": "投稿：Probe A 等 2 个模块（一次投稿一套） (#73)",
+    "record": {
+      "id": "probe-b",
+      "name": "Probe B",
+      "author": "probe",
+      "description": "Harmless upload probe module B. Does nothing.",
+      "versions": [
+        {
+          "version": "1.0",
+          "versionCode": 1,
+          "zipUrl": "https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/7d41145c42963d132130c5f24d6e8f0a9b8b958eb3a1c481e3485f8d5e9f0534.zip",
+          "size": 376,
+          "time": 1792762244965,
+          "sha256": "7d41145c42963d132130c5f24d6e8f0a9b8b958eb3a1c481e3485f8d5e9f0534"
+        }
+      ],
+      "source": "https://www.coolapk.com/feed/65432100",
+      "sourceCheck": {
+        "verdict": "unreadable",
+        "via": [],
+        "evidence": [],
+        "reason": "酷安应答读不懂（Unexpected token '<', \"<!DOCTYPE \"... is not valid JSON）"
+      },
+      "uploader": "彧祜",
+      "coolapkUid": "2781460",
+      "pledge": {
+        "version": "pledge-v1",
+        "atMs": 1792762244965
+      },
+      "ownership": {
+        "nonce": "z621gt",
+        "proofPrefix": "29e06374028f",
+        "via": "bio-set",
+        "verifiedAt": 1792762241665
+      },
+      "identity": {
+        "capturedAt": 1792762241665,
+        "username": "彧祜",
+        "displayUsername": "彧祜",
+        "level": 4,
+        "bio": "29e06374028f-z621gt",
+        "regdate": 1562571600,
+        "logintime": 1792761930,
+        "userAvatar": "http://avatar.coolapk.com/data/002/78/14/60_avatar_big.jpg?t=1733673716",
+        "userBigAvatar": "http://avatar.coolapk.com/data/002/78/14/60_avatar_big.jpg?t=1733673716",
+        "cover": "http://avatar.coolapk.com/cover/17/77/43/2781460_1777438636.jpg",
+        "follow": 203,
+        "fans": 24,
+        "be_like_num": 386
+      },
+      "storage": "github-release-asset",
+      "releaseTag": "assets-v1",
+      "assetName": "7d41145c42963d132130c5f24d6e8f0a9b8b958eb3a1c481e3485f8d5e9f0534.zip",
+      "submittedAt": "2026-10-23T13:30:44.965Z"
+    }
+  },
+  "pr": {
+    "number": 73,
+    "url": "https://github.com/SukiSU-Community/modules-repo/pull/73"
+  },
+  "report": {
+    "commentId": 6369965950,
+    "commentUrl": "https://github.com/SukiSU-Community/modules-repo/pull/73#issuecomment-6369965950",
+    "packages": [
+      {
+        "name": "probe-a-1.zip",
+        "staticMarkdown": "# 模块投稿安全审核报告\n\n- 目标文件：`probe-a-1.zip`\n- zip 读取方式：内置解析器\n- 生成时间：2026-10-23T16:23:16.749Z\n- 规则版本：静态规则表 `risk-rules.mjs`，共 26 条内容规则\n\n## 结论\n\n**风险等级：LOW**\n\n- 变更类型：**首次收录**\n- 处置：**`auto-approve`** / 标签 `auto-approved`\n- 依据：未命中上架拦截名单（名单共 11 条 armed / 11 条定案）—— 等级不再决定上不上架；风险等级 low 在本模型里只是标注输入，不再拦上架\n- 命中统计：high 0 / medium 0 / low 0 / info 0\n- 恶意行为链：未命中（名单共 11 条 armed / 11 条定案）\n- 标注（不影响上架）：危险能力 0 项；覆盖不全 0 项；上下文题 0 项\n\n## 元数据\n\n| 字段 | module.prop | 投稿表单声明 | 是否一致 |\n|---|---|---|---|\n| id | `probe-a` | `probe-a` | ✅ 一致 |\n| version | `1.0` | `1.0` | ✅ 一致 |\n\n- name：Probe A\n- author：probe\n- description：Harmless upload probe module A. Does nothing.\n- module.prop 路径：`module.prop`\n\n## 文件清单\n\nzip 内成功读出 2 个文件条目，压缩后 0.4 KB，声明解压后 0.00 MB。\n\n| 类别 | 文件 | 大小 | 行数 |\n|---|---|---:|---:|\n| 规范脚本 | `service.sh` | 56 B | 4 |\n| 属性文件(.prop) | `module.prop` | 121 B | 7 |\n\n## 包结构与审核覆盖度\n\n- 条目总数：2（文件 2 / 目录 0），阈值 3000\n- 最高声明压缩比：1.2:1（`module.prop`），阈值 200:1\n- 符号链接条目：无\n- 越界/绝对路径条目：无\n- 重名条目：无\n- 加密条目：无\n- 不支持的压缩方式：无\n- 反斜杠路径条目：无\n- 解压失败的条目：无\n- 行级规则的输入上限：24 KB/条目（超出只把前缀喂给规则，并逐条记 `AUDIT_COVERAGE_TRUNCATED`：哪个条目、原文多少字节、实扫多少字节）\n- 报告内嵌全文的上限：512 KB/文件（Markdown 只贴前缀，全文在 JSON 产物里；上限之外的字节连规则也没读过，见上一条）\n\n## 风险发现\n\n未命中任何风险规则。\n## 投稿者隐私提示（不计入风险等级）\n\n未发现需要提醒的隐私信息。\n\n## 逐行扫过的文件全文（人工复核用）\n\n### `service.sh` — 56 B / 4 行\n\n```sh\n#!/system/bin/sh\n# Harmless probe module: no-op.\nexit 0\n```\n\n### `module.prop` — 121 B / 7 行\n\n```sh\nid=probe-a\nname=Probe A\nversion=1.0\nversionCode=1\nauthor=probe\ndescription=Harmless upload probe module A. Does nothing.\n```\n\n---\n\n_本报告由 `contrib/audit/scan.mjs` 生成；**未经人工审核** —— 上不上架由一次可复验的机器运行判定（判据：`risk-rules.mjs` 的上架拦截名单 ∪ AI 恶意结论，§2）；本模块可自动进入索引，随附上面的能力与覆盖标注。_",
+        "aiRaw": "```json\n{\n  \"status\": \"ok\",\n  \"reasonCode\": null,\n  \"staticRiskLevel\": \"low\",\n  \"levelAfterAi\": \"low\",\n  \"agree\": true,\n  \"risk\": null,\n  \"backend\": \"qca\",\n  \"model\": \"qfmodel\",\n  \"promptSha256\": \"3fce09d745bfb0a4a4f689af3349d01da0a9590c4b49f1d1e557842b1d820544\",\n  \"budgetBasis\": \"uncalibrated-conservative-byte-proxy：DEFAULT_MAX_BRIEF_BYTES 与 qfmodel 的 max_input_tokens=180000 之间没有任何已标定的换算，标定需要一次真实发送（TODO，见 ai-review.mjs 常量段注释）\",\n  \"findings\": [],\n  \"brief\": {\n    \"byteSize\": 1909,\n    \"neededBytes\": 1909,\n    \"corpusFiles\": 2,\n    \"fileCount\": 2,\n    \"overBudget\": false,\n    \"budgetBasis\": \"uncalibrated-conservative-byte-proxy：DEFAULT_MAX_BRIEF_BYTES 与 qfmodel 的 max_input_tokens=180000 之间没有任何已标定的换算，标定需要一次真实发送（TODO，见 ai-review.mjs 常量段注释）\",\n    \"omitted\": [],\n    \"shapes\": {\n      \"textEntries\": 2,\n      \"binaryDigestEntries\": 0,\n      \"polyglotAsText\": 0,\n      \"nonTextRerouted\": 0,\n      \"forensicsRowsSent\": 0\n    },\n    \"sections\": [\n      765,\n      757,\n      183,\n      201\n    ]\n  },\n  \"meta\": {\n    \"backend\": \"qca\",\n    \"model\": \"qfmodel\",\n    \"agentId\": \"agent_00sl0jk7cwvlscr4no9c\",\n    \"agentVersion\": 5,\n    \"sessionId\": \"sess_00tb26380iyo0c18novn\",\n    \"totalCredits\": 6.74,\n    \"activeSeconds\": 1184.676554,\n    \"sessionStatus\": \"idle\",\n    \"eventId\": \"evt_00tb3xib10zcwi1xrs1x\",\n    \"agentMessageCount\": 1,\n    \"eventPages\": 1,\n    \"eventPageSize\": 100\n  }\n}\n```",
+        "ai": {
+          "status": "ok",
+          "reasonCode": null,
+          "staticRiskLevel": "low",
+          "levelAfterAi": "low",
+          "agree": true,
+          "risk": null,
+          "backend": "qca",
+          "model": "qfmodel",
+          "promptSha256": "3fce09d745bfb0a4a4f689af3349d01da0a9590c4b49f1d1e557842b1d820544",
+          "budgetBasis": "uncalibrated-conservative-byte-proxy：DEFAULT_MAX_BRIEF_BYTES 与 qfmodel 的 max_input_tokens=180000 之间没有任何已标定的换算，标定需要一次真实发送（TODO，见 ai-review.mjs 常量段注释）",
+          "findings": [],
+          "brief": {
+            "byteSize": 1909,
+            "neededBytes": 1909,
+            "corpusFiles": 2,
+            "fileCount": 2,
+            "overBudget": false,
+            "budgetBasis": "uncalibrated-conservative-byte-proxy：DEFAULT_MAX_BRIEF_BYTES 与 qfmodel 的 max_input_tokens=180000 之间没有任何已标定的换算，标定需要一次真实发送（TODO，见 ai-review.mjs 常量段注释）",
+            "omitted": [],
+            "shapes": {
+              "textEntries": 2,
+              "binaryDigestEntries": 0,
+              "polyglotAsText": 0,
+              "nonTextRerouted": 0,
+              "forensicsRowsSent": 0
+            },
+            "sections": [
+              765,
+              757,
+              183,
+              201
+            ]
+          },
+          "meta": {
+            "backend": "qca",
+            "model": "qfmodel",
+            "agentId": "agent_00sl0jk7cwvlscr4no9c",
+            "agentVersion": 5,
+            "sessionId": "sess_00tb26380iyo0c18novn",
+            "totalCredits": 6.74,
+            "activeSeconds": 1184.676554,
+            "sessionStatus": "idle",
+            "eventId": "evt_00tb3xib10zcwi1xrs1x",
+            "agentMessageCount": 1,
+            "eventPages": 1,
+            "eventPageSize": 100
+          }
+        },
+        "aiParseFailed": false
+      },
+      {
+        "name": "probe-b-1.zip",
+        "staticMarkdown": "# 模块投稿安全审核报告\n\n- 目标文件：`probe-b-1.zip`\n- zip 读取方式：内置解析器\n- 生成时间：2026-10-23T16:23:16.792Z\n- 规则版本：静态规则表 `risk-rules.mjs`，共 26 条内容规则\n\n## 结论\n\n**风险等级：LOW**\n\n- 变更类型：**首次收录**\n- 处置：**`auto-approve`** / 标签 `auto-approved`\n- 依据：未命中上架拦截名单（名单共 11 条 armed / 11 条定案）—— 等级不再决定上不上架；风险等级 low 在本模型里只是标注输入，不再拦上架\n- 命中统计：high 0 / medium 0 / low 0 / info 0\n- 恶意行为链：未命中（名单共 11 条 armed / 11 条定案）\n- 标注（不影响上架）：危险能力 0 项；覆盖不全 0 项；上下文题 0 项\n\n## 元数据\n\n| 字段 | module.prop | 投稿表单声明 | 是否一致 |\n|---|---|---|---|\n| id | `probe-b` | `probe-b` | ✅ 一致 |\n| version | `1.0` | `1.0` | ✅ 一致 |\n\n- name：Probe B\n- author：probe\n- description：Harmless upload probe module B. Does nothing.\n- module.prop 路径：`module.prop`\n\n## 文件清单\n\nzip 内成功读出 2 个文件条目，压缩后 0.4 KB，声明解压后 0.00 MB。\n\n| 类别 | 文件 | 大小 | 行数 |\n|---|---|---:|---:|\n| 规范脚本 | `service.sh` | 56 B | 4 |\n| 属性文件(.prop) | `module.prop` | 121 B | 7 |\n\n## 包结构与审核覆盖度\n\n- 条目总数：2（文件 2 / 目录 0），阈值 3000\n- 最高声明压缩比：1.2:1（`module.prop`），阈值 200:1\n- 符号链接条目：无\n- 越界/绝对路径条目：无\n- 重名条目：无\n- 加密条目：无\n- 不支持的压缩方式：无\n- 反斜杠路径条目：无\n- 解压失败的条目：无\n- 行级规则的输入上限：24 KB/条目（超出只把前缀喂给规则，并逐条记 `AUDIT_COVERAGE_TRUNCATED`：哪个条目、原文多少字节、实扫多少字节）\n- 报告内嵌全文的上限：512 KB/文件（Markdown 只贴前缀，全文在 JSON 产物里；上限之外的字节连规则也没读过，见上一条）\n\n## 风险发现\n\n未命中任何风险规则。\n## 投稿者隐私提示（不计入风险等级）\n\n未发现需要提醒的隐私信息。\n\n## 逐行扫过的文件全文（人工复核用）\n\n### `service.sh` — 56 B / 4 行\n\n```sh\n#!/system/bin/sh\n# Harmless probe module: no-op.\nexit 0\n```\n\n### `module.prop` — 121 B / 7 行\n\n```sh\nid=probe-b\nname=Probe B\nversion=1.0\nversionCode=1\nauthor=probe\ndescription=Harmless upload probe module B. Does nothing.\n```\n\n---\n\n_本报告由 `contrib/audit/scan.mjs` 生成；**未经人工审核** —— 上不上架由一次可复验的机器运行判定（判据：`risk-rules.mjs` 的上架拦截名单 ∪ AI 恶意结论，§2）；本模块可自动进入索引，随附上面的能力与覆盖标注。_",
+        "aiRaw": "```json\n{\n  \"status\": \"ok\",\n  \"reasonCode\": null,\n  \"staticRiskLevel\": \"low\",\n  \"levelAfterAi\": \"low\",\n  \"agree\": true,\n  \"risk\": null,\n  \"backend\": \"qca\",\n  \"model\": \"qfmodel\",\n  \"promptSha256\": \"3fce09d745bfb0a4a4f689af3349d01da0a9590c4b49f1d1e557842b1d820544\",\n  \"budgetBasis\": \"uncalibrated-conservative-byte-proxy：DEFAULT_MAX_BRIEF_BYTES 与 qfmodel 的 max_input_tokens=180000 之间没有任何已标定的换算，标定需要一次真实发送（TODO，见 ai-review.mjs 常量段注释）\",\n  \"findings\": [],\n  \"brief\": {\n    \"byteSize\": 1909,\n    \"neededBytes\": 1909,\n    \"corpusFiles\": 2,\n    \"fileCount\": 2,\n    \"overBudget\": false,\n    \"budgetBasis\": \"uncalibrated-conservative-byte-proxy：DEFAULT_MAX_BRIEF_BYTES 与 qfmodel 的 max_input_tokens=180000 之间没有任何已标定的换算，标定需要一次真实发送（TODO，见 ai-review.mjs 常量段注释）\",\n    \"omitted\": [],\n    \"shapes\": {\n      \"textEntries\": 2,\n      \"binaryDigestEntries\": 0,\n      \"polyglotAsText\": 0,\n      \"nonTextRerouted\": 0,\n      \"forensicsRowsSent\": 0\n    },\n    \"sections\": [\n      765,\n      757,\n      183,\n      201\n    ]\n  },\n  \"meta\": {\n    \"backend\": \"qca\",\n    \"model\": \"qfmodel\",\n    \"agentId\": \"agent_00sl0jk7cwvlscr4no9c\",\n    \"agentVersion\": 5,\n    \"sessionId\": \"sess_00tb3xmv7ttz45hv35ge\",\n    \"totalCredits\": 1.15,\n    \"activeSeconds\": 62.338317,\n    \"sessionStatus\": \"idle\",\n    \"eventId\": \"evt_00tb40zechmgw5dl46ig\",\n    \"agentMessageCount\": 1,\n    \"eventPages\": 1,\n    \"eventPageSize\": 100\n  }\n}\n```",
+        "ai": {
+          "status": "ok",
+          "reasonCode": null,
+          "staticRiskLevel": "low",
+          "levelAfterAi": "low",
+          "agree": true,
+          "risk": null,
+          "backend": "qca",
+          "model": "qfmodel",
+          "promptSha256": "3fce09d745bfb0a4a4f689af3349d01da0a9590c4b49f1d1e557842b1d820544",
+          "budgetBasis": "uncalibrated-conservative-byte-proxy：DEFAULT_MAX_BRIEF_BYTES 与 qfmodel 的 max_input_tokens=180000 之间没有任何已标定的换算，标定需要一次真实发送（TODO，见 ai-review.mjs 常量段注释）",
+          "findings": [],
+          "brief": {
+            "byteSize": 1909,
+            "neededBytes": 1909,
+            "corpusFiles": 2,
+            "fileCount": 2,
+            "overBudget": false,
+            "budgetBasis": "uncalibrated-conservative-byte-proxy：DEFAULT_MAX_BRIEF_BYTES 与 qfmodel 的 max_input_tokens=180000 之间没有任何已标定的换算，标定需要一次真实发送（TODO，见 ai-review.mjs 常量段注释）",
+            "omitted": [],
+            "shapes": {
+              "textEntries": 2,
+              "binaryDigestEntries": 0,
+              "polyglotAsText": 0,
+              "nonTextRerouted": 0,
+              "forensicsRowsSent": 0
+            },
+            "sections": [
+              765,
+              757,
+              183,
+              201
+            ]
+          },
+          "meta": {
+            "backend": "qca",
+            "model": "qfmodel",
+            "agentId": "agent_00sl0jk7cwvlscr4no9c",
+            "agentVersion": 5,
+            "sessionId": "sess_00tb3xmv7ttz45hv35ge",
+            "totalCredits": 1.15,
+            "activeSeconds": 62.338317,
+            "sessionStatus": "idle",
+            "eventId": "evt_00tb40zechmgw5dl46ig",
+            "agentMessageCount": 1,
+            "eventPages": 1,
+            "eventPageSize": 100
+          }
+        },
+        "aiParseFailed": false
+      }
+    ]
+  }
+}
