@@ -305,6 +305,40 @@ test('bio-set：未知 via 一律拒 —— 扩的是白名单，不是「未知
   }
 });
 
+// ── 'session'：服务端签发的长效会话令牌 ─────────────────────────────────────
+// 这一支没有可复算的前缀，CI 只能核对形状。下面两条一条钉「形状对 ⇒ 过」，
+// 一条钉「形状不对 ⇒ 拒」—— 少了后者，白名单里那个值就等于「见到就放行」。
+const sessionEntry = (own = {}) => entry({
+  ownership: { nonce: '', proofPrefix: '', via: 'session', verifiedAt: 1791600000000, ...own },
+});
+
+test('session：via=session 且形状正确（无前缀、无 nonce、verifiedAt 为正整数）→ ok', () => {
+  const v = checkPendingProof(sessionEntry());
+  assert.deepEqual(v, { ok: true });
+  // 空串前缀不是「格式写坏」，是这一支本来就没有前缀 —— 与 bio 那支的空串必须分开判，
+  // 所以顺手确认 bio 的尺子仍然咬人（同一个空串走 'bio' 要拒）。
+  const asBio = entry({ ownership: { nonce: 'abc123', proofPrefix: '', via: 'bio', verifiedAt: 2 } });
+  assert.equal(checkPendingProof(asBio).ok, false, "空前缀走 'bio' 必须仍被拒");
+});
+
+test('session：形状不对一律拒 —— 带前缀 / 带 nonce / verifiedAt 不是正整数', () => {
+  const bad = [
+    { proofPrefix: wantPrefix('demo', ZIP_A) },
+    { proofPrefix: '4f91ceb8' },
+    { nonce: 'abc123' },
+    { verifiedAt: 0 },
+    { verifiedAt: -1 },
+    { verifiedAt: 1.5 },
+    { verifiedAt: '1791600000000' },
+    { verifiedAt: undefined },
+  ];
+  for (const over of bad) {
+    const v = checkPendingProof(sessionEntry(over));
+    assert.equal(v.ok, false, `应当被拒：${JSON.stringify(over)}`);
+    assert.match(v.error, /session|ownership/, `拒因要点名是这一支：${JSON.stringify(over)}`);
+  }
+});
+
 test('bio-set：CLI 走真目录 —— 整批三枚 → 0；把其中一枚换成别的包 → 1 且点名那一枚', () => {
   const dir = mk('vpp-set-ok-');
   let dir2;
