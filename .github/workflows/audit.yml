@@ -99,6 +99,11 @@ jobs:
       # 这两个必须分开导出 —— 合成一个就会退成「台账改动也算索引 PR」，那正是 2026-10-17 复现打穿的形状。
       ledger_pr: ${{ steps.kind.outputs.ledger_pr }}
       ledger_sealed: ${{ steps.derive.outputs.sealed }}
+      # 台账 PR 的提交人准入结论（见「台账 PR 的提交人准入（与投稿 PR 同等）」那一步）。
+      # approve 的台账支要读它：actor 不在白名单 ⇒ 即便机器章齐也不许给绿。
+      # 非台账 PR 时那一步被跳过、这个 output 是空 —— approve 只在 LEDGER_PR=true 时读它，
+      # 而那时它必然已经写成 true/false（写不到就 red，fail closed）。
+      ledger_actor_ok: ${{ steps.ledgeractor.outputs.ok }}
       # 逐字复核的结论（`{ "<章指向的 commit>": {ok, summary|reason} }`）。
       # 两个 job 不共享工作区，而 merge-index 那一次重推导同样要读它 —— 所以经 job output 传。
       # 走 base64：reason 里有**投稿方可控的文字**（条目名、路径、错误第一行），
@@ -386,8 +391,14 @@ jobs:
       # pledge/ownership/identity。栽赃一条假条目不碰酷安、不碰 /submit 也能达成。
       #
       # 三道检查各自买到什么（脚本头有全文，这里只留结论）：
-      #   (a) 推导复算：pledge.version 在已发布集合内、ownership.via === 'bio'、
-      #       ownership.proofPrefix === sha256(entry.id + ':' + <digest>)[0:8]。
+      #   (a) 推导复算：pledge.version 在已发布集合内、ownership.via ∈ {'bio', 'bio-set', 'session'}，
+      #       并按 via 分派 —— bio（v1，单枚）复算 sha256(entry.id + ':' + <digest>)[0:8]，
+      #       bio-set（v2，集合）复算 sha256('sukisu-proof-v2:' + canon(这一套))[0:12]，
+      #       **session 这一支没有可复算的前缀**：令牌在 Worker 的 KV 里，CI 既看不到也验不了，
+      #       只能核形状（proofPrefix 与 nonce 是空串、verifiedAt 是正整数）。所以 session 条目的
+      #       (a) 层强度**低于** bio / bio-set —— 认它等于认「服务端说它验过了」，而不是
+      #       「我们复算过」。这笔账在 scripts/verify-pending-proof.mjs 头注释与
+      #       OWNERSHIP_VIAS 上方各写了一遍，这里必须与那两处同口径。
       #       离线、无密钥、无网络。挡的是「形状都不对」的伪造；**挡不住**会自己
       #       算哈希的人拼一条自洽的 —— 那条路靠 (b) 封。它复算的是条目里**客户端自己上报**
       #       的 sha256，这个值等于 Worker ⑤-f 绑进口令的那份摘要，只因为 ⑤-c 禁止
@@ -610,6 +621,59 @@ jobs:
             fs.appendFileSync(process.env.GITHUB_OUTPUT, "sealed=" + sealed + "\n");
             if (!sealed) console.log("[derive] sealed=false：" + why);
           '
+
+      - name: 台账 PR 的提交人准入（与投稿 PR 同等）
+        id: ledgeractor
+        # 台账 PR 不走 pending 那道 actor 门（它不碰 pending/，grep --require-actor 全仓只有投稿那一处），
+        # 所以在这里单独补一道。要挡的是两类人：
+        #   ① fork 来的外部账号 —— user.login 是外人的名字，不可能命中白名单；
+        #   ② 任何一个有写权限的内部人 —— 台账上的每一条都是一次下架决定，不该由「随便哪个协作者」
+        #      提一条 PR 就把别人的模块抹掉。人工下架请走维护者账号（仓库 owner 或 vars.LEDGER_PR_ACTORS）。
+        # 这一格红 ⇒ audit 红 ⇒ approve 第一步「上游没过检」也红 ⇒ merge-index 不合（fail closed）；
+        # approve 的台账支另外还读 ok 这个 output，两道都齐才给绿。
+        if: github.event_name == 'pull_request' && steps.kind.outputs.ledger_pr == 'true'
+        shell: bash
+        env:
+          ALLOW: ${{ vars.SUBMISSION_PR_ACTORS || 'sukisu-module-submissions[bot]' }}
+          ALLOW_MAINTAINERS: ${{ vars.LEDGER_PR_ACTORS || '' }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          ACTOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          # 先写成 false 再校验：任何一条 exit 1 之前它都已经落盘，读的人永远读到显式结论，
+          # 而不是一个「没跑成所以大概是 true」的空白。
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+          if [ -z "${ACTOR:-}" ]; then
+            echo "::error::读不到这条 PR 的提交人（github.event.pull_request.user.login 为空）—— 台账 PR 的准入判定 fail closed。" >&2
+            exit 1
+          fi
+          ACTOR_LOW="$(printf '%s' "$ACTOR" | tr '[:upper:]' '[:lower:]')"
+          OWNER_LOW="$(printf '%s' "${REPO_OWNER:-}" | tr '[:upper:]' '[:lower:]')"
+          # 白名单 = vars.SUBMISSION_PR_ACTORS（默认 App 登录名）∪ vars.LEDGER_PR_ACTORS（维护者，可空）
+          # ∪ 仓库 owner。GitHub 的 login 大小写不敏感，统一转小写比，免得换个大小写就漏过去。
+          HIT=""
+          while IFS= read -r entry; do
+            entry="$(printf '%s' "$entry" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+            [ -n "$entry" ] || continue
+            if [ "$entry" = "$ACTOR_LOW" ]; then HIT="$entry"; break; fi
+          done <<< "$(printf '%s,%s' "${ALLOW:-}" "${ALLOW_MAINTAINERS:-}" | tr ',' '\n')"
+          if [ -z "$HIT" ] && [ -n "$OWNER_LOW" ] && [ "$OWNER_LOW" = "$ACTOR_LOW" ]; then
+            HIT="仓库 owner（${REPO_OWNER}）"
+          fi
+          if [ -z "$HIT" ]; then
+            {
+              echo "::error::台账 PR 只许由白名单账号提；人工下架请走维护者账号。"
+              echo "::error::这条 PR 的提交人：${ACTOR}"
+              echo "::error::投稿白名单（vars.SUBMISSION_PR_ACTORS，默认 sukisu-module-submissions[bot]）：${ALLOW:-<空>}"
+              if [ -n "${ALLOW_MAINTAINERS:-}" ]; then
+                echo "::error::维护者白名单（vars.LEDGER_PR_ACTORS）：${ALLOW_MAINTAINERS}"
+              fi
+              echo "::error::仓库 owner（${REPO_OWNER:-<空>}）始终可以提台账 PR。"
+            } >&2
+            exit 1
+          fi
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+          echo "[ledger-actor] 台账 PR 提交人 ${ACTOR} 命中白名单（${HIT}）。"
 
       # ---------------------------------------------------------------
       # 2. 跑静态扫描（纯 Node，无 npm 依赖）
@@ -1640,6 +1704,7 @@ jobs:
           DERIVED: ${{ needs.audit.outputs.index_derived }}
           LEDGER_PR: ${{ needs.audit.outputs.ledger_pr }}
           LEDGER_SEALED: ${{ needs.audit.outputs.ledger_sealed }}
+          LEDGER_ACTOR_OK: ${{ needs.audit.outputs.ledger_actor_ok }}
           ACTION: ${{ needs.audit.outputs.action }}
           LABEL: ${{ needs.audit.outputs.label }}
           RISK: ${{ needs.audit.outputs.risk }}
@@ -1680,6 +1745,18 @@ jobs:
           # 证据由 derive 那一步核（每条新增/改动的处置带本 PR 上的机器章，且本次运行给出复核成立的
           # 结论）；这里只读它导出的那一个布尔，不在这里再判一遍。
           if [ "${LEDGER_PR:-}" = "true" ]; then
+            # 准入排在内容前面：机器章核的是「这条处置被复核过」，核不出「谁有资格提这条 PR」。
+            # 顺序也要紧 —— actor 不命中时该念的是「谁在提」，念成「章齐不齐」会让人以为是内容问题。
+            if [ "${LEDGER_ACTOR_OK:-}" != "true" ]; then
+              {
+                echo "::error::未获批准：这条 PR 动了处置台账，但提交人不在白名单里。"
+                echo "::error::台账上的每一条都是一次下架决定，只许由白名单账号提；人工下架请走维护者账号。"
+                echo "::error::白名单 = vars.SUBMISSION_PR_ACTORS（默认 sukisu-module-submissions[bot]）"
+                echo "::error::  ∪ vars.LEDGER_PR_ACTORS（维护者白名单，可空）∪ 仓库 owner。"
+                echo "::error::依据见 audit 作业「台账 PR 的提交人准入（与投稿 PR 同等）」那一步的输出。"
+              } >&2
+              exit 1
+            fi
             if [ "${LEDGER_SEALED:-}" = "true" ]; then
               echo "批准：这次处置台账改动的每一条都有钉在本 PR 某一枚提交上的机器章，且那一枚提交上的复核结论成立。"
               echo "（合并由 merge-index 走 ledger 那一支：它还会按此刻的 main 重推导一遍，并在合完立刻 purge CDN。）"

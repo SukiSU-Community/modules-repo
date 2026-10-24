@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -1008,3 +1008,149 @@ test('actor 白名单住在 workflow 变量里（默认值是核实过的 App �
   assert.ok(!script.includes('sukisu-module-submissions'),
     '脚本里不许烧死 actor 名 —— 白名单必须来自调用方，换 App/换仓库不用改代码');
 });
+
+/* ------------------------------------- 台账 PR 的提交人准入（越权下架那条链上的 B 格） */
+
+/**
+ * 从 WF 里切出某一步的 `run: |` 脚本体（缩进对齐后返回）。
+ * 这里刻意不复用 stepBlock：那个 helper 切的是「整步含 if/env」，而真跑需要的是能直接喂给 bash 的正文。
+ */
+function runBodyOfStep(name) {
+  const lines = fs.readFileSync(WF, 'utf8').replace(/\r\n/g, '\n').split('\n');
+  const start = lines.findIndex((l) => l.trim() === `- name: ${name}`);
+  assert.ok(start >= 0, `workflow 里必须存在名为「${name}」的步骤（改名要一起改这里）`);
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i += 1) {
+    if (/^ {6}- (?:name|uses): /.test(lines[i])) { end = i; break; }
+  }
+  let open = -1;
+  for (let i = start + 1; i < end; i += 1) {
+    if (/^\s*run: \|\s*$/.test(lines[i])) { open = i; break; }
+  }
+  assert.ok(open > start, `步骤「${name}」里必须有 run: | 块`);
+  const keyIndent = lines[open].length - lines[open].trimStart().length;
+  const body = [];
+  for (let i = open + 1; i < end; i += 1) {
+    const l = lines[i];
+    if (l.trim() !== '' && l.length - l.trimStart().length <= keyIndent) break;
+    body.push(l);
+  }
+  const nonBlank = body.filter((l) => l.trim());
+  assert.ok(nonBlank.length > 0, `步骤「${name}」的 run 块是空的`);
+  const indent = Math.min(...nonBlank.map((l) => l.length - l.trimStart().length));
+  return `${body.map((l) => l.slice(indent)).join('\n')}\n`;
+}
+
+const LEDGER_ACTOR_STEP = '台账 PR 的提交人准入（与投稿 PR 同等）';
+const APPROVE_STEP = '只批准「未命中拦截名单的首次收录」或「可复算的索引重建」或「盖上机器章的台账改动」';
+
+/**
+ * 真跑切出来的那段 bash。起法与 runner 一致：GitHub 对 `shell: bash` 展开成
+ * `bash --noprofile --norc -e -o pipefail`，那个 `-e` 是 runner 给的、脚本里撤不掉
+ * —— 用不带 -e 的壳跑，就等于在比线上宽松一档的环境里比（这个坑 audit-triage 那批用例踩过）。
+ */
+function runBashStep(script, env) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wfstep-'));
+  const out = path.join(dir, 'gh-output');
+  fs.writeFileSync(out, '', 'utf8');
+  fs.writeFileSync(path.join(dir, 'step.sh'), script, 'utf8');
+  // 用 spawnSync 而不是 execFileSync：这里断言的是「红了没有、红在哪」，红是数据不是异常。
+  // （execFileSync 在 rc!=0 时抛错，它的 err.stdout/stderr 在 Windows 上只带部分字段，
+  //   上面那两条用例就是被这个静默吃掉了 stderr —— 用 rc 直读的壳才不会骗自己。）
+  const r = spawnSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', 'step.sh'], {
+    cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, GITHUB_OUTPUT: out, ...env },
+  });
+  const exported = fs.readFileSync(out, 'utf8');
+  fs.rmSync(dir, { recursive: true, force: true });
+  return { rc: r.status ?? 1, stdout: String(r.stdout || ''), stderr: String(r.stderr || ''), exported };
+}
+
+test('台账 PR 的提交人准入：白名单命中才放行，外部账号与空白名单一律 fail closed', () => {
+  const body = runBodyOfStep(LEDGER_ACTOR_STEP);
+  const base = { ALLOW: 'sukisu-module-submissions[bot]', ALLOW_MAINTAINERS: '', REPO_OWNER: 'f0d010c' };
+
+  const ok = runBashStep(body, { ...base, ACTOR: 'sukisu-module-submissions[bot]' });
+  assert.equal(ok.rc, 0, `白名单账号必须过：${ok.stderr}`);
+  assert.match(ok.exported, /^ok=true$/m);
+
+  // 这一格就是简报里说的 fork PR：外部账号的 login 不可能命中白名单。
+  const outsider = runBashStep(body, { ...base, ACTOR: 'random-outsider' });
+  assert.equal(outsider.rc, 1, '外部账号必须判红');
+  assert.match(outsider.exported, /^ok=false$/m,
+    '判红时也必须先写下显式结论 —— 读的人不该看到一个「没跑成所以大概是 true」的空白 output');
+  assert.match(outsider.stderr, /台账 PR 只许由白名单账号提/);
+  assert.match(outsider.stderr, /random-outsider/, '报错要点名这条 PR 的提交人，否则人不知道该去找谁');
+  assert.match(outsider.stderr, /vars\.SUBMISSION_PR_ACTORS/);
+
+  // 维护者白名单（vars.LEDGER_PR_ACTORS，可空）
+  const maint = runBashStep(body, { ...base, ALLOW_MAINTAINERS: 'someone-maintainer', ACTOR: 'Someone-Maintainer' });
+  assert.equal(maint.rc, 0, 'GitHub 的 login 大小写不敏感，转小写比之后必须命中');
+  assert.match(maint.exported, /^ok=true$/m);
+
+  // 仓库 owner 始终可以提
+  const owner = runBashStep(body, { ...base, ACTOR: 'F0D010C' });
+  assert.equal(owner.rc, 0);
+  assert.match(owner.exported, /^ok=true$/m);
+
+  // 读不到提交人：fail closed，不是「读不到就当放行」
+  const blank = runBashStep(body, { ...base, ACTOR: '' });
+  assert.equal(blank.rc, 1);
+  assert.match(blank.exported, /^ok=false$/m);
+  assert.match(blank.stderr, /读不到这条 PR 的提交人/);
+
+  // 三个白名单都空时**不能**因为「空 = 空」而放行：空串必须跳过，不是命中。
+  const allEmpty = runBashStep(body, { ALLOW: '', ALLOW_MAINTAINERS: '', REPO_OWNER: '', ACTOR: 'random-outsider' });
+  assert.equal(allEmpty.rc, 1, '空白名单 + 外部账号必须红（空串不许当成通配）');
+  const emptyActorVsEmptyAllow = runBashStep(body, { ALLOW: '', ALLOW_MAINTAINERS: '', REPO_OWNER: '', ACTOR: ' ' });
+  assert.equal(emptyActorVsEmptyAllow.rc, 1, '空白 ACTOR 在任何白名单配置下都必须红');
+});
+
+test('approve 的台账支：actor 不命中 ⇒ 一定红；命中才轮到机器章', () => {
+  const body = runBodyOfStep(APPROVE_STEP);
+  const env = (extra) => ({
+    DISPOSITION: '', INDEX_PR: 'false', DERIVED: 'false', LEDGER_PR: 'true',
+    LEDGER_SEALED: 'true', LEDGER_ACTOR_OK: 'false',
+    ACTION: '', LABEL: '', RISK: '', CHANGE_TYPE: '', MODULE_ID: '', REASONS: '',
+    DISPOSITION_REASON: '', ...extra,
+  });
+
+  // 章齐但 actor 不命中：红，且念的是「谁在提」而不是「章齐不齐」。
+  const denied = runBashStep(body, env({}));
+  assert.equal(denied.rc, 1, 'actor 不命中时 approve 必须红 —— 这一格是「merge-index 不会合」的唯一依据');
+  assert.match(denied.stderr, /提交人不在白名单里/);
+  assert.doesNotMatch(denied.stdout, /批准：这次处置台账改动/);
+
+  const allowed = runBashStep(body, env({ LEDGER_ACTOR_OK: 'true' }));
+  assert.equal(allowed.rc, 0, '两道都齐时必须绿（否则台账 PR 永远合不了，等于把功能关死）');
+  assert.match(allowed.stdout, /批准：这次处置台账改动/);
+
+  // 空（那一步被跳过 / output 没导出来）也必须红：'' 不是 'true'。
+  assert.equal(runBashStep(body, env({ LEDGER_ACTOR_OK: '' })).rc, 1);
+
+  // 顺序：准入在内容之前。顺序错了文案就会把「谁在提」念成「章齐不齐」。
+  const iActor = body.indexOf('LEDGER_ACTOR_OK');
+  const iSealed = body.indexOf('LEDGER_SEALED');
+  assert.ok(iActor >= 0 && iSealed >= 0, 'approve 的台账支必须同时读这两个 output');
+  assert.ok(iActor < iSealed, '准入必须排在机器章之前：先说谁在提，再说章齐不齐');
+
+  // 索引重建那条路不许被这道门连坐：它的 LEDGER_PR 是 false，走的是上面那条分支。
+  const indexPr = runBashStep(body, env({ LEDGER_PR: 'false', INDEX_PR: 'true', DERIVED: 'true', LEDGER_ACTOR_OK: 'false', LEDGER_SEALED: '' }));
+  assert.equal(indexPr.rc, 0, '索引重建 PR 与台账准入无关，不许被它连坐');
+});
+
+test('ledger_actor_ok 从 audit 作业的 output 一路串到 approve 的 env（改名要两边一起改）', () => {
+  const wf = fs.readFileSync(WF, 'utf8').replace(/\r\n/g, '\n');
+  assert.match(wf, /ledger_actor_ok: \$\{\{ steps\.ledgeractor\.outputs\.ok \}\}/,
+    'job output 少一行，approve 读到的就永远是空 ⇒ 台账 PR 全红（fail closed，但功能死）');
+  assert.match(wf, /LEDGER_ACTOR_OK: \$\{\{ needs\.audit\.outputs\.ledger_actor_ok \}\}/);
+
+  const block = stepBlock(wf, 'id: ledgeractor');
+  assert.match(block, /^ {8}if: github\.event_name == 'pull_request' && steps\.kind\.outputs\.ledger_pr == 'true'$/m,
+    '只在台账 PR 上跑：投稿 PR 已经有 --require-actor 那道门，重复判一遍只会多一次红');
+  assert.match(block, /ALLOW: \$\{\{ vars\.SUBMISSION_PR_ACTORS \|\| 'sukisu-module-submissions\[bot\]' \}\}/,
+    '默认值与投稿那道门同一个变量 —— 两处写两个默认值就会在换 App 时只换一半');
+  assert.match(block, /ALLOW_MAINTAINERS: \$\{\{ vars\.LEDGER_PR_ACTORS \|\| '' \}\}/);
+  assert.match(block, /ACTOR: \$\{\{ github\.event\.pull_request\.user\.login \}\}/);
+});
+

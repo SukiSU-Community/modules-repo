@@ -68,6 +68,18 @@ export const MACHINE_SEAL_RE = /^ci:audit@[0-9a-f]{40}$/;
 export const SEAL_PENDING_BY = `${MACHINE_SEAL_PREFIX}pending`;
 
 /**
+ * 探针命名空间：`--reason test-probe` 只许用在这几个前缀开头的模块 id 上。
+ *
+ * 为什么光有「必须带 --sha256」不够：那条判据问的是**这一枚包什么也不做**，而它对一枚
+ * 真模块的包也照样成立 —— 谁都能拿一个内容无害的真包来当「探针」，然后把这个正经模块
+ * 标成 test-probe 下架。机器章的四条判据只核「复核成立」，核不出「这枚包本来就是我方的」。
+ * 所以这一档再加一道身份约束：id 必须落在流水线自检自己造出来的那几个命名空间里。
+ *
+ * 给真模块下架请用 malware / policy / copyright / impersonation / security / abandoned / other。
+ */
+export const PROBE_ID_RE = /^(probe|e2e|canary|selftest)[-_]/i;
+
+/**
  * 组一条处置记录。
  *
  * `by` 是**这一次把这条记录带上 head 的运行**的机器章，不是「admin 说的」。
@@ -134,7 +146,7 @@ export async function main(argv = process.argv.slice(2), io = console, deps = {}
           --kind revoke|deny --reason ${REASONS.join('|')}
           --by ${MACHINE_SEAL_PREFIX}<这条台账 PR 的 head commit sha>
           [--note <公示说明>] [--verify <复核命令>] [--dry-run] [--no-harvest]
-          （--reason test-probe 必须带 --sha256：这一档按「这一枚包什么也不做」复核）`;
+          （--reason test-probe 必须同时带 --id 与 --sha256，且 id 要落在 probe- / e2e- / canary- / selftest- 命名空间）`;
   if (!flags.id && !flags.sha256 && !flags.uid) {
     io.error(`[revoke] 必须至少给一个选择器（--id / --sha256 / --uid）。\n${usage}`);
     return 2;
@@ -147,11 +159,27 @@ export async function main(argv = process.argv.slice(2), io = console, deps = {}
     io.error(`[revoke] --reason 必须是公示分类之一（${REASONS.join(' / ')}），收到 ${JSON.stringify(flags.reason)}`);
     return 2;
   }
-  // 探针档（test-probe）走的是「这枚包什么也不做」那条复核：verify-report-evidence 要按 sha256
-  // 定位到 base 索引里的**那一枚产物**才谈得上判内容，所以这一档必须点名产物，不许只给 id。
+  // 探针档（test-probe）是**流水线自检留下的包**那一条窄路，三件事都得先满足：
+  //   ① 必须点名 id：台账里那条处置要能回访到「它属于哪个探针模块」；
+  //   ② 必须点名 sha256：verify-report-evidence 要按 sha256 定位到 base 索引里的**那一枚产物**
+  //      才谈得上判内容，只按 id 抹整个模块过不了台账 PR 的复核；
+  //   ③ id 必须落在探针命名空间（PROBE_ID_RE）里：这条 reason 的判据是「包内什么也不做」，
+  //      它对一枚真模块的包也照样成立 —— 没有这道身份约束，一个内容无害的真包就能被标成
+  //      test-probe 下架，而机器章只核「复核成立」，核不出「这枚包本来就是我方的」。
+  if (flags.reason === 'test-probe' && !flags.id) {
+    io.error('[revoke] --reason test-probe 必须同时给 --id：探针档要同时点名「哪一枚包」（--sha256）'
+      + '与「它属于哪个探针模块」（--id），只给摘要的话台账里那条处置没有可以回访的模块。');
+    return 2;
+  }
   if (flags.reason === 'test-probe' && !flags.sha256) {
     io.error('[revoke] --reason test-probe 必须同时给 --sha256：探针档复核的是「这一枚具体包什么也不做」，'
       + '只按 id 抹整个模块过不了台账 PR 的复核。');
+    return 2;
+  }
+  if (flags.reason === 'test-probe' && !PROBE_ID_RE.test(String(flags.id).trim())) {
+    io.error('[revoke] --reason test-probe 只用于流水线自检留下的探针包，模块 id 必须以 probe- / e2e- / '
+      + 'canary- / selftest- 开头（收到 ' + JSON.stringify(flags.id) + '）。'
+      + '给真模块下架请用 reason=malware|policy|copyright|impersonation|security|abandoned|other。');
     return 2;
   }
   if (!flags.by || flags.by === true) {

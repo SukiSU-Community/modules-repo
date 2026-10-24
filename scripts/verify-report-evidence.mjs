@@ -55,6 +55,14 @@ export const PROBE_MAX_TOTAL_BYTES = 256 * 1024;
 /** 占位脚本里「不算做事」的整行。剥掉注释与空行后只许剩这些。 */
 export const PROBE_HARMLESS_LINES = new Set(['exit 0', 'exit', ':', 'true']);
 
+/**
+ * `module.prop` 在探针档里**只许**出现的键。
+ *
+ * 为什么要有这一格：`install=` / `post-fs-data=` / `service=` 这些键自己就是「安装后会做事」，
+ * 不靠任何条目内容就能改设备 —— 而只看条目内容的那套判据看不见它们。
+ */
+export const PROBE_PROP_KEYS = new Set(['id', 'name', 'version', 'versionCode', 'author', 'description']);
+
 /** 索引文件：被下架的那一枚产物「现在用户能不能下到」由它回答。 */
 export const DEFAULT_INDEX_FILE = 'json/modules.json';
 
@@ -223,15 +231,22 @@ export function verifyReportEvidenceDoc(ev, { openPackage, readEntry }) {
  *
  *   1. 归档 ≤ PROBE_MAX_PACKAGE_BYTES、解压合计 ≤ PROBE_MAX_TOTAL_BYTES —— 「几百字节的占位包」；
  *   2. 每个条目都是文本（`isNonTextContent` 不命中：没有 ELF/PE/Mach-O/DEX/ZIP 魔数、没有 NUL）；
- *   3. 根上有 `module.prop`，它自报的 `id` / `versionCode` 与处置点名的那一条一致；
- *   4. 除 `module.prop` 外，每个条目剥掉 `#` 注释与空行之后**只剩空操作**
+ *   3. **只许根级条目**：任何条目路径带 `/`（尤其 `system/**`）一律判红；
+ *   4. 根上有 `module.prop`，它自报的 `id` / `versionCode` 与处置点名的那一条一致，且**只许**
+ *      `id` / `name` / `version` / `versionCode` / `author` / `description` 六个键；
+ *   5. 除 `module.prop` 外，每个条目剥掉 `#` 注释与空行之后**只剩空操作**
  *      （`exit 0` / `exit` / `:` / `true`）。
  *
- * 第 4 条是这一档能不能被滥用的全部：一个包只要真的会做事（写文件、改属性、起进程、装 .so），
- * 就过不了这一格，也就拿不到探针章。所以「有 write 权限的人把真模块标成 test-probe 抹掉」
- * 这条路走不通 —— 能过的包，抹掉它对用户的损害上限就是「少一个什么也不做的条目」。
+ * 只看内容（第 5 条）是不够的：**「内容全是空操作」≠「安装后什么也不做」**。KernelSU 模块靠
+ * `system/**` 覆盖层挂载，用空文件顶掉 `system/bin/sh`、`system/build.prop`、`Settings.apk`
+ * 或塞一张 CA 证书，是「禁用系统应用」这类主流模块的正常工作方式。所以路径必须是独立一格（第 3 条），
+ * `module.prop` 里的钩子键（不靠任何条目内容就能改设备）也必须独立挡（第 4 条）。
  *
- * 这一层只吃 `readZip` 的产物，不下载、不碰路径，所以每条失效方向都能离线逐条打到。
+ * 这几格合起来才是这一档能不能被滥用的全部：一个包只要真的会做事（覆盖系统文件、写文件、改属性、
+ * 起进程、装 .so），就过不了，也就拿不到探针章。所以「有 write 权限的人把真模块标成 test-probe
+ * 抹掉」这条路走不通 —— 能过的包，抹掉它对用户的损害上限就是「少一个什么也不做的条目」。
+ *
+ * 这一层只吃 `readZip` 的产物，不下载、不解压，所以每条失效方向都能离线逐条打到。
  */
 export function judgeProbePackage({ d = {}, size = 0, files = [], unread = [] } = {}) {
   const who = d.id || '(无 id)';
@@ -252,6 +267,13 @@ export function judgeProbePackage({ d = {}, size = 0, files = [], unread = [] } 
   for (const f of files) {
     total += Buffer.byteLength(String(f.content == null ? '' : f.content), 'utf8');
     if (isNonTextContent(f)) problems.push(`${who} 的 ${f.name} 是二进制（或含 NUL）—— 探针档只收文本占位`);
+    // 路径也是判据，而且是独立的一格：探针包只许根级条目。`system/**` 是覆盖层 —— 一枚内容为
+    // `:` 甚至 0 字节的条目照样能顶掉系统的 `bin/sh` / `build.prop` / `Settings.apk` / CA 证书，
+    // 那已经不是「什么也不做」了。只读内容的那套判据对这一类全部放行。
+    if (/[\\/]/.test(String(f.name == null ? '' : f.name))) {
+      problems.push(`${who} 的条目 ${JSON.stringify(f.name)} 带路径分隔符（不在归档根上）—— 探针包不该带覆盖层：`
+        + 'KernelSU 模块的 system/** 会把条目挂进系统，用空文件顶掉系统文件本身就是「做了事」');
+    }
   }
   if (total > PROBE_MAX_TOTAL_BYTES) {
     problems.push(`${who}：解压后共 ${total} 字节，超过探针档上限 ${PROBE_MAX_TOTAL_BYTES}`);
@@ -266,6 +288,14 @@ export function judgeProbePackage({ d = {}, size = 0, files = [], unread = [] } 
       const eq = line.indexOf('=');
       if (eq <= 0) continue;
       fields.set(line.slice(0, eq).trim(), line.slice(eq + 1).trim());
+    }
+    // module.prop 只许六个键：`install=` / `post-fs-data=` / `service=` 这类钩子自己就是
+    // 「安装后会做事」，不靠任何条目内容就足以改设备。
+    for (const k of fields.keys()) {
+      if (!PROBE_PROP_KEYS.has(k)) {
+        problems.push(`${who} 的 module.prop 里出现探针档不认的键 ${JSON.stringify(k)} —— 只许 `
+          + `${[...PROBE_PROP_KEYS].join(' / ')} 六个键（钩子键本身就是「安装后会做事」）`);
+      }
     }
     const propId = fields.get('id');
     if (!propId) {
@@ -350,7 +380,9 @@ export async function reviewLedgerPr({
   // 失败都要留在这格的红里 —— 直接按 sha 覆写的话，前面那条的失败会被后面那条的成功抹掉。
   const acc = new Map();
   const addProblem = (sha, msg) => {
-    if (!acc.has(sha)) acc.set(sha, { problems: [], checked: 0 });
+    // 形状必须与 addChecked 建的那格一致：少了 `probe`，同一枚章里「既有失败又有成功探针」
+    // 的时候 `undefined + n` 会变成 NaN。
+    if (!acc.has(sha)) acc.set(sha, { problems: [], checked: 0, probe: 0 });
     acc.get(sha).problems.push(msg);
   };
   const addChecked = (sha, n, probe = 0) => {
@@ -457,15 +489,34 @@ export async function reviewLedgerPr({
       const handle = packages.get(sha);
       let r;
       if (isProbe) {
-        // 探针档：跳过「条目内逐字定位」，换成「这枚包什么也不做」的核对。取包与实算 sha256 在上面
-        // 已经走过一遍（地址来自 base 索引，不是证据里写的），这一格只判内容。
-        try {
-          const z = readAll(handle.path);
-          r = judgeProbePackage({ d, size: handle.bytes.length, files: z.files, unread: z.unread });
-        } catch (e) {
-          r = { ok: false, problems: [`读整包失败：${String((e && e.message) || e)}`], checked: 0 };
+        // 探针档：跳过「条目内逐字定位」，换成「这枚包什么也不做」的核对。
+        //
+        // 取包地址来自 base 索引（不是证据里写的），但那**只决定取哪一条 URL**，不证明取回来的
+        // 字节就是处置点名的那一枚：downloadToBuffer 只判协议/主机/重定向/大小，assertDownloadUrl
+        // 只比 URL 尾名是不是 `<sha>.zip` —— 两处都不算摘要。所以这一格必须自己实算一次。
+        const actual = sha256Hex(Buffer.from(handle.bytes));
+        if (actual !== String(sha).toLowerCase()) {
+          problems.push(`${who}：取回的包实算 sha256 是 ${actual.slice(0, 12)}，与处置点名的 ${sha.slice(0, 12)} 不是同一枚 —— 文件名的 <sha>.zip 只是约定，不是摘要`);
+          continue;
         }
-        probeTotal += r.checked;
+        // 先判归档字节数、再解压：readZip 会把整包解进内存（单条目默认 24 MiB），
+        // 一枚 64 KiB 的归档可以塞爆 runner —— 超上限的包根本不进解压器。
+        if (handle.bytes.length > PROBE_MAX_PACKAGE_BYTES) {
+          r = {
+            ok: false, checked: 0,
+            problems: [`${who}：归档 ${handle.bytes.length} 字节，超过探针档上限 ${PROBE_MAX_PACKAGE_BYTES} —— 这一档只收几百字节的占位包`],
+          };
+        } else {
+          try {
+            const z = readAll(handle.path);
+            r = judgeProbePackage({ d, size: handle.bytes.length, files: z.files, unread: z.unread });
+          } catch (e) {
+            r = { ok: false, problems: [`读整包失败：${String((e && e.message) || e)}`], checked: 0 };
+          }
+        }
+        // 汇总口径按**处置**（也就是一枚包）计，不按条目数：`r.checked` 是条目数（files.length），
+        // 拿它当「条」报会把一枚包报成 2 条处置。
+        probeTotal = r.ok ? 1 : 0;
       } else {
         r = verifyReportEvidenceDoc(doc, {
           openPackage: () => handle.bytes,
@@ -486,7 +537,7 @@ export async function reviewLedgerPr({
   for (const [sha, a] of acc) {
     const parts = [];
     if (a.checked) parts.push(`逐字复核：${a.checked} 段引用在归档里逐字节对上`);
-    if (a.probe) parts.push(`探针档：${a.probe} 条按「包内没有可执行内容」核对通过`);
+    if (a.probe) parts.push(`探针档：${a.probe} 枚包按「没有覆盖层、也没有可执行内容」核对通过`);
     reviews[sha] = a.problems.length
       ? { ok: false, reason: a.problems.join('；') }
       : { ok: true, summary: parts.join('；') || '复核通过' };
