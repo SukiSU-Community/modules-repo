@@ -96,9 +96,15 @@ const PREFIX_V2_RE = /^[0-9a-f]{12}$/;
  * 认得的 ownership.via 取值 —— 换代次序按设计文档 §15/§17.5「读的一侧先扩成旧值 ∪ 新值」：
  *   'bio'     = v1 单枚口令（今天线上唯一在跑的那一支，形状一个字不改）
  *   'bio-set' = v2 集合口令，一次批量投稿 N 枚共用一枚口令，前缀绑的是**整套**
+ *   'session' = 服务端签发的长效会话令牌（90 天）。这一支**没有可复算的前缀**：
+ *               令牌本身在 Worker 的 KV 里，CI 这边既看不到也验不了，只能核对形状
+ *               （proofPrefix 与 nonce 都是空串、verifiedAt 是正整数）。所以它的
+ *               (a) 层强度**低于** bio/bio-set 两支 —— 认它等于认「服务端说它验过了」，
+ *               而不是「我们复算过」。这一点是刻意的：免改签名的代价就是把一次复算
+ *               换成一次信任，写在这里是为了让后来的人看得见这笔账。
  * 未知值照旧一律拒 —— 扩的是白名单，不是「未知就当放行」。
  */
-export const OWNERSHIP_VIAS = ['bio', 'bio-set'];
+export const OWNERSHIP_VIAS = ['bio', 'bio-set', 'session'];
 export const PROOF_PREFIX_LEN = 8;
 export const PROOF_PREFIX_LEN_V2 = 12;
 /** v2 的输入前缀，与 worker/src/proof.ts:132 逐字同一串；改它就是换代。 */
@@ -221,6 +227,39 @@ export function checkPendingProof(entry, ctx = {}) {
     if (!SHA256_RE.test(c.sha)) {
       return { ok: false, error: `${id}：${c.where}「${c.sha.slice(0, 72)}」不是 64 位小写十六进制的 sha256，拒` };
     }
+  }
+
+  // ── 'session'：服务端签发的长效会话令牌 ──
+  // 这一支没有口令，所以**没有可复算的前缀**：能核对的只有形状。三条形状都有理由：
+  //  · proofPrefix === ''：会话这条路压根没算过前缀，留个非空值只会让人以为它能复算；
+  //  · nonce === ''：同理，令牌不是口令，写个 nonce 进来就是在冒充签名那条路；
+  //  · verifiedAt 是正整数：它是「服务端哪一刻验的」，缺失或形状不对就无法追溯。
+  // 判序刻意排在 'bio' 之前：'bio' 那条要求 8 位十六进制前缀，空串会被它用一句
+  // 「不是 8 位小写十六进制」拒掉 —— 那句文案对会话这条路是错的（它不是格式写坏了，
+  // 而是本来就没有）。先认出是哪一支，再按那一支的尺子量。
+  if (own.via === 'session') {
+    if (own.proofPrefix !== '') {
+      return {
+        ok: false,
+        error: `${id}：ownership.via='session' 的 proofPrefix 必须是空串（收到「${String(own.proofPrefix).slice(0, 40)}」）`
+          + ' —— 会话令牌那条路没有可复算的前缀，写一个前缀进来就是在冒充口令那条路，拒',
+      };
+    }
+    if (own.nonce !== '') {
+      return {
+        ok: false,
+        error: `${id}：ownership.via='session' 的 nonce 必须是空串（收到「${String(own.nonce).slice(0, 40)}」）`
+          + ' —— 会话令牌不是口令，带 nonce 的会话条目读不懂，拒',
+      };
+    }
+    if (typeof own.verifiedAt !== 'number' || !Number.isInteger(own.verifiedAt) || own.verifiedAt <= 0) {
+      return {
+        ok: false,
+        error: `${id}：ownership.via='session' 的 verifiedAt 必须是正整数毫秒时间戳（收到「${String(own.verifiedAt).slice(0, 40)}」）`
+          + ' —— 会话令牌那条路没有可复算的前缀，这一格是唯一的追溯锚点，缺了就拒',
+      };
+    }
+    return { ok: true };
   }
 
   if (own.via === 'bio') {
