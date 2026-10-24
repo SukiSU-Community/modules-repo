@@ -82,8 +82,9 @@ test('缺选择器 / 缺 by / reason 不在枚举 / version-code 没配 id → �
 });
 
 test('--dry-run：把要写的条目说清楚，但不落盘、不重算索引', async () => {
-  const s = sandboxWithModule();
-  const { rc, io } = await run(s, ['--id', 'mod_x', '--sha256', SHA('c'), '--kind', 'revoke', '--reason', 'test-probe', '--by', BY, '--dry-run']);
+  // test-probe 只收探针命名空间里的 id（见下一条用例），所以这里造一枚探针模块。
+  const s = sandboxWithModule('probe-dryrun');
+  const { rc, io } = await run(s, ['--id', 'probe-dryrun', '--sha256', SHA('c'), '--kind', 'revoke', '--reason', 'test-probe', '--by', BY, '--dry-run']);
   assert.equal(rc, 0);
   assert.match(io.out.join('\n'), /--dry-run：没写任何文件/);
   assert.equal(fs.existsSync(s.ledgerPath), false);
@@ -91,8 +92,8 @@ test('--dry-run：把要写的条目说清楚，但不落盘、不重算索引',
 });
 
 test('正常下架：写台账 -> 调 build-index 重算 -> 索引里那条真没了', async () => {
-  const s = sandboxWithModule();
-  const { rc, io } = await run(s, ['--id', 'mod_x', '--sha256', SHA('c'), '--kind', 'revoke', '--reason', 'test-probe', '--by', BY, '--note', '流水线探针包'], capture());
+  const s = sandboxWithModule('probe-e2e');
+  const { rc, io } = await run(s, ['--id', 'probe-e2e', '--sha256', SHA('c'), '--kind', 'revoke', '--reason', 'test-probe', '--by', BY, '--note', '流水线探针包'], capture());
   assert.equal(rc, 0, io.out.join('\n') + '\n' + io.out.join('\n'));
 
   const ledger = JSON.parse(fs.readFileSync(s.ledgerPath, 'utf8'));
@@ -101,7 +102,7 @@ test('正常下架：写台账 -> 调 build-index 重算 -> 索引里那条真�
   // `dispositions.test.mjs` 那组兼容用例负责 —— 两边的分工别在一处重复。
   assert.equal(ledger.schema, 'sukisu-dispositions-v2');
   assert.equal(ledger.dispositions.length, 1);
-  assert.equal(ledger.dispositions[0].id, 'mod_x');
+  assert.equal(ledger.dispositions[0].id, 'probe-e2e');
   assert.equal(ledger.dispositions[0].kind, 'revoke');
   assert.equal(ledger.dispositions[0].by, BY, '署名必须原样落进台账');
   assert.match(ledger.dispositions[0].at, /Z$/, '写入的时间必须带时区');
@@ -109,7 +110,7 @@ test('正常下架：写台账 -> 调 build-index 重算 -> 索引里那条真�
   const idx = JSON.parse(fs.readFileSync(s.indexPath, 'utf8'));
   assert.deepEqual(idx.modules.map((m) => m.id), [], '索引要被 build-index 重算，不是被脚本手改');
   assert.match(io.out.join('\n'), /台账抹掉版本 1/);
-  assert.match(io.out.join('\n'), /git checkout -b revoke\/mod_x/);
+  assert.match(io.out.join('\n'), /git checkout -b revoke\/probe-e2e/);
   fs.rmSync(s.dir, { recursive: true, force: true });
 });
 
@@ -136,8 +137,8 @@ test('只指到产物：抹那一条版本，模块与其它版本留着', async
 });
 
 test('test-probe 不带 --sha256 → 退出 2：探针档按「这一枚包什么也不做」复核，只给 id 过不了', async () => {
-  const s = sandboxWithModule();
-  const { rc, io } = await run(s, ['--id', 'mod_x', '--kind', 'revoke', '--reason', 'test-probe', '--by', BY]);
+  const s = sandboxWithModule('probe-nosha');
+  const { rc, io } = await run(s, ['--id', 'probe-nosha', '--kind', 'revoke', '--reason', 'test-probe', '--by', BY]);
   assert.equal(rc, 2);
   assert.match(io.out.join('\n'), /test-probe 必须同时给 --sha256/);
   assert.equal(fs.existsSync(s.ledgerPath), false, '拒写时不许建台账文件');
@@ -145,10 +146,10 @@ test('test-probe 不带 --sha256 → 退出 2：探针档按「这一枚包什�
 });
 
 test('同样选择器重复下处置 → 退出 4，不写第二条', async () => {
-  const s = sandboxWithModule();
-  await run(s, ['--id', 'mod_x', '--sha256', SHA('c'), '--kind', 'revoke', '--reason', 'test-probe', '--by', BY]);
+  const s = sandboxWithModule('probe-dup');
+  await run(s, ['--id', 'probe-dup', '--sha256', SHA('c'), '--kind', 'revoke', '--reason', 'test-probe', '--by', BY]);
   const before = fs.readFileSync(s.ledgerPath, 'utf8');
-  const { rc, io } = await run(s, ['--id', 'mod_x', '--sha256', SHA('c'), '--kind', 'revoke', '--reason', 'malware', '--by', `ci:audit@${'cd'.repeat(20)}`], capture());
+  const { rc, io } = await run(s, ['--id', 'probe-dup', '--sha256', SHA('c'), '--kind', 'revoke', '--reason', 'malware', '--by', `ci:audit@${'cd'.repeat(20)}`], capture());
   assert.equal(rc, 4);
   assert.match(io.out.join('\n'), /已经有同样选择器的记录/);
   assert.equal(fs.readFileSync(s.ledgerPath, 'utf8'), before, '重复下处置不许往台账里堆矛盾记录');
@@ -225,5 +226,34 @@ test('main：--by 形状不对时退出 2，并告诉人 sha 从哪儿来，绝�
   assert.equal(rc, 2);
   assert.ok(lines.some((l) => l.includes(SEAL_PENDING_BY)), '报错要顺手给出两枚提交的写法，否则人只能瞎猜');
   assert.equal(fs.existsSync(s.ledgerPath), false, '一条都不该写下去');
+  fs.rmSync(s.dir, { recursive: true, force: true });
+});
+
+test('test-probe + 真模块 id → 退出 2：探针档的判据对真包也成立，没有命名空间就能把一枚无害的真包标成探针下架', async () => {
+  const s = sandboxWithModule();
+  const { rc, io } = await run(s, ['--id', 'mod_x', '--sha256', SHA('c'), '--kind', 'revoke', '--reason', 'test-probe', '--by', BY]);
+  assert.equal(rc, 2);
+  assert.match(io.out.join('\n'), /test-probe 只用于流水线自检留下的探针包/);
+  assert.match(io.out.join('\n'), /probe- \/ e2e- \/ canary- \/ selftest-/, '报错要把认得的命名空间列出来');
+  assert.match(io.out.join('\n'), /malware\|policy\|copyright/, '并告诉人真模块该用哪几个 reason');
+  assert.equal(fs.existsSync(s.ledgerPath), false, '拒写时不许建台账文件');
+  fs.rmSync(s.dir, { recursive: true, force: true });
+});
+
+test('test-probe + probe- 前缀 + sha256 → 放行：流水线自检的探针包走得通这条窄路', async () => {
+  const s = sandboxWithModule('probe-ok');
+  const { rc, io } = await run(s, ['--id', 'probe-ok', '--sha256', SHA('c'), '--kind', 'revoke', '--reason', 'test-probe', '--by', BY]);
+  assert.equal(rc, 0, io.out.join('\n'));
+  const ledger = JSON.parse(fs.readFileSync(s.ledgerPath, 'utf8'));
+  assert.equal(ledger.dispositions[0].reason, 'test-probe');
+  fs.rmSync(s.dir, { recursive: true, force: true });
+});
+
+test('test-probe 不带 --id → 退出 2：只给摘要的话台账里那条处置回访不到探针模块', async () => {
+  const s = sandboxWithModule();
+  const { rc, io } = await run(s, ['--sha256', SHA('c'), '--kind', 'revoke', '--reason', 'test-probe', '--by', BY]);
+  assert.equal(rc, 2);
+  assert.match(io.out.join('\n'), /test-probe 必须同时给 --id/);
+  assert.equal(fs.existsSync(s.ledgerPath), false, '拒写时不许建台账文件');
   fs.rmSync(s.dir, { recursive: true, force: true });
 });

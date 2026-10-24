@@ -86,14 +86,23 @@ API 允许先建提交对象、后建分支，所以分支被创建的那一瞬�
 
 流水线自检留下的探针包（`test-probe`）没有任何「指控引用的原文」可核 —— 它要证明的是
 「这枚包里**什么也不做**」。所以 `verify-report-evidence.mjs` 对 `reason=test-probe` 的处置换一套判据
-（`judgeProbePackage`），换成四格：
+（`judgeProbePackage`），换成六格：
 
 | # | 判据 | 挡的是什么 |
 |---|---|---|
 | ① | 归档 ≤ 64 KiB、解压后合计 ≤ 256 KiB | 拿一枚真模块冒充探针 |
 | ② | 每个条目都得是文本（无 ELF/PE/Mach-O/DEX/ZIP 魔数、无 NUL 字节） | 把 `.so` / dex 混进「空包」 |
-| ③ | 根上有 `module.prop`，自报的 `id` / `versionCode` 与处置点名的一致 | 一包两用：拿着 A 的空包去抹 B |
-| ④ | 除 `module.prop` 外，每个条目剥掉注释与空行后只剩 `exit 0` / `exit` / `:` / `true` | 「占位包」里塞一行 `rm -rf` |
+| ③ | **每个条目都在归档根上**（名字不含 `/` 或 `\`） | 覆盖层：`system/**` 下的条目靠挂载顶掉系统文件，内容可以只是 `:` 甚至 0 字节 |
+| ④ | 根上有 `module.prop`，自报的 `id` / `versionCode` 与处置点名的一致 | 一包两用：拿着 A 的空包去抹 B |
+| ⑤ | `module.prop` 只许 `id` / `name` / `version` / `versionCode` / `author` / `description` 六个键 | `install=` / `post-fs-data=` / `service=` 这类键本身就是「安装后会做事」 |
+| ⑥ | 除 `module.prop` 外，每个条目剥掉注释与空行后只剩 `exit 0` / `exit` / `:` / `true` | 「占位包」里塞一行 `rm -rf` |
+
+③ 与 ⑤ 是同一课的两半：**「内容全是空操作」不等于「安装后什么也不做」**。KernelSU 模块
+靠 `system/**` 覆盖层挂载，一枚内容为 `:` 的 `system/bin/sh` 照样能把系统 shell 顶掉，
+一枚 0 字节的 `system/priv-app/Settings/Settings.apk` 照样能禁用系统设置 —— 而这些正是
+「禁用系统应用」这类主流模块的正常工作方式。所以路径与 `module.prop` 的键各占一格，
+不能靠「逐行看内容」一格兜住。同理，取回的字节必须**实算** sha256 与处置点名的比对：
+`<sha>.zip` 只是下载地址尾名的约定，不是摘要。
 
 两条路**互不走串**：探针档只认 `sukisu-evidence-v1`（§8 审核证据），举报那条只认
 `sukisu-report-evidence-v1`；拿错一类过来，红在 schema 那一格，不会被当成「没问题」。

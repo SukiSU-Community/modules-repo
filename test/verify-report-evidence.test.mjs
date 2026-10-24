@@ -739,6 +739,159 @@ test('探针档端到端：标成 test-probe 却是一枚真会做事的包 ⇒ 
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+/* -------------------------------------------- 探针档：覆盖层与 module.prop 键白名单 */
+
+/**
+ * P0-1 的正面样本：**内容全是空操作 ≠ 安装后什么也不做**。
+ *
+ * KernelSU 模块靠 `system/**` 覆盖层挂载 —— 一枚内容为 `:` 甚至 0 字节的条目照样能顶掉
+ * `system/bin/sh`、`system/build.prop`、`Settings.apk`、CA 证书位。这些都是「禁用系统应用」
+ * 这类主流模块的正常工作方式，所以路径必须是独立一格判据。
+ */
+test('探针档：条目带路径（覆盖层）⇒ 一律不成立，尤其 system/**', () => {
+  const prop = 'id=probe_a\nversionCode=3\n';
+  for (const [entry, why] of [
+    [{ name: 'system/bin/sh', content: ':\n' }, '顶掉系统 shell'],
+    [{ name: 'system/build.prop', content: ':\n' }, '顶掉系统属性'],
+    [{ name: 'system/priv-app/Settings/Settings.apk', content: '' }, '0 字节顶掉系统应用'],
+    [{ name: 'system/etc/hosts', content: 'exit 0\n' }, '顶掉 hosts'],
+    [{ name: 'system/etc/security/cacerts/evil.0', content: ':\n' }, '塞一张 CA 证书'],
+    [{ name: 'system/bin/evil', content: 'exit 0\n' }, '往系统 bin 里放东西'],
+  ]) {
+    const f = fixtureProbe('probe_a', 3, [
+      { name: 'module.prop', content: prop },
+      entry,
+    ]);
+    const r = judgeProbePackage(probeArgsOf(f));
+    assert.equal(r.ok, false, `${why}（${entry.name}）本该判红`);
+    assert.match(r.problems.join('；'), /覆盖层|路径分隔符/, `${entry.name} 的红要说清是覆盖层`);
+  }
+});
+
+test('探针档：根级 service.sh 内容为 : ⇒ 仍然成立（正面样本不许被误伤）', () => {
+  const f = fixtureProbe('probe_a', 3, [
+    { name: 'module.prop', content: 'id=probe_a\nname=Probe A\nversion=1.0\nversionCode=3\nauthor=probe\ndescription=probe\n' },
+    { name: 'service.sh', content: ':\n' },
+  ]);
+  const r = judgeProbePackage(probeArgsOf(f));
+  assert.equal(r.ok, true, r.problems.join('；'));
+});
+
+test('探针档：module.prop 出现钩子键（install= / post-fs-data= / service=）⇒ 不成立', () => {
+  for (const key of ['install=/data/adb/evil.sh', 'post-fs-data=/data/adb/e.sh', 'service=/data/adb/s.sh', 'whatever=1']) {
+    const f = fixtureProbe('probe_a', 3, [
+      { name: 'module.prop', content: `id=probe_a\nversionCode=3\n${key}\n` },
+      { name: 'service.sh', content: 'exit 0\n' },
+    ]);
+    const r = judgeProbePackage(probeArgsOf(f));
+    assert.equal(r.ok, false, `module.prop 里的 ${key} 本该挡下`);
+    assert.match(r.problems.join('；'), /不认的键/);
+  }
+});
+
+test('探针档：module.prop 只有合法的六个键 ⇒ 成立', () => {
+  const f = fixtureProbe('probe_a', 3, [
+    { name: 'module.prop', content: 'id=probe_a\nname=Probe A\nversion=1.0\nversionCode=3\nauthor=probe\ndescription=probe\n' },
+    { name: 'service.sh', content: '# no-op\nexit 0\n' },
+  ]);
+  const r = judgeProbePackage(probeArgsOf(f));
+  assert.equal(r.ok, true, r.problems.join('；'));
+});
+
+/* ------------------------------------ 探针档：取回的字节必须实算 sha256（不许只信文件名） */
+
+test('探针档：取回的包实算 sha256 与处置点名的不一致 ⇒ 不成立（<sha>.zip 只是约定）', async () => {
+  const good = fixtureProbe('mod_x', 3);
+  // 换一枚字节完全不同、但同样「什么也不做」的包：内容判据会放行，只有 sha 这一格挡得住。
+  const impostor = fixtureProbe('mod_x', 3, [
+    { name: 'module.prop', content: 'id=mod_x\nversionCode=3\n' },
+    { name: 'service.sh', content: 'exit 0\n' },
+  ]);
+  assert.notEqual(impostor.sha, good.sha, '夹具的两包必须真的不同');
+  const dir = ledgerRepo([good]);
+  const { c1 } = makeLedgerCommits(dir, good, { reason: 'test-probe', id: 'mod_x', versionCode: 3 });
+  const { reviews } = await reviewLedgerPr({
+    cwd: dir, baseRef: 'main', headRef: 'HEAD',
+    deps: { download: async () => impostor.zip },
+  });
+  assert.equal(reviews[c1].ok, false, '字节不是点名那一枚就不能盖章');
+  assert.match(reviews[c1].reason, /实算 sha256/);
+  assert.match(reviews[c1].reason, /不是同一枚/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('探针档：归档超上限时根本不进解压器（先判字节数）', async () => {
+  // 造一枚**真包**、但归档 > 64 KiB：这个条目用 stored（method=0）存，deflate 压不下去。
+  const fat = Array.from({ length: 20000 }, () => Math.random().toString(16).slice(2, 6)).join('');
+  const f = fixtureProbe('mod_x', 3, [
+    { name: 'module.prop', content: 'id=mod_x\nversionCode=3\n' },
+    { name: 'service.sh', content: fat, method: 0 },
+  ]);
+  assert.ok(f.zip.length > PROBE_MAX_PACKAGE_BYTES, `夹具的包必须真的超上限（${f.zip.length}）`);
+  const dir = ledgerRepo([f]);
+  const { c1 } = makeLedgerCommits(dir, f, { reason: 'test-probe', id: 'mod_x', versionCode: 3 });
+  let readAllCalled = 0;
+  const { reviews } = await reviewLedgerPr({
+    cwd: dir, baseRef: 'main', headRef: 'HEAD',
+    deps: {
+      download: async () => f.zip,
+      readAll: () => { readAllCalled++; throw new Error('不该走到解压'); },
+    },
+  });
+  assert.equal(reviews[c1].ok, false);
+  assert.match(reviews[c1].reason, /超过探针档上限/);
+  assert.equal(readAllCalled, 0, '超上限的包不许进解压器 —— 否则 64 KiB 归档能塞爆 runner');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('探针档汇总按处置（枚包）计，不按条目数', async () => {
+  const f = fixtureProbe('mod_x', 3); // 两个条目：module.prop + service.sh
+  const dir = ledgerRepo([f]);
+  const { c1 } = makeLedgerCommits(dir, f, { reason: 'test-probe', id: 'mod_x', versionCode: 3 });
+  const { reviews } = await reviewLedgerPr({ cwd: dir, baseRef: 'main', headRef: 'HEAD', deps: depsFor(f) });
+  assert.equal(reviews[c1].ok, true, reviews[c1].reason);
+  assert.match(reviews[c1].summary, /探针档：1 枚包/);
+  assert.doesNotMatch(reviews[c1].summary, /探针档：2 /, '条目数不许被当成处置数报出去');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('同一枚章里既有失败的探针又有成功的探针 ⇒ 汇总不许出现 NaN', async () => {
+  const bad = fixtureProbe('mod_0', 3, [
+    { name: 'module.prop', content: 'id=mod_0\nversionCode=3\n' },
+    { name: 'system/bin/sh', content: ':\n' },
+  ]);
+  const good = fixtureProbe('mod_1', 3);
+  // 两枚都要在 base 索引里，否则失败会落在「索引里没有这一枚产物」那一格，打不到 NaN。
+  const dir = ledgerRepo([bad, good]);
+  G(dir, 'checkout', '-qb', 'dispose/mixedprobe');
+  const raw = [bad, good].map((f, i) => ({
+    kind: 'revoke', reason: 'test-probe', by: 'ci:audit@pending', at: '2026-10-22T00:00:00.000Z',
+    id: `mod_${i}`, versionCode: 3, sha256: f.sha,
+    subject: { coolapkUid: '12345678' }, evidence: [{ file: f.file }],
+  }));
+  const writeLedger = (list) => fs.writeFileSync(path.join(dir, 'json', 'dispositions.json'),
+    JSON.stringify({ schema: 'sukisu-dispositions-v2', dispositions: list }, null, 2) + '\n');
+  for (const f of [bad, good]) {
+    const abs = path.join(dir, ...f.file.split('/'));
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, f.evidenceBytes);
+  }
+  writeLedger(raw);
+  G(dir, 'add', '-A');
+  G(dir, 'commit', '-qm', 'C1');
+  const c1 = G(dir, 'rev-parse', 'HEAD').trim();
+  writeLedger(raw.map((e) => ({ ...e, by: `ci:audit@${c1}` })));
+  G(dir, 'add', '-A');
+  G(dir, 'commit', '-qm', 'C2');
+  const { reviews } = await reviewLedgerPr({
+    cwd: dir, baseRef: 'main', headRef: 'HEAD', deps: depsForList([bad, good]),
+  });
+  assert.equal(reviews[c1].ok, false);
+  assert.match(reviews[c1].reason, /覆盖层|路径分隔符/);
+  assert.doesNotMatch(reviews[c1].reason, /NaN/);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
 test('两条路互不走串：举报证据不给探针档、审核证据不给举报那条路', async () => {
   // (a) reason=test-probe 却拿举报证据来凑 ⇒ 红在 schema 那一格
   const f = fixtureDoc();

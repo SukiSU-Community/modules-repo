@@ -11,11 +11,15 @@
  * 两道检查，各自买到什么（这是本文件唯一不许含糊的地方，说过头比没有更糟）：
  *
  *  (a) 推导复算（checkPendingProof，离线、无密钥、无网络）：
- *      要求 `pledge.version` 在已发布集合内、`ownership.via` ∈ {'bio', 'bio-set'}，
+ *      要求 `pledge.version` 在已发布集合内、`ownership.via` ∈ {'bio', 'bio-set', 'session'}，
  *      且口令前缀按 via 那一代各自复算：
  *        * `bio`（v1，单枚）  → `sha256(entry.id + ':' + <digest>)[0:8]`
  *        * `bio-set`（v2，集合）→ `sha256('sukisu-proof-v2:' + canon(这一套))[0:12]`，
  *          canon 见 canonicalProofSet（按 id 升序、同 id 再按 sha 升序，逐枚 `id:sha` 用 `,` 连接）
+ *        * `session`（长效会话令牌）→ **没有可复算的前缀**：令牌在 Worker 的 KV 里，
+ *          CI 这边既看不到也验不了，只能核形状（proofPrefix 与 nonce 是空串、
+ *          verifiedAt 是正整数）。所以认它等于认「服务端说它验过了」而不是「我们复算过」，
+ *          这一支的 (a) 层强度低于 bio/bio-set，账记在 OWNERSHIP_VIAS 上方那段注释里。
  *      —— 公式与 worker/src/proof.ts 的 proofPrefixFor / proofPrefixV2 和前端
  *      public/scripts/proof.js 是同一份实现口径（v1 三份各钉着黄金值：demo + e37287b0… → 4f91ceb8）。
  *      它挡的是「形状都不对」的伪造：懒得自洽的手写条目在这一层就红。
