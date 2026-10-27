@@ -1,8 +1,11 @@
 # ---------------------------------------------------------------------------
 # AI 预算标定（一次性，人工触发）
 #
-# 为什么需要这一步：`audit/ai-review.mjs` 里的 `DEFAULT_MAX_BRIEF_BYTES = 240000`
-# 是一个**没有依据的保守代理值**（评审 F4）。它需要由一次真跑的成本读数来撑住。
+# 为什么需要这一步：`audit/ai-review.mjs` 里的 `DEFAULT_MAX_BRIEF_BYTES`（现为 480000）
+# 必须是**量出来的**，不是拍的。它的第一个真实依据来自一次事故：本仓唯一一次真实投稿
+# `device_faker-20260926.zip` 在旧形状下 neededBytes = 448,301 B，而被当年那个 240,000 的
+# 默认值判成 over-budget、模型压根没被调用（run 39096250929）。这个 workflow 继续
+# 用真跑读数把这个数撑住，并顺带量出「一份 brief 实际花多少 credits」。
 #
 # ⚠️ 2026-10-27 修正：这个 workflow 原先要产出 `input_tokens / neededBytes` 这个比值，
 #    那是**做不到**的 —— QCA 不给 token 数。供应商文档两处原文：
@@ -17,7 +20,10 @@
 # 这个 workflow 只做一件事：拿一枚真包真发一次，把上面两个数打印到 job summary 里。
 # 它**不改任何代码、不写任何仓库文件**：标定是运维动作，改代码要走 PR。
 #
-# ⚠️ 这里的花费是真钱：一次 qca 会话按 usage.total_credits 计费（实测 10~13 credits 一发）。
+# ⚠️ 这里的花费是真钱：一次 qca 会话按 usage.total_credits 计费。
+#    2026-10-27 真跑读数：815,067 B 的 brief 花了 **162.05 credits**（active 515.6 s）。
+#    更早的一次 40461351426 同量级。所以默认上限按这个量级取，不是按两位数取
+#    （此前默认写 `15` 且注释称「实测 10~13」—— 那个数没有任何出处，是本文件的错误）。
 #    所以只有 workflow_dispatch，没有 push / schedule 触发。
 #
 # ⚠️ 拿不到读数的三种情形（没有产物 / 会话不是终态 / 没有 total_credits）**必须红**，
@@ -30,17 +36,23 @@ on:
   workflow_dispatch:
     inputs:
       zip_path:
-        description: '要标定的模块 zip 路径（相对仓库根，例如 pending/demo.zip）'
-        required: true
+        description: '要标定的模块 zip 路径（相对仓库根）。留空则现场生成体量对位的探针包'
+        required: false
+        default: ''
+        type: string
+      probe_text_bytes:
+        description: '现场生成探针时的目标文本字节数（真包约 766 KB，默认 780000）'
+        required: false
+        default: '780000'
         type: string
       index_path:
         description: '用于判定首次收录/版本更新的索引路径（留空则不传，changeType 会退化为 unknown）'
         required: false
         type: string
       credits_ceiling:
-        description: '一发允许花的 credits 上限（用来反推字节预算，默认 15 —— 实测一发 10~13）'
+        description: '一发允许花的 credits 上限（反推字节预算用；默认 200 —— 2026-10-27 真跑实测一发 162.05）'
         required: false
-        default: '15'
+        default: '200'
         type: string
 
 permissions:
@@ -78,18 +90,39 @@ jobs:
             exit 1
           fi
 
-      # 先用同一套扫描器产出一份报告：ai-review.mjs 的 brief 是从报告 + 包内条目组装的，
-      # 直接拿一份手写报告会让标定的比值与线上那条路不是同一件事。
-      - name: 扫一遍（产出 brief 的输入）
+      # 标定要一枚真包。zip 不在仓库里（`.gitignore` 有 `*.zip`，`scripts/audit-corpus.mjs:18`
+      # 写明下载的 zip 一律落在仓库外），所以默认**现场生成**一枚体量对位的探针：
+      #   · 不为这一次运行往 git 历史里塞一个几百 KB 的二进制；
+      #   · 也不必为它开一条 `!calibration/*.zip` 的 ignore 例外（开了例外，以后「哪个 zip
+      #     能进仓」就变成要逐个记住的事）。
+      # 探针的体量必须落在真实工作点 —— 理由见 audit/calibration-probe.mjs 文件头。
+      # 想标定一枚真包时传 zip_path 覆盖这个默认。
+      - name: 准备标定的包（默认现场造探针）
+        id: pack
         env:
-          ZIP_PATH: ${{ inputs.zip_path }}
-          INDEX_PATH: ${{ inputs.index_path }}
+          ZIP_INPUT: ${{ inputs.zip_path }}
+          PROBE_BYTES: ${{ inputs.probe_text_bytes }}
         run: |
           set -euo pipefail
+          ZIP_PATH="${ZIP_INPUT:-}"
+          if [ -z "$ZIP_PATH" ]; then
+            ZIP_PATH="audit-probe.zip"
+            node audit/calibration-probe.mjs --out "$ZIP_PATH" --text-bytes "${PROBE_BYTES:-780000}"
+          fi
           if [ ! -f "$ZIP_PATH" ]; then
             echo "::error::找不到 zip：${ZIP_PATH}（这个路径要相对仓库根，且必须在本次 checkout 里）"
             exit 1
           fi
+          echo "zip=$ZIP_PATH" >> "$GITHUB_OUTPUT"
+
+      # 先用同一套扫描器产出一份报告：ai-review.mjs 的 brief 是从报告 + 包内条目组装的，
+      # 直接拿一份手写报告会让标定的比值与线上那条路不是同一件事。
+      - name: 扫一遍（产出 brief 的输入）
+        env:
+          ZIP_PATH: ${{ steps.pack.outputs.zip }}
+          INDEX_PATH: ${{ inputs.index_path }}
+        run: |
+          set -euo pipefail
           mkdir -p audit-out
           ARGS=(--out-dir audit-out)
           if [ -n "${INDEX_PATH:-}" ] && [ -f "$INDEX_PATH" ]; then
@@ -108,12 +141,43 @@ jobs:
             exit 1
           }
 
-      # 真发一次。**故意不设 AI_BRIEF_MAX_BYTES**：标定要量的是「装下整包需要多少」，
-      # 先给一个预算上限会让这一发提前走 over-budget 分支，什么都量不到。
+      # 算出「装下整包需要多少字节」。下一步拿它当 --max-bytes，让那一发真的把整包发出去。
+      # 为什么必须算而不是让 ai-review 自己决定：不传 --max-bytes 时它会退回默认值（现为 480000），
+      # 「不设预算」不等于「不设上限」—— 真包/探针动辄 800 KB，会直接走 over-budget、
+      # 压根不调用模型，读数一个都没有（2026-10-27 实测踩过）。
+      - name: 算 neededBytes（下一发的预算上界）
+        id: budget
+        env:
+          ZIP_PATH: ${{ steps.pack.outputs.zip }}
+        run: |
+          set -euo pipefail
+          BASE=$(basename "$ZIP_PATH")
+          node audit/calibration-budget.mjs "audit-out/$BASE.audit.json" "$ZIP_PATH" > budget.json
+          cat budget.json
+          # 用 node 校验而不是 `[ "$NEEDED" -le 0 ]`：后者在 NEEDED 不是数字时返回 2，
+          # 被 if 当成「条件不成立」放过去 —— 一个读不懂的值会被当合法值传进预算。
+          NEEDED=$(node -e "
+            const b = require('./budget.json');
+            const n = Number(b.neededBytes);
+            if (!Number.isFinite(n) || n <= 0) {
+              console.error('::error::budget.json 里的 neededBytes 不是正数：' + JSON.stringify(b.neededBytes));
+              process.exit(1);
+            }
+            process.stdout.write(String(n));
+          ")
+          echo "needed=$NEEDED" >> "$GITHUB_OUTPUT"
+
+      # 真发一次。**必须显式给一个足够大的 --max-bytes**：
+      # 标定要量的是「装下整包需要花多少 credits」，所以这一发必须真的把整包发出去。
+      # 2026-10-27 实测踩到的坑：原先这里没有传 --max-bytes，注释写着「故意不设预算」——
+      # 但不设预算 ≠ 不设上限，ai-review.mjs 会退回 DEFAULT_MAX_BRIEF_BYTES（现为 480000）。
+      # 体量对位的探针需要 815067 B，于是这一发直接走了 over-budget 分支、**压根没调用模型**，
+      # 状态是 over-budget、拿不到任何 credits 读数。标定因此必须自己把上限抬到 neededBytes 之上。
       - name: 真发一次（这一步会计费）
         id: fire
         env:
-          ZIP_PATH: ${{ inputs.zip_path }}
+          ZIP_PATH: ${{ steps.pack.outputs.zip }}
+          NEEDED: ${{ steps.budget.outputs.needed }}
           QODER_PAT: ${{ secrets.QODER_PAT }}
           QCA_AGENT_ID: ${{ vars.QCA_AGENT_ID }}
           QCA_AGENT_VERSION: ${{ vars.QCA_AGENT_VERSION }}
@@ -126,7 +190,8 @@ jobs:
           set -uo pipefail
           BASE=$(basename "$ZIP_PATH")
           ARGS=(run --report "audit-out/$BASE.audit.json" --zip "$ZIP_PATH"
-                --out "audit-out/ai-$BASE.json" --status "audit-out/ai-$BASE.status")
+                --out "audit-out/ai-$BASE.json" --status "audit-out/ai-$BASE.status"
+                --max-bytes "$NEEDED")
           if [ -n "${QCA_PROMPT_SHA:-}" ]; then
             ARGS+=(--expected-prompt-sha "$QCA_PROMPT_SHA")
           fi
@@ -163,7 +228,8 @@ jobs:
           const needed = b.neededBytes ?? null;
           const byteSize = b.byteSize ?? null;
           const maxBytes = b.maxBytes ?? null;
-          const ceilingRaw = process.env.CREDITS_CEILING || '15';
+          // 兜底值要与 workflow_dispatch 的 default 一致：两边不一致时「没传」会按另一个数反推预算。
+          const ceilingRaw = process.env.CREDITS_CEILING || '200';
           const ceiling = Number(ceilingRaw);
 
           const lines = [];
@@ -238,5 +304,35 @@ jobs:
           lines.push('📌 关于 token：供应商的 spans「不暴露 token 数」、花费「以 credits 计」，');
           lines.push('   `GET /sessions/{id}` 也没有 token 字段，因此本标定**不产出任何 token 系数**。');
           lines.push('   真要按 token 卡，只能等供应商把 token 数露出来。');
+
+          // ⚠️ 读数不能只往 GITHUB_STEP_SUMMARY 写。
+          // 2026-10-27 实测踩到的坑：上一次标定真跑成了（花的钱真花掉了），但读数只进了
+          // step summary —— 那个页面是前端渲染的，`gh run view --log` 抓不到，CLI 里
+          // 一个数都读不出来。标定这个 job 的**唯一产出**就是这三个数，读不出来等于没标定。
+          // 所以：① 同时打到 stdout（进日志）② 落一份 json ③ 下面当 artifact 上传。
+          fs.writeFileSync('calibration.json', JSON.stringify({
+            zip: tgt.zip || null,
+            status: a.status || null,
+            neededBytes: Number(needed),
+            byteSize: Number(byteSize),
+            maxBytes: Number(maxBytes),
+            totalCredits: Number(credits),
+            activeSeconds: secs,
+            sessionStatus: status,
+            creditsPerKb: Number(creditsPerKb.toFixed(9)),
+            creditsCeiling: Number(ceiling),
+            safeBytes,
+          }, null, 2) + '\n');
+          console.log(lines.join('\n'));
           fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
           NODE
+
+      # artifact 是这份读数的落地副本：step summary 是渲染产物，CLI 抓不到；
+      # 日志会被 90 天清掉、且混在几千行里。标定要「后人能复核这个预算怎么来的」。
+      - name: 读数落盘（artifact）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: calibration-readings
+          path: calibration.json
+          if-no-files-found: warn
