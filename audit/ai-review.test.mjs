@@ -1181,7 +1181,14 @@ test('F4a：预算依据如实写明是未标定的保守字节代理，没有�
   assert.match(String(QFMODEL_MAX_INPUT_TOKENS), /180000/);
   assert.doesNotMatch(BUDGET_BASIS, /tokens?\s*[≈~]/, '不许出现任何被当成事实的字符/token 换算');
   const src = readFileSync(join(REPO_ROOT, 'audit', 'ai-review.mjs'), 'utf8');
-  assert.match(src, /TODO\(标定/, '标定待办在代码里可 grep 到');
+  // 这里原先钉的是 /TODO\(标定/ —— 那个待办**做不到**，已经删掉（2026-10-27 核实）：
+  // QCA 的 spans 不暴露 token 数、花费只以 credits 计、GET /sessions/{id} 也没有 token 字段。
+  // 钉「TODO 存在」等于钉住一句假话。改成钉住**真实的边界**：代码里必须写明为什么测不出 token 系数，
+  // 免得后人又把「标定一次就有 token 系数」当成待办重新加回来。
+  assert.match(src, /标定的真实边界/, 'token 测不出来的原因必须写在代码里，而不是只在 PR 里说过');
+  assert.match(src, /no token counts|不暴露 token 数/, '供应商不给 token 数这条事实要可 grep');
+  assert.match(src, /credits, not tokens|以 \*\*credits|只以 credits/, '花费以 credits 计这条事实要可 grep');
+  assert.doesNotMatch(src, /TODO\(标定/, '不能留一个做不到的 TODO 让人反复重试');
   assert.match(src, /DEFAULT_MAX_BRIEF_BYTES = 240000/);
 });
 

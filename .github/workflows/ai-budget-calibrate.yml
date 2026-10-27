@@ -2,21 +2,26 @@
 # AI 预算标定（一次性，人工触发）
 #
 # 为什么需要这一步：`audit/ai-review.mjs` 里的 `DEFAULT_MAX_BRIEF_BYTES = 240000`
-# 是一个**没有依据的保守代理值**（评审 F4）。它的单位是字节，而 qfmodel 的上限是
-# `max_input_tokens = 180000` —— 两者之间**没有任何已标定的换算**。brief 里带行号前缀
-# （`N| `）与中英混排原文，字节→token 的比值会随内容漂移，所以任何系数在标定之前写进
-# 代码都会被后人当成既成事实引用（ai-review.mjs 的常量段注释写了同一句话）。
+# 是一个**没有依据的保守代理值**（评审 F4）。它需要由一次真跑的成本读数来撑住。
 #
-# 这个 workflow 只做一件事：拿一枚真包真发一次，把
-#     input_tokens / neededBytes
-# 的实测比值打印到 job summary 里，供人把 `AI_BRIEF_MAX_BYTES` 写进 audit.yml 的 env。
+# ⚠️ 2026-10-27 修正：这个 workflow 原先要产出 `input_tokens / neededBytes` 这个比值，
+#    那是**做不到**的 —— QCA 不给 token 数。供应商文档两处原文：
+#      · `shared/events.md`：spans expose **no token counts** or internal timing
+#      · `shared/tools-and-resources.md`：Model spend is reported as **credits, not tokens**
+#      · `GET /sessions/{id}` 只有 `usage.total_credits` 与 `stats`，无 token 字段
+#    也没有任何官方 credits↔token 换算口径。所以现在的产出改成**两个实测值之比**：
+#      · credits / neededBytes（credits per KB）—— 分子分母都是真读出来的，不含假设
+#      · 按单发 credits 上限线性外推的字节预算（唯一假设是「字节翻倍花费大致翻倍」）
+#    再拿这个字节预算去定 `AI_BRIEF_MAX_BYTES`。**不产出任何 token 系数** —— 无从测起。
+#
+# 这个 workflow 只做一件事：拿一枚真包真发一次，把上面两个数打印到 job summary 里。
 # 它**不改任何代码、不写任何仓库文件**：标定是运维动作，改代码要走 PR。
 #
 # ⚠️ 这里的花费是真钱：一次 qca 会话按 usage.total_credits 计费（实测 10~13 credits 一发）。
 #    所以只有 workflow_dispatch，没有 push / schedule 触发。
 #
-# ⚠️ 拿不到 input_tokens 时**必须红**，不许打印一个编出来的比值：这个 job 的唯一产出
-#    就是一个数，编一个数比不产出更糟（后人会拿它去定预算）。
+# ⚠️ 拿不到读数的三种情形（没有产物 / 会话不是终态 / 没有 total_credits）**必须红**，
+#    不许打印一个编出来的数：这个 job 的唯一产出就是两个数，编一个数比不产出更糟。
 # ---------------------------------------------------------------------------
 
 name: AI Budget Calibrate
@@ -31,6 +36,11 @@ on:
       index_path:
         description: '用于判定首次收录/版本更新的索引路径（留空则不传，changeType 会退化为 unknown）'
         required: false
+        type: string
+      credits_ceiling:
+        description: '一发允许花的 credits 上限（用来反推字节预算，默认 15 —— 实测一发 10~13）'
+        required: false
+        default: '15'
         type: string
 
 permissions:
@@ -64,7 +74,7 @@ jobs:
             [ -n "${!k:-}" ] || MISSING="$MISSING $k"
           done
           if [ -n "$MISSING" ]; then
-            echo "::error::标定需要凭据，缺：${MISSING# }。没有凭据就没有 input_tokens 可读，这一发不许绿。"
+            echo "::error::标定需要凭据，缺：${MISSING# }。没有凭据就没有可真跑的一发，这一发不许绿。"
             exit 1
           fi
 
@@ -126,10 +136,11 @@ jobs:
           echo "code=$CODE" >> "$GITHUB_OUTPUT"
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
 
-      - name: 打印比值（拿不到就红，不许编一个数）
+      - name: 打印读数（拿不到就红，不许编一个数）
         env:
           BASE: ${{ steps.fire.outputs.base }}
           CODE: ${{ steps.fire.outputs.code }}
+          CREDITS_CEILING: ${{ inputs.credits_ceiling }}
         run: |
           set -euo pipefail
           OUT="audit-out/ai-${BASE}.json"
@@ -144,16 +155,16 @@ jobs:
           const b = (a && a.brief) || {};
           const meta = (a && a.meta) || {};
           const tgt = (a && a.target) || {};
-          // QCA 的可用成本字段只有这两个（没有 finish_reason、没有 neurons，见 ai-review.mjs）。
-          // 会话状态必须一起看：running 时读到的是「截至那一刻」，把中间值当终值是错的。
+          // 可读读数只有这三样（供应商文档：spans 不给 token 数，花费以 credits 计）。
+          // 别再找 input_tokens —— GET /sessions/{id} 根本没有这个字段，见 ai-review.mjs 文件头。
           const credits = meta.totalCredits ?? null;
           const secs = meta.activeSeconds ?? null;
           const status = meta.sessionStatus ?? null;
           const needed = b.neededBytes ?? null;
           const byteSize = b.byteSize ?? null;
           const maxBytes = b.maxBytes ?? null;
-          // 字段名以 ai-review.mjs 的 qcaSessionCost 为准（input_tokens / prompt_tokens 都试过）。
-          const inputTokens = meta.inputTokens ?? null;
+          const ceilingRaw = process.env.CREDITS_CEILING || '15';
+          const ceiling = Number(ceilingRaw);
 
           const lines = [];
           lines.push('## AI 预算标定读数');
@@ -166,43 +177,66 @@ jobs:
           lines.push(`- 会话状态：${status ?? '<读不到>'}（不是终态时下面的成本只是截至那一刻）`);
           lines.push(`- total_credits：${credits ?? '<读不到>'}`);
           lines.push(`- active_seconds：${secs ?? '<读不到>'}`);
-          lines.push(`- input_tokens：${inputTokens ?? '<供应商没给>'}`);
           lines.push('');
 
-          if (inputTokens === null || !Number.isFinite(Number(inputTokens)) || Number(inputTokens) <= 0) {
-            lines.push('### ⛔ 标定失败：读不到 input_tokens');
+          // 会话没跑完时读到的花费是「截至那一刻」，用它定预算会偏小 —— 这一发必须重跑。
+          const TERMINAL = new Set(['idle', 'completed', 'failed', 'canceled', 'cancelled', 'stopped']);
+          if (typeof status !== 'string' || !TERMINAL.has(status)) {
+            lines.push('### ⛔ 标定失败：会话不是终态');
             lines.push('');
-            lines.push('这一步的唯一产出就是 `input_tokens / neededBytes` 那个比值。');
-            lines.push('拿不到 input_tokens 时**不许**用一个假设的系数凑一个数出来 —— 后人会拿它去定预算，');
-            lines.push('而一个编出来的比值与「没标定」相比更危险（它看起来像事实）。');
-            lines.push('请到 qca 会话详情里人工核对 usage 字段名，再回来改 qcaSessionCost 的读取路径。');
+            lines.push(`读到 status=\`${status ?? '<空>'}\`。花费还在涨的时候取数，等于把中间值当终值，`);
+            lines.push('据此定出来的预算会偏小、上线后把正常包判成 over-budget。等会话结束再跑一次。');
             fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
-            console.error('::error::标定失败：产物里没有可用的 input_tokens（meta.inputTokens）');
+            console.error(`::error::标定失败：会话状态不是终态（${status ?? '<空>'}）`);
+            process.exit(1);
+          }
+
+          if (!Number.isFinite(Number(credits)) || Number(credits) <= 0) {
+            lines.push('### ⛔ 标定失败：读不到 total_credits');
+            lines.push('');
+            lines.push('credits 是供应商唯一可靠报告的花费读数（`usage.total_credits`）。');
+            lines.push('拿不到它时**不许**用一个假设的系数凑一个数出来 —— 后人会拿它去定预算，');
+            lines.push('而一个编出来的比值与「没标定」相比更危险（它看起来像事实）。');
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
+            console.error('::error::标定失败：产物里没有可用的 meta.totalCredits');
             process.exit(1);
           }
 
           if (!Number.isFinite(Number(needed)) || Number(needed) <= 0) {
             lines.push('### ⛔ 标定失败：产物里没有 neededBytes');
             lines.push('');
-            lines.push('分母读不出来，比值无从谈起 —— 与读不到 input_tokens 同一句话：不许凑。');
+            lines.push('分母读不出来，比值无从谈起 —— 与读不到 credits 同一句话：不许凑。');
             fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
             console.error('::error::标定失败：产物里没有 brief.neededBytes');
             process.exit(1);
           }
 
-          const ratio = Number(inputTokens) / Number(needed);
-          const tokensPerByte = ratio.toFixed(6);
-          // 反过来给一个可直接抄进 workflow 的字节预算：按 qfmodel 的 max_input_tokens 留 10% 余量。
-          // 180000 从 ai-review.mjs 的 QFMODEL_MAX_INPUT_TOKENS 抄来（本 workflow 不 import 那个模块，
-          // 因为标定的前提就是「那个常量没有依据」—— 这里只把它当上限，不当换算依据）。
-          const safeBytes = Math.floor(180000 * 0.9 / ratio);
+          if (!Number.isFinite(ceiling) || ceiling <= 0) {
+            lines.push('### ⛔ 标定失败：credits_ceiling 不是正数');
+            lines.push('');
+            lines.push(`读到 \`${ceilingRaw}\`。这个输入用来反推字节预算，必须是一个正数。`);
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
+            console.error(`::error::标定失败：credits_ceiling 非法（${ceilingRaw}）`);
+            process.exit(1);
+          }
+
+          // credits per KB —— 这是两个**实测可读**字段之比，不含任何假设。
+          const creditsPerKb = Number(credits) / (Number(needed) / 1024);
+          // 给一个可直接抄进 workflow 的字节预算：把「一发允许花多少 credits」按同一比例摊到字节上。
+          // 这一步是**线性外推**（唯一的输入就是这份 brief，字节翻倍花费大致也翻倍），
+          // 不是 token 换算 —— 供应商不提供 token 数，任何 token 系数都无从测起。
+          const safeBytes = Math.floor(Number(ceiling) / Number(credits) * Number(needed));
           lines.push('### 读数');
           lines.push('');
-          lines.push(`- \`input_tokens / neededBytes\` = **${tokensPerByte}** token/B`);
-          lines.push(`- 按 qfmodel 上限 180000 token 留 10% 余量推算的字节预算：**${safeBytes}** B`);
+          lines.push(`- \`credits / neededBytes\` = **${creditsPerKb.toFixed(6)}** credits/KB（两个实测值之比，无假设）`);
+          lines.push(`- 按单发 ${ceiling} credits 上限线性外推的字节预算：**${safeBytes}** B`);
           lines.push(`  （即把 \`AI_BRIEF_MAX_BYTES: '${safeBytes}'\` 写进 audit.yml 的 AI 步 env）`);
           lines.push('');
-          lines.push('⚠️ 这是**一次**标定。brief 的字节→token 比值随内容（行号前缀、中英混排）漂移，');
+          lines.push('⚠️ 这是**一次**标定。两者之比随内容（行号前缀、中英混排、压缩率）漂移，');
           lines.push('   所以别把它当成永久系数：换模型、换 prompt 形状、或线上出现 over-budget 误报时重跑一次。');
+          lines.push('');
+          lines.push('📌 关于 token：供应商的 spans「不暴露 token 数」、花费「以 credits 计」，');
+          lines.push('   `GET /sessions/{id}` 也没有 token 字段，因此本标定**不产出任何 token 系数**。');
+          lines.push('   真要按 token 卡，只能等供应商把 token 数露出来。');
           fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
           NODE

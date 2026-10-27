@@ -138,10 +138,22 @@ export const MALICE_EVIDENCE_MAX = 10;
  *   而「1 字节 brief ≈ 多少 token」本模块不知道、也**不许**猜一个当事实写。
  *   brief 里的行号前缀（`N| `）与中英混排原文都会让字节→token 的比值漂移，
  *   任何系数在没标定之前写进代码都会被后人当既成事实引用。
- * TODO(标定，需要一次真实发送 —— 等主控批准)：
- *   拿一个真包跑一发 qca，把「实际 input tokens / usage.total_credits / stats.active_seconds」
- *   记回 §0.3，再据实测比值定 DEFAULT_MAX_BRIEF_BYTES（并在报告里写清标定的包与日期）。
- *   在此之前，over-budget 的文案只报字节（neededBytes），不报任何 token 推断。
+ * 标定这件事的**真实边界**（2026-10-27 核实，此前这里是错的）：
+ *
+ *   原先这里写着「拿一个真包跑一发 qca，把实际 input tokens / total_credits / active_seconds
+ *   记回来定 DEFAULT_MAX_BRIEF_BYTES」。前一半是**做不到**的：QCA 根本不给 token 数。
+ *   供应商文档两处原文 —— `shared/events.md` 的 `span.model_request_end` 一节
+ *   「Spans expose **no token counts** or internal timing」；`shared/tools-and-resources.md`
+ *   「Model spend is reported as **credits, not tokens**」。`GET /sessions/{id}` 只有累计
+ *   `usage.total_credits` 与 `stats`，没有 input/output token 字段。
+ *   credits 与 token 之间也**没有任何官方换算口径**（只有「按 usage.total_credits 计费」）。
+ *
+ *   所以不存在「测一次就得到字节→token 系数」这条路。硬要凑，只能是拿一个假设的
+ *   credits→token 比再乘一遍 —— 那与直接编一个 240000 是同一类错误，只是多一层看起来像证据。
+ *
+ *   结论：`DEFAULT_MAX_BRIEF_BYTES` 保持为**写明的保守代理值**，由 `AI_BRIEF_MAX_BYTES`
+ *   覆盖（运维动作，不改代码）；over-budget 的文案只报字节（neededBytes），不报任何 token 推断。
+ *   真要按 token 卡，只能等供应商把 token 数露出来 —— 在那之前，本模块不假装已经标定。
  */
 export const DEFAULT_MAX_BRIEF_BYTES = 240000;
 
@@ -172,7 +184,8 @@ export const QFMODEL_MAX_INPUT_TOKENS = 180000;
 /** 写进产物的预算依据说明：人工复核必须一眼看到这个数是怎么来的（以及它不是怎么来的）。 */
 export const BUDGET_BASIS = 'uncalibrated-conservative-byte-proxy：DEFAULT_MAX_BRIEF_BYTES 与 '
   + `qfmodel 的 max_input_tokens=${QFMODEL_MAX_INPUT_TOKENS} 之间没有任何已标定的换算，`
-  + '标定需要一次真实发送（TODO，见 ai-review.mjs 常量段注释）';
+  + '标定需要一次真实发送，而 QCA 不暴露 token 数（花费只以 credits 计、spans 无 token 计数），'
+  + '所以只能量出 credits/字节，得不到 token 系数';
 
 /**
  * max_tokens 的下限。实测带 reasoning 的模型在 700 时会把预算吃光，
@@ -1003,10 +1016,11 @@ function eventText(item) {
  * 记成 null 并留一句 `error`，绝不把已经成立的结论改成 failed（那等于让运维读数的缺失变成安全判定）。
  * 壳的几种写法都试（`item` / 裸对象 / `session`），因为本模块的离线测试钉的是字段名而不是信封。
  *
- * `inputTokens` 是**标定专用**的读数（契约 §2.3 的 ai-budget-calibrate.yml 要拿它算
- * `input_tokens / neededBytes`）。三种可能的字段名都试（`input_tokens` / `prompt_tokens` /
- * `inputTokens`），因为供应商换过一次口径、而标定只要一个真数；**都没有就是 null**，
- * 绝不推断一个数出来 —— 编出来的比值比「没标定」更危险，它会看起来像事实。
+ * `inputTokens` 是**成本读数**的一部分，但**供应商从来不给**（2026-10-27 核实）：
+ * QCA 的 `GET /sessions/{id}` 只有累计 `usage.total_credits` 与 `stats`，
+ * 文档原文见文件头「标定的真实边界」一节。所以这里保留读取路径只为了**万一**供应商
+ * 哪天把 token 数露出来时不用再改代码 —— 但**不假装它可以被标定**，也绝不推断。
+ * 拿不到就是 null，标定 workflow 已改成不再为它报红（它要的是可读到的读数，不是编读数）。
  */
 async function qcaSessionCost({ fetchImpl, base, headers, signal, sessionId }) {
   const none = { totalCredits: null, activeSeconds: null, status: null, inputTokens: null };
