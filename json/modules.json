@@ -1,5 +1,23 @@
 {
   "name": "SukiSU-Ultra Modules",
-  "lastUpdate": 1792779073520,
-  "modules": []
+  "lastUpdate": 1793089943775,
+  "modules": [
+    {
+      "id": "device_faker",
+      "name": "Device Faker",
+      "author": "酷安@瓦力喀/GitHub@Seyud",
+      "description": "使用Zygisk实现自定义配置对应用伪装机型",
+      "versions": [
+        {
+          "version": "v1.6.0",
+          "versionCode": 20260926,
+          "zipUrl": "https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/0d7b717ba25d541b3ae064b93ffd618b330af32f1f55c9abebfaf8a560f9be12.zip",
+          "size": 969705,
+          "time": 1792296703101,
+          "sha256": "0d7b717ba25d541b3ae064b93ffd618b330af32f1f55c9abebfaf8a560f9be12"
+        }
+      ],
+      "verified": false
+    }
+  ]
 }
