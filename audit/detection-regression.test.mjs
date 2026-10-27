@@ -744,9 +744,12 @@ const NARROWING_WITNESSES = [
       assert.equal(r.riskLevel, 'low');
       assert.notEqual(r.decision.action, 'auto-approve',
         '有撤销就不许自动放行（Task 2.8）：这一格是 A1 与 2.8 的接缝，豁免不许把它抹平');
-      assert.equal(r.decision.action, 'request-review', `实测 ${r.decision.action}`);
+      // ⚠ 2026-10-26 去人工化（契约 §1.1 ③）：request-review → block。上一句 notEqual 一字未动，
+      // 它钉的是「撤销不许被豁免抹平」；这一句补的是「抹平之后落在哪一格」。
+      assert.equal(r.decision.action, 'block', `实测 ${r.decision.action}`);
+      assert.equal(r.decision.label, 'auto-rejected');
     },
-    measured: 'low / request-review，revokedBundledRefs 1 笔，0 findings',
+    measured: 'low / block（2026-10-26 去人工化；此前为 low / request-review），revokedBundledRefs 1 笔，0 findings',
   },
   {
     id: 'NW-3',
@@ -842,11 +845,13 @@ const NARROWING_WITNESSES = [
         '撤销这笔账必须在（它不在就说明记账层被摘了）：' + JSON.stringify(r.revokedBundledRefs));
       assert.equal(r.riskLevel, 'low');
       assert.equal(r.changeType, 'first', '前提：首次收录 —— 这一档正是自动通道的那一格');
-      assert.equal(r.decision.action, 'request-review',
+      // ⚠ 2026-10-26 去人工化（契约 §1.1 ③）：request-review → block / auto-rejected。
+      assert.equal(r.decision.action, 'block',
         '「机器替它作过证」就不能同时是自动放行的理由：' + JSON.stringify(r.decision));
+      assert.equal(r.decision.label, 'auto-rejected');
       assert.match(r.decision.reason, /机器不替它作证/, `决策理由必须指名道姓：${r.decision.reason}`);
     },
-    measured: 'low / request-review，0 findings，revokedBundledRefs 1 笔',
+    measured: 'low / block（2026-10-26 去人工化；此前为 low / request-review），0 findings，revokedBundledRefs 1 笔',
   },
   {
     id: 'NW-8',

@@ -344,8 +344,10 @@ jobs:
                 + `这次合并带进 \`main\` 的 pending 条目**没有**被盖审核章，因此不会进正式索引。\n\n`
                 + `- 原因：${rep.reason || '(publish-from-main 没给原因，见该 run 日志)'}\n`
                 + `- 认定的提交：\`${process.env.SHA}\`\n\n`
-                + `要么让该 PR 上名字为 \`approve\` 的 check 变成 success 后重跑本 workflow，`
-                + `要么走人工双签盖章（见 GOVERNANCE.md）。这里不做「看起来像通过了就盖」。`;
+                + `要么让该 PR 上名字为 \`approve\` 的 check 变成 success 后重跑本 workflow。`
+                + `这里不做「看起来像通过了就盖」。\n\n`
+                + `（2026-10-26 起没有「人工双签盖章」这条路：本站只有机器审核，判据见 GOVERNANCE.md`
+                + ` 第 2 节。approve 不是 success 就等于这一发没有结论，而不是「等人来签」。）`;
             } else {
               const rc = process.env.BUILD_RC || '0';
               body = `## 索引已重建\n\n`

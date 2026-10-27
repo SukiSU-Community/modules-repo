@@ -442,7 +442,11 @@ test('端到端：恶意模块判 high，脚本全文与行号证据都在报告
   ]);
   const r = scanZip(p, { declaredId: 'evil_mod', declaredVersion: 'v1', changeType: 'first' });
   assert.equal(r.riskLevel, 'high');
-  assert.equal(r.decision.needsHumanReview, true);
+  // ⚠ 2026-10-26 去人工化：本条原断 needsHumanReview:true。这一发命中 SELINUX_DISABLE
+  // （MALICE_LIST 成员）⇒ 新轴 ① 支：block + auto-rejected，机器直接拒，不再等人。
+  assert.equal(r.decision.action, 'block');
+  assert.equal(r.decision.label, 'auto-rejected');
+  assert.equal(r.decision.needsHumanReview, false);
   const ids = new Set(r.findings.map((f) => f.ruleId));
   for (const need of ['SELINUX_DISABLE', 'PIPE_TO_SHELL', 'OBFUSCATED_DECODE_EXEC',
     'RM_RF_MUTABLE', 'WRITE_SYSTEM_VENDOR', 'HOSTS_MODIFY', 'SUSPICIOUS_DOMAIN',
@@ -461,16 +465,21 @@ test('端到端：恶意模块判 high，脚本全文与行号证据都在报告
   assert.ok(r.scripts.some((s) => s.name === 'module.prop'));
 });
 
-test('端到端：低风险但为版本更新 -> 打 needs-human-review 不自动合入', () => {
+test('端到端：低风险但为版本更新 -> 与首投同一套判据，自动放行（契约 §1.1 第 ④ 支）', () => {
   const p = writeZip('update.zip', [
     { name: 'module.prop', content: 'id=cool_mod\nversion=v1.1\n' },
     { name: 'customize.sh', content: CLEAN_SH },
   ]);
   const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.1', changeType: 'update' });
   assert.equal(r.riskLevel, 'low');
-  assert.equal(r.decision.action, 'request-review');
-  assert.equal(r.decision.label, 'needs-human-review');
-  assert.equal(r.decision.needsHumanReview, true);
+  // ⚠ 2026-10-26 去人工化：本条原期望 request-review / needs-human-review / needsHumanReview:true。
+  // 契约 §1.1 要点「`update` 与 `first` 判据完全等价 —— 不做跨版本差异比对（用户 Q12 口径）」，
+  // 所以低风险更新与低风险首投走同一格：auto-approve。老文案「按规则一律人工审」是假陈述。
+  assert.equal(r.decision.action, 'auto-approve');
+  assert.equal(r.decision.label, 'auto-approved');
+  assert.equal(r.decision.needsHumanReview, false);
+  assert.equal(r.decision.axis, 'malice');
+  assert.match(r.decision.reason, /版本更新与首次收录适用同一套判据/);
 });
 
 test('端到端：报告渲染 —— Markdown 含结论/表格/隐私脱敏，JSON 可解析', () => {
@@ -655,7 +664,10 @@ test('端到端：越界路径条目判 high 且绝不自动放行', () => {
   ]);
   const r = scanZip(p, { declaredId: 'cool_mod', declaredVersion: 'v1.0', changeType: 'first' });
   assert.equal(r.riskLevel, 'high');
-  assert.equal(r.decision.needsHumanReview, true);
+  // STRUCT_UNSAFE_PATH 在 MALICE_LIST 里 ⇒ 新轴 ① 支：block + auto-rejected。
+  assert.equal(r.decision.action, 'block');
+  assert.equal(r.decision.label, 'auto-rejected');
+  assert.equal(r.decision.needsHumanReview, false);
   assert.ok(r.findings.some((f) => f.ruleId === 'STRUCT_UNSAFE_PATH' && f.file === '../escape.sh'));
 });
 
@@ -998,7 +1010,10 @@ test('端到端：声明解压 1 GB 的条目按 zip bomb 拦下', () => {
   assert.ok(ids.has('STRUCT_ZIP_BOMB'), JSON.stringify([...ids]));
   assert.ok(ids.has('STRUCT_RATIO'), JSON.stringify([...ids]));
   assert.equal(r.riskLevel, 'high');
-  assert.equal(r.decision.needsHumanReview, true);
+  // STRUCT_ZIP_BOMB 在 MALICE_LIST 里 ⇒ 新轴 ① 支：block + auto-rejected。
+  assert.equal(r.decision.action, 'block');
+  assert.equal(r.decision.label, 'auto-rejected');
+  assert.equal(r.decision.needsHumanReview, false);
   assert.ok(r.structure.totalUncompressed >= 1024 * 1024 * 1024, String(r.structure.totalUncompressed));
 });
 
@@ -1145,7 +1160,12 @@ test('EXEC_BUNDLED_FILE：撤销判据是「它真的在扫描面里」，不是
   // 上面两条断言已经确认这里确实发生过两次撤销（install.sh、lib.sh 都在扫描面上，那条 high 被撤），
   // 而 E 拍定的就是「撤销过就不许走自动通道」——旧期望与本轮规格直接冲突，按规格改。
   // 撤销本身、等级、findings 内容一字未动，代价只落在决策上。见 task-2.8-report.md「与现有用例的冲突」。
-  assert.equal(r1.decision.action, 'request-review', '撤销过两次就不许自动放行（fix8-E）');
+  // ⚠ 2026-10-26 去人工化（契约 §1.1 第 ③ 支）：撤销过的那一档从 request-review 变成 block，
+  //   拒的动作没变（旧轴上 request-review 在 CI 里的后果与 block 完全一样），只是不再假装
+  //   「有个人会来签」—— label 是 auto-rejected、needsHumanReview 是 false。
+  assert.equal(r1.decision.action, 'block', '撤销过两次就不许自动放行（fix8-E）');
+  assert.equal(r1.decision.label, 'auto-rejected');
+  assert.equal(r1.decision.needsHumanReview, false);
   assert.equal(r1.revokedBundledRefs.length, 2, JSON.stringify(r1.revokedBundledRefs));
 
   // 同一个形状，但那个 .sh 不在包里（运行期才写出来）：解析不到 -> 照报 high，且不许承诺读过
@@ -1611,11 +1631,13 @@ test('fixtures：干净模块带 changeType: first 仍可自动放行，不带 o
   assert.ok(!withOpts.findings.some((f) => f.ruleId === 'EXEC_BUNDLED_FILE'),
     CLEAN_SH + ' 里的 `cp -f busybox $MODPATH/...` 不是执行别的文件');
 
-  // 同一个包不带 opts：changeType 落到 unknown，low+unknown 只能是 request-review。
+  // 同一个包不带 opts：changeType 落到 unknown，新轴 ② 支 ⇒ block（fail-closed）。
   // 这条断言是留着提醒回归表：scanToReport(zip) 这个形状下「干净模块自动放行」永远测不到。
+  // ⚠ 2026-10-26 去人工化：action 从 request-review 变成 block，label 是 auto-rejected。
   const bare = await scanToReport(clean);
   assert.equal(bare.changeType, 'unknown');
-  assert.equal(bare.decision.action, 'request-review');
+  assert.equal(bare.decision.action, 'block');
+  assert.equal(bare.decision.label, 'auto-rejected');
   assert.equal(bare.riskLevel, 'low');
 
   assert.match(moduleProp('eval.x'), /^id=eval\.x$/m);
@@ -1807,11 +1829,14 @@ test('F4 端到端：只在 system.prop 里写 boot 状态的模块不再被判 
   assert.equal(r.riskLevel, 'high');
   // 换轴接线（2026-10-21，旧期望 `action === 'block'`）：PROP_BOOT_SPOOF 是 §3 右列 / §13.6
   // 「降档 + 给 AI 一道上下文题」那一族的成员，不在上架拦截名单里 ⇒ 等级不再拦它。
-  // 这一发没有传 opts.changeType ⇒ changeType 是 unknown，落的是新轴上那条**待拍保守分支**
-  // （§13 第 2 条「要不要给 update 另加一道」未拍，不许自行默认成放行），所以期望是 request-review；
+  // 这一发没有传 opts.changeType ⇒ changeType 是 unknown，落的是新轴上 ② 支（fail-closed）：
+  // 分不清首投还是更新就按不可上架处理 —— 这是名单外唯一还会拦下的那一格（契约 §1.1 第 ② 支）。
   // 同一形状带 changeType:'first' 时落 auto-approve，那一格由 fix3-P8 / fix4-P12 与
   // malice-axis.test.mjs 的端到端那几发钉。
-  assertListedOutside(r, ['PROP_BOOT_SPOOF'], '只在 system.prop 里写 boot 状态：', 'request-review');
+  // ⚠ 2026-10-26 去人工化：② 支的 action 从 request-review 变成 block（label auto-rejected）。
+  assertListedOutside(r, ['PROP_BOOT_SPOOF'], '只在 system.prop 里写 boot 状态：', 'block');
+  assert.equal(r.decision.label, 'auto-rejected');
+  assert.equal(r.decision.needsHumanReview, false);
   assert.match(r.decision.reason, /无法判定是首次收录还是版本更新/, r.decision.reason);
   assert.ok(r.annotation.contextQuestions.includes('PROP_BOOT_SPOOF'),
     '它必须进 §6 那道上下文题的输入清单，否则降档就等于把这一族从 AI 眼前也删掉了');
@@ -2067,7 +2092,9 @@ test('fix2-P3：向模块目录写出/解包 + 执行同名条目必须升级（
   // 上面两条断言仍在钉这件事，且 EXEC_BUNDLED_FILE 确实被撤掉了。
   // 但撤销一旦发生（这里是常规写法 sh $MODDIR/install.sh），E 就关掉自动通道 ——
   // 旧期望与本轮规格直接冲突，按规格改；代价落在决策上，不落进散文。
-  assert.equal(ok.decision.action, 'request-review', '有撤销记录就不自动放行（fix8-E）');
+  // ⚠ 2026-10-26 去人工化（契约 §1.1 第 ③ 支）：request-review → block（label auto-rejected）。
+  assert.equal(ok.decision.action, 'block', '有撤销记录就不自动放行（fix8-E）');
+  assert.equal(ok.decision.label, 'auto-rejected');
   assert.deepEqual(ok.revokedBundledRefs.map((x) => x.resolvedEntry), ['install.sh'], JSON.stringify(ok.revokedBundledRefs));
 
   // 写出发现的证据字段要齐全
@@ -3391,11 +3418,12 @@ test('fix8-E：载荷改名成 .js/.sh/.lua 骗到撤销后，等级不动但不
     assert.equal(r.counts.info, 0, `${name}：撤销记录不是 findings 里的 info（renderJSON 会连带脱敏）`);
     assert.equal(r.escalated.length, 0, `${name}：本来就在扫描面上，没有升级证人`);
     // 唯一的行为变化：自动通道关上，且只朝更严的方向翻。
-    // 这条放在记录断言之前 —— 改前的红应当直接写成 auto-approve ≠ request-review（那个洞本身），
+    // 这条放在记录断言之前 —— 改前的红应当直接写成 auto-approve ≠ block（那个洞本身），
     // 而不是「字段不存在」的 TypeError。
-    assert.equal(r.decision.action, 'request-review', `${name}：撤销过就不许自动放行`);
-    assert.equal(r.decision.label, 'needs-human-review', name);
-    assert.equal(r.decision.needsHumanReview, true, name);
+    // ⚠ 2026-10-26 去人工化：request-review → block，label 是 auto-rejected（契约 §1.1 第 ③ 支）。
+    assert.equal(r.decision.action, 'block', `${name}：撤销过就不许自动放行`);
+    assert.equal(r.decision.label, 'auto-rejected', name);
+    assert.equal(r.decision.needsHumanReview, false, name);
     assert.ok(r.decision.reason.includes(name),
       `${name}：reason 必须指名被撤销的条目，人看得见是哪个文件`);
     // 但撤销不再静默：专用字段里要有指名条目的一笔记录。
@@ -3424,7 +3452,7 @@ test('fix8-E 反证：payload.dat 那一格撤销并未发生，记录里不能�
   // escalated / scripts / revokedBundledRefs 三句钉着，加上上面「那条 high 还在、等级还是 high」，
   // 全是一字未动。旧那句 block 是等级轴的副产品；`EXEC_BUNDLED_FILE` 按 §3.2 ② 末段归能力轴，
   // 不在 §13.5 的 11 条名单里 ⇒ 名单外 ⇒ 上架 + 标注（读数必须在标注里点名）。
-  // 与上一发同一口径：fix8-E 的闸由 payload.js/.sh/.lua 那三形的 `request-review` 钉着。
+  // 与上一发同一口径：fix8-E 的闸由 payload.js/.sh/.lua 那三形的 `block` 钉着。
   assertListedOutside(r, ['EXEC_BUNDLED_FILE'], 'fix8-E 反证：');
   // Task 2.7（fix10-P11）换了这里 instrument 的对象，主张一字没动：
   // 「撤销没有发生 ⇒ 记录里不许有一笔」。发生过的读取代价现在落在 feed 上（载荷被逐行扫过），
@@ -3445,6 +3473,9 @@ test('fix8-E 单元：decide 第三参可选、默认 null；medium/high 与 upd
   assert.equal(decide('low', 'first', { revokedCount: 0, revokedEntries: [] }).action, 'auto-approve',
     '没发生过撤销就照旧放行');
   const d = decide('low', 'first', revoked);
+  // 契约 §1.2：老轴（malice 缺省）逐字保留 —— 这里测的正是那一支，所以期望仍是
+  // request-review / needs-human-review。生产路径恒传 malice，永远走新轴，
+  // 新轴 ③ 支的 block 由上面 e8Zip 那三发端到端钉着。
   assert.equal(d.action, 'request-review');
   assert.equal(d.label, 'needs-human-review');
   assert.equal(d.needsHumanReview, true);
@@ -3475,7 +3506,9 @@ test('fix8-E：撤销记录写包内真实条目名，引用里的大小写拼�
   assert.equal(lo.revokedBundledRefs.length, 1, JSON.stringify(lo.revokedBundledRefs));
   assert.equal(lo.revokedBundledRefs[0].resolvedEntry, 'payload.js', '写真实条目名');
   assert.equal(lo.revokedBundledRefs[0].ref, 'sh $MODDIR/PAYLOAD.js', '引用原文照抄，供人工复验');
-  assert.equal(lo.decision.action, 'request-review');
+  // ⚠ 2026-10-26 去人工化：新轴 ③ 支 ⇒ block / auto-rejected。
+  assert.equal(lo.decision.action, 'block');
+  assert.equal(lo.decision.label, 'auto-rejected');
   assert.ok(lo.decision.reason.includes('payload.js'), lo.decision.reason);
 
   // 两条撤销：两个被执行条目各自记账，reason 把两个条目都点名。
@@ -3511,7 +3544,9 @@ test('fix8-E 代价一侧也钉住：标准写法被撤销同样记账转人工�
   assert.equal(legit.findings.length, 0, 'E 不给标准写法新增任何发现');
   assert.equal(legit.revokedBundledRefs.length, 1, JSON.stringify(legit.revokedBundledRefs));
   assert.equal(legit.revokedBundledRefs[0].resolvedEntry, 'verify.sh');
-  assert.equal(legit.decision.action, 'request-review');
+  // ⚠ 2026-10-26 去人工化：新轴 ③ 支 ⇒ block / auto-rejected（「转人工队列」这个去处已删除）。
+  assert.equal(legit.decision.action, 'block');
+  assert.equal(legit.decision.label, 'auto-rejected');
   assert.ok(!/可疑|恶意|绕过|嫌犯/.test(legit.decision.reason), legit.decision.reason);
 
   // 撤销的另一半：引用指向包外程序时，机器没有替任何**包内条目**作过证，不该记这一笔。
@@ -3545,7 +3580,9 @@ test('fix8-E：EXEC_INDIRECT 的撤销在同一条 net 里（变量钉成包内 
   assert.equal(r.revokedBundledRefs.length, 1, JSON.stringify(r.revokedBundledRefs));
   assert.equal(r.revokedBundledRefs[0].ruleId, 'EXEC_INDIRECT', JSON.stringify(r.revokedBundledRefs[0]));
   assert.equal(r.revokedBundledRefs[0].resolvedEntry, 'payload.js');
-  assert.equal(r.decision.action, 'request-review');
+  // ⚠ 2026-10-26 去人工化：新轴 ③ 支 ⇒ block / auto-rejected。
+  assert.equal(r.decision.action, 'block');
+  assert.equal(r.decision.label, 'auto-rejected');
   assert.ok(r.decision.reason.includes('payload.js'), r.decision.reason);
 });
 
@@ -5333,7 +5370,11 @@ test('T4-B3 撤销（工单 §2.5 / §3 B3）：polyglot 进 feed 之后，`sh $
   assert.deepEqual(r.counts, { high: 4, medium: 2, low: 1, info: 0 });
   assert.equal(r.riskLevel, 'high');
   assert.equal(r.decision.action, 'block');
-  assert.equal(r.decision.needsHumanReview, true);
+  // ⚠ 2026-10-26 去人工化：label 从 needs-human-review 变成 auto-rejected，
+  // needsHumanReview 恒 false（机器自己拒，不再等人）。这一发命中 PIPE_TO_SHELL/SELINUX_DISABLE
+  // 两条 MALICE_LIST 成员 ⇒ 新轴 ① 支，结论仍是 block，只是不再标「待人工」。
+  assert.equal(r.decision.label, 'auto-rejected');
+  assert.equal(r.decision.needsHumanReview, false);
   assert.deepEqual(t4fed(r), [], '已在 feed 上的条目不重复记账：polyglot 那一步只补「原本一行都没读」的那几份');
 });
 
@@ -6686,13 +6727,28 @@ test('DXE-01 同一句字面值：写在 customize.sh 里是 high，躺在 dex �
   assert.equal(r.counts.high, 1, `参与定级的 high 只能来自脚本那一发，实得 ${r.counts.high}`);
 });
 
-test('DXE-01b 只有干净 dex 的包仍然 medium 且不开自动放行 —— 这一层永远不用来放宽（§0.7）', async () => {
+test('DXE-01b 只有干净 dex 的包仍然不开自动放行 —— 这一层永远不用来放宽（§0.7）', async () => {
   const zip = makeModuleZip({ id: 'dexe_only', files: [['classes.dex', DEXE_BYTES]] });
   const r = await scanToReport(zip, { changeType: 'first' });
   assert.equal(r.counts.high, 0, '执行型三面全被降成 info，所以一枚 high 都不该有');
   assert.equal(r.riskLevel, 'medium');
   assert.equal(r.decision.action, 'block', '含 dex 的包不许因为这层"读出来了"就自动放行');
-  assert.equal(r.decision.needsHumanReview, true);
+  // ⚠ 2026-10-26 去人工化：结论（block）一个字没变，变的是它凭什么拦、以及拦下之后叫什么。
+  // 旧断言 needsHumanReview:true 描述的是「转人工」；那个去处已经删除，label 现在是 auto-rejected。
+  // 拦下它的**不是** medium 那条 STRUCT_BINARY（那只是标注，§1.1「level 不再参与判决」），
+  // 而是这份 dex 常量池里读出的 WRITE_SYSTEM_VENDOR —— MALICE_LIST 成员，新轴 ① 支。
+  // classifyMalice 按契约 §1.3 只认 ruleId、不看 severity，所以一条 info 级的池读数照样能拦；
+  // 这正是「§0.7 这一层永远不用来放宽」在新轴下的落点，断言必须写清是哪一条在说话。
+  assert.equal(r.decision.label, 'auto-rejected');
+  assert.equal(r.decision.needsHumanReview, false);
+  assert.equal(r.malice.malicious, true, JSON.stringify(r.malice));
+  assert.ok(r.malice.hits.some((h) => h.source === 'static' && h.ruleId === 'WRITE_SYSTEM_VENDOR'),
+    `拦它的是池里读出的名单成员：${JSON.stringify(r.malice.hits)}`);
+  assert.equal(r.findings.find((f) => f.ruleId === 'WRITE_SYSTEM_VENDOR').severity, 'info',
+    '档位仍是 info（常量池不承诺这行会被跑）—— 拦不拦与档位是两件事，这里要看得见这个分离');
+  // §10「不许静默」：不拦上架的那几条读数仍然必须在标注里点名。
+  assert.ok(annOf(r).includes('STRUCT_BINARY'),
+    `medium 不参与判决，那它就必须在标注里被点名：annotation=${JSON.stringify(r.annotation)}`);
 });
 
 test('DXE-02 存在型证据从常量池里也抓到了：档位由那条规则自己定，行号落在串序号范围内', async () => {

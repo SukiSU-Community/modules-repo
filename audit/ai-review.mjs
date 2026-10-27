@@ -145,6 +145,27 @@ export const MALICE_EVIDENCE_MAX = 10;
  */
 export const DEFAULT_MAX_BRIEF_BYTES = 240000;
 
+/**
+ * 从环境变量 `AI_BRIEF_MAX_BYTES` 读预算上限（契约 §2.3）。
+ *
+ * 为什么要有这个开关：240000 这个数是「没有依据的保守代理值」（见上面的 TODO），
+ * 标定出来之后要能改**而不改代码** —— 改代码就得走一次 PR，而标定是运维动作。
+ *
+ * 采信条件是 `Number.isFinite` 且 > 0，其余一律退回默认值。**不做字符串宽容**
+ * （'240k' / '240,000' / 带单位都当没写）：把读不懂的配置猜成一个数，比用默认值更危险 ——
+ * 猜错的方向如果偏小，AI 层会对正常包报 over-budget 拒稿；偏大则让 brief 顶穿模型输入上限，
+ * 两种失效都不会在本地跑测试时暴露。宁可退回一个**写明的**默认值。
+ *
+ * @param {Record<string,string|undefined>} [env]
+ * @returns {number} 有效的字节上限（> 0）
+ */
+export function briefBudgetFromEnv(env = (typeof process !== 'undefined' ? process.env : {})) {
+  const raw = env ? env.AI_BRIEF_MAX_BYTES : undefined;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return DEFAULT_MAX_BRIEF_BYTES;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_BRIEF_BYTES;
+}
+
 /** qfmodel 的 max_input_tokens —— 只是参照量，**不是**预算的换算依据（见上面的 TODO）。 */
 export const QFMODEL_MAX_INPUT_TOKENS = 180000;
 
@@ -981,17 +1002,26 @@ function eventText(item) {
  * 与 `send_session_events` 那条不同，这一发是**信息位**：读不到就把 `totalCredits`/`activeSeconds`
  * 记成 null 并留一句 `error`，绝不把已经成立的结论改成 failed（那等于让运维读数的缺失变成安全判定）。
  * 壳的几种写法都试（`item` / 裸对象 / `session`），因为本模块的离线测试钉的是字段名而不是信封。
+ *
+ * `inputTokens` 是**标定专用**的读数（契约 §2.3 的 ai-budget-calibrate.yml 要拿它算
+ * `input_tokens / neededBytes`）。三种可能的字段名都试（`input_tokens` / `prompt_tokens` /
+ * `inputTokens`），因为供应商换过一次口径、而标定只要一个真数；**都没有就是 null**，
+ * 绝不推断一个数出来 —— 编出来的比值比「没标定」更危险，它会看起来像事实。
  */
 async function qcaSessionCost({ fetchImpl, base, headers, signal, sessionId }) {
-  const none = { totalCredits: null, activeSeconds: null, status: null };
+  const none = { totalCredits: null, activeSeconds: null, status: null, inputTokens: null };
   try {
     const json = await qcaFetchJson(fetchImpl, joinUrl(base, `/sessions/${sessionId}`),
       { method: 'GET', headers, signal }, 'qca get_session');
     const s = (json && (json.item || json.session)) || json || {};
+    const u = (s.usage && typeof s.usage === 'object') ? s.usage : {};
+    const rawIn = u.input_tokens ?? u.prompt_tokens ?? u.inputTokens;
+    const inN = Number(rawIn);
     return {
       totalCredits: (s.usage && s.usage.total_credits) ?? null,
       activeSeconds: (s.stats && s.stats.active_seconds) ?? null,
       status: typeof s.status === 'string' ? s.status : null,
+      inputTokens: Number.isFinite(inN) && inN > 0 ? inN : null,
     };
   } catch (err) {
     return { ...none, error: `get_session：${err.message}`.slice(0, 200) };
@@ -1060,6 +1090,8 @@ async function callQca({ cfg, prompt, signal, deadline, timeoutMs, fetchImpl }) 
         // 有什么记什么：QCA 的可用成本字段只有这两个（没有 finish_reason、没有 neurons）。
         totalCredits: cost.totalCredits,
         activeSeconds: cost.activeSeconds,
+        // 标定专用读数（契约 §2.3）：供应商没给就是 null，绝不推断。
+        inputTokens: cost.inputTokens,
         // 会话状态必须一起记：running 时读到的数是「截至那一刻」，不记状态就会把中间值当终值。
         sessionStatus: cost.status,
         ...(cost.error ? { costError: cost.error } : {}),
@@ -1477,6 +1509,7 @@ const USAGE = `用法: node audit/ai-review.mjs run --report <pkg.audit.json> --
 凭据只从 env 读：QODER_PAT / QCA_AGENT_ID / QCA_AGENT_VERSION / QCA_ENVIRONMENT_ID / QCA_API_BASE
                  AI_API_KEY / AI_API_BASE / AI_MODEL（workers-ai 后端）
 状态值：ok | failed | untrusted | over-budget —— disabled 只由 workflow 在没有凭据时写，本模块永远不写。
+预算：--max-bytes > env AI_BRIEF_MAX_BYTES > DEFAULT_MAX_BRIEF_BYTES（env 值须 Number.isFinite 且 > 0，读不懂退回默认）
 产物或 status 写不出去 = 非零退出（状态写不出去时也必须红）。
 `;
 
@@ -1654,7 +1687,10 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     return finish('failed', { reason: `包读取失败：${err.message}` });
   }
 
-  const maxBytes = Number(opts['max-bytes']) > 0 ? Number(opts['max-bytes']) : DEFAULT_MAX_BRIEF_BYTES;
+  // 预算优先级：显式 --max-bytes > 环境变量 AI_BRIEF_MAX_BYTES > DEFAULT_MAX_BRIEF_BYTES。
+  // 命令行排第一是因为它是「这一次运行」的显式意图；环境变量是「这台机器/这个 workflow」的配置。
+  const cliMax = Number(opts['max-bytes']);
+  const maxBytes = Number.isFinite(cliMax) && cliMax > 0 ? cliMax : briefBudgetFromEnv(env);
   const brief = buildBrief({ report, entries, maxBytes });
   const briefMeta = {
     byteSize: brief.byteSize,
@@ -1684,8 +1720,13 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   if (brief.overBudget) {
     return finish('over-budget', {
       reasonCode: 'over-budget',
+      // 契约 §2.3：拒因必须**可操作** —— 明写「当前 X B / 上限 Y B」并给出投稿者能做的事
+      // （精简文本体积）。只报数字等于让投稿者自己猜「那我要减多少」；而分片送审本轮不做，
+      // 所以不能拿「我们会支持更大包」搪塞。
       reason: `把整包送出去**需要 ${brief.neededBytes} B**，预算只有 ${maxBytes} B（硬上界：四个节标题、`
-        + `空区占位与节间换行都已计入），所以略过了 ${brief.omitted.length} 条；本次未调用模型。${budgetNote}`,
+        + `空区占位与节间换行都已计入），所以略过了 ${brief.omitted.length} 条；本次未调用模型。`
+        + `当前 ${brief.neededBytes} B / 上限 ${maxBytes} B，请精简文本体积（删掉包内不参与安装的`
+        + `大段文本、把内嵌的日志/证书/固件之类挪出包外）后重新投稿。${budgetNote}`,
       staticRiskLevel: report.riskLevel ?? null,
       brief: briefMeta,
       unreadFromReport: Array.isArray(report.unread) ? report.unread.length : 0,

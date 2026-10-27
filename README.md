@@ -71,8 +71,10 @@ node scripts/fetch-pending-zip.mjs pending/ --out-dir /tmp/zips \
 }
 ```
 
-`verified` 是我们额外带的字段：**脚本自动放行的一律 `false`**，
-只有人工复核通过后才置 `true`。`versions` 按 `versionCode` 降序，最新版在前。
+`verified` 是我们额外带的字段：**一律 `false`**。本站没有「人工复核通过」这一档
+（见 `GOVERNANCE.md` 第 1 节），所以没有谁有权把它置 `true` —— 要让它变真，得先把「谁有权
+置真、凭什么置真」重新建出来，而不是由投稿者自己在 pending JSON 里填一个 `true`。
+`versions` 按 `versionCode` 降序，最新版在前。
 
 ### pending 条目格式
 
@@ -136,7 +138,7 @@ ci:audit@<那一枚写下处置实体的 commit 的 40 位小写 sha>
 ## 两段式自动放行（为什么 publish 不再直接写索引）
 
 ```
-投稿 PR ──audit（扫描+报告）──> approve（只在「低风险+首次收录」时成功）
+投稿 PR ──audit（扫描+报告）──> approve（只在未命中上架拦截名单时成功；首投与更新同一套判据）
                                       │
                             publish（只 squash 合并）
                                       │
@@ -200,6 +202,19 @@ node scripts/publish-from-main.mjs --pending pending --sha <main上的提交> \
      --owner SukiSU-Community --repo modules-repo --report r.json
 node --test test/publish-from-main.test.mjs
 ```
+
+## 谁能发某个模块的新版本（归属）
+
+首投合入之后，**该模块的版本更新只收首位成功投稿者**：服务端记着「哪个 moduleId 属于哪个
+酷安 UID」，更新单出示的 UID 对不上就整单拒（全有全无，拒绝发生在任何 GitHub 写入之前）；
+归属确认不出来时同样是拒，不是放行 —— 服务端故障在这一格等于「更新暂时投不进来」。
+更新与首次收录走**同一套判据**（`audit/risk-rules.mjs` 的 `decide()`），不做跨版本差异比对。
+
+归属记录**不进这个仓库**，只住在服务端：这个仓库是 public，`GOVERNANCE.md` 第 6 节授权公开的
+只有昵称 / 酷安 UID / 出处链接 / 包哈希，而「某个 moduleId 属于某个 UID」是一条新的关联信息
+（连起来就是一张「谁投过哪些模块」的清单），索引消费方也不需要它。代价是这一格**没有给外人
+一条能自己跑一遍的复验命令** —— 与第 3 节那枚钉在公开提交上的机器章不同。详见
+`GOVERNANCE.md` 第 9 节。
 
 ## main 分支保护 runbook（**必须在新 workflow 上了 main 之后再执行**）
 
@@ -288,6 +303,10 @@ JSON
 - 拒绝路径：`customize.sh` 里放 `curl … | sh` + `setenforce 0` 的样本 → 扫描判高风险 →
   `approve` **fail** → 标签 `needs-human-review` + `blocked-auto-merge` → `mergeStateStatus: BLOCKED`，
   并且那次 `workflow_run` 触发的重建被 job 级 `if` **skipped**（红审核不会顺带开索引 PR）。
+
+> **注（2026-10-26）**：上面那条拒绝路径是当时的现场记录。标签与拒稿外观此后换过代 ——
+> `block` 现在打 `auto-rejected`（不再打 `needs-human-review` / `blocked-auto-merge`）、在 PR 里
+> 逐条列拒因、并自动关闭 PR；「转人工」那一态已从判据里删除，见 `GOVERNANCE.md` 第 2 节第 6 条。
 
 ### 还开着的两个口子（不是代码能解决的）
 

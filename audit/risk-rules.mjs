@@ -2663,15 +2663,19 @@ export function summarizeCoverage(findings, extras = {}) {
  * 也是任何调用方没接到判据时的保守默认 —— 不许有人把它当成第二份判据来用）。
  * 生产调用点 `scan.mjs` 与 audit.yml 的「分流决策」都已传第四参 ⇒ 上不上架只由名单 ∪ AI 恶意结论决定。
  *
- * 新轴的形状（用户拍的四条，一条不许自己放宽）：
- *   1. 命中名单（静态 ∪ AI 恶意）⇒ `block`。取严：任一命中就不上架。
- *   2. 名单外的一切 —— 包括 root 模块正当功能那批 high（PROP_BOOT_SPOOF / VERIFIED_BOOT_SPOOF /
- *      MAGISK_POLICY_LIVE / SELINUX_* / EXEC_BUNDLED_FILE / MODDIR_RUNTIME_WRITE）—— **不再拦上架**，
- *      等级与命中读数退成标注（`summarizeCoverage`），由报告与 PR 评论呈现。
- *   3. `update` / `unknown` 这一档维持 request-review：§13 第 2 条（要不要给版本更新另加一道）
- *      标的是**待拍**，本函数不许自行默认。
- *   4. fix8-E 那道「撤销过就不自动放行」在新轴上照旧生效（它只会更严）。
- * 措辞纪律在四条之上还有一条：只有**命中**那一句可以说「恶意」，未命中的三条说的是「上架拦截名单」。
+ * 新轴的形状（**二值**：只有 block 与 auto-approve，`request-review` 整个消失）：
+ *   1. `malice.malicious === true` ⇒ `block`。
+ *   2. `String(changeType).split('+')` 含 `'unknown'` ⇒ `block`（分不清首投还是更新，fail-closed）。
+ *      注意批量 PR 的 `changeTypeOf()` 会产出 `first+update` 这种拼接值，那种要**放行**；
+ *      只有真的含 unknown 才拦。
+ *   3. `coverage.revokedCount > 0` ⇒ `block`（机器不替执行过模块自带文件的条目作证）。
+ *   4. 其余一切（first / update / 任意 level）⇒ `auto-approve`。
+ *
+ * 为什么 `request-review` 必须消失（契约 §1.1）：它今天在 CI 里的后果与 `block` 完全一样
+ * （approve 红、PR 挂着、没人能签），是一个黑洞；去人工化后没有「转人工」这个去处。
+ * **`level` 不再参与判决**，只进 reason 文案；**`update` 与 `first` 判据完全等价**，
+ * 不做跨版本差异比对。
+ * 措辞纪律：只有**命中**那一句可以说「恶意」，其余说的是「上架拦截名单」。
  * @param {'low'|'medium'|'high'} level
  * @param {'first'|'update'|'unknown'} changeType
  * @param {{ revokedCount?:number, revokedEntries?:string[] }|null} [coverage] 撤销覆盖度
@@ -2680,36 +2684,40 @@ export function summarizeCoverage(findings, extras = {}) {
 export function decide(level, changeType, coverage = null, malice = undefined) {
   const useNewAxis = !!(malice && typeof malice === 'object' && typeof malice.malicious === 'boolean');
   if (useNewAxis) {
-    // 1) 取严：任一命中就不上架。AI 那一支只加不减（§2 不变量）。
+    // ① 取严：命中名单（静态 ∪ AI 恶意）就不上架。AI 那一支只加不减（§2 不变量）。
     if (malice.malicious) {
-      return { action: 'block', label: 'needs-human-review', needsHumanReview: true,
+      return { action: 'block', label: 'auto-rejected', needsHumanReview: false,
         axis: 'malice', basis: Array.isArray(malice.basis) ? malice.basis : [],
         hits: Array.isArray(malice.hits) ? malice.hits : [],
         reason: malice.reason || '命中恶意行为链名单，不上架' };
     }
-    // 3) 不是首次收录 ⇒ 那一道还待拍，维持今天的行为（只更严不更松）。
-    if (changeType !== 'first') {
-      return { action: 'request-review', label: 'needs-human-review', needsHumanReview: true,
+    // ② 分不清首投还是更新 ⇒ fail-closed。拼接值（first+update）里不含 unknown，不在此列。
+    const changeParts = String(changeType).split('+');
+    if (changeParts.includes('unknown')) {
+      return { action: 'block', label: 'auto-rejected', needsHumanReview: false,
         axis: 'malice',
-        reason: changeType === 'update'
-          ? '未命中上架拦截名单，但这是对已收录模块的版本更新 —— 「要不要给 update 另加一道」是 §13 第 2 条的待拍项，本轮不自行默认，维持转人工'
-          : '无法判定是首次收录还是版本更新（未提供索引），保守起见转人工' };
+        reason: '未命中上架拦截名单，但无法判定是首次收录还是版本更新（未提供索引），'
+          + '按不可上架处理' };
     }
-    // 4) fix8-E：撤销过 ⇒ 机器不替它作证。
+    // ③ fix8-E：撤销过 ⇒ 机器不替它作证（措辞：说的是「不予自动放行」，不写「需人工确认」）。
     const revokedCount = coverage && Number(coverage.revokedCount) > 0 ? Number(coverage.revokedCount) : 0;
     if (revokedCount > 0) {
       const entries = (Array.isArray(coverage.revokedEntries) ? coverage.revokedEntries : [])
         .filter((x) => typeof x === 'string' && x);
       const shown = entries.length ? entries.join('、') : `共 ${revokedCount} 次撤销涉及的条目`;
       const noun = entries.length > 1 ? '这些条目' : '该条目';
-      return { action: 'request-review', label: 'needs-human-review', needsHumanReview: true,
+      return { action: 'block', label: 'auto-rejected', needsHumanReview: false,
         axis: 'malice',
         reason: `未命中上架拦截名单，但它执行了模块自带的 ${shown}；${noun}已读且行级规则无命中，`
-          + '机器不替它作证，需人工确认' };
+          + '机器不替它作证，不予自动放行' };
     }
-    // 2) 名单外 ⇒ 上架 + 标注。「未经人工审核」这句话由 annotation 与呈现层落（§10）。
+    // ④ 名单外 ⇒ 上架 + 标注。「未经人工审核」这句话由 annotation 与呈现层落（§10）。
+    //    update 要额外说明「版本更新与首次收录适用同一套判据」—— 那句「按规则需要人工审核」
+    //    是假陈述，已经删掉，这里不能再漏掉新的那一句。
+    const isUpdate = changeParts.includes('update');
     return { action: 'auto-approve', label: 'auto-approved', needsHumanReview: false, axis: 'malice',
-      reason: `${malice.reason || '未命中上架拦截名单'}；风险等级 ${level} 在本模型里只是标注输入，不再拦上架` };
+      reason: `${malice.reason || '未命中上架拦截名单'}；风险等级 ${level} 在本模型里只是标注输入，不再拦上架`
+        + (isUpdate ? '；版本更新与首次收录适用同一套判据' : '') };
   }
 
   // ── 老轴（等级 + changeType）：malice 缺省时逐字保留 ──

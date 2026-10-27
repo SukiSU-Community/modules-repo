@@ -19,7 +19,12 @@
 # 分流判据（2026-10-21 换轴：设计文档 §2 / §4 / §13.5；等级不再当判决）：
 #   命中上架拦截名单（**任一**包；静态 11 条 ∪ AI 恶意结论且引用逐字复验过）-> block，不进索引
 #   名单外的一切，含 root 模块正当功能本身那批 high                        -> auto-approved，自动合入索引
-#   不是首次收录（update / unknown）与「撤销过执行类发现」那两格              -> request-review，不自动合入
+#   判据是**二值**（2026-10-26 去人工化，契约 §1.1）：只有 block 与 auto-approve 两值。
+#   曾经的 request-review 态在 CI 里的后果与 block 完全一样（approve 红、PR 挂着、没人能签），
+#   而那个「人」从来没有存在过 —— 它挡住的唯一东西是版本更新（update 一律落这一档，
+#   等于把更新入口关死）。这一态连同 needs-human-review 标签已整个删除。
+#   **update 与 first 判据完全等价**，不做跨版本差异比对：机器判的是这一包本身。
+#   判据自己跑不成（我们的故障）另打 audit-broken，PR 保持 open —— 不拿自家故障关别人的 PR。
 #   等级、覆盖读数、能力读数在新模型里只是**标注**（随报告与评论公示），不再决定上不上架。
 #   措辞纪律：拦下说的是「命中名单」这件事，等级高不等于恶意；没命中也不代表「查过了没事」。
 #   审核不通过的内容绝不出现在正式索引里。
@@ -35,8 +40,13 @@
 #      任一条不合格整份不采信，而不是丢掉那一条继续盖章；
 #   ③ 模型的自由文本进 PR 评论前封条数与单条长度（分流决策里，改这一步时必须保留）。
 # 五种状态（disabled / ok / failed / untrusted / over-budget）由 AI 步逐包写进
-# audit-out/ai-<zip basename>.status，由「分流决策」消费：failed / untrusted / over-budget
-# 各用自己那句串、整步红；ok 参与 raiseLevel 抬级；disabled 等级不动。
+# audit-out/ai-<zip basename>.status，由「分流决策」消费（2026-10-26 契约 §2 定下失效方向）：
+#   disabled / failed  -> **降级放行**：只走静态名单，等级不动，ai_status=degraded，
+#                         PR 正文与回执明写「本次 AI 安全员未参与」—— 不是「AI 看过并同意」；
+#   untrusted          -> 拒该包（判据不可采信），action=block / label=auto-rejected；
+#   over-budget        -> 拒该包（没看全），同上；「没看全」不是「看过了没事」；
+#   ok                 -> 参与 raiseLevel 抬级。
+# 「判据自己跑不成」才是整步红（label=audit-broken），与上面五态是两件事。
 # 判自动放行的判据全仓只有一份（audit/risk-rules.mjs 的 classifyMalice + decide）：分流那一步 import 它，
 # 不在这里抄第二份；AI 步自己也不产出 action —— 它只写等级读数与那份「恶意结论 + 引用逐字复验结果」，
 # 名单上 AI 那一支的 ∪ 发生在分流（§0 第 1 条：静态 ∪ AI 恶意结论，两边都只有拒的权力）。
@@ -85,6 +95,9 @@ jobs:
       label: ${{ steps.triage.outputs.label }}
       change_type: ${{ steps.triage.outputs.change_type }}
       needs_human_review: ${{ steps.triage.outputs.needs_human_review }}
+      # 契约 §2 / §3.5：ok / degraded / rejected 三值。degraded 表示「AI 层没参与，
+      # 只过了静态恶意名单」，评论与回执要明写那一句；rejected 表示有包判据不成立、按拒处理。
+      ai_status: ${{ steps.triage.outputs.ai_status }}
       module_id: ${{ steps.triage.outputs.module_id }}
       module_version: ${{ steps.triage.outputs.module_version }}
       reasons: ${{ steps.triage.outputs.reasons }}
@@ -693,8 +706,18 @@ jobs:
           mkdir -p audit-out
           # 索引用于判定“首次收录 / 版本更新”
           INDEX="${FORCE_INDEX:-$LOCATE_INDEX}"
-          [ -f "$INDEX" ] || INDEX=""
-          echo "用于判定首次收录/版本更新的索引：${INDEX:-（无，changeType 会退化为 unknown）}"
+          # 契约 §2.1（Q18）：索引不存在**必须整步红**，不许退化成 changeType=unknown 再让 decide()
+          # 把它判成「分不清首投还是更新 ⇒ 拒」。那两件事的责任人不同：
+          #   - 索引丢了 = 我们的仓库配置坏了（MODULE_INDEX_PATH 指错、locate 没找到）
+          #   - unknown  = 分不清首投还是更新（旧写法把这一格也念成投稿者的问题）
+          # 拿自家故障去关投稿人的 PR，正是本仓库那条「把我们的故障说成投稿者的风险」的假陈述。
+          if [ ! -f "$INDEX" ]; then
+            echo "::error::索引文件不存在：无法判定首投/更新，本步红"
+            echo "::error::（期望路径：FORCE_INDEX='${FORCE_INDEX:-<空>}' / LOCATE_INDEX='${LOCATE_INDEX:-<空>}'）"
+            echo "::error::这是仓库配置的问题，不是这次投稿的结论 —— 修好 vars.MODULE_INDEX_PATH 或 locate 步后重跑。"
+            exit 1
+          fi
+          echo "用于判定首次收录/版本更新的索引：$INDEX"
 
           # 扫描器路径由 locate 步骤按 PREFIX 推导后传过来（不再写死 contrib/audit/scan.mjs）。
           # 索引仓库形态 PREFIX 为空 -> audit/scan.mjs；monorepo 形态 -> contrib/audit/scan.mjs。
@@ -946,14 +969,20 @@ jobs:
           #      让人看得出这条 PR 里到底有几个人投稿 —— F16 那个洞不许因为换轴而重新打开。
           # 没有报告就不许定级（audit-out 为空 → 直接红），不许把「什么都没扫到」当成放行理由。
           #
-          # AI 那一层（Task 6.1）在这一格消费，不在别处：五种状态要在这里产生五种不同的下游后果。
-          #   disabled      → 等级不动，文案是「未启用」那句；名单上 AI 那一支没有读数（只有静态那半）；
+          # AI 那一层（Task 6.1）在这一格消费，不在别处：五种状态要在这里产生五种不同的下游后果
+          # （契约 §2，2026-10-26 去人工化定案）：
+          #   disabled      → **降级放行**：等级不动，只走静态名单，ai_status=degraded，文案「未启用」；
+          #   failed        → **降级放行**：同上，ai_status=degraded，reason 明写「AI 未跑成」；
           #   ok            → 逐包 raiseLevel 抬级（只升不降），findings 并进 reasons，
           #                   maliceVerdict 是名单 ∪ 的第二个来源（只有 malicious:true 且引用逐字复验过才加拒）；
-          #   failed        → 本步 exit 1，「没跑成」那句；
-          #   untrusted     → 本步 exit 1，「判据不可采信」那句（与 failed 不同串）；
-          #   over-budget   → 本步 exit 1，「送不全」那句：不是它同意，是没看全。
-          # 红开在这里而不是 AI 那一步，是因为那一步先红会把本步整步跳过（found=='true' 没有 always()）：
+          #   untrusted     → **拒该包**：action=block / label=auto-rejected，ai_status=rejected，
+          #                   reason 明写「判据不可采信」；
+          #   over-budget   → **拒该包**：同上，reason 明写「没看全，不是同意」+ 当前字节数/上限。
+          # 四种「不是 ok」**都不许让本步 exit 1**：把「这一发 AI 层没给结论」渲染成 CI 坏了，
+          # 投稿者只看到一个红叉，既看不到判据也看不到为什么拒。仍然整步红的只有「判据自己跑不成」
+          # （没有报告 / riskLevel 缺或越界 / 状态值不在五态 / 口径对不上）—— 那是我们的故障。
+          #
+          # 红为什么开在这里而不是 AI 那一步：那一步先红会把本步整步跳过（found=='true' 没有 always()），
           # 那样五态文案出不来、判据全空、PR 一片沉默 —— 判据层才是开火的正确位置。
           node -e '
             const fs=require("fs");
@@ -986,11 +1015,19 @@ jobs:
               // 一份报告都没读成时，还能说的只剩「这个 PR 里有几份报告文件」。
               w("package_count",String(reports.length || names.length));
               w("ai_note",aboutAi===false ? "" : m);
+              // ai_status 与 risk 同一方向：判据自己跑不成时**没有结论**，留空。
+              // 填 ok 是假话（AI 层可能压根没跑），填 degraded 也不对 —— degraded 的意思是
+              // 「降级放行」，而这一发没有放行。下游要区分「没有结论」与「降级」，
+              // 靠的是 steps.triage.conclusion，不是这一格。
+              w("ai_status","");
               w("reasons",m);
               // 这三格永远不过 decide()：红那一发的处置只有一个方向。而 auto-approve 是 publish 作业的门票
               // （它的 if 认 found 与 action 两个 output）、auto-approved 是标签步会真打上去的颜色 ——
               // 判据自己没跑成却写出这两格里任何一个，就是把「通道坏了」渲染成「已放行」。
-              w("action","block"); w("label","needs-human-review"); w("needs_human_review","true");
+              // 标签必须是 audit-broken 而不是 auto-rejected（契约 §2.2.1）：「判据自己跑不成」
+              // 是我们的故障，不是这次投稿的结论。写成 auto-rejected 会让投稿者收到一封「你被拒了」
+              // 而实际上该修的是 CI；那正是本仓库那条「把我们的故障说成投稿者的风险」的同一句假陈述。
+              w("action","block"); w("label","audit-broken"); w("needs_human_review","true");
             };
             const fail=(m,aboutAi)=>{ console.error(`::error::分流决策：${m}`); writeFailClosed(m,aboutAi); process.exit(1); };
             const NO_REPORT="found=true 但 audit-out 里没有任何 .audit.json —— 没有报告就不定级，更不放行";
@@ -1041,22 +1078,35 @@ jobs:
             const noStatus=pkgs.filter((p)=>ai[p]===undefined);
             if (statusFiles.length && noStatus.length) fail(`有 ${noStatus.length} 包没有对应的 ai-*.status：${noStatus.join(", ")}`
               + " —— AI 步的收口闸没咬住；「缺状态」不等于「没配凭据」，不许退成未启用");
-            // 三种「跑了但不成立」各用自己那句串。合并成一句，下游就只剩一种后果（§0.1）。
-            const fire=(list,label,extra)=>{
-              if (!list.length) return;
-              const detail=list.map((p)=>{
-                let a=null; try { a=JSON.parse(fs.readFileSync(`${dir}/ai-${p}.json`,"utf8")); } catch { /* 读不到原因就只报状态，红照旧 */ }
-                const why=(a && typeof a.reason === "string") ? `（${a.reason.slice(0,200)}）` : "";
-                return `${p}${why}`;
-              }).join(" ");
-              fail(`AI 安全员${label}（${list.length} 包：${detail}）：${extra}`);
+            // ── 五态消费（契约 §2）：四种「不是 ok」**都不是整步红** ────────────────────────
+            // 旧写法在这里三发 fail()：failed / untrusted / over-budget 全 exit 1。那是把
+            // 「这一发 AI 层没给结论」说成「CI 坏了」—— 投稿者拿到一个红叉，看不到判据，
+            // 也看不到「为什么拒」。契约 §2 把它拆成两个方向：
+            //   ① 降级放行（disabled / failed）：只走静态名单，等级不动，记 ai_status=degraded；
+            //   ② 拒该包（untrusted / over-budget）：这一包不许放行，action=block / label=auto-rejected。
+            // 仍然整步红的只剩「判据自己跑不成」：上面那几道闸（没有报告 / riskLevel 缺或越界 /
+            // 状态值不在五态 / 口径对不上）。**那是我们的故障，不是这次投稿的结论。**
+            const whyOf=(p)=>{
+              let a=null; try { a=JSON.parse(fs.readFileSync(`${dir}/ai-${p}.json`,"utf8")); } catch { /* 读不到原因就只报状态 */ }
+              return (a && typeof a.reason === "string") ? a.reason.slice(0,200) : "";
             };
-            fire(pkgs.filter((p)=>ai[p]==="failed"),"没跑成",
-              "这一发的结论不存在（模型调用失败 / 输入读不到 / 产物写不出去），不许把「没意见」当成「同意」");
-            fire(pkgs.filter((p)=>ai[p]==="untrusted"),"判据不可采信",
-              "跑成了但 schema 或逐字引用复验不过，整份不采信 —— 要修的是我们的 prompt 与预算，不是供应商");
-            fire(pkgs.filter((p)=>ai[p]==="over-budget"),"送不全",
-              "不是它同意，是没看全 —— 原文装不进单发预算或压根没有可送入的条目，这一发根本没发过");
+            const degradedPkgs=pkgs.filter((p)=>ai[p]==="disabled"||ai[p]==="failed");
+            const rejectedPkgs=pkgs.filter((p)=>ai[p]==="untrusted"||ai[p]==="over-budget");
+            // 四句串各用各的：合并成一句就等于只剩一种下游后果（§0.1）。
+            const rejectWhyOf=(p)=>{
+              const head=ai[p]==="untrusted"
+                ? "判据不可采信（schema 或逐字引用复验不过，整份不采信）"
+                : "没看全，不是同意";
+              const r=whyOf(p);
+              return `${p}：AI 安全员${head}${r?`（${r}）`:""}`;
+            };
+            const degradedWhyOf=(p)=>{
+              const head=ai[p]==="failed"
+                ? "AI 未跑成（模型调用失败 / 输入读不到 / 产物写不出去）"
+                : "AI 未启用（QCA 四件配置缺一：PAT / agent id / agent version / environment id）";
+              const r=whyOf(p);
+              return `${p}：${head}${r?`（${r}）`:""}`;
+            };
 
             const repByPkg={};
             for (const x of reports) repByPkg[x.pkg]=x.r;
@@ -1106,6 +1156,7 @@ jobs:
               }));
             }
             const disabledPkgs=pkgs.filter((p)=>ai[p]==="disabled");
+            const failedPkgs=pkgs.filter((p)=>ai[p]==="failed");
             // 键名 T6.2 去掉了旧的 llm 前缀，改成 ai_note（写出处与两处消费点一起改；
             // 只改一半的那一发会让「复核方式」那一句永远拿到空串）。**文案本身一个字没动** ——
             // 五态怎么开火是 6.1 的资产，改坏了要靠 6.1 那 31 条红来发现。
@@ -1113,7 +1164,16 @@ jobs:
             if (!statusFiles.length) {
               aiNote="AI 安全员这一步没有产物（audit-out 里没有任何 ai-*.status）：本轮只有静态扫描，等级不由 AI 参与";
             } else if (!okPkgs.length) {
-              aiNote="AI 安全员未启用（QCA 四件配置缺一：PAT / agent id / agent version / environment id）：本轮只有静态扫描，等级不由 AI 参与";
+              // 全非 ok 有两条方向不同的路，文案不许合并（契约 §2 表 + §3.5）：
+              //   degraded（disabled / failed）⇒ 降级放行，但必须明写「AI 未参与」；
+              //   rejected（untrusted / over-budget）⇒ 这一发压根没成立，明写「判据不成立」。
+              // failed 与 disabled 也必须分开：前者是「配了但没跑成」，说成「未启用」会让运维
+              // 去查凭据而不是查模型 —— 那是把一次调用失败指错到另一个配置项上。
+              aiNote = rejectedPkgs.length
+                ? "本次 AI 安全员未参与（判据不成立）：只过了静态恶意名单"
+                : failedPkgs.length
+                  ? "本次 AI 安全员未参与（AI 未跑成）：只过了静态恶意名单"
+                  : "AI 安全员未启用（QCA 四件配置缺一：PAT / agent id / agent version / environment id）：本轮只有静态扫描，等级不由 AI 参与";
             } else {
               const changed=okPkgs.some((p)=>order[aiLevel[p]]>order[riskOf(repByPkg[p])]);
               // 立场与效果是两件事，不能共用一个分支（2026-10-16 CI run 38890758068 实测）：
@@ -1128,12 +1188,24 @@ jobs:
                   : "AI 安全员已复核（每条引用都逐字复验过送出去的那一份原文）：同意静态结论，等级未抬；AI 只能加严、无权放行";
               // 混合形态不可能由脚本产生，但也不许被写成「AI 同意」—— 按「有 N 包没有 AI 意见」呈现。
               if (disabledPkgs.length) aiNote+=`；另有 ${disabledPkgs.length} 包没有 AI 意见（未启用）`;
+              if (failedPkgs.length) aiNote+=`；另有 ${failedPkgs.length} 包 AI 未跑成（降级放行，只过静态名单）`;
+              if (rejectedPkgs.length) aiNote+=`；另有 ${rejectedPkgs.length} 包 AI 判据不成立（该包按拒处理）`;
             }
+            // ai_status 是契约 §2 / §3.5 要求写出的那一格，供回执与 PR 正文明写
+            // 「本次 AI 安全员未参与（原因），只过了静态恶意名单」。三值取最坏的那一档：
+            // rejected > degraded > ok —— 混一轮里只要有一包判据不成立，整轮就不许说成 ok。
+            const aiStatus = rejectedPkgs.length ? "rejected"
+              : (degradedPkgs.length || !okPkgs.length) ? "degraded" : "ok";
+            // 五态的拒因与降级因都要进 reasons：评论层逐条列出拒因（§2.2-2），
+            // 而「没跑成」那一类以前只活在会过期的 runner 日志里。
+            reasons=reasons.concat(rejectedPkgs.map(rejectWhyOf));
+            reasons=reasons.concat(degradedPkgs.map(degradedWhyOf));
             w("risk",risk); w("change_type",changeType);
             w("module_id",[...new Set(reports.map((x)=>idOf(x.r)))].join(","));
             w("module_version",[...new Set(reports.map((x)=>verOf(x.r)))].join(","));
             w("package_count",String(reports.length));
             w("ai_note",aiNote);
+            w("ai_status",aiStatus);
             w("reasons",reasons.join("；"));
 
             // ── 分流判据：恶意行为轴（设计文档 §2 / §4 / §13.5；用户 2026-10-21 拍的四条）────────────
@@ -1209,10 +1281,28 @@ jobs:
               fail(`名单命中而 decide() 给出的处置是 ${JSON.stringify(String(d.action).slice(0,32))}：`
                 + "「取严：任一命中就不上架」在被改宽，这一步不许放行");
             }
+            // ── 契约 §2：untrusted / over-budget ⇒ **拒该包**，不是整步红 ──────────────────
+            // 这两态的共性是「这一发压根没有可采信的读数」：untrusted 是 schema / 逐字引用
+            // 复验不过，over-budget 是原文没送全。把「没有读数」当成「没命中名单」就是 §0 那条
+            // 「不许把没意见当同意」的同一个错法，只是发生在 AI 这一层。
+            //
+            // 所以这一格**不过 decide()**：decide() 判的是「名单命中没命中」，而这里连名单
+            // 那一支的读数都不存在 —— 拿一个不存在的读数去喂判据，等于给「算错方向」留位置。
+            // 处置直接写成 block / auto-rejected（与 decide() 的 block 分支同形），理由进 reasons。
+            // 仍然 exit 0：这不是 CI 坏了，这是本次投稿的结论。
+            let action=d.action, label=d.label;
+            let needsHumanReview = d.needsHumanReview===false ? "false" : "true";
+            if (rejectedPkgs.length) {
+              if (action!=="block") {
+                action="block"; label="auto-rejected"; needsHumanReview="false";
+                console.error(`::notice::AI 判据不成立（${rejectedPkgs.join(", ")}）⇒ 该包按拒处理：`
+                  + "decide() 本来给的是放行，但这一轮有包没有可采信的读数");
+              }
+            }
             // 这里一个「放行」的字面量都不写：action / label 全部来自 import 进来的那份判据，
             // needs_human_review 反过来写（认不出 false 就是 true）—— 未知形状一律按不放行。
-            w("action",d.action); w("label",d.label);
-            w("needs_human_review", d.needsHumanReview===false ? "false" : "true");
+            w("action",action); w("label",label);
+            w("needs_human_review", needsHumanReview);
             })().catch((e)=>{
               // 判据自己出问题 = 红。兜成「按静态结论继续」等于把这道闸交给故障。
               const m=`分流决策异常：${e && e.message ? e.message : String(e)}`;
@@ -1518,14 +1608,14 @@ jobs:
             if (TRIAGE === 'success') {
               intro += verdict(String(process.env.RISK).toUpperCase(),
                 '（取本 PR 全部报告里最严的一份）', ctLabel(process.env.CHANGE_TYPE));
+              // 契约 §2.2（Q14）：判据跑成了、结论是 block 就是**终局**，不是「等人来签」。
+              // 换轴前这里写着「本站没有人可以签它进来 —— 要翻案请在本 PR 里说明并附证据」，
+              // 而 request-review 这个去处已经整个删除（§1.1）：写「等人工」是把一个不存在的
+              // 去处指给投稿者看，他照着做只会一直等。所以文案改成「拒因 + 修好后可重新投稿」，
+              // 并且这一步之后 PR 会被自动关（见「拒稿收口」那一步）。
               if (process.env.ACTION !== 'auto-approve') {
-                if (process.env.RISK === 'low') {
-                  // 走到这一支只有两种可能：含已收录模块的更新，或多份投稿里不全是首次收录。
-                  // 两种都不是「中/高风险」——把它写成中/高风险就是把我们的判据说反。
-                  intro += `\n⚠️ 风险虽低，但按规则不自动合入（含已收录模块的版本更新，或本 PR 内并非每份投稿都是首次收录）：这一条不在自动放行的范围里，本站没有人可以签它进来 —— 要翻案请在**本 PR 里**说明并附证据。\n`;
-                } else {
-                  intro += `\n⛔ 中/高风险，本 PR 不会自动合入。本站只有机器审核，没有人签这一格；要翻案请在**本 PR 里**说明并附证据 —— 推一个新提交（或手动重跑审核）时这套判据会原样再跑一遍。\n`;
-                }
+                intro += '\n⛔ 未命中放行判据，本 PR 不会合入。拒因见下面「依据」那一行（逐条列出）。\n'
+                  + '改好之后可以**重新投稿**：这一条 PR 会被自动关闭，新投稿开一条新的即可，不需要在这里等谁回复。\n';
               } else if (process.env.DISPOSITION === 'clear') {
                 intro += `\n✅ 静态扫描未发现风险且每份投稿都是首次收录，已自动合入索引。\n`;
               } else if (process.env.DISPOSITION === 'hit') {
@@ -1542,7 +1632,11 @@ jobs:
               // 分流跑了但判不动、自己红的 —— 处置与标签是 #48 写死的字面量，等级**故意**是空的。
               intro += verdict('（本轮没有等级：分流自己没过检）',
                 ' —— 这一格空着是判据，不是漏填', ctLabel(process.env.CHANGE_TYPE));
+              // 契约 §2.2.1：这一格是**我们的**故障（audit-broken），不是投稿者的结论 ——
+              // 所以 PR 不会被自动关，投稿者也不用「修好重投」。这两句话必须写清，
+              // 否则他收到的信号是「我被拒了」，而他其实什么都没做错。
               intro += '\n🛑 上面那个处置是**故障安全方向**（不放行），不是对这一个模块量出来的结论。风险等级填任何一档都是替一个没量过的等级说话；这条通道自己坏了，需要维护者看这条 run。\n';
+              intro += '这条 PR **不会被自动关闭**：修好 CI 之后重跑审核即可，你不需要重新投稿。\n';
             } else {
               intro += `- 本轮**没有判据**：分流决策这一步没有运行${brokenStep ? `（先红的是「${brokenStep[0]}」）` : ''}。\n`
                 + '- 因此这一条评论里没有任何风险等级、处置或标签结论 —— 不是「低风险」，也不是「不通过」，是没量。\n';
@@ -1588,7 +1682,7 @@ jobs:
           LABEL: ${{ steps.triage.outputs.label }}
         with:
           script: |
-            // LABEL 为空只有一种意思：分流决策整步没运行（跑了但判不动的那一发写的是 needs-human-review）。
+            // LABEL 为空只有一种意思：分流决策整步没运行（跑了但判不动的那一发写的是 audit-broken）。
             // 这时候**一个标签都不许打**：拿空串去 addLabels 不是留白，是 API 报错，
             // 而那个报错会把「我们这条通道自己坏了」伪装成「打标签这一步挂了」。
             // 「需要有人看」这件事已经由评论里那句「先红的是哪一步」承担了，不在这里发明第二个信号。
@@ -1597,8 +1691,11 @@ jobs:
               console.log('分流决策没有产出标签（整步未运行）：本轮不打标签，也不建标签');
               return;
             }
+            // 契约 §2.2.1：两个标签各自只说自己的事，**不再追加 blocked-auto-merge**
+            // （那枚标签的名字在暗示「有个人会来解」，而新模型里没有这个去处）。
+            //   auto-rejected = 判据跑成了、结论是不上架（投稿者的问题）
+            //   audit-broken  = 判据自己跑不成（我们的问题，PR 保持 open）
             const add = [label];
-            if (label === 'needs-human-review') add.push('blocked-auto-merge');
             // 标签可能尚未在仓库中创建，缺失时先建后打
             for (const l of add) {
               try {
@@ -1607,10 +1704,15 @@ jobs:
                 await github.rest.issues.createLabel({
                   owner: context.repo.owner, repo: context.repo.repo,
                   name: l, color: l === 'auto-approved' ? '0e8a16' : 'd93f0b',
-                  // 这句是**打在 PR 上的说法**，必须与分流那一步真实的判据同一句话：
+                  // 这几句是**打在 PR 上的说法**，必须与分流那一步真实的判据同一句话：
                   // 换轴之后拿到 auto-approved 的原因是「名单里没有它」，不是「等级低」——
                   // 写成「低风险且首次收录」就是假陈述（正当功能的 high 也在这格里）。
-                  description: l === 'auto-approved' ? '未命中上架拦截名单，由一次可复验的机器运行判定自动放行' : '未自动放行：机器判定，本站没有人工签这一格',
+                  // 而两个红标签必须说清「谁的问题」（契约 §2.2.1），否则投稿者无从判断该改什么。
+                  description: l === 'auto-approved'
+                    ? '未命中上架拦截名单，由一次可复验的机器运行判定自动放行'
+                    : (l === 'audit-broken'
+                      ? '审核通道自己坏了（不是这次投稿的结论）：修好 CI 后重跑'
+                      : '机器判定不上架：拒因见 PR 评论，修好后可重新投稿'),
                 });
               }
             }
@@ -1620,6 +1722,74 @@ jobs:
               repo: context.repo.repo,
               labels: add,
             });
+
+      # ---------------------------------------------------------------
+      # 拒稿收口（契约 §2.2 / Q14）：判据跑成了、结论是 block ⇒ **自动关 PR**。
+      #
+      # 为什么必须关：换轴之后 `request-review` 整个删除，block 就是终局 ——
+      # 没有任何人能把这个 PR 签进来。留着它 open 的唯一效果是让投稿者对着一条
+      # 永远不会变绿的红叉等下去，而那是一个不存在的去处。
+      #
+      # 为什么只挂在 `auto-rejected` 上（不挂 audit-broken）：
+      #   auto-rejected = 判据跑成了、结论是不上架（投稿者的问题，改好可重投）
+      #   audit-broken  = 判据自己跑不成（我们的问题，PR 保持 open，修好 CI 重跑即可）
+      # 拿自家故障去关别人的 PR，就是本仓库那条「把我们的故障说成投稿者的风险」。
+      #
+      # 为什么用 `!cancelled()` 而不是 `always()`：
+      #   `always()` 在**取消**时也会跑，而取消（新的 push 触发 concurrency 取消）意味着
+      #   「这一发的结果不作数」—— 那时候去关 PR 等于用一发被丢弃的结论关掉别人的投稿。
+      #   `!cancelled()` 才是「前面红了也要跑，但被取消就不跑」。
+      # 为什么放在这里而不是 approve 之后：approve 会因 action != auto-approve 而红，
+      #   放在它后面就永远被跳过 —— 那正是契约 §2.2 点名要避免的位置。
+      # ---------------------------------------------------------------
+      - name: 拒稿收口（自动关闭被判不上的投稿 PR）
+        if: github.event_name == 'pull_request' && !cancelled() && steps.locate.outputs.found == 'true'
+        uses: actions/github-script@v7
+        env:
+          LABEL: ${{ steps.triage.outputs.label }}
+          TRIAGE_CONCLUSION: ${{ steps.triage.conclusion }}
+          ACTION: ${{ steps.triage.outputs.action }}
+        with:
+          script: |
+            // 三重条件，缺一个都不许关：
+            //   ① 分流决策跑成了（TRIAGE_CONCLUSION === 'success'）—— 红那一发没有结论；
+            //   ② 标签是 auto-rejected —— 那是「判据跑成了、结论是不上架」的唯一记号
+            //      （audit-broken 走另一个标签，PR 要留着）；
+            //   ③ action 是 block —— 与 ② 互相印证：两个 output 由同一段脚本写，
+            //      对不上说明有人只改了一半，那时候关 PR 是在赌哪一个才是真的。
+            const label = String(process.env.LABEL || '').trim();
+            const triage = String(process.env.TRIAGE_CONCLUSION || '');
+            const action = String(process.env.ACTION || '').trim();
+            if (triage !== 'success') {
+              console.log(`分流决策没有结论（conclusion=${triage || '<空>'}）：不关 PR —— 那一发没有可依据的判决`);
+              return;
+            }
+            if (label !== 'auto-rejected') {
+              console.log(`标签是 ${JSON.stringify(label)}，不是 auto-rejected：不关 PR`);
+              return;
+            }
+            if (action !== 'block') {
+              console.log(`action 是 ${JSON.stringify(action)}，与标签 auto-rejected 对不上：不关 PR（只改了一半，先修接线）`);
+              return;
+            }
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              console.log('不是 pull_request 事件：不关');
+              return;
+            }
+            // 只关 open 的：重跑一条已经关掉的 PR 不该再发一次 close 请求
+            // （GitHub 对已关的 PR 发 close 是 422，会把一条本该绿的收口步打成红）。
+            if (pr.state !== 'open') {
+              console.log(`PR #${pr.number} 当前状态是 ${pr.state}：不再关`);
+              return;
+            }
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              state: 'closed',
+            });
+            console.log(`已自动关闭 PR #${pr.number}（命中上架拦截名单 / 撤销过执行类发现 / 分不清首投更新）：拒因见 PR 评论，修好后可重新投稿`);
 
   # -------------------------------------------------------------------
   # 判定器自己先过检：跑仓库单测。
@@ -1657,7 +1827,7 @@ jobs:
   # 批准闸：把「扫完了」和「可以合并」拆成两个 check。
   #
   # 为什么必须拆：audit job 绿只说明扫描跑通了，不代表结论是放行。required status
-  # check 若直接钉在 audit 上，那么「中风险、需人工审核」的 PR 同样能满足 required
+  # check 若直接钉在 audit 上，那么「命中名单、不上架」的 PR 同样能满足 required
   # check —— 分支保护就形同虚设。所以保护要要求的是 approve 这一条，而它只在
   # action == auto-approve 时成功。
   #
