@@ -135,12 +135,43 @@ jobs:
             exit 1
           }
 
-      # 真发一次。**故意不设 AI_BRIEF_MAX_BYTES**：标定要量的是「装下整包需要多少」，
-      # 先给一个预算上限会让这一发提前走 over-budget 分支，什么都量不到。
+      # 算出「装下整包需要多少字节」。下一步拿它当 --max-bytes，让那一发真的把整包发出去。
+      # 为什么必须算而不是让 ai-review 自己决定：不传 --max-bytes 时它会退回默认 240000，
+      # 「不设预算」不等于「不设上限」—— 真包/探针动辄 800 KB，会直接走 over-budget、
+      # 压根不调用模型，读数一个都没有（2026-10-27 实测踩过）。
+      - name: 算 neededBytes（下一发的预算上界）
+        id: budget
+        env:
+          ZIP_PATH: ${{ steps.pack.outputs.zip }}
+        run: |
+          set -euo pipefail
+          BASE=$(basename "$ZIP_PATH")
+          node audit/calibration-budget.mjs "audit-out/$BASE.audit.json" "$ZIP_PATH" > budget.json
+          cat budget.json
+          # 用 node 校验而不是 `[ "$NEEDED" -le 0 ]`：后者在 NEEDED 不是数字时返回 2，
+          # 被 if 当成「条件不成立」放过去 —— 一个读不懂的值会被当合法值传进预算。
+          NEEDED=$(node -e "
+            const b = require('./budget.json');
+            const n = Number(b.neededBytes);
+            if (!Number.isFinite(n) || n <= 0) {
+              console.error('::error::budget.json 里的 neededBytes 不是正数：' + JSON.stringify(b.neededBytes));
+              process.exit(1);
+            }
+            process.stdout.write(String(n));
+          ")
+          echo "needed=$NEEDED" >> "$GITHUB_OUTPUT"
+
+      # 真发一次。**必须显式给一个足够大的 --max-bytes**：
+      # 标定要量的是「装下整包需要花多少 credits」，所以这一发必须真的把整包发出去。
+      # 2026-10-27 实测踩到的坑：原先这里没有传 --max-bytes，注释写着「故意不设预算」——
+      # 但不设预算 ≠ 不设上限，ai-review.mjs 会退回 DEFAULT_MAX_BRIEF_BYTES（240000）。
+      # 体量对位的探针需要 815067 B，于是这一发直接走了 over-budget 分支、**压根没调用模型**，
+      # 状态是 over-budget、拿不到任何 credits 读数。标定因此必须自己把上限抬到 neededBytes 之上。
       - name: 真发一次（这一步会计费）
         id: fire
         env:
           ZIP_PATH: ${{ steps.pack.outputs.zip }}
+          NEEDED: ${{ steps.budget.outputs.needed }}
           QODER_PAT: ${{ secrets.QODER_PAT }}
           QCA_AGENT_ID: ${{ vars.QCA_AGENT_ID }}
           QCA_AGENT_VERSION: ${{ vars.QCA_AGENT_VERSION }}
@@ -153,7 +184,8 @@ jobs:
           set -uo pipefail
           BASE=$(basename "$ZIP_PATH")
           ARGS=(run --report "audit-out/$BASE.audit.json" --zip "$ZIP_PATH"
-                --out "audit-out/ai-$BASE.json" --status "audit-out/ai-$BASE.status")
+                --out "audit-out/ai-$BASE.json" --status "audit-out/ai-$BASE.status"
+                --max-bytes "$NEEDED")
           if [ -n "${QCA_PROMPT_SHA:-}" ]; then
             ARGS+=(--expected-prompt-sha "$QCA_PROMPT_SHA")
           fi
