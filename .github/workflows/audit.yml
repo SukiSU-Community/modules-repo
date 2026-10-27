@@ -19,7 +19,12 @@
 # 分流判据（2026-10-21 换轴：设计文档 §2 / §4 / §13.5；等级不再当判决）：
 #   命中上架拦截名单（**任一**包；静态 11 条 ∪ AI 恶意结论且引用逐字复验过）-> block，不进索引
 #   名单外的一切，含 root 模块正当功能本身那批 high                        -> auto-approved，自动合入索引
-#   不是首次收录（update / unknown）与「撤销过执行类发现」那两格              -> request-review，不自动合入
+#   判据是**二值**（2026-10-26 去人工化，契约 §1.1）：只有 block 与 auto-approve 两值。
+#   曾经的 request-review 态在 CI 里的后果与 block 完全一样（approve 红、PR 挂着、没人能签），
+#   而那个「人」从来没有存在过 —— 它挡住的唯一东西是版本更新（update 一律落这一档，
+#   等于把更新入口关死）。这一态连同 needs-human-review 标签已整个删除。
+#   **update 与 first 判据完全等价**，不做跨版本差异比对：机器判的是这一包本身。
+#   判据自己跑不成（我们的故障）另打 audit-broken，PR 保持 open —— 不拿自家故障关别人的 PR。
 #   等级、覆盖读数、能力读数在新模型里只是**标注**（随报告与评论公示），不再决定上不上架。
 #   措辞纪律：拦下说的是「命中名单」这件事，等级高不等于恶意；没命中也不代表「查过了没事」。
 #   审核不通过的内容绝不出现在正式索引里。
@@ -35,8 +40,13 @@
 #      任一条不合格整份不采信，而不是丢掉那一条继续盖章；
 #   ③ 模型的自由文本进 PR 评论前封条数与单条长度（分流决策里，改这一步时必须保留）。
 # 五种状态（disabled / ok / failed / untrusted / over-budget）由 AI 步逐包写进
-# audit-out/ai-<zip basename>.status，由「分流决策」消费：failed / untrusted / over-budget
-# 各用自己那句串、整步红；ok 参与 raiseLevel 抬级；disabled 等级不动。
+# audit-out/ai-<zip basename>.status，由「分流决策」消费（2026-10-26 契约 §2 定下失效方向）：
+#   disabled / failed  -> **降级放行**：只走静态名单，等级不动，ai_status=degraded，
+#                         PR 正文与回执明写「本次 AI 安全员未参与」—— 不是「AI 看过并同意」；
+#   untrusted          -> 拒该包（判据不可采信），action=block / label=auto-rejected；
+#   over-budget        -> 拒该包（没看全），同上；「没看全」不是「看过了没事」；
+#   ok                 -> 参与 raiseLevel 抬级。
+# 「判据自己跑不成」才是整步红（label=audit-broken），与上面五态是两件事。
 # 判自动放行的判据全仓只有一份（audit/risk-rules.mjs 的 classifyMalice + decide）：分流那一步 import 它，
 # 不在这里抄第二份；AI 步自己也不产出 action —— 它只写等级读数与那份「恶意结论 + 引用逐字复验结果」，
 # 名单上 AI 那一支的 ∪ 发生在分流（§0 第 1 条：静态 ∪ AI 恶意结论，两边都只有拒的权力）。
