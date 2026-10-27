@@ -30,8 +30,14 @@ on:
   workflow_dispatch:
     inputs:
       zip_path:
-        description: '要标定的模块 zip 路径（相对仓库根，例如 pending/demo.zip）'
-        required: true
+        description: '要标定的模块 zip 路径（相对仓库根）。留空则现场生成体量对位的探针包'
+        required: false
+        default: ''
+        type: string
+      probe_text_bytes:
+        description: '现场生成探针时的目标文本字节数（真包约 766 KB，默认 780000）'
+        required: false
+        default: '780000'
         type: string
       index_path:
         description: '用于判定首次收录/版本更新的索引路径（留空则不传，changeType 会退化为 unknown）'
@@ -78,18 +84,39 @@ jobs:
             exit 1
           fi
 
-      # 先用同一套扫描器产出一份报告：ai-review.mjs 的 brief 是从报告 + 包内条目组装的，
-      # 直接拿一份手写报告会让标定的比值与线上那条路不是同一件事。
-      - name: 扫一遍（产出 brief 的输入）
+      # 标定要一枚真包。zip 不在仓库里（`.gitignore` 有 `*.zip`，`scripts/audit-corpus.mjs:18`
+      # 写明下载的 zip 一律落在仓库外），所以默认**现场生成**一枚体量对位的探针：
+      #   · 不为这一次运行往 git 历史里塞一个几百 KB 的二进制；
+      #   · 也不必为它开一条 `!calibration/*.zip` 的 ignore 例外（开了例外，以后「哪个 zip
+      #     能进仓」就变成要逐个记住的事）。
+      # 探针的体量必须落在真实工作点 —— 理由见 audit/calibration-probe.mjs 文件头。
+      # 想标定一枚真包时传 zip_path 覆盖这个默认。
+      - name: 准备标定的包（默认现场造探针）
+        id: pack
         env:
-          ZIP_PATH: ${{ inputs.zip_path }}
-          INDEX_PATH: ${{ inputs.index_path }}
+          ZIP_INPUT: ${{ inputs.zip_path }}
+          PROBE_BYTES: ${{ inputs.probe_text_bytes }}
         run: |
           set -euo pipefail
+          ZIP_PATH="${ZIP_INPUT:-}"
+          if [ -z "$ZIP_PATH" ]; then
+            ZIP_PATH="audit-probe.zip"
+            node audit/calibration-probe.mjs --out "$ZIP_PATH" --text-bytes "${PROBE_BYTES:-780000}"
+          fi
           if [ ! -f "$ZIP_PATH" ]; then
             echo "::error::找不到 zip：${ZIP_PATH}（这个路径要相对仓库根，且必须在本次 checkout 里）"
             exit 1
           fi
+          echo "zip=$ZIP_PATH" >> "$GITHUB_OUTPUT"
+
+      # 先用同一套扫描器产出一份报告：ai-review.mjs 的 brief 是从报告 + 包内条目组装的，
+      # 直接拿一份手写报告会让标定的比值与线上那条路不是同一件事。
+      - name: 扫一遍（产出 brief 的输入）
+        env:
+          ZIP_PATH: ${{ steps.pack.outputs.zip }}
+          INDEX_PATH: ${{ inputs.index_path }}
+        run: |
+          set -euo pipefail
           mkdir -p audit-out
           ARGS=(--out-dir audit-out)
           if [ -n "${INDEX_PATH:-}" ] && [ -f "$INDEX_PATH" ]; then
@@ -113,7 +140,7 @@ jobs:
       - name: 真发一次（这一步会计费）
         id: fire
         env:
-          ZIP_PATH: ${{ inputs.zip_path }}
+          ZIP_PATH: ${{ steps.pack.outputs.zip }}
           QODER_PAT: ${{ secrets.QODER_PAT }}
           QCA_AGENT_ID: ${{ vars.QCA_AGENT_ID }}
           QCA_AGENT_VERSION: ${{ vars.QCA_AGENT_VERSION }}
