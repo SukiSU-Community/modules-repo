@@ -1,0 +1,198 @@
+# ---------------------------------------------------------------------------
+# AI 预算标定（一次性，人工触发）
+#
+# 为什么需要这一步：`audit/ai-review.mjs` 里的 `DEFAULT_MAX_BRIEF_BYTES = 240000`
+# 是一个**没有依据的保守代理值**（评审 F4）。它的单位是字节，而 qfmodel 的上限是
+# `max_input_tokens = 180000` —— 两者之间**没有任何已标定的换算**。brief 里带行号前缀
+# （`N| `）与中英混排原文，字节→token 的比值会随内容漂移，所以任何系数在标定之前写进
+# 代码都会被后人当成既成事实引用（ai-review.mjs 的常量段注释写了同一句话）。
+#
+# 这个 workflow 只做一件事：拿一枚真包真发一次，把
+#     input_tokens / neededBytes
+# 的实测比值打印到 job summary 里，供人把 `AI_BRIEF_MAX_BYTES` 写进 audit.yml 的 env。
+# 它**不改任何代码、不写任何仓库文件**：标定是运维动作，改代码要走 PR。
+#
+# ⚠️ 这里的花费是真钱：一次 qca 会话按 usage.total_credits 计费（实测 10~13 credits 一发）。
+#    所以只有 workflow_dispatch，没有 push / schedule 触发。
+#
+# ⚠️ 拿不到 input_tokens 时**必须红**，不许打印一个编出来的比值：这个 job 的唯一产出
+#    就是一个数，编一个数比不产出更糟（后人会拿它去定预算）。
+# ---------------------------------------------------------------------------
+
+name: AI Budget Calibrate
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: '要标定的模块 zip 路径（相对仓库根，例如 pending/demo.zip）'
+        required: true
+        type: string
+      index_path:
+        description: '用于判定首次收录/版本更新的索引路径（留空则不传，changeType 会退化为 unknown）'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  calibrate:
+    name: Calibrate AI brief budget
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # 标定的前提是凭据齐。缺任何一件就直接红 —— 这一发的产物就是那个比值，
+      # 没有凭据就没有比值，「跳过」在这里等于什么都没做却显示成功。
+      - name: 检查凭据
+        env:
+          QODER_PAT: ${{ secrets.QODER_PAT }}
+          QCA_AGENT_ID: ${{ vars.QCA_AGENT_ID }}
+          QCA_AGENT_VERSION: ${{ vars.QCA_AGENT_VERSION }}
+          QCA_ENVIRONMENT_ID: ${{ vars.QCA_ENVIRONMENT_ID }}
+        run: |
+          set -euo pipefail
+          MISSING=""
+          for k in QODER_PAT QCA_AGENT_ID QCA_AGENT_VERSION QCA_ENVIRONMENT_ID; do
+            [ -n "${!k:-}" ] || MISSING="$MISSING $k"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::标定需要凭据，缺：${MISSING# }。没有凭据就没有 input_tokens 可读，这一发不许绿。"
+            exit 1
+          fi
+
+      # 先用同一套扫描器产出一份报告：ai-review.mjs 的 brief 是从报告 + 包内条目组装的，
+      # 直接拿一份手写报告会让标定的比值与线上那条路不是同一件事。
+      - name: 扫一遍（产出 brief 的输入）
+        env:
+          ZIP_PATH: ${{ inputs.zip_path }}
+          INDEX_PATH: ${{ inputs.index_path }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$ZIP_PATH" ]; then
+            echo "::error::找不到 zip：${ZIP_PATH}（这个路径要相对仓库根，且必须在本次 checkout 里）"
+            exit 1
+          fi
+          mkdir -p audit-out
+          ARGS=(--out-dir audit-out)
+          if [ -n "${INDEX_PATH:-}" ] && [ -f "$INDEX_PATH" ]; then
+            ARGS+=(--index "$INDEX_PATH")
+          fi
+          node audit/scan.mjs --zip "$ZIP_PATH" "${ARGS[@]}"
+          ls -l audit-out
+
+      # 真发一次。**故意不设 AI_BRIEF_MAX_BYTES**：标定要量的是「装下整包需要多少」，
+      # 先给一个预算上限会让这一发提前走 over-budget 分支，什么都量不到。
+      - name: 真发一次（这一步会计费）
+        id: fire
+        env:
+          ZIP_PATH: ${{ inputs.zip_path }}
+          QODER_PAT: ${{ secrets.QODER_PAT }}
+          QCA_AGENT_ID: ${{ vars.QCA_AGENT_ID }}
+          QCA_AGENT_VERSION: ${{ vars.QCA_AGENT_VERSION }}
+          QCA_ENVIRONMENT_ID: ${{ vars.QCA_ENVIRONMENT_ID }}
+          QCA_PROMPT_SHA: ${{ vars.QCA_PROMPT_SHA }}
+        run: |
+          # runner 的 `shell: bash` 带 -e，任何非 0 都会当场打断 —— 而这一发**允许**非 0
+          # （over-budget / failed 都是有信息量的结果：至少 neededBytes 出来了）。
+          # 所以这里显式收退出码，由下一步决定该红还是该继续。
+          set -uo pipefail
+          BASE=$(basename "$ZIP_PATH")
+          ARGS=(run --report "audit-out/$BASE.audit.json" --zip "$ZIP_PATH"
+                --out "audit-out/ai-$BASE.json" --status "audit-out/ai-$BASE.status")
+          if [ -n "${QCA_PROMPT_SHA:-}" ]; then
+            ARGS+=(--expected-prompt-sha "$QCA_PROMPT_SHA")
+          fi
+          CODE=0
+          node audit/ai-review.mjs "${ARGS[@]}" || CODE=$?
+          echo "退出码：$CODE（状态：$( [ -f "audit-out/ai-$BASE.status" ] && tr -d '\r\n' < "audit-out/ai-$BASE.status" || echo '<没写出>' )）"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+      - name: 打印比值（拿不到就红，不许编一个数）
+        env:
+          BASE: ${{ steps.fire.outputs.base }}
+          CODE: ${{ steps.fire.outputs.code }}
+        run: |
+          set -euo pipefail
+          OUT="audit-out/ai-${BASE}.json"
+          if [ ! -f "$OUT" ]; then
+            echo "::error::ai-review.mjs 没写出产物 ${OUT}（退出码 ${CODE}）：这一发没有可读的读数，标定失败。"
+            exit 1
+          fi
+          node - "$OUT" <<'NODE'
+          const fs = require('fs');
+          const p = process.argv[2];
+          const a = JSON.parse(fs.readFileSync(p, 'utf8'));
+          const b = (a && a.brief) || {};
+          const meta = (a && a.meta) || {};
+          const tgt = (a && a.target) || {};
+          // QCA 的可用成本字段只有这两个（没有 finish_reason、没有 neurons，见 ai-review.mjs）。
+          // 会话状态必须一起看：running 时读到的是「截至那一刻」，把中间值当终值是错的。
+          const credits = meta.totalCredits ?? null;
+          const secs = meta.activeSeconds ?? null;
+          const status = meta.sessionStatus ?? null;
+          const needed = b.neededBytes ?? null;
+          const byteSize = b.byteSize ?? null;
+          const maxBytes = b.maxBytes ?? null;
+          // 字段名以 ai-review.mjs 的 qcaSessionCost 为准（input_tokens / prompt_tokens 都试过）。
+          const inputTokens = meta.inputTokens ?? null;
+
+          const lines = [];
+          lines.push('## AI 预算标定读数');
+          lines.push('');
+          lines.push(`- 包：\`${tgt.zip || '<产物里没记>'}\``);
+          lines.push(`- 状态：\`${a.status || '<无>'}\``);
+          lines.push(`- brief 实际送出（byteSize）：**${byteSize}** B`);
+          lines.push(`- 装下整包需要（neededBytes）：**${needed}** B`);
+          lines.push(`- 本次生效预算（maxBytes）：${maxBytes} B`);
+          lines.push(`- 会话状态：${status ?? '<读不到>'}（不是终态时下面的成本只是截至那一刻）`);
+          lines.push(`- total_credits：${credits ?? '<读不到>'}`);
+          lines.push(`- active_seconds：${secs ?? '<读不到>'}`);
+          lines.push(`- input_tokens：${inputTokens ?? '<供应商没给>'}`);
+          lines.push('');
+
+          if (inputTokens === null || !Number.isFinite(Number(inputTokens)) || Number(inputTokens) <= 0) {
+            lines.push('### ⛔ 标定失败：读不到 input_tokens');
+            lines.push('');
+            lines.push('这一步的唯一产出就是 `input_tokens / neededBytes` 那个比值。');
+            lines.push('拿不到 input_tokens 时**不许**用一个假设的系数凑一个数出来 —— 后人会拿它去定预算，');
+            lines.push('而一个编出来的比值与「没标定」相比更危险（它看起来像事实）。');
+            lines.push('请到 qca 会话详情里人工核对 usage 字段名，再回来改 qcaSessionCost 的读取路径。');
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
+            console.error('::error::标定失败：产物里没有可用的 input_tokens（meta.inputTokens）');
+            process.exit(1);
+          }
+
+          if (!Number.isFinite(Number(needed)) || Number(needed) <= 0) {
+            lines.push('### ⛔ 标定失败：产物里没有 neededBytes');
+            lines.push('');
+            lines.push('分母读不出来，比值无从谈起 —— 与读不到 input_tokens 同一句话：不许凑。');
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
+            console.error('::error::标定失败：产物里没有 brief.neededBytes');
+            process.exit(1);
+          }
+
+          const ratio = Number(inputTokens) / Number(needed);
+          const tokensPerByte = ratio.toFixed(6);
+          // 反过来给一个可直接抄进 workflow 的字节预算：按 qfmodel 的 max_input_tokens 留 10% 余量。
+          // 180000 从 ai-review.mjs 的 QFMODEL_MAX_INPUT_TOKENS 抄来（本 workflow 不 import 那个模块，
+          // 因为标定的前提就是「那个常量没有依据」—— 这里只把它当上限，不当换算依据）。
+          const safeBytes = Math.floor(180000 * 0.9 / ratio);
+          lines.push('### 读数');
+          lines.push('');
+          lines.push(`- \`input_tokens / neededBytes\` = **${tokensPerByte}** token/B`);
+          lines.push(`- 按 qfmodel 上限 180000 token 留 10% 余量推算的字节预算：**${safeBytes}** B`);
+          lines.push(`  （即把 \`AI_BRIEF_MAX_BYTES: '${safeBytes}'\` 写进 audit.yml 的 AI 步 env）`);
+          lines.push('');
+          lines.push('⚠️ 这是**一次**标定。brief 的字节→token 比值随内容（行号前缀、中英混排）漂移，');
+          lines.push('   所以别把它当成永久系数：换模型、换 prompt 形状、或线上出现 over-budget 误报时重跑一次。');
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
+          NODE

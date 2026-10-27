@@ -190,7 +190,7 @@ function runTriage(reports, ai, opts = {}) {
  * （同形的一条见 §0.44：评论顶层的 budgetBasis 写成 null 而不是不见）。
  */
 const VERDICT_KEYS = ['risk', 'change_type', 'module_id', 'module_version', 'package_count',
-  'ai_note', 'reasons', 'action', 'label', 'needs_human_review'].sort();
+  'ai_note', 'ai_status', 'reasons', 'action', 'label', 'needs_human_review'].sort();
 
 /**
  * 判据红的那一发必须写出的东西（盘点 G.2）。原来这批用例钉的是 `deepEqual(kv, {})`
@@ -206,7 +206,7 @@ const VERDICT_KEYS = ['risk', 'change_type', 'module_id', 'module_version', 'pac
 function assertFailClosed(kv, msg = '') {
   assert.deepEqual(Object.keys(kv).sort(), VERDICT_KEYS, `${msg}键集要与绿那一发逐字相同`);
   assert.equal(kv.action, 'block', `${msg}红那一发的处置只有 block 一个方向`);
-  assert.equal(kv.label, 'needs-human-review', msg);
+  assert.equal(kv.label, 'audit-broken', `${msg}判据自己跑不成 → audit-broken（契约 §2.2.1：我们的故障，不是投稿的结论）`);
   assert.equal(kv.needs_human_review, 'true', msg);
   assert.equal(kv.risk, '', `${msg}没有结论就留空，不许填一个看起来量出来的等级`);
 }
@@ -393,10 +393,13 @@ test('单包：名单外的 medium/high 不再拦上架，update / unknown 照�
     '① 取严：命中名单就不上架');
   assert.equal(runTriage({ a: repHit('low', 'first') }).kv.action, 'block',
     '等级低也拦：命中就是命中，等级不参与这一格');
-  // 不是首次收录 ⇒ §13 第 2 条那一格是待拍，维持转人工（只更严不更松）。
-  assert.equal(runTriage({ a: rep('low', 'update') }).kv.action, 'request-review',
-    '「要不要给 update 另加一道」待拍，本步不许自行默认成上架');
-  assert.equal(runTriage({ a: rep('low', 'unknown') }).kv.action, 'request-review');
+  // 不是首次收录 ⇒ 契约 §1.1 ② 那一格：unknown 仍然 fail-closed；
+  // 而 update 已经与 first 等价（§1.1 要点「`update` 与 `first` 判据完全等价」），
+  // 所以 update 现在走 ④ 支自动放行 —— 旧断言「待拍，维持转人工」随契约落地作废。
+  assert.equal(runTriage({ a: rep('low', 'update') }).kv.action, 'auto-approve',
+    '§1.1 要点：版本更新与首次收录适用同一套判据，不再有「更新另加一道」这个待拍格');
+  assert.equal(runTriage({ a: rep('low', 'unknown') }).kv.action, 'block',
+    '分不清首投还是更新 ⇒ ② 支 fail-closed');
   assert.equal(runTriage({ a: repHit('high', 'update') }).kv.action, 'block',
     '命中 + 更新两个理由同时成立时，取严只剩 block，两条不许互相抵消');
 });
@@ -410,8 +413,10 @@ test('fix8-E 在新轴上照旧生效：撤销过执行类发现 ⇒ 名单外�
   };
   const { kv, err } = runTriage({ a: withRevoke });
   assert.equal(err, null, err && err.stderr);
-  assert.equal(kv.action, 'request-review', '机器替被执行文件作过证 ⇒ 它不能同时又是自动放行的理由');
-  assert.equal(kv.needs_human_review, 'true');
+  // ⚠ 2026-10-26 去人工化（契约 §1.1 ③）：request-review → block / auto-rejected。
+  assert.equal(kv.action, 'block', '机器替被执行文件作过证 ⇒ 它不能同时又是自动放行的理由');
+  assert.equal(kv.needs_human_review, 'false');
+  assert.equal(kv.label, 'auto-rejected');
   // 反面对照：同一份报告把撤销那一格清空才谈得上自动放行（证明上面那句不是抄来的常量）。
   assert.equal(runTriage({ a: rep('low', 'first') }).kv.action, 'auto-approve');
 });
@@ -428,16 +433,21 @@ test('两包：一包命中名单、一包干净 → block（这就是修前会 
   assert.equal(kv.package_count, '2');
   assert.equal(kv.risk, 'high', '等级必须取所有报告里最严的，不是取最新的一份');
   assert.equal(kv.action, 'block');
-  assert.equal(kv.needs_human_review, 'true');
+  // ⚠ 2026-10-26 去人工化：needs_human_review 恒 false（output 契约保留、不再驱动标签）。
+  assert.equal(kv.needs_human_review, 'false');
   assert.match(kv.reasons, /evil: 原因 high/);
   assert.match(kv.reasons, /good: 原因 low/);
 });
 
-test('low+first 与 low+update 混投 → 不是 auto-approve（每一份都得是首次收录）', () => {
+test('low+first 与 low+update 混投 → 自动放行（update 与 first 判据等价，§1.1 要点）', () => {
+  // ⚠ 2026-10-26：契约 §1.1 要点写明「`update` 与 `first` 判据完全等价」，旧断言
+  // 「不是每一份都首次收录就不自动合入（§13 第 2 条待拍）」随契约落地作废 —— 那一格已被拍掉。
   const { kv } = runTriage({ a: rep('low', 'first'), b: rep('low', 'update') });
   assert.equal(kv.change_type, 'first+update');
   assert.equal(kv.risk, 'low');
-  assert.equal(kv.action, 'request-review', '不是「每一份都首次收录」就不自动合入（§13 第 2 条待拍那一格）');
+  assert.equal(kv.action, 'auto-approve',
+    '§1.1：更新与首投适用同一套判据，混投不再另加一道闸');
+  assert.equal(kv.needs_human_review, 'false');
 });
 
 test('命中名单那份排最后也照样 block（判据与文件名顺序无关）', () => {
@@ -601,10 +611,18 @@ test('变异哨兵：把判据退回「只取最新那一份报告」，多包�
 
 /* ------------------------------------- 变异哨兵（G.2）：证明上面那批 fail-closed 断言不是空跑 */
 
-/** 造一发判据红：AI 状态 failed 而静态是 low+first —— 最容易被「顺手放行」的那个形状。 */
-const redRun = (script) => runTriage({ 'demo.zip': rep('low', 'first') },
-  { 'demo.zip': { status: 'failed', artifact: aiArt('demo.zip', { status: 'failed', reason: '超时' }) } },
-  { script });
+/**
+ * 造一发**真正整步红**：报告缺 riskLevel。
+ *
+ * 2026-10-26 去人工化之后，`failed` 不再整步红了（契约 §2：它降级放行）。
+ * 仍然整步红的只剩「判据自己跑不成」—— 报告本身不完整就属于这一类，
+ * 所以这几发变异哨兵改用坏报告起，不再用 failed 起（用 failed 起会变成在测一条已经改掉的行为）。
+ */
+const redRun = (script) => {
+  const missing = { ...rep('low', 'first') };
+  delete missing.riskLevel;
+  return runTriage({ 'demo.zip': missing }, undefined, { script });
+};
 
 test('变异哨兵：把 fail() 退回「先 exit 1、output 一段不写」，红那一发就又是一片空白', () => {
   const mutated = TRIAGE_JS.replace(
@@ -621,7 +639,7 @@ test('变异哨兵：把 fail() 退回「先 exit 1、output 一段不写」，�
 
 test('变异哨兵：把红那一发的处置写成 auto-approve，就是给一发判据没跑成的投稿盖放行章', () => {
   const mutated = TRIAGE_JS.replace(
-    'w("action","block"); w("label","needs-human-review"); w("needs_human_review","true");',
+    'w("action","block"); w("label","audit-broken"); w("needs_human_review","true");',
     'w("action","auto-approve"); w("label","auto-approved"); w("needs_human_review","false");',
   );
   assert.notEqual(mutated, TRIAGE_JS, '变异哨兵的替换点漂了（fail-closed 那三格改了写法）—— 更新它，别删掉它');
@@ -865,50 +883,65 @@ test('矩阵·disabled：等级不动、action 不变、文案是「未启用」
   assert.doesNotMatch(kv.ai_note, /同意|复验/, '没跑过的层不许冒充跑过');
 });
 
-test('矩阵·failed：分流整步 exit 1，文案「没跑成」，判据留下但只有 fail-closed 那一个方向', () => {
+test('矩阵·failed：**降级放行**（不是红），文案「没跑成」，等级不动且明写 AI 未参与', () => {
+  // 契约 §2（2026-10-26 去人工化）：failed 从「整步红」改成「降级放行」。
+  // 理由：旧行为是一次模型超时就让整条投稿挂死在一个没人会来看的红叉上 ——
+  // 那不是保守，那是把「AI 这一层没有参与」误报成「这次投稿被拒了」。
+  // 但它降级的方式必须守死：只走静态名单、风险等级**一个字都不许动**（不许因为 AI 挂了就抬级，
+  // 也不许假装 AI 看过了）。
   const { kv, err, stderr } = runTriage({ 'demo.zip': rep('low', 'first') },
     { 'demo.zip': { status: 'failed', artifact: aiArt('demo.zip', { status: 'failed', reason: '模型调用失败：超时' }) } });
-  assert.notEqual(err, null, 'failed 必须是红，不是「AI 没意见所以按静态放行」');
-  assert.match(stderr, /没跑成/);
-  assert.match(stderr, /demo\.zip/, '要点名是哪一包');
-  assertFailClosed(kv);
-  // 静态明明说 low，而这一轮没有结论 ⇒ risk 留空。写成 low 会让评论层落进「风险虽低但含版本更新」
-  // 那句（说的是另一件事），写成 high 则是把平台故障算到投稿者头上（§2.7 文案纪律）。
+  assert.equal(err, null, 'failed 不再整步红：它降级放行，由 PR 正文与回执明写 AI 未参与');
+  assert.match(kv.ai_note, /未跑成|没跑成/);
+  assert.doesNotMatch(kv.ai_note, /同意|复验/, '没跑成的层不许冒充跑过');
+  // 静态说 low ⇒ 等级就是 low。降级放行**不许**顺手抬级（抬级是 AI 的权限，AI 没说话就没有这一支）。
+  assert.equal(kv.risk, 'low', 'AI 没跑成 ≠ 风险变高；等级回到静态那一个读数');
   assert.equal(kv.change_type, 'first', 'changeType 是报告里的事实，与 AI 跑没跑成无关');
   assert.equal(kv.package_count, '1');
-  assert.match(kv.ai_note, /没跑成/);
+  // ai_status 是契约 §3.5 要求写出的那一格：degraded 明写「降级」，供回执与 PR 正文引用。
+  assert.equal(kv.ai_status, 'degraded', '降级放行必须在产物里留下 degraded，否则下游分不清「没参与」与「参与了且同意」');
+  // 判据仍然是 block：AI 没参与 ⇒ 静态名单是唯一判据，而这一包**没命中名单**（静态 low），
+  // 所以放行。形态上与「AI 说 ok 且同意静态」不同（ai_status=degraded），但 action 可以相同。
+  assert.equal(kv.action, 'auto-approve', '静态名单未命中 ⇒ 放行；降级不等于拒');
   assert.match(kv.reasons, /模型调用失败：超时/, '被弃的原因要能进 output，不只活在会过期的 runner 日志里');
+  assert.doesNotMatch(stderr, /::error::/, '降级放行不许在 stderr 打 ::error::（那会让 Actions 渲染成红叉）');
 });
 
-test('矩阵·untrusted：exit 1，文案「判据不可采信」，与 failed 那句不同串', () => {
+test('矩阵·untrusted：**拒该包**，文案「判据不可采信」，与 failed 那句不同串', () => {
+  // 契约 §2：untrusted / over-budget 是「这一发判据不成立」⇒ 拒该包，但**不是整步红**。
+  // 差别在哪：整步红是「CI 坏了，重跑或找维护者」；拒该包是「这次投稿的结论是不放行」，
+  // 投稿者要拿到逐条拒因与 auto-rejected 标签，而不是一个空红叉。
   const { kv, err, stderr } = runTriage({ 'demo.zip': rep('low', 'first') },
     { 'demo.zip': { status: 'untrusted', artifact: aiArt('demo.zip', { status: 'untrusted', reason: 'quote 未能逐字复验' }) } });
-  assert.notEqual(err, null);
-  assert.match(stderr, /判据不可采信/);
-  assert.doesNotMatch(stderr, /没跑成/, '四句串各用各的：合并成一句就等于只剩一种下游后果（§0.1）');
-  assertFailClosed(kv);
-  assert.match(kv.ai_note, /判据不可采信/);
-  assert.doesNotMatch(kv.ai_note, /没跑成/, '同一句话进了 output 也还是不许并串');
+  assert.equal(err, null, 'untrusted 是这一包的结论，不是 CI 故障');
+  assert.match(kv.reasons, /判据不可采信/);
+  assert.match(kv.reasons, /quote 未能逐字复验/, '拒因要能送到投稿者眼前');
+  assert.doesNotMatch(kv.ai_note, /没跑成/, '四句串各用各的：合并成一句就等于只剩一种下游后果（§0.1）');
+  assert.equal(kv.action, 'block', '判据不成立 ⇒ 这一包不许放行');
+  assert.equal(kv.label, 'auto-rejected', '拒该包打 auto-rejected（不是 audit-broken：那是我们的故障）');
+  assert.equal(kv.ai_status, 'rejected');
+  assert.match(kv.ai_note, /判据不成立|判据不可采信/);
+  assert.doesNotMatch(kv.ai_note, /同意|复验过的那一份/, '不可采信的那一发不许被念成「已逐字复验」');
+  assert.doesNotMatch(kv.ai_note, /未启用/, '判据不成立不是未启用：那是运维没配凭据');
 });
 
-test('矩阵·over-budget：exit 1，那句含「没看全」，绝不含「同意静态结论」', () => {
+test('矩阵·over-budget：**拒该包**，那句含「没看全」，绝不含「同意静态结论」', () => {
   const { kv, err, stderr } = runTriage({ 'demo.zip': rep('low', 'first'), 'evil.zip': rep('low', 'first') },
     { 'demo.zip': 'disabled',
       'evil.zip': { status: 'over-budget', artifact: aiArt('evil.zip', { status: 'over-budget', reason: '需要 90000 B，预算 60000 B' }) } });
-  assert.notEqual(err, null);
-  assert.match(stderr, /没看全/);
+  assert.equal(err, null, 'over-budget 是这一包的结论，不是 CI 故障');
+  assert.match(kv.reasons, /没看全/);
   // 工单要求「不含同意」。字面断 !includes('同意') 做不到 —— over-budget 那句本身就该含
   // 「不是它同意，是没看全」（§1 第 2 步），所以钉子钉在「不许声称模型同意」那一侧。
-  assert.doesNotMatch(stderr, /同意静态结论|模型同意|AI 全部看过/);
-  assertFailClosed(kv);
-  // 这一格原来钉的是 `ai_note === undefined`（「判据不成立时连文案都不许留下」）。G.2 把它反过来：
-  // 文案正是这一发唯一能送到投稿者眼前的东西。要钉的是它**不许声称模型同意**，
-  // 以及两包都是 low+first 时 risk 仍然留空 —— 「没结论」与「量出来是 low」是两句话。
-  assert.match(kv.ai_note, /送不全/);
-  assert.doesNotMatch(kv.ai_note, /同意静态结论|模型同意|AI 全部看过/);
-  assert.doesNotMatch(stderr, /未启用/, '送不全不是未启用：那是运维没配凭据');
+  assert.doesNotMatch(`${kv.ai_note}${kv.reasons}`, /同意静态结论|模型同意|AI 全部看过/);
+  // 混投里只要有一包判据不成立，整轮就不许说成 ok（ai_status 取最坏那一档）。
+  assert.equal(kv.ai_status, 'rejected', '一包 rejected ⇒ 整轮 rejected，不许按「大多数是 disabled」洗成 degraded');
+  assert.equal(kv.action, 'block', '手里有一包判据不成立 ⇒ 整单不放行');
+  assert.equal(kv.label, 'auto-rejected');
   assert.equal(kv.package_count, '2');
   assert.equal(kv.change_type, 'first');
+  assert.doesNotMatch(stderr, /::error::/, '拒该包不是 CI 故障，不打 ::error::');
+  assert.doesNotMatch(kv.ai_note, /未启用/, '送不全不是未启用：那是运维没配凭据');
 });
 
 test('矩阵·ok+raise：抬级只进标注那一格；AI 要拦得住得靠 maliceVerdict（判定轴上那一发拒的权力）', () => {
@@ -932,7 +965,10 @@ test('矩阵·ok+raise：抬级只进标注那一格；AI 要拦得住得靠 mal
   assert.equal(byAi.err, null, byAi.err && byAi.err.stderr);
   assert.equal(byAi.kv.action, 'block',
     'AI 那一支没接到判定轴上 ⇒ ∪ 只剩静态那半支，跑的是比定案更窄的名单');
-  assert.equal(byAi.kv.needs_human_review, 'true');
+  // ⚠ 2026-10-26 去人工化：needs_human_review 这个 output 契约要求「保留（下游有用），
+  // 但不再驱动标签」；新轴上它恒 false（机器自己拒，没有「等人」这个去处）。
+  assert.equal(byAi.kv.needs_human_review, 'false');
+  assert.equal(byAi.kv.label, 'auto-rejected');
 
   // 反面：AI 说了恶意但引用复验不过 ⇒ 不采信、不拦（③ 那条「逐字定位到」的门槛同样管这一格）。
   const unverified = runTriage({ 'demo.zip': rep('low', 'first') }, {
@@ -1020,23 +1056,26 @@ test('矩阵·混合 disabled + ok：按「有 N 包没有 AI 意见」呈现，
   assert.doesNotMatch(kv.ai_note, /全都看过|每包都/, '混合形态不许被洗成「AI 复核过了」');
 });
 
-test('矩阵：一包 ok 抬级、另一包 failed → 仍然红，红的是 failed 那一包', () => {
-  const { kv, err, stderr } = runTriage({
+test('矩阵：一包 ok 抬级、另一包 failed → **降级放行**，failed 那一包明写未参与且等级仍照抬', () => {
+  // 契约 §2 改动后这一格的方向变了：failed 不再吃掉整轮结论。但有两件事必须守住：
+  //   ① 一句话都不许省 —— 正文与回执必须写明「有 1 包 AI 未跑成」，否则它会安静地变成「全都看过」；
+  //   ② a.zip 那一包真的 ok 且真的抬到了 high，这个抬级**照常生效**（降级的是一包，不是整轮判据作废）。
+  const { kv, err } = runTriage({
     'a.zip': rep('low', 'first'),
     'b.zip': rep('low', 'first'),
   }, {
     'a.zip': { status: 'ok', ...aiArt('a.zip', { agree: false, risk: 'high' }) },
     'b.zip': 'failed',
   });
-  assert.notEqual(err, null, '任何一包没跑成都不是「其余包按静态定级就行」');
-  assert.match(stderr, /没跑成/);
-  assert.match(stderr, /b\.zip/);
-  assertFailClosed(kv, 'a.zip 抬到 high 这件事不许变成结论：');
-  // 这一发最容易写错的地方：a.zip 真的 ok 且真的抬到了 high，于是「顺手把算出来的等级填进去」
-  // 看起来很合理 —— 但整轮没有结论（b.zip 没跑成），填进去就是把半份定级说成定级。
-  assert.equal(kv.risk, '');
-  assert.match(kv.ai_note, /没跑成/);
-  assert.match(kv.ai_note, /b\.zip/);
+  assert.equal(err, null, err && err.stderr);
+  // b.zip 没有跑成 ⇒ 整轮 ai_status 是 degraded（不是 ok，也不是 rejected）
+  assert.equal(kv.ai_status, 'degraded', '一包 failed ⇒ 整轮 degraded；说成 ok 就是替没跑过的那层作证');
+  assert.match(kv.ai_note, /未跑成|没跑成/);
+  assert.match(kv.ai_note, /1 包/, '要点名有几包没跑成');
+  assert.doesNotMatch(kv.ai_note, /全都|每包都/, '混合形态不许被洗成「每包都复核过」');
+  // a.zip 的 ok 结论照常生效：它把 low 抬到 high，整单取最严 ⇒ high。
+  assert.equal(kv.risk, 'high', 'ok 那一包的抬级不许因为另一包 failed 而作废');
+  assert.equal(kv.package_count, '2');
 });
 
 test('矩阵：一个 ai-*.status 都没有 → 等级不动，文案说「这一步没有产物」，不是旧的「已跳过 LLM 复核」', () => {
@@ -1157,7 +1196,7 @@ test('判自动放行只许一份判据：TRIAGE_JS 里一个「放行」字面�
     'decide() 只许被调用一次（绿那一发）：红那一发的处置是 writeFailClosed 里写死的三格，不过决策矩阵');
   assert.equal((TRIAGE_JS.match(/=classifyMalice\(/g) || []).length, 1,
     '名单判据也只许一个调用点：逐包各判一次由循环给，不许在别处再数一遍命中');
-  assert.match(TRIAGE_JS, /w\("action","block"\); w\("label","needs-human-review"\); w\("needs_human_review","true"\);/,
+  assert.match(TRIAGE_JS, /w\("action","block"\); w\("label","audit-broken"\); w\("needs_human_review","true"\);/,
     'fail-closed 那三格必须是写死的字面量 —— 让它由任何函数算出来，就等于给「算错方向」留了位置');
 });
 
@@ -1187,24 +1226,28 @@ test('旧两步已换成一步：id: mode 与 id: llm 都不存在，AI 步接�
 
 test('五态的四种「不是 ok」文案在分流里各占一句，互不复用', () => {
   const block = TRIAGE_REGION;
-  for (const s of ['未启用', '没跑成', '判据不可采信', '送不全']) {
+  for (const s of ['未启用', '未跑成', '判据不可采信', '没看全']) {
     assert.ok(block.includes(s), `缺「${s}」这条串`);
   }
 });
 
 /* --------------------------------------------------------------- 端到端：AI 步的产物喂给分流 */
 
-test('端到端：AI 步写出的那批文件，分流按同一口径读得到（over-budget 那一发真的开火）', () => {
+test('端到端：AI 步写出的那批文件，分流按同一口径读得到（over-budget 那一发真的拒该包）', () => {
   const r = runAiStep({ plan: { 'demo.zip': { status: 'ok' }, 'evil.zip': { status: 'over-budget' } } });
   assert.equal(r.code, 0, r.stderr);
   installModule(r.dir);
   const { err, stderr, kv } = runTriage({}, undefined, { dir: r.dir, module: false });
-  assert.notEqual(err, null, 'AI 步 exit 0 + 分流红 = §0.2-2 要求的分工');
-  assert.match(stderr, /没看全/);
-  assertFailClosed(kv);
-  assert.match(kv.ai_note, /送不全/);
+  // 契约 §2 之后 over-budget 不再是整步红：它是「这一包的判据不成立」⇒ 拒该包、打 auto-rejected。
+  // 要证的仍是同一件事 —— AI 步写出的那批状态文件，分流真读得到并且真按它开了火。
+  assert.equal(err, null, err && err.stderr);
+  assert.match(kv.reasons, /没看全/);
+  assert.equal(kv.action, 'block', '有一包判据不成立 ⇒ 整单不放行');
+  assert.equal(kv.label, 'auto-rejected', '拒该包（不是 audit-broken：那是我们的故障）');
+  assert.equal(kv.ai_status, 'rejected');
   assert.equal(kv.module_id, 'demo,evil', '这一发的报告是 AI 步真写出来的，事实位照报');
   assert.equal(kv.package_count, '2');
+  assert.doesNotMatch(stderr, /::error::/, '拒该包不是 CI 故障');
 });
 
 test('端到端：ok + AI 恶意结论经 AI 步落盘后，分流的 action 从 auto-approve 变成 block', () => {
@@ -1223,7 +1266,10 @@ test('端到端：ok + AI 恶意结论经 AI 步落盘后，分流的 action 从
   assert.equal(err, null, err && err.stderr);
   assert.equal(kv.risk, 'low', 'AI 的恶意结论不改等级：等级那一根轴只由 raiseLevel 走（§2 两轴分开写）');
   assert.equal(kv.action, 'block', '静态干净 + AI 恶意且引用复验过 ⇒ 拦：这一发就是 ∪ 接上了的证据');
-  assert.equal(kv.needs_human_review, 'true');
+  // ⚠ 2026-10-26 去人工化：output 契约保留 needs_human_review（下游有用），但它不再驱动标签，
+  // 新轴上恒 false —— 机器自己拒，没有「等人」这个去处。
+  assert.equal(kv.needs_human_review, 'false');
+  assert.equal(kv.label, 'auto-rejected');
 
   // 同一条路上的对照：AI 只抬级（agree:false + 一条 high findings）、没有恶意结论 ⇒ 抬上去的是标注，
   // 判决仍然是放行。这一发留着，因为它是「换轴不许把等级重新变成判决」的端到端证人。
@@ -1730,7 +1776,7 @@ const introLine = (body, prefix) => body.split('\n').find((l) => l.startsWith(pr
 
 test('T6.3·分流判不动而红：等级明确写「没有等级」，处置照抄 fail-closed 的 block，绝不念「中/高风险」', () => {
   const { body } = introOnly({
-    TRIAGE_CONCLUSION: 'failure', RISK: '', ACTION: 'block', LABEL: 'needs-human-review',
+    TRIAGE_CONCLUSION: 'failure', RISK: '', ACTION: 'block', LABEL: 'audit-broken',
     REASONS: '分流决策异常：x is not iterable', AI_NOTE: '',
   });
   assert.match(body, /- 风险等级：\*\*（本轮没有等级：分流自己没过检）\*\* —— 这一格空着是判据，不是漏填/);
@@ -1790,7 +1836,7 @@ test('T6.3·封口 2：单条依据 500 字截到 200 —— 沿用本步那把 
 
 test('T6.3·封口 3：模块 id 30 个只贴 10 个并点名余下 20 个', () => {
   const ids = Array.from({ length: 30 }, (_, i) => 'mod_' + i).join(',');
-  const { body } = introOnly({ MODULE_ID: ids, RISK: 'high', ACTION: 'request-review', LABEL: 'needs-human-review' });
+  const { body } = introOnly({ MODULE_ID: ids, RISK: 'high', ACTION: 'request-review', LABEL: 'auto-rejected' });
   assert.match(introLine(body, '- 模块 id：'), /mod_9`…（另有 20 个未列出/);
   assert.doesNotMatch(body, /mod_10/);
 });
@@ -1868,9 +1914,16 @@ test('T6.3·LABEL 为空（分流整步没跑）：一个标签都不打、不�
   assert.match(r.stdout, /本轮不打标签/);
 });
 
-test('T6.3·needs-human-review 照旧连带 blocked-auto-merge；auto-approved 单独一个', () => {
-  const blocked = runLabelStep({ LABEL: 'needs-human-review' });
-  assert.deepEqual((blocked.calls || []).find((c) => c[0] === 'add'), ['add', 'needs-human-review', 'blocked-auto-merge']);
+test('T6.3·两个红标签各自独立，谁也不连带谁（契约 §2.2.1）', () => {
+  // 换轴前这里是「needs-human-review 连带 blocked-auto-merge」。那个连带已经拆掉：
+  //   auto-rejected = 判据跑成了、结论是不上架（投稿者的问题）
+  //   audit-broken  = 判据自己跑不成（我们的问题，PR 保持 open）
+  // blocked-auto-merge 两格都不再追加 —— 它名字在暗示「有个人会来解」，而新模型里没有这个去处。
+  const rejected = runLabelStep({ LABEL: 'auto-rejected' });
+  assert.deepEqual((rejected.calls || []).find((c) => c[0] === 'add'), ['add', 'auto-rejected'],
+    '红标签不许再连带 blocked-auto-merge：没人会来解，挂着它就是又一句假承诺');
+  const broken = runLabelStep({ LABEL: 'audit-broken' });
+  assert.deepEqual((broken.calls || []).find((c) => c[0] === 'add'), ['add', 'audit-broken']);
   const ok = runLabelStep({ LABEL: 'auto-approved' });
   assert.deepEqual((ok.calls || []).find((c) => c[0] === 'add'), ['add', 'auto-approved']);
 });
@@ -1912,4 +1965,130 @@ test('T6.3·变异三：把「✅ 只配 clear」那道闸退回成只看 ACTION
   } });
   assert.match(c.body, /✅/, '变异体必须真的念出已合入 —— 念不出来是这条哨兵自己失效，不是闸还在');
   assert.doesNotMatch(c.body, /处置台账命中/, '变异体绕过了 hit 那一支，所以那句不该出现');
+});
+
+/* ------------------------------------------------- 拒稿收口（契约 §2.2 / Q14） */
+
+const CLOSE_STEP = '拒稿收口（自动关闭被判不上的投稿 PR）';
+
+const CLOSE_RUNNER = [
+  'const step = require("./step.cjs");',
+  'const fs = require("fs");',
+  'const calls = [];',
+  'const github = { rest: { pulls: {',
+  '  update: async (o) => { calls.push(["close", o.pull_number, o.state]); },',
+  '} } };',
+  'const context = { repo: { owner: "tester", repo: "modules-repo" },',
+  '  payload: { pull_request: { number: 42, state: process.env.__PR_STATE || "open" } } };',
+  'const core = { info: (m) => console.log(String(m)), warning: (m) => console.warn(String(m)), setOutput: () => {} };',
+  'step(github, context, core).then(',
+  '  () => fs.writeFileSync("close.json", JSON.stringify(calls)),',
+  '  (e) => { console.error("CLOSE-STEP-THREW: " + (e && e.message ? e.message : String(e))); process.exit(1); },',
+  ');',
+  '',
+].join('\n');
+
+/** 真跑「拒稿收口」；prState 用来测「已经是 closed 的 PR 不该再发一次 close」。 */
+function runCloseStep(env = {}, js, prState) {
+  const slice = js === undefined ? extractStep(CLOSE_STEP, 'script') : { text: js, region: '' };
+  const dir = fs.mkdtempSync(path.join(TMP, 'close-'));
+  fs.writeFileSync(path.join(dir, 'step.cjs'),
+    `module.exports = async function step(github, context, core) {
+${slice.text}
+}
+`, 'utf8');
+  fs.writeFileSync(path.join(dir, 'runner.cjs'), CLOSE_RUNNER, 'utf8');
+  const full = { ...process.env };
+  for (const [k, v] of Object.entries(env)) full[k] = v === undefined || v === null ? '' : String(v);
+  if (prState) full.__PR_STATE = prState;
+  let err = null;
+  let stdout = '';
+  try {
+    stdout = execFileSync(process.execPath, ['runner.cjs'], { cwd: dir, encoding: 'utf8', env: full, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) { err = e; stdout = String(e.stdout || ''); }
+  const p = path.join(dir, 'close.json');
+  const calls = fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf8')) : null;
+  return { err, stdout, calls, region: slice.region, script: slice.text,
+    stderr: err ? String(e_stderr(err)) : '' };
+}
+function e_stderr(err) { return err && err.stderr ? err.stderr : ''; }
+
+test('收口·判据跑成了且结论是 block ⇒ 自动关 PR（request-review 已删除，block 就是终局）', () => {
+  const r = runCloseStep({ TRIAGE_CONCLUSION: 'success', LABEL: 'auto-rejected', ACTION: 'block' });
+  assert.equal(r.err, null, `这一步不许自己炸：${r.stderr}`);
+  assert.deepEqual(r.calls, [['close', 42, 'closed']],
+    '契约 §2.2 第 3 条：拒稿必须自动关 PR —— 留着 open 等于让投稿者对着一个永远不会变绿的红叉等下去');
+});
+
+test('收口·audit-broken 不关 PR（那是我们的故障，投稿者没做错事）', () => {
+  const r = runCloseStep({ TRIAGE_CONCLUSION: 'success', LABEL: 'audit-broken', ACTION: 'block' });
+  assert.equal(r.err, null, `这一步不许自己炸：${r.stderr}`);
+  assert.deepEqual(r.calls || [], [],
+    '契约 §2.2.1：audit-broken 的 PR 保持 open —— 该修的是我们，让他「修好重投」是误导');
+  assert.match(r.stdout, /不是 auto-rejected/);
+});
+
+test('收口·分流自己红（没有结论）⇒ 不关：红那一发没有可依据的判决', () => {
+  const r = runCloseStep({ TRIAGE_CONCLUSION: 'failure', LABEL: 'audit-broken', ACTION: 'block' });
+  assert.equal(r.err, null, `这一步不许自己炸：${r.stderr}`);
+  assert.deepEqual(r.calls || [], []);
+  assert.match(r.stdout, /没有结论/);
+});
+
+test('收口·标签与 action 对不上 ⇒ 不关（只改了一半，先修接线而不是赌哪一个是真的）', () => {
+  const r = runCloseStep({ TRIAGE_CONCLUSION: 'success', LABEL: 'auto-rejected', ACTION: 'auto-approve' });
+  assert.equal(r.err, null, `这一步不许自己炸：${r.stderr}`);
+  assert.deepEqual(r.calls || [], [], '两个 output 由同一段脚本写，对不上时关 PR 就是在赌');
+  assert.match(r.stdout, /对不上/);
+});
+
+test('收口·已经是 closed 的 PR 不再发一次 close（重跑旧 PR 不该把收口步打成红）', () => {
+  const r = runCloseStep({ TRIAGE_CONCLUSION: 'success', LABEL: 'auto-rejected', ACTION: 'block' }, undefined, 'closed');
+  assert.equal(r.err, null, `这一步不许自己炸：${r.stderr}`);
+  assert.deepEqual(r.calls || [], [], 'GitHub 对已关的 PR 发 close 是 422');
+});
+
+test('收口·变异一：把三重条件全摘掉 ⇒ 判据自己红的那一发也开始关 PR', () => {
+  const src = extractStep(CLOSE_STEP, 'script').text;
+  // 一次把三道守卫都短路掉，模拟「有人嫌啰嗦，改成只要 label 对就关」。
+  const mutated = src
+    .replace("if (triage !== 'success') {", 'if (false) {')
+    .replace("if (action !== 'block') {", 'if (false) {');
+  assert.notEqual(mutated, src, '变异没落地：守卫的写法变了要一起改这里');
+  const r = runCloseStep({ TRIAGE_CONCLUSION: 'failure', LABEL: 'auto-rejected', ACTION: 'auto-approve' }, mutated);
+  assert.deepEqual(r.calls, [['close', 42, 'closed']],
+    '变异体必须真的关掉 —— 关不掉是这条哨兵自己失效，不是闸还在');
+});
+
+test('收口·步骤的 if: 必须用 !cancelled() 而不是 always()（取消的那一发结论不作数）', () => {
+  const region = extractStep(CLOSE_STEP, 'script').region;
+  const line = region.match(/^ {8}if: .*$/m);
+  assert.ok(line, '这一步必须有步骤级 if');
+  assert.match(line[0], /!cancelled\(\)/,
+    'always() 在取消时也跑，而取消意味着这一发结果不作数 —— 那时关 PR 等于用被丢弃的结论关别人的投稿');
+  assert.doesNotMatch(line[0], /always\(\)/);
+  assert.match(line[0], /steps\.locate\.outputs\.found == 'true'/,
+    '没有投稿内容的维护类 PR 不该走到收口这一步');
+});
+
+test('收口·拒稿评论说的是「修好后可重新投稿」，不再指一个不存在的去处', () => {
+  const c = runCommentStep({ env: {
+    ...CONCL_OK, RISK: 'high', ACTION: 'block', LABEL: 'auto-rejected', CHANGE_TYPE: 'first',
+    AI_NOTE: '同意静态结论', MODULE_ID: 'demo', PACKAGE_COUNT: '1', REASONS: '命中名单：X',
+  } });
+  assert.match(c.body, /重新投稿/, '必须告诉投稿者下一步怎么做');
+  assert.doesNotMatch(c.body, /没有人可以签它进来|没有人签这一格/,
+    'request-review 已整个删除（§1.1）：再说「等人来签」就是把一个不存在的去处指给投稿者看');
+});
+
+test('收口·audit-broken 的评论明写「PR 不会被自动关闭，你不需要重新投稿」', () => {
+  // audit-broken 只由 writeFailClosed 写出，而它写完就 exit 1 ⇒ 这一发的 conclusion 必是 failure。
+  // 夹具照这个真实形状写：拿 success 配 audit-broken 是一份线上不存在的报告。
+  const c = runCommentStep({ env: {
+    ...CONCL_OK, TRIAGE_CONCLUSION: 'failure',
+    RISK: '', ACTION: 'block', LABEL: 'audit-broken', CHANGE_TYPE: '',
+    AI_NOTE: '', MODULE_ID: 'demo', PACKAGE_COUNT: '1', REASONS: '报告缺 riskLevel',
+  } });
+  assert.match(c.body, /不会被自动关闭/, '我们的故障必须说清「不用你重投」，否则他收到的信号是「我被拒了」');
+  assert.match(c.body, /不需要重新投稿/);
 });

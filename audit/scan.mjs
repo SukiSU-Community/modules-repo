@@ -1499,13 +1499,19 @@ export function renderMarkdown(report) {
   L.push('---');
   L.push('');
   // 这句话必须随轴走。分档判据取 decision 自己的形状，不取 reason 的正则：
-  // 未命中那几句里也含「名单」二字（「未命中上架拦截名单」），拿 /名单/ 当判据会把待拍那一档
+  // 未命中那几句里也含「名单」二字（「未命中上架拦截名单」），拿 /名单/ 当判据会把保守那一档
   // 念成「命中了名单」—— 那是替一个没命中的模块说一句指控，方向正好反了。
+  //
+  // ⚠ 2026-10-26 去人工化（契约 §1.1）：分档**不能再取 `needsHumanReview`**。新轴二值化之后
+  //   它恒为 false（block 也是 false —— 机器自己拒，不再等人），拿它当判据会把每一发被拒的
+  //   模块都念成「本模块可自动进入索引」，方向正好反了，而且是在 PR 评论这种给人看的那一层。
+  //   判据改成 `action`：新轴只有 block / auto-approve 两值，二者互斥且穷尽。
   const wired = report.decision.axis === 'malice';
   const hitList = wired && Array.isArray(report.decision.basis) && report.decision.basis.length > 0;
-  L.push(`_本报告由 \`contrib/audit/scan.mjs\` 生成；**未经人工审核** —— 上不上架由一次可复验的机器运行判定（判据：\`risk-rules.mjs\` 的上架拦截名单 ∪ AI 恶意结论，§2）；${report.decision.needsHumanReview
+  const blocked = wired ? report.decision.action === 'block' : report.decision.needsHumanReview;
+  L.push(`_本报告由 \`contrib/audit/scan.mjs\` 生成；**未经人工审核** —— 上不上架由一次可复验的机器运行判定（判据：\`risk-rules.mjs\` 的上架拦截名单 ∪ AI 恶意结论，§2）；${blocked
     ? (wired
-      ? `本次机器判定**不上架**${hitList ? '（命中上架拦截名单或 AI 恶意结论）' : '（未命中名单，但这一档按 §13 的待拍项 / 撤销记账维持保守分支）'}。`
+      ? `本次机器判定**不上架**${hitList ? '（命中上架拦截名单或 AI 恶意结论）' : '（未命中名单，但分不清首投还是更新 / 撤销记账维持保守分支）'}。`
       : '本次机器判定不放行；这一发的 decision 走的是老轴（调用点没传恶意定性）—— 生产调用点已接线，出现这句说明有人新增了调用点。')
     : '本模块可自动进入索引，随附上面的能力与覆盖标注。'}_`);
   L.push('');

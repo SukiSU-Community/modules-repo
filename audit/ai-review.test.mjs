@@ -19,7 +19,7 @@ import {
   TEXT_FEED_CAP_BYTES, MAX_SHAPED_ROWS, fitTextEntry,
   EVENT_PAGE_SIZE, MAX_EVENT_PAGES, MAX_RAW_EXCERPT, UNTRUSTED_MARK, OVER_BUDGET_REASON_CODES,
   PROMPT_SHA256, NON_TEXT_MARK, FORENSICS_LINE_CAP, FORENSICS_IMPORT_CAP,
-  DEFAULT_TIMEOUT_MS,
+  DEFAULT_TIMEOUT_MS, briefBudgetFromEnv,
 } from './ai-review.mjs';
 import { detectBinary, trimSnippet } from './risk-rules.mjs';
 import { scanZip, isCliEntry, isNonTextContent, readZip, MAX_SCAN_BYTES_PER_ENTRY } from './scan.mjs';
@@ -1183,6 +1183,44 @@ test('F4a：预算依据如实写明是未标定的保守字节代理，没有�
   const src = readFileSync(join(REPO_ROOT, 'audit', 'ai-review.mjs'), 'utf8');
   assert.match(src, /TODO\(标定/, '标定待办在代码里可 grep 到');
   assert.match(src, /DEFAULT_MAX_BRIEF_BYTES = 240000/);
+});
+
+test('契约 §2.3：AI_BRIEF_MAX_BYTES 环境变量优先，读不懂一律退回默认值（不许猜一个数）', () => {
+  // 采信条件 = Number.isFinite 且 > 0。四个方向各钉一格：
+  assert.equal(briefBudgetFromEnv({ AI_BRIEF_MAX_BYTES: '900000' }), 900000, '合法值必须采信');
+  assert.equal(briefBudgetFromEnv({ AI_BRIEF_MAX_BYTES: '240000' }), 240000);
+  // 读不懂 / 越界 ⇒ 默认值。这里的每一条都对应一种真实手滑：写了单位、写了千分位、
+  // 写了 0（想表达「不限」）、写了负数、写了空串（env 存在但没值）。
+  for (const bad of ['240k', '240,000', '0', '-1', '', 'abc', 'NaN', 'Infinity']) {
+    assert.equal(briefBudgetFromEnv({ AI_BRIEF_MAX_BYTES: bad }), DEFAULT_MAX_BRIEF_BYTES,
+      `'${bad}' 不许被猜成一个数 —— 猜小了会误报 over-budget 拒稿，猜大了会顶穿模型输入上限`);
+  }
+  assert.equal(briefBudgetFromEnv({}), DEFAULT_MAX_BRIEF_BYTES, '没配就是默认值');
+  assert.equal(briefBudgetFromEnv(undefined), DEFAULT_MAX_BRIEF_BYTES, 'env 整个不在也不许抛');
+
+  // 默认值本身不许被这个改动动过（§2.3 第一句：240000 保留为默认值）。
+  const src = readFileSync(join(REPO_ROOT, 'audit', 'ai-review.mjs'), 'utf8');
+  assert.match(src, /DEFAULT_MAX_BRIEF_BYTES = 240000/);
+});
+
+test('契约 §2.3：优先级 --max-bytes > AI_BRIEF_MAX_BYTES > 默认值（三档各自生效）', async () => {
+  const entries = [file('x.sh', 'echo hi\n')];
+  const call = async (argvExtra, env) => runMain({ report: R, entries,
+    argvExtra: ['--backend', 'workers-ai', ...argvExtra],
+    env: { AI_API_BASE: 'https://x/v1', AI_API_KEY: 'k', AI_MODEL: 'm', ...env },
+    fetchImpl: async () => { throw new Error('不该走到网络'); } });
+
+  // ① 命令行显式给 ⇒ 用它，env 不许盖过它（这一次运行的用户意图最具体）。
+  const cli = await call(['--max-bytes', '5000'], { AI_BRIEF_MAX_BYTES: '900000' });
+  assert.equal(cli.payload.brief.maxBytes, 5000, '--max-bytes 必须压过环境变量');
+
+  // ② 没给命令行 ⇒ 用 env（这正是标定之后改运维配置的那条路，不改代码）。
+  const fromEnv = await call([], { AI_BRIEF_MAX_BYTES: '5000' });
+  assert.equal(fromEnv.payload.brief.maxBytes, 5000, 'env 要真的接进 buildBrief，不能只读不用');
+
+  // ③ 两样都没有 ⇒ 默认值。
+  const dflt = await call([], {});
+  assert.equal(dflt.payload.brief.maxBytes, DEFAULT_MAX_BRIEF_BYTES);
 });
 
 test('F4b：over-budget 的文案说「需要」多少字节，不是说「装下了」多少', async () => {

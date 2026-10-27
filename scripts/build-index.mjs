@@ -176,7 +176,9 @@ export function normalizeEntry(raw, source = '<memory>') {
       author,
       description,
       versions,
-      // 自动放行一律未复核；人工复核通过后再置 true。
+      // `verified` 恒等于投稿者自己在 pending JSON 里填的那个布尔，**不是**「复核过」的标记：
+      // 本站没有「人工复核通过后置 true」这一档（见 GOVERNANCE 第 1 节），没有谁有权把它置真。
+      // 要让它变真，得先把「谁有权置真、凭什么置真」重新建出来，而不是由投稿者自己填一个 true。
       verified: raw.verified === true,
     },
   };
