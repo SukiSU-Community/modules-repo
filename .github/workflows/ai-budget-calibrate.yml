@@ -85,8 +85,18 @@ jobs:
           if [ -n "${INDEX_PATH:-}" ] && [ -f "$INDEX_PATH" ]; then
             ARGS+=(--index "$INDEX_PATH")
           fi
-          node audit/scan.mjs --zip "$ZIP_PATH" "${ARGS[@]}"
+          # 包路径是**位置参数**，不是 --zip（scan.mjs 没有 --zip 这个开关）。
+          # 2026-10-27 修：这里原先写成 `--zip "$ZIP_PATH"`，scan.mjs 只打印了一屏用法就
+          # 正常退出（退出码 0），`ls -l audit-out` 显示空目录、这一步仍然是绿的 —— 于是
+          # 下一步报「--report 指向的文件不存在」，看上去像 ai-review.mjs 的问题，
+          # 实际是这里从来没真跑通过一次。找不到产物就必须当场红。
+          node audit/scan.mjs "$ZIP_PATH" "${ARGS[@]}"
           ls -l audit-out
+          # 空目录不算跑过：scan.mjs 认不出参数时正是以「打印用法 + 退出 0」收场。
+          ls audit-out/*.audit.json > /dev/null 2>&1 || {
+            echo "::error::scan.mjs 没有产出任何 *.audit.json（audit-out 是空的）—— 参数或包有问题，标定无法继续。"
+            exit 1
+          }
 
       # 真发一次。**故意不设 AI_BRIEF_MAX_BYTES**：标定要量的是「装下整包需要多少」，
       # 先给一个预算上限会让这一发提前走 over-budget 分支，什么都量不到。
