@@ -17,6 +17,8 @@ import {
   SYSTEM_PROMPT, STATUS_VALUES, MODULE_WRITABLE_STATUSES, MIN_MAX_TOKENS, QCA_BASE,
   sanitizeUntrusted, BUDGET_BASIS, QFMODEL_MAX_INPUT_TOKENS, DEFAULT_MAX_BRIEF_BYTES,
   TEXT_FEED_CAP_BYTES, MAX_SHAPED_ROWS, fitTextEntry,
+  looksBundled, extractWindows, WINDOW_GAP_MARK, WINDOW_FEED_CAP_BYTES,
+  BUNDLE_MIN_BYTES, BUNDLE_AVG_LINE_BYTES, WINDOW_CONTEXT_LINES,
   EVENT_PAGE_SIZE, MAX_EVENT_PAGES, MAX_RAW_EXCERPT, UNTRUSTED_MARK, OVER_BUDGET_REASON_CODES,
   PROMPT_SHA256, NON_TEXT_MARK, FORENSICS_LINE_CAP, FORENSICS_IMPORT_CAP,
   DEFAULT_TIMEOUT_MS, briefBudgetFromEnv,
@@ -335,8 +337,11 @@ test('prompt 第 3 条把「可引用的两面」写死：② 逐行原文 + ③
 test('被预算略掉的 ③ 条目不许进 corpus：略掉的东西模型根本没看到，引用它必须是造假', () => {
   // 900 → 1200 B 这一档是 ㉚ 之后重测的：② 的节标题长了约 230 B（它现在还要交代「未送部分」），
   // 同一对夹具的临界档跟着上移。实测 needed=1395 B：≤1000 两篇都略，1100~1300 只略 big.so，≥1400 一条都不略。
+  // 2026-10-27 再上移一次：② 的节标题又长了一截（现在要交代「两条进料规则」），同一对夹具实测
+  // needed=1848 B，临界档变成「≤1500 两篇都略、1600~1840 只略 big.so、≥1848 一条都不略」。
+  // 取 1700：落在「只略 big.so」那一档的中间，两侧都有余量，不会因为文案再改一个字就翻面。
   const elf = Buffer.concat([Buffer.from(ELF8), Buffer.alloc(4096, 0x90)]);
-  const b = buildBrief({ report: R, maxBytes: 1200,
+  const b = buildBrief({ report: R, maxBytes: 1700,
     entries: [file('a.sh', 'echo hi\n'), { name: 'big.so', size: 900000, content: elf.toString('utf8'), head: elf }] });
   assert.deepEqual(b.omitted.map((o) => o.name), ['big.so'], `这一档要略掉的正是那枚 ③ 条目（实测 omitted=${b.omitted.map((o) => o.name)}）`);
   assert.equal(b.corpus.has('big.so'), false, 'corpus.set 必须在预算判断之后：先登记再判预算 = 让模型引用没送出的东西');
@@ -1175,10 +1180,16 @@ test('真接口实测：DEFAULT_TIMEOUT_MS 要盖过 QCA 的排程尾部（三�
     `默认超时 ${DEFAULT_TIMEOUT_MS}ms 盖不住今天见过的最差一发（第三发到 926s 仍在 rescheduling、没答）`);
 });
 
-test('F4a：预算依据如实写明是未标定的保守字节代理，没有发明 token 系数', () => {
-  assert.match(BUDGET_BASIS, /uncalibrated|未标定/);
+test('F4a：预算依据如实写明它是怎么来的、以及不是怎么来的，没有发明 token 系数', () => {
+  // 2026-10-27 之前这一条钉的是 /uncalibrated|未标定/：那时默认值 240000 确实是「凭空的保守代理值」。
+  // 现在默认值由一条**可核验的实测量**定（唯一一次真投稿 device_faker 在旧形状下 neededBytes=448301，
+  // 线上 run 39096250929 因此被判 over-budget 拒稿），所以「未标定」这个自我描述本身已经不准确了 ——
+  // 但当年要防的那件事**没变**：不许把 credits / token 之间的猜测写成事实。改钉下面三条。
+  assert.match(BUDGET_BASIS, /measured-not-guessed/, '依据必须自陈是实测，不是代理值');
+  assert.match(BUDGET_BASIS, /448301|448,301/, '依据里要带上那个实测数 —— 否则「实测」两个字无法核验');
   assert.match(BUDGET_BASIS, /真实发送/, '标定需要一次真实发送 —— 这条必须写在依据里，不是藏在注释里');
   assert.match(String(QFMODEL_MAX_INPUT_TOKENS), /180000/);
+  assert.match(BUDGET_BASIS, /没有任何已标定的换算/, '仍然必须明说字节↔token 没有换算');
   assert.doesNotMatch(BUDGET_BASIS, /tokens?\s*[≈~]/, '不许出现任何被当成事实的字符/token 换算');
   const src = readFileSync(join(REPO_ROOT, 'audit', 'ai-review.mjs'), 'utf8');
   // 这里原先钉的是 /TODO\(标定/ —— 那个待办**做不到**，已经删掉（2026-10-27 核实）：
@@ -1189,7 +1200,8 @@ test('F4a：预算依据如实写明是未标定的保守字节代理，没有�
   assert.match(src, /no token counts|不暴露 token 数/, '供应商不给 token 数这条事实要可 grep');
   assert.match(src, /credits, not tokens|以 \*\*credits|只以 credits/, '花费以 credits 计这条事实要可 grep');
   assert.doesNotMatch(src, /TODO\(标定/, '不能留一个做不到的 TODO 让人反复重试');
-  assert.match(src, /DEFAULT_MAX_BRIEF_BYTES = 240000/);
+  // 默认值本身：480000 由实测 448301 上取余量得来，不是随手一个圆整数。
+  assert.match(src, /DEFAULT_MAX_BRIEF_BYTES = 480000/);
 });
 
 test('契约 §2.3：AI_BRIEF_MAX_BYTES 环境变量优先，读不懂一律退回默认值（不许猜一个数）', () => {
@@ -1205,9 +1217,13 @@ test('契约 §2.3：AI_BRIEF_MAX_BYTES 环境变量优先，读不懂一律退�
   assert.equal(briefBudgetFromEnv({}), DEFAULT_MAX_BRIEF_BYTES, '没配就是默认值');
   assert.equal(briefBudgetFromEnv(undefined), DEFAULT_MAX_BRIEF_BYTES, 'env 整个不在也不许抛');
 
-  // 默认值本身不许被这个改动动过（§2.3 第一句：240000 保留为默认值）。
+  // 默认值由本改动抬过（2026-10-27：240000 → 480000）。这里**不再**钉具体数字 ——
+  // 钉一次具体数字就等于每次调预算都要改一条断言，断言会被当成噪声顺手改掉，那它就失效了。
+  // 钉的是这条契约真正要保的性质：默认值必须为正、且 env 合法值确实压过它。
   const src = readFileSync(join(REPO_ROOT, 'audit', 'ai-review.mjs'), 'utf8');
-  assert.match(src, /DEFAULT_MAX_BRIEF_BYTES = 240000/);
+  assert.match(src, /export const DEFAULT_MAX_BRIEF_BYTES = \d+;/);
+  assert.ok(Number.isInteger(DEFAULT_MAX_BRIEF_BYTES) && DEFAULT_MAX_BRIEF_BYTES > 0);
+  assert.equal(briefBudgetFromEnv({ AI_BRIEF_MAX_BYTES: String(DEFAULT_MAX_BRIEF_BYTES) }), DEFAULT_MAX_BRIEF_BYTES);
 });
 
 test('契约 §2.3：优先级 --max-bytes > AI_BRIEF_MAX_BYTES > 默认值（三档各自生效）', async () => {
@@ -1248,7 +1264,9 @@ test('F4b：over-budget 的文案说「需要」多少字节，不是说「装�
     [['payload.json', 60001, true]], '超上限的条目要在产物里逐条留下「原文多少 / 送了多少 / 是不是连第一行都没送满」');
   assert.match(r.payload.reason, /需要 \d+ B/);
   assert.doesNotMatch(r.payload.reason, /装不进预算（\d+ \/ \d+ B/, '旧口径（byteSize / maxBytes）会把人工复核带偏');
-  assert.match(r.payload.reason, /未标定|uncalibrated/, '文案里带上预算依据');
+  // 2026-10-27：依据从「未标定的保守代理」变成了「实测」，所以这里钉的是**依据必须出现在文案里**
+  // 这件事本身（人工复核不看代码，只看这条 reason），而不是旧的 uncalibrated 那个词。
+  assert.match(r.payload.reason, /measured-not-guessed/, '文案里带上预算依据');
   assert.equal(r.payload.brief.budgetBasis, BUDGET_BASIS);
 });
 
@@ -2154,14 +2172,19 @@ test('截断之后复验仍然逐字：送出去那一段引得到，落在未�
 
 test('㉚ 买到的那一格：越界的唯一原因是若干条超上限的原文时，形状改完发得出去（常数没动）', () => {
   const fat = (n) => Array.from({ length: n }, (_, i) => `k${i}: "${'y'.repeat(24)}",`).join('\n');
+  // 夹具要**真的**越过默认预算，否则「形状改完装得下」在「本来就装得下」的世界上永远成立，
+  // 这一格就成了永绿的假成功。单条 fat(1000) = 33889 B，15 条 + service.sh ≈ 508 KB > 480000。
+  // 注意：这里的内容不含任何热点关键词 ⇒ 走的是**前缀**那一档（windowedEntries 应为 0），
+  // 也就是说这条用例钉的仍然是「截前缀」那一半，没有被新增的窗口化顺手改成另一回事。
   const entries = [
-    ...Array.from({ length: 8 }, (_, i) => file(`assets/chunk-${i}.js`, fat(1000))),   // 8 × ~31 KB
+    ...Array.from({ length: 15 }, (_, i) => file(`assets/chunk-${i}.js`, fat(1000))),   // 15 × ~33 KB
     file('service.sh', 'echo hi\n'),
   ];
   const raw = entries.reduce((s, e) => s + Buffer.byteLength(e.content, 'utf8'), 0);
   assert.ok(raw > DEFAULT_MAX_BRIEF_BYTES, `夹具：全量原文 ${raw} B 本来就越过 ${DEFAULT_MAX_BRIEF_BYTES}`);
   const b = buildBrief({ report: R, entries, maxBytes: DEFAULT_MAX_BRIEF_BYTES });
-  assert.equal(b.shapes.textClipped, 8);
+  assert.equal(b.shapes.textClipped, 15);
+  assert.equal(b.shapes.windowedEntries, 0, '没有热点就回退前缀那一档，不许悄悄变成窗口化');
   assert.equal(b.omitted.length, 0, '一条都不该被略掉');
   assert.equal(b.overBudget, false, `改完形状要装得下：needed=${b.neededBytes} / 预算 ${DEFAULT_MAX_BRIEF_BYTES}`);
   assert.equal(b.byteSize <= DEFAULT_MAX_BRIEF_BYTES, true, 'F4c 那条硬上界不许因为改形状而失效');
@@ -2187,5 +2210,130 @@ test('shaped 清单有上限：条目再多也只列 MAX_SHAPED_ROWS 条，剩�
   assert.equal(b.shapes.textClipped, MAX_SHAPED_ROWS + 5, '但计数要说真数，不能被清单上限一起吃掉');
   assert.equal(b.shapes.shapedDropped, 5);
 });
+
+// ─── ㉛ 压缩/打包产物的「窗口摘录」：这一层是**新增的判据**，必须自己有一组用例 ───
+// 为什么单独一组：前缀截断那一档的用例全在 ㉚，而窗口化是另一条路 ——
+// 它扫全文（比静态读得多）、按形态判定（不看名字）、并且把 corpus 变成稀疏数组。
+// 这三件事每一件都能单独把复验闸或覆盖承诺撬开，所以逐条钉。
+
+test('㉛-1 形态判据只看体积与平均行长：改个扩展名 / 换个目录都不绕过', () => {
+  // 不到下限：多大的手写文件都不算产物
+  const hand = Array.from({ length: 30 }, (_, i) => `echo ${i}`).join('\n');
+  assert.equal(looksBundled(hand), false);
+  assert.equal(looksBundled('x'.repeat(BUNDLE_MIN_BYTES - 1)), false, '不到体积下限一律不碰');
+  // 过了下限但行短：仍然是手写（哪怕它很大）
+  const bigHand = Array.from({ length: 4000 }, (_, i) => `echo ${i}`).join('\n');
+  assert.ok(bigHand.length > BUNDLE_MIN_BYTES);
+  assert.equal(looksBundled(bigHand), false, '平均行长短于阈值 ⇒ 手写，哪怕体积很大');
+  // 过了下限且行长超阈值：产物 —— 与文件名、扩展名、目录名都无关
+  const minified = `var a=${'1'.repeat(BUNDLE_AVG_LINE_BYTES * 60)};`;
+  assert.ok(minified.length > BUNDLE_MIN_BYTES, `夹具：必须越过体积下限 ${BUNDLE_MIN_BYTES}`);
+  for (const name of ['a.js', 'a.css', 'notes.md', 'pay-load', 'system/x.sh']) {
+    assert.equal(looksBundled(minified), true, `${name}：判据只看形态，不看名字`);
+  }
+});
+
+test('㉛-2 扫全文：热点落在前缀之外（第 N 行）也照样被送出去 —— 这正是「比静态读得多」', () => {
+  assert.equal(WINDOW_FEED_CAP_BYTES <= TEXT_FEED_CAP_BYTES, true, '窗口上限不得超过单条目上限');
+  // 造一行 minified：前 200 KB 全是填充，`eval(` 在很靠后的位置。
+  const filler = '.'.repeat(200 * 1024);
+  const line = `${filler}eval(atob("cGF5bG9hZA=="))${filler}`;
+  // 先确认这一条真的会被判成产物，且**前缀里没有热点** —— 否则这条用例在「前缀里就有」的世界上也成立。
+  assert.equal(looksBundled(line), true);
+  assert.equal(/eval|atob/.test(line.slice(0, TEXT_FEED_CAP_BYTES)), false, '夹具：热点必须落在静态/前缀读不到的地方');
+  const w = extractWindows(line);
+  assert.equal(w.windowed, true, '这一档必须走窗口化');
+  assert.ok(w.hits >= 1);
+  const sent = w.lines.filter((x) => x !== undefined).join('\n');
+  assert.match(sent, /eval\(/, '热点必须真的被送出去 —— 它在前缀之外，前缀截断永远送不到');
+  assert.match(sent, /atob\(/);
+  assert.ok(w.sentBytes <= WINDOW_FEED_CAP_BYTES, `窗口上限是硬上界（实测 ${w.sentBytes}）`);
+});
+
+test('㉛-3 一个热点都没有 ⇒ 退回前缀，不是什么都不送（送 0 B 会让模型以为条目不存在）', () => {
+  const plain = `${'.'.repeat(BUNDLE_AVG_LINE_BYTES * 100)}`;
+  assert.equal(looksBundled(plain), true, '夹具：它是产物形态');
+  const w = extractWindows(plain);
+  assert.equal(w.windowed, false, '没有热点就不许声称「扫了全文」');
+  assert.equal(w.hits, 0);
+  assert.ok(w.lines.length > 0 && w.lines[0] !== undefined, '退回前缀：第一条必须是有内容的');
+  assert.ok(w.sentBytes > 0);
+});
+
+test('㉛-4 corpus 是稀疏数组：没送的那一行必须判「没送进 brief」，不能静默变成空串通过', () => {
+  // 这条钉子防的是一个具体漏洞：`foldQuote(undefined)` → ''，而 '任意串'.includes('') 恒为 true。
+  // 少了这一格，窗口化就等于把「逐字复验」这道闸自己拆了：引用任何没送的行都能验过。
+  const filler = '.'.repeat(200 * 60);
+  const hot = `${filler}eval(1)`;
+  const body = `${Array.from({ length: 30 }, (_, i) => `line ${i} ${filler}`).join('\n')}\n${hot}`;
+  const b = buildBrief({ report: R, entries: [file('bundle.js', body)], maxBytes: DEFAULT_MAX_BRIEF_BYTES });
+  assert.equal(b.shapes.windowedEntries, 1, '夹具：必须走窗口化');
+  const sent = b.corpus.get('bundle.js');
+  const missing = sent.findIndex((x) => x === undefined);
+  assert.ok(missing >= 0, '稀疏数组里必须有没送出去的行，否则这条用例没在测东西');
+  const r = verifyQuotes({ findings: [{ file: 'bundle.js', line: missing + 1, quote: 'line 0' }] }, b.corpus);
+  assert.equal(r.ok, false, '引用没送出去的行必须判红');
+  assert.match(r.bad[0].reason, /没有送进本次 brief/);
+  // 送出去的那一行照样要能逐字复验（不许因为改形状把真话也判成假话）
+  const lastLine = sent.findIndex((x) => typeof x === 'string' && x.includes('eval(1)'));
+  assert.ok(lastLine >= 0);
+  assert.equal(verifyQuotes({ findings: [{ file: 'bundle.js', line: lastLine + 1, quote: 'eval(1)' }] }, b.corpus).ok, true);
+});
+
+test('㉛-5 行内多段切片：一行里相距很远的热点都要送到，段间省略标记不许被引用', () => {
+  // minify 的一行里常有好几个热点，彼此相隔很远（一个 bundle 就是一行）。两个陷阱各自能单独成立：
+  //   ① 只取第一个热点 ⇒ 后面的 `fetch(` 根本送不到，这一行里其余可疑点全丢；
+  //   ② 多段直接拼成一行送 ⇒ 模型能跨过被切掉的区间引用，那条「证据」原文里不存在。
+  // 填充用非词字符：紧贴 `eval` 的字母会让 \beval\b 失配，夹具就什么都不测了。
+  const gapA = '.'.repeat(5000);   // 两个热点相距 5000 B，远大于小预算下单段的覆盖范围
+  const line = `eval(1)${gapA}fetch("http://evil.test/x")${gapA}innerHTML=x`;
+  const w = extractWindows(line, 4000);
+  assert.equal(w.windowed, true);
+  assert.equal(w.hits, 1, '整条只有 1 行（hits 数的是行，不是位置）—— 正因为如此才必须靠下面逐热点断言');
+  const kept = w.lines.find((x) => typeof x === 'string');
+  assert.ok(kept, '必须至少放进去一行');
+  // ① 三个热点（相距 5000 B）都必须送到 —— 只取第一个位置的话后两个必然缺失（变异 E）。
+  for (const pat of [/eval\(/, /fetch\(/, /innerHTML/]) {
+    assert.match(kept, pat, `${pat} 必须送到：只取第一个热点会让这一行其余可疑点全丢`);
+  }
+  // ② 真有省略标记时，整段抄下来必须判红（那是拼接产物，不是原文）
+  assert.ok(kept.includes(WINDOW_GAP_MARK), '多段之间必须有省略标记，否则拼接无法识别');
+  const b = { corpus: new Map([['x.js', w.lines]]) };
+  const bad = verifyQuotes({ findings: [{ file: 'x.js', line: 1, quote: kept }] }, b.corpus);
+  assert.equal(bad.ok, false, '整段抄下来时含着省略标记 ⇒ 那是拼接产物，不是原文');
+  assert.match(bad.bad[0].reason, /跨过了被切掉的区间/);
+  // 但其中**真实存在**的单段照样能引用（省略标记不许连坐真话）
+  assert.equal(verifyQuotes({ findings: [{ file: 'x.js', line: 1, quote: 'eval(1)' }] }, b.corpus).ok, true,
+    '同一行里真实存在的那一段不许被省略标记连坐');
+});
+
+test('㉛-6 二进制不因「行长超标」被当产物切片：真 ELF 走 ③ 那一档', () => {
+  // 实测量的那一次事故：.so 与无后缀 ELF 没有换行，平均行长极大，
+  // 只看行长的判据会把它们判成「已 minify 的机器文本」然后去切字节。
+  const elf = Buffer.concat([Buffer.from(ELF8), Buffer.alloc(200 * 1024, 0x00)]);
+  const b = buildBrief({ report: R, entries: [{ name: 'zygisk/arm64-v8a.so', size: elf.length,
+    content: elf.toString('utf8'), head: elf }], maxBytes: DEFAULT_MAX_BRIEF_BYTES });
+  assert.equal(b.shapes.windowedEntries, 0, '二进制条目不许走窗口化');
+  assert.equal(b.shapes.binaryDigestEntries, 1, '它必须仍然是 ③ 那一档');
+  assert.equal(b.corpus.has('zygisk/arm64-v8a.so'), true, '③ 的登记行仍是可引用原文');
+});
+
+test('㉛-7 每一个条目都仍然出现在 ②/③ 里：窗口化不是「按路径跳过」', () => {
+  // §1 的覆盖承诺（每条必登记）不许被新判据顺手破坏。
+  const env = {
+    'webroot/assets/app.js': `${'.'.repeat(BUNDLE_AVG_LINE_BYTES * 40)}eval(1)`,
+    'webroot/assets/style.css': `${'.'.repeat(BUNDLE_AVG_LINE_BYTES * 40)}`,
+    'customize.sh': 'echo hi\n',
+    'module.prop': 'id=demo\n',
+  };
+  const entries = Object.entries(env).map(([n, t]) => file(n, t));
+  const b = buildBrief({ report: R, entries, maxBytes: DEFAULT_MAX_BRIEF_BYTES });
+  for (const name of Object.keys(env)) {
+    assert.equal(b.corpus.has(name), true, `${name} 必须在 corpus 里（窗口化也不许把条目整条丢掉）`);
+  }
+  assert.equal(b.omitted.length, 0);
+  assert.equal(b.shapes.textEntries, 4);
+});
+
 
 

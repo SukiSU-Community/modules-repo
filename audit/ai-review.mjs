@@ -45,22 +45,24 @@
 //     判据不另起一份：复用静态的 `detectBinary` 与 `isNonTextContent`（见 classifyFeedEntry）。
 //
 // 装不下怎么办（D5c）：如实写 over-budget 并红，**绝不许「截断后当干净」**。
-//   半条文件既读不出语义、又让模型以为自己看到了整包，那是最坏的一种输入；
-//   真包实测文本约 766 KB 而 qfmodel 的 max_input_tokens 是 180,000，所以这是常路
-//   不是异常路 —— 由调用方（T6）据此不发这一发。
+//   半条文件既读不出语义、又让模型以为自己看到了整包，那是最坏的一种输入。
+//   真包实测（2026-10-27，`device_faker-20260926.zip`）：旧进料形状下 neededBytes = 448,301 B，
+//   而旧默认预算 240,000 B ⇒ 本仓**唯一一次真实投稿**直接 over-budget、模型压根没被调用。
+//   因此「装不下」不是异常路而是默认路：抬上限（见 DEFAULT_MAX_BRIEF_BYTES）治「拒稿」，
+//   改形状（见 extractWindows）治「花多少 credits」—— 分工不同，缺一不可。
 //   over-budget 的文案报的是「**需要**多少字节」（neededBytes），不是「装下了多少」：
 //   人工复核要的是「把整包送出去还差多少」，给「已经塞进去多少」会直接误导这个判断。
 //
-// 预算这个数**没有依据**（评审 F4）：DEFAULT_MAX_BRIEF_BYTES 是字节，qfmodel 的
+// 预算这个数**由实测定，不凭想象**（评审 F4）：DEFAULT_MAX_BRIEF_BYTES 是字节，qfmodel 的
 //   180,000 是 max_input_tokens，两者之间**没有任何已标定的换算**。本模块因此：
 //   ① 不许凭空格子发明一个字符/token 系数 —— 见 BUDGET_BASIS，代码与报告里都写明它
-//      是「未标定的保守字节代理」（uncalibrated conservative byte proxy）；
+//      的依据（480000 来自一次真实投稿的实测 neededBytes，不是保守代理值）；
 //   ② maxBytes 是**硬上界**：①②③④ 四个节标题、占位文案、节之间的换行全部计入 used，
 //      所以 `overBudget === false ⟹ byteSize <= maxBytes`（旧实现漏了这些，实测过
 //      overBudget=false 而 byteSize=732 > 700 的自相矛盾）；反过来 overBudget=true 时
 //      byteSize 允许越界，因为那一发**根本不发**，越界只是「需要多少」的读数；
-//   ③ 标定需要**一次真实发送**（拿一个真包发一发，记 input tokens / total_credits /
-//      active_seconds 回来才能定系数）—— 这是待办，不在离线单测里假装能证明。
+//   ③ 标定的真实边界：QCA **不暴露 token 数**（花费只以 credits 计，spans 无 token 计数），
+//      所以只能量出 credits/字节，得不到 token 系数。见 `.github/workflows/ai-budget-calibrate.yml`。
 //
 // 供应商与调用形状（Qoder Cloud Agents，模型 qfmodel，effort: medium；均为实测结论）：
 //   一次判定 = create_session → send_session_events → 轮询 list_session_events，
@@ -151,17 +153,32 @@ export const MALICE_EVIDENCE_MAX = 10;
  *   所以不存在「测一次就得到字节→token 系数」这条路。硬要凑，只能是拿一个假设的
  *   credits→token 比再乘一遍 —— 那与直接编一个 240000 是同一类错误，只是多一层看起来像证据。
  *
- *   结论：`DEFAULT_MAX_BRIEF_BYTES` 保持为**写明的保守代理值**，由 `AI_BRIEF_MAX_BYTES`
- *   覆盖（运维动作，不改代码）；over-budget 的文案只报字节（neededBytes），不报任何 token 推断。
+ *   结论：`DEFAULT_MAX_BRIEF_BYTES` 由一个**可核验的实测量**定，不是凭空的保守代理值
+ *   （见下面的常量注释）；由 `AI_BRIEF_MAX_BYTES` 覆盖（运维动作，不改代码）；
+ *   over-budget 的文案只报字节（neededBytes），不报任何 token 推断。
  *   真要按 token 卡，只能等供应商把 token 数露出来 —— 在那之前，本模块不假装已经标定。
  */
-export const DEFAULT_MAX_BRIEF_BYTES = 240000;
+/**
+ * 整份 brief 的字节预算（= 允许送出去多少）。
+ *
+ * 这个数**不再是凭空的「保守代理值」**（2026-10-27 之前的 240000 是）。
+ * 定它的依据是一条实测：
+ *   本仓库唯一一次真实投稿包 `device_faker-20260926.zip`（969,705 B / 57 条目），
+ *   在**旧进料形状**下 `neededBytes` = 448,301 B，而旧默认预算 240,000 B
+ *   ⇒ 线上那一发直接判 `over-budget`、压根没调用模型、整包被拒（run 39096250929，2026-10-18）。
+ *   也就是说：默认值比真实工作点低了将近一倍，**唯一一次真投稿就是被它拒的**。
+ *   480,000 = 448,301 上取 ~7% 余量，够这一次真包、也够同量级的后续包。
+ *
+ * 为什么是「抬上限」而不是「压进料」解决这一个问题：这两件事本轮**都做**了，但分工不同 ——
+ *   上限管「万一装不下也不许拒稿」，形状管「实际送多少、花多少 credits」（见 extractWindows）。
+ *   只改形状不改上限，等于把「装不下就拒稿」的引信留在原地：下一个包大一点又重演一次。
+ */
+export const DEFAULT_MAX_BRIEF_BYTES = 480000;
 
 /**
  * 从环境变量 `AI_BRIEF_MAX_BYTES` 读预算上限（契约 §2.3）。
  *
- * 为什么要有这个开关：240000 这个数是「没有依据的保守代理值」（见上面的 TODO），
- * 标定出来之后要能改**而不改代码** —— 改代码就得走一次 PR，而标定是运维动作。
+ * 为什么要有这个开关：标定是运维动作，改预算不该走一次 PR。
  *
  * 采信条件是 `Number.isFinite` 且 > 0，其余一律退回默认值。**不做字符串宽容**
  * （'240k' / '240,000' / 带单位都当没写）：把读不懂的配置猜成一个数，比用默认值更危险 ——
@@ -178,12 +195,13 @@ export function briefBudgetFromEnv(env = (typeof process !== 'undefined' ? proce
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_BRIEF_BYTES;
 }
 
-/** qfmodel 的 max_input_tokens —— 只是参照量，**不是**预算的换算依据（见上面的 TODO）。 */
+/** qfmodel 的 max_input_tokens —— 只是参照量，**不是**预算的换算依据（见上面的真实边界）。 */
 export const QFMODEL_MAX_INPUT_TOKENS = 180000;
 
 /** 写进产物的预算依据说明：人工复核必须一眼看到这个数是怎么来的（以及它不是怎么来的）。 */
-export const BUDGET_BASIS = 'uncalibrated-conservative-byte-proxy：DEFAULT_MAX_BRIEF_BYTES 与 '
-  + `qfmodel 的 max_input_tokens=${QFMODEL_MAX_INPUT_TOKENS} 之间没有任何已标定的换算，`
+export const BUDGET_BASIS = 'measured-not-guessed：DEFAULT_MAX_BRIEF_BYTES=480000 由唯一一次真实投稿'
+  + '（device_faker-20260926，旧形状 neededBytes=448301）定，不是保守代理值；'
+  + `它与 qfmodel 的 max_input_tokens=${QFMODEL_MAX_INPUT_TOKENS} 之间仍然没有任何已标定的换算，`
   + '标定需要一次真实发送，而 QCA 不暴露 token 数（花费只以 credits 计、spans 无 token 计数），'
   + '所以只能量出 credits/字节，得不到 token 系数';
 
@@ -473,6 +491,334 @@ function clipNote(fit) {
     + `，未送 ${fit.droppedLines} 行 —— 静态对它也只读到 ${MAX_SCAN_BYTES_PER_ENTRY} B，两边同一档，不是谁被裁了`;
 }
 
+/* -------------------------------------------------------------------------------------------
+ * 进料形状之二：压缩/打包产物只送「热点窗口」
+ *
+ * 为什么要有这一档（2026-10-27 实测，见 DEFAULT_MAX_BRIEF_BYTES 的注释）：
+ *   唯一一次真实投稿 `device_faker-20260926.zip` 送出去 431,916 B 原文，其中 **426,978 B（98.9%）**
+ *   是 `webroot/assets/*` 下的现代前端构建产物（Vite 打出来的 `.js` / `.css`，已被 minify）。
+ *   真正的可执行面（`customize.sh` / `service.sh` / `module.prop` 等）只有 4,938 B。
+ *   也就是说旧形状把 98.9% 的预算与 credits 花在「读不出结构的一行机器文本」上，
+ *   而模型对 minified 单行代码的语义理解本来就接近于零 —— 花掉的钱没有换成判断力。
+ *
+ * 这一档**不是**把产物排除在外（那才是 fail-open）：每一条文本条目仍然出现在 ② 里、
+ *   仍然带自己的真实行号与字节账，只是不再整篇送，而是**扫全文、只把命中了危险关键词的
+ *   那几行连同上下文送出去**。所以：
+ *     * 藏在包尾的投毒点照样被扫到 —— 这是「抽窗口」与「截前缀」的本质区别，
+ *       截前缀丢掉的是后面的一切，抽窗口丢掉的是与语义无关的填充；
+ *     * 行号是**原文行号**（corpus 用稀疏数组按原下标落位），引用复验仍然逐字对得上；
+ *     * 判据只看形态（体积 + 平均行长），不看名字：`assets/` 只是今天的样子，
+ *       按路径豁免 = 投稿者改个目录名就绕过去（计划 §0.7 第 3 条量过并否决过）。
+ *
+ * 与静态层的关系：静态对每条目只读前 MAX_SCAN_BYTES_PER_ENTRY B（前缀）。
+ *   这一档扫的是**全文**，命中的热点可能落在静态没读到的那一段里 —— 只多不少，不违反不变量。
+ * ---------------------------------------------------------------------------------------- */
+
+/** 平均行长超过它就当压缩/打包产物（手写代码平均一行几十字节，minify 后是几千）。 */
+export const BUNDLE_AVG_LINE_BYTES = 200;
+/** 体积低于它的不做窗口化：小文件整篇送更省事，也不值得为它算一遍窗口。 */
+export const BUNDLE_MIN_BYTES = 8192;
+/** 每个热点行前后各带几行上下文（够看出这段在干什么，又不会把整个函数体拖进来）。 */
+export const WINDOW_CONTEXT_LINES = 2;
+/** 单条目最多取多少个热点（防止一份产物里几万个 `fetch(` 把上限吃光、反而挤掉别的条目）。 */
+export const WINDOW_HIT_CAP = 400;
+/** 命中行整行装不下时，行内切片至少要有这么多字节才有意义（低于它不如不给）。 */
+export const MIN_WINDOW_SLICE = 256;
+/**
+ * 压缩/打包产物的**单条目**送出上限，比静态的 MAX_SCAN_BYTES_PER_ENTRY（24 KB）小一档。
+ *
+ * 为什么可以比静态少，而不算「AI 比静态瞎」：
+ *   1. 静态层自己的前缀扫描**照旧独立跑**，它读到什么、命中什么，完全不受这里影响；
+ *   2. AI 层是**只加严、不参与放行**的第二层（见文件头），所以「AI 少看一点」的方向是
+ *      「AI 少给一条加严线索」，不是「放行了一枚本该被拦的包」—— 不存在由此产生的 fail-open；
+ *   3. 反过来，这一档**扫的是全文**（找热点），静态只读前缀。真包实测 5 条命中行落在
+ *      静态读不到的那一段里 —— 这一档实际是「AI 看到静态看不到的东西」的唯一来源。
+ *
+ * 为什么不是 24 KB：15 条前端产物 × 24 KB = 368 KB，光这一档就把预算吃光，
+ *   等于「只送高价值」没有发生（实测整包 neededBytes 488576 > 480000，真包又被判 over-budget）。
+ *   8 KB 是实测过的档位（`C:\tmp\window-tiers.mjs`）：整包约 205 KB，与 480 KB 预算之间有充足余量。
+ */
+export const WINDOW_FEED_CAP_BYTES = 8192;
+
+/**
+ * 热点关键词。**这是判据的一部分，不是实现细节**：改这张表等于改「AI 能看到哪些可疑点」。
+ * 分组写在这里，是为了让「为什么不按扩展名/路径豁免」这件事有地方讲：
+ * 我们挑的是**语义上会干坏事的那几个调用面**，与文件叫什么是两件事。
+ */
+export const BUNDLE_HOT_SPOT = new RegExp([
+  // 代码执行 / 命令执行 / 反射
+  '\\beval\\b', '\\bnew\\s+Function\\b', '\\bFunction\\s*\\(', '\\bexecSync\\b', '\\bexecFile\\b',
+  '\\bchild_process\\b', '\\bspawn\\b', '\\bshell\\b', '\\bsystem\\b', '\\bpopen\\b',
+  // 网络 / 外联 / 隐蔽信道
+  '\\bfetch\\s*\\(', '\\bXMLHttpRequest\\b', '\\bWebSocket\\b', '\\bsendBeacon\\b',
+  '\\bimportScripts\\b', '\\bpostMessage\\b', '\\bEventSource\\b', '\\bnavigator\\.sendBeacon\\b',
+  // 编解码 / 混淆载荷
+  '\\batob\\b', '\\bbtoa\\b', '\\bunescape\\b', '\\bdecodeURIComponent\\b', '\\bfromCharCode\\b',
+  // 存储 / 凭证 / 注入面
+  '\\blocalStorage\\b', '\\bsessionStorage\\b', '\\bindexedDB\\b', '\\bdocument\\.cookie\\b',
+  '\\binnerHTML\\b', '\\bouterHTML\\b', '\\bdocument\\.write\\b', '\\binsertAdjacentHTML\\b',
+  '\\bdangerouslySetInnerHTML\\b', '\\bcreateElement\\s*\\(', '\\bsetAttribute\\s*\\(',
+  // Android 侧的敏感面（WebUI 里点得到的东西）
+  '\\bsu\\b', '\\bmagisk\\b', '\\bksud\\b', '\\bmount\\b', '\\bchmod\\b', '\\biptables\\b',
+  '\\bcrontab\\b', '\\bresetprop\\b', '\\bsetenforce\\b',
+  // 凭证 / 密钥字面量
+  '\\bAuthorization\\b', '\\bpassword\\b', '\\btoken\\b', '\\bcredential\\b', '\\bsecret\\b',
+].join('|'));
+
+/** 这一行第一个热点关键词出现的位置（没有则 -1）。切片要围绕它取，而不是从行首截。 */
+function hotIndex(line) {
+  const s = String(line == null ? '' : line);
+  BUNDLE_HOT_SPOT.lastIndex = 0;
+  const m = BUNDLE_HOT_SPOT.exec(s);
+  return m ? m.index : -1;
+}
+
+/** 一行里**全部**热点位置（字符下标，升序，近邻合并）。
+ *
+ * 为什么需要「全部」：minify 之后整个 bundle 常常就是**一行**，那一行里可能有十几个
+ * `fetch(` / `eval` / `token` / `innerHTML`。只看第一个位置取一个切片，
+ * 等于把这一行里其余九个可疑点全部丢掉 —— 而这条条目会被挑出来恰恰是因为它可疑。
+ * 同一行里的多段切片用 `…[行内省略]…` 连接，仍然逐字来自原文（见 sliceMany）。
+ */
+function hotPositions(line, cap = WINDOW_HIT_CAP) {
+  const s = String(line == null ? '' : line);
+  const re = new RegExp(BUNDLE_HOT_SPOT.source, 'g');
+  const pos = [];
+  let m;
+  while ((m = re.exec(s)) !== null && pos.length < cap) {
+    pos.push(m.index);
+    if (m.index === re.lastIndex) re.lastIndex += 1;  // 零宽匹配保护
+  }
+  return pos;
+}
+
+/**
+ * 同一行内多段切片之间的分隔符。
+ *
+ * 它出现在 corpus 的那一行里，但**原文里并没有这个串**。所以引用里含它就说明
+ * 「引的是跨了被切掉区间的拼接结果」，`quoteProblem` 必须判成造假 —— 否则模型可以
+ * 把两段不相邻的代码拼起来当一条证据，而那条证据在原文件里根本不存在。
+ */
+export const WINDOW_GAP_MARK = '…⟪省略⟫…';
+/** 单行内最多切几段（minify 的一行里可能有几十个热点，切碎了反而读不出上下文）。 */
+export const WINDOW_MAX_SLICES = 8;
+
+/** 围绕命中位置切一段**字节安全**的片段（不把多字节字符切成半个），返回字节区间与文本。 */
+function byteSlice(buf, atBytes, room) {
+  const MIN_SIDE = 60;
+  const before = Math.max(MIN_SIDE, Math.min(atBytes, Math.floor((room - MIN_SIDE) / 2)));
+  let lo = Math.max(0, atBytes - before);
+  let hi = Math.min(buf.length, lo + room);
+  lo = Math.max(0, hi - room);
+  const back = (p) => { let x = p; while (x > 0 && (buf[x] & 0xc0) === 0x80) x -= 1; return x; };
+  const fwd = (p) => { let x = p; while (x < buf.length && (buf[x] & 0xc0) === 0x80) x += 1; return x; };
+  lo = back(lo);
+  hi = fwd(hi);
+  return { lo, hi, text: buf.subarray(lo, hi).toString('utf8') };
+}
+
+/**
+ * 单行装不下时取**多段**切片，段间用 WINDOW_GAP_MARK 连接。
+ *
+ * 为什么不是只取第一处：minify 之后的整个 bundle 常常就是**一行**，那一行里可能有
+ * 十几个 `fetch(` / `eval` / `token` / `innerHTML`。只取第一段等于把这一行里其余
+ * 可疑点全丢掉 —— 而这条条目被挑出来恰恰是因为它可疑，这会让「扫了全文」名不副实。
+ */
+function sliceMany(line, room) {
+  const s = String(line == null ? '' : line);
+  const buf = Buffer.from(s, 'utf8');
+  const pos = hotPositions(s);
+  if (!pos.length) return sliceAround(s, 0, room);
+  const gap = Buffer.byteLength(WINDOW_GAP_MARK, 'utf8');
+  const want = Math.min(pos.length, WINDOW_MAX_SLICES);
+  const per = Math.max(MIN_WINDOW_SLICE, Math.floor((room - gap * (want - 1)) / want));
+  const out = [];
+  let coveredTo = 0;
+  for (const at of pos) {
+    if (out.length >= want) break;
+    const atBytes = Buffer.byteLength(s.slice(0, at), 'utf8');
+    if (atBytes < coveredTo) continue;          // 已被上一段包住，不再重复占预算
+    const piece = byteSlice(buf, atBytes, per);
+    if (piece.hi <= coveredTo) continue;
+    out.push(piece.text);
+    coveredTo = piece.hi;
+  }
+  if (!out.length) return sliceAround(s, 0, room);
+  const joined = out.join(WINDOW_GAP_MARK);
+  return Buffer.byteLength(joined, 'utf8') <= room ? joined : out[0];
+}
+
+/**
+ * 围绕命中位置切一段**字节安全**的片段（不把多字节字符切成半个）。
+ * 命中处在片段里居中，两侧按剩余空间对称取，收到 UTF-8 码点边界上。
+ */
+function sliceAround(line, hitAt, room) {
+  const s = String(line == null ? '' : line);
+  const at = hitAt >= 0 ? hitAt : 0;
+  // hitAt 是**字符**下标，先换回字节偏移（前面可能有中文注释）。
+  const atBytes = Buffer.byteLength(s.slice(0, at), 'utf8');
+  return byteSlice(Buffer.from(s, 'utf8'), atBytes, room).text;
+}
+
+/** 这条文本条目像不像压缩/打包产物（只看形态，不看名字）。 */
+export function looksBundled(content) {
+  const s = String(content == null ? '' : content);
+  const bytes = Buffer.byteLength(s, 'utf8');
+  if (bytes < BUNDLE_MIN_BYTES) return false;
+  const lines = splitLines(s);
+  // 空内容 / 只有一行空串时 lines.length 是 1，除法仍成立。
+  const avg = bytes / Math.max(1, lines.length);
+  return avg > BUNDLE_AVG_LINE_BYTES;
+}
+
+/**
+ * 扫全文、抽热点窗口。
+ *
+ * 返回的 `lines` 是**稀疏数组**，下标就是原文的 0-based 行号 —— 这一点是刻意的：
+ * `quoteProblem` 拿 `f.line - 1` 去这个数组里取，取到的必须是**那一行原文本身**，
+ * 否则「模型引用了第 5000 行」就会被判成「不在原文里」，而它其实在，只是没送。
+ * 稀疏数组让「没送的行」取到 `undefined`，`quoteProblem` 因此能给出一条准确的拒绝理由。
+ *
+ * @returns {{lines:(string|undefined)[], clipped:boolean, sentBytes:number, totalBytes:number,
+ *            totalLines:number, droppedLines:number, lineCut:boolean,
+ *            windowed:boolean, hits:number, windows:number}}
+ */
+export function extractWindows(content, cap = WINDOW_FEED_CAP_BYTES, hitCap = WINDOW_HIT_CAP) {
+  const s = String(content == null ? '' : content);
+  const all = splitLines(s);
+  const totalBytes = textBytes(s);
+  const limit = Number.isInteger(cap) && cap > 0 ? cap : WINDOW_FEED_CAP_BYTES;
+
+  // 找热点行号（0-based）。一行命中多次只算一处热点。
+  const hitLines = [];
+  for (let i = 0; i < all.length && hitLines.length < hitCap; i += 1) {
+    BUNDLE_HOT_SPOT.lastIndex = 0;
+    if (BUNDLE_HOT_SPOT.test(all[i])) hitLines.push(i);
+  }
+  // 一个热点都没有 ⇒ 这一条按「前缀」送（调用方回退 fitTextEntry），
+  // 因为「什么都不送」会让模型以为这条不存在，那比送前缀更糟。
+  if (!hitLines.length) {
+    return { ...fitTextEntry(s, cap), windowed: false, hits: 0, windows: 0 };
+  }
+
+  // 每个热点扩成 [i-K, i+K] 区间，再合并重叠 —— 相邻热点共用一个窗口，不重复占预算。
+  const spans = [];
+  for (const i of hitLines) {
+    const lo = Math.max(0, i - WINDOW_CONTEXT_LINES);
+    const hi = Math.min(all.length - 1, i + WINDOW_CONTEXT_LINES);
+    const last = spans[spans.length - 1];
+    if (last && lo <= last.hi + 1) last.hi = Math.max(last.hi, hi);
+    else spans.push({ lo, hi });
+  }
+
+  // 装料：`lines` 按**原文行号**落位，所以放入顺序不影响输出顺序。
+  // 优先放命中行（它们是这条条目被挑出来的理由），再把上下文塞进剩下的空间。
+  const lines = new Array(all.length);
+  const partials = new Set();
+  const renderBytes = () => textBytes(windowBlockBody(lines));
+
+  /** 放一行（整行）。装不下就撤销、返回 false —— 撤销是必须的：不放回会让后面的渲染都带上它。 */
+  const placeWhole = (i) => {
+    if (lines[i] !== undefined) return true;
+    lines[i] = all[i];
+    if (renderBytes() <= limit) return true;
+    lines[i] = undefined;
+    return false;
+  };
+
+  /**
+   * 命中行整行都装不下时（minify 后单行上百 KB 是常态），退化成**围绕命中位置的字节切片**。
+   * 为什么不是放弃这一行：放弃等于这条条目送出去 0 B，「扫了全文」就成了一句空话 ——
+   * 实测真包里有 5 条正好是这种（`DeviceFakerFormFields` 单行 111 KB），全被丢光。
+   * 切片的字节仍然来自原文，只是不完整；条目头会写明「这一行是切片」，
+   * 复验也只会拿切出来的这一段去比，模型引用了被切掉的部分照样判造假。
+   */
+  const placeSlice = (i, hitAt) => {
+    if (lines[i] !== undefined) return true;
+    const room = limit - renderBytes() - 12;   // "NNNN| " 与换行
+    if (room < MIN_WINDOW_SLICE) return false;
+    lines[i] = sliceMany(all[i], room);
+    if (renderBytes() <= limit) { partials.add(i); return true; }
+    lines[i] = undefined;
+    return false;
+  };
+
+  let sentWindows = 0;
+  for (const sp of spans) {
+    const inSpan = [];
+    for (let i = sp.lo; i <= sp.hi; i += 1) inSpan.push(i);
+    const isHit = new Set(inSpan.filter((i) => all[i] !== undefined && hotIndex(all[i]) >= 0));
+    let got = 0;
+    // ① 命中行先放
+    for (const i of [...isHit].sort((a, b) => a - b)) {
+      const at = hotIndex(all[i]);
+      if (placeWhole(i) || placeSlice(i, at)) got += 1;
+    }
+    // ② 上下文行用剩下的空间
+    for (const i of inSpan) {
+      if (isHit.has(i)) continue;
+      if (placeWhole(i)) got += 1;
+    }
+    if (got > 0) sentWindows += 1;
+  }
+
+  // 一行都没放进去（连切片都不够）⇒ 退回前缀：送一点点总比让模型以为条目不存在强。
+  if (!lines.some((x) => x !== undefined)) {
+    return { ...fitTextEntry(s, cap), windowed: false, hits: hitLines.length, windows: 0 };
+  }
+
+  const keptLines = lines.filter((x) => x !== undefined).length;
+  const used = renderBytes();
+  return {
+    lines,
+    clipped: true,
+    sentBytes: used,
+    totalBytes,
+    totalLines: all.length,
+    droppedLines: all.length - keptLines,
+    lineCut: partials.size > 0,
+    partialLines: partials.size,
+    windowed: true,
+    hits: hitLines.length,
+    windows: sentWindows,
+    droppedWindows: spans.length - sentWindows,
+    scannedHits: hitLines.length >= hitCap,
+  };
+}
+
+/** 窗口化条目的头注：说清「扫了全文、只送了热点」，别让模型把「没在这里」读成「包里没有」。 */
+function windowNote(w) {
+  return `本条原文 ${w.totalBytes} B / ${w.totalLines} 行，判定为压缩/打包产物（已 minify，整篇送进来读不出结构），`
+    + `所以**扫了全文**、只把命中危险关键词的 ${w.hits} 行连同前后 ${WINDOW_CONTEXT_LINES} 行送出去：`
+    + `实际送出 ${w.windows} 段共 ${w.sentBytes} B（这一档单条目上限 ${WINDOW_FEED_CAP_BYTES} B），省略 ${w.droppedLines} 行`
+    + `${w.scannedHits ? `（热点已按 ${WINDOW_HIT_CAP} 处封顶）` : ''}`
+    + `${w.droppedWindows > 0 ? `（有 ${w.droppedWindows} 段因上限没装下）` : ''}`
+    + `${w.partialLines ? `；其中 ${w.partialLines} 行是**围绕命中位置的切片**（那一行 minify 后本身就超过单条目上限，整行装不下）` : ''}`
+    + '。省略的是与关键词无关的填充 —— 井号在的行号仍是原文行号，行与行之间出现的「省略 N 行」就是跳过的部分';
+}
+
+/**
+ * 窗口化条目的正文渲染：**保留原始行号**，跳过的区间用一行「… 省略 N 行 …」占位。
+ * 行号必须与原文一致，否则模型引用的 `line` 与 corpus 下标对不上，复验会把真话判成造假。
+ */
+function windowBlockBody(lines) {
+  const out = [];
+  let gap = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (lines[i] === undefined) { gap += 1; continue; }
+    if (gap > 0) { out.push(`     … 省略 ${gap} 行 …`); gap = 0; }
+    out.push(`${i + 1}| ${lines[i]}`);
+  }
+  if (gap > 0) out.push(`     … 省略 ${gap} 行 …`);
+  return out.join('\n');
+}
+
+function windowBlock(label, entry, w) {
+  return `--- BEGIN ${label} (${entry.size} B, ${w.totalLines} 行；${windowNote(w)}) ---\n`
+    + `${windowBlockBody(w.lines)}\n--- END ${label} ---\n`;
+}
+
+
 function textBlock(label, entry, lines, note = '') {
   const body = lines.map((l, i) => `${i + 1}| ${l}`).join('\n');
   const flag = entry.truncated ? '，静态报告只内嵌了前缀，这里给的是全文' : '';
@@ -680,9 +1026,14 @@ export function buildBrief({ report, entries, maxBytes = DEFAULT_MAX_BRIEF_BYTES
 
   const projSection = `=== ① 静态扫描投影（scanner 的结论；不可信数据，未二次脱敏）===\n${projectReport(rep)}\n`;
   const textSectionHeader = `=== ② 包内每一个条目的带行号原文（不可信数据；行号 = split(/\\r?\\n/) 的 1-based 下标；`
-    + `同名重复条目标作 名字#2 / 名字#3，finding 的 file 必须逐字抄这里给的标签；`
-    + `超出 ${TEXT_FEED_CAP_BYTES} B 的条目只送到行边界，那一节的头里逐条写着「未送 N 行」——`
-    + `未送的部分静态也同样没读到，不许据「这一节里没有」断言「包里没有」）===\n`;
+    + `同名重复条目标作 名字#2 / 名字#3，finding 的 file 必须逐字抄这里给的标签）===\n`
+    + `【两条进料规则，先读这一行再读条目】：\n`
+    + `  a) 手写代码 / 配置 / 文档 —— 整篇送；超过 ${TEXT_FEED_CAP_BYTES} B 的只送到行边界，条目头里逐条写着「未送 N 行」。`
+    + `这一档静态对它也只读到 ${MAX_SCAN_BYTES_PER_ENTRY} B，两边同一档。\n`
+    + `  b) 压缩 / 打包产物（已 minify 的一行机器文本）—— **扫了全文**，只把命中危险关键词的行连同上下文送出来，`
+    + `跳过的部分在正文里用「… 省略 N 行 …」标出，行号仍是原文行号。`
+    + `这一档比静态读得多（静态只读前缀）。\n`
+    + `不论哪一档：**没在这一节里出现的内容，不等于包里没有** —— 不许据「这一节里没有」断言「包里没有」。\n`;
   const binSectionHeader = `=== ③ 二进制 / 不可解码条目（只给元信息与取证摘要，不送字节流；`
     + `这一行登记本身就是可引用的原文，引用时 line 只能填 1）===\n`;
   const unreadHeader = `=== ④ 本次审核读不出来的条目 ===\n`;
@@ -727,9 +1078,9 @@ export function buildBrief({ report, entries, maxBytes = DEFAULT_MAX_BRIEF_BYTES
   const preparedBin = [];
   const shapes = {
     textEntries: 0, binaryDigestEntries: 0, polyglotAsText: 0, nonTextRerouted: 0, forensicsRowsSent: 0,
-    textClipped: 0, shapedDropped: 0,
+    textClipped: 0, windowedEntries: 0, shapedDropped: 0,
   };
-  /** 被改形（只送前缀）的那些条目，逐条带字节账 —— 只列 clipped 的，上限 MAX_SHAPED_ROWS 条。 */
+  /** 被改形的条目，逐条带字节账 —— 只列 clipped / windowed 的，上限 MAX_SHAPED_ROWS 条。 */
   const shaped = [];
   for (const e of list) {
     if (!e || typeof e.name !== 'string' || !e.name) continue;
@@ -738,13 +1089,38 @@ export function buildBrief({ report, entries, maxBytes = DEFAULT_MAX_BRIEF_BYTES
     const label = labeler(e.name);
     const bin = detectBinary(e.head);
     if (classifyFeedEntry(e, bin, polyglotFedNames) === 'text') {
-      // 进料形状（㉚）：超过单条目上限的原文只送**行边界上的前缀**，上限就是静态自己那一个。
-      const fit = fitTextEntry(e.content);
-      const parts = [bin ? '本条有魔数，但静态按 T4 通道把它当文本逐行读过，这里同样送全文' : '', clipNote(fit)]
+      // 进料形状（㉚），两档：
+      //   a) 压缩/打包产物（形态判定，见 looksBundled）⇒ **扫全文抽热点窗口**，行号保持原文行号；
+      //   b) 其余（手写代码 / 配置 / 文档）⇒ 保持原样，超过单条目上限的只送**行边界上的前缀**。
+      // 为什么 a 在最前面：判据看完整体积与平均行长，不看名字 —— 按路径豁免会被改个目录名绕过。
+      const w = looksBundled(e.content) ? extractWindows(e.content) : null;
+      const parts = [bin ? '本条有魔数，但静态按 T4 通道把它当文本逐行读过，这里同样送全文' : '']
         .filter(Boolean).join('；');
+      if (w && w.windowed) {
+        preparedText.push({ entry: e, label, lines: w.lines, block: windowBlock(label, e, w) });
+        shapes.textEntries += 1;
+        shapes.windowedEntries += 1;
+        if (bin) shapes.polyglotAsText += 1;
+        if (shaped.length < MAX_SHAPED_ROWS) {
+          shaped.push({
+            name: label, bytes: w.totalBytes, sentBytes: w.sentBytes,
+            lines: w.totalLines, sentLines: w.lines.filter((x) => x !== undefined).length,
+            lineCut: false, windowed: true, hits: w.hits, windows: w.windows,
+          });
+        } else shapes.shapedDropped += 1;
+        continue;
+      }
+      // 没有热点（或不像产物）⇒ 回到前缀那一档。
+      // `w` 只在 `looksBundled` 为真时才非 null，所以 `w && !w.windowed` 就是
+      // 「判成了产物、但全文一个危险关键词都没命中」—— 这时 fitTextEntry 与 w 里的行完全一致，
+      // 重算一次是为了让返回形状统一（w 多了 windowed/hits/windows 几个记账键）。
+      const fit = fitTextEntry(e.content);
+      const notes = [parts, clipNote(fit), w && !w.windowed
+        ? '本条判定为压缩/打包产物，但全文没有命中任何危险关键词，所以按前缀送（一条内容都不给模型会让它误以为条目不存在）'
+        : ''].filter(Boolean).join('；');
       preparedText.push({
         entry: e, label, lines: fit.lines,
-        block: textBlock(label, e, fit.lines, parts),
+        block: textBlock(label, e, fit.lines, notes),
       });
       shapes.textEntries += 1;
       if (bin) shapes.polyglotAsText += 1;
@@ -1394,7 +1770,18 @@ function quoteProblem(f, corpus) {
   if (!corpus.has(f.file)) return 'file 不在可引用清单（corpus）里';
   const lines = corpus.get(f.file) || [];
   if (!Number.isInteger(f.line) || f.line < 1 || f.line > lines.length) return 'line 越界';
+  // 压缩/打包产物是「抽热点窗口」送的：corpus 是稀疏数组，没送的行取到 undefined。
+  // 这里必须**显式**判空，不能让 undefined 静默变成空串 —— 那会让 foldQuote 折叠出 ''，
+  // 而 '任意串'.includes('') 恒为 true，于是「引用一行根本没送出去的内容」也能验过，
+  // 窗口化就把这条闸自己拆了。（旧注释写着「静态也一样没读到」，窗口化之后不再成立。）
+  if (typeof lines[f.line - 1] !== 'string') {
+    return 'line 是原文行号，但这一行没有送进本次 brief（压缩产物只送热点窗口），无法逐字复验';
+  }
   if (typeof f.quote !== 'string' || !f.quote.length) return 'quote 缺失';
+  // 压缩产物的长行是**切了多段再用省略标记连起来**送的。原文里没有这个标记，
+  // 所以引用里含它 ⇒ 这条引用跨过了被切掉的区间，是两段不相邻代码的拼接，
+  // 而拼接出来的那条「证据」在原文件里并不存在。必须整份不采信。
+  if (f.quote.includes(WINDOW_GAP_MARK)) return `quote 跨过了被切掉的区间（含 ${WINDOW_GAP_MARK}），拼接出来的内容原文里没有`;
   if (!foldQuote(f.quote).length) return 'quote 折叠后为空（纯空白不算引用）';
   if (!foldQuote(lines[f.line - 1]).includes(foldQuote(f.quote))) return 'quote 不在那一行原文里';
   return null;

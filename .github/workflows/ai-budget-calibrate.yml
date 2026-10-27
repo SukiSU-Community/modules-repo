@@ -1,8 +1,11 @@
 # ---------------------------------------------------------------------------
 # AI 预算标定（一次性，人工触发）
 #
-# 为什么需要这一步：`audit/ai-review.mjs` 里的 `DEFAULT_MAX_BRIEF_BYTES = 240000`
-# 是一个**没有依据的保守代理值**（评审 F4）。它需要由一次真跑的成本读数来撑住。
+# 为什么需要这一步：`audit/ai-review.mjs` 里的 `DEFAULT_MAX_BRIEF_BYTES`（现为 480000）
+# 必须是**量出来的**，不是拍的。它的第一个真实依据来自一次事故：本仓唯一一次真实投稿
+# `device_faker-20260926.zip` 在旧形状下 neededBytes = 448,301 B，而被当年那个 240,000 的
+# 默认值判成 over-budget、模型压根没被调用（run 39096250929）。这个 workflow 继续
+# 用真跑读数把这个数撑住，并顺带量出「一份 brief 实际花多少 credits」。
 #
 # ⚠️ 2026-10-27 修正：这个 workflow 原先要产出 `input_tokens / neededBytes` 这个比值，
 #    那是**做不到**的 —— QCA 不给 token 数。供应商文档两处原文：
@@ -17,7 +20,10 @@
 # 这个 workflow 只做一件事：拿一枚真包真发一次，把上面两个数打印到 job summary 里。
 # 它**不改任何代码、不写任何仓库文件**：标定是运维动作，改代码要走 PR。
 #
-# ⚠️ 这里的花费是真钱：一次 qca 会话按 usage.total_credits 计费（实测 10~13 credits 一发）。
+# ⚠️ 这里的花费是真钱：一次 qca 会话按 usage.total_credits 计费。
+#    2026-10-27 真跑读数：815,067 B 的 brief 花了 **162.05 credits**（active 515.6 s）。
+#    更早的一次 40461351426 同量级。所以默认上限按这个量级取，不是按两位数取
+#    （此前默认写 `15` 且注释称「实测 10~13」—— 那个数没有任何出处，是本文件的错误）。
 #    所以只有 workflow_dispatch，没有 push / schedule 触发。
 #
 # ⚠️ 拿不到读数的三种情形（没有产物 / 会话不是终态 / 没有 total_credits）**必须红**，
@@ -44,9 +50,9 @@ on:
         required: false
         type: string
       credits_ceiling:
-        description: '一发允许花的 credits 上限（用来反推字节预算，默认 15 —— 实测一发 10~13）'
+        description: '一发允许花的 credits 上限（反推字节预算用；默认 200 —— 2026-10-27 真跑实测一发 162.05）'
         required: false
-        default: '15'
+        default: '200'
         type: string
 
 permissions:
@@ -136,7 +142,7 @@ jobs:
           }
 
       # 算出「装下整包需要多少字节」。下一步拿它当 --max-bytes，让那一发真的把整包发出去。
-      # 为什么必须算而不是让 ai-review 自己决定：不传 --max-bytes 时它会退回默认 240000，
+      # 为什么必须算而不是让 ai-review 自己决定：不传 --max-bytes 时它会退回默认值（现为 480000），
       # 「不设预算」不等于「不设上限」—— 真包/探针动辄 800 KB，会直接走 over-budget、
       # 压根不调用模型，读数一个都没有（2026-10-27 实测踩过）。
       - name: 算 neededBytes（下一发的预算上界）
@@ -164,7 +170,7 @@ jobs:
       # 真发一次。**必须显式给一个足够大的 --max-bytes**：
       # 标定要量的是「装下整包需要花多少 credits」，所以这一发必须真的把整包发出去。
       # 2026-10-27 实测踩到的坑：原先这里没有传 --max-bytes，注释写着「故意不设预算」——
-      # 但不设预算 ≠ 不设上限，ai-review.mjs 会退回 DEFAULT_MAX_BRIEF_BYTES（240000）。
+      # 但不设预算 ≠ 不设上限，ai-review.mjs 会退回 DEFAULT_MAX_BRIEF_BYTES（现为 480000）。
       # 体量对位的探针需要 815067 B，于是这一发直接走了 over-budget 分支、**压根没调用模型**，
       # 状态是 over-budget、拿不到任何 credits 读数。标定因此必须自己把上限抬到 neededBytes 之上。
       - name: 真发一次（这一步会计费）
@@ -222,7 +228,8 @@ jobs:
           const needed = b.neededBytes ?? null;
           const byteSize = b.byteSize ?? null;
           const maxBytes = b.maxBytes ?? null;
-          const ceilingRaw = process.env.CREDITS_CEILING || '15';
+          // 兜底值要与 workflow_dispatch 的 default 一致：两边不一致时「没传」会按另一个数反推预算。
+          const ceilingRaw = process.env.CREDITS_CEILING || '200';
           const ceiling = Number(ceilingRaw);
 
           const lines = [];
@@ -297,5 +304,35 @@ jobs:
           lines.push('📌 关于 token：供应商的 spans「不暴露 token 数」、花费「以 credits 计」，');
           lines.push('   `GET /sessions/{id}` 也没有 token 字段，因此本标定**不产出任何 token 系数**。');
           lines.push('   真要按 token 卡，只能等供应商把 token 数露出来。');
+
+          // ⚠️ 读数不能只往 GITHUB_STEP_SUMMARY 写。
+          // 2026-10-27 实测踩到的坑：上一次标定真跑成了（花的钱真花掉了），但读数只进了
+          // step summary —— 那个页面是前端渲染的，`gh run view --log` 抓不到，CLI 里
+          // 一个数都读不出来。标定这个 job 的**唯一产出**就是这三个数，读不出来等于没标定。
+          // 所以：① 同时打到 stdout（进日志）② 落一份 json ③ 下面当 artifact 上传。
+          fs.writeFileSync('calibration.json', JSON.stringify({
+            zip: tgt.zip || null,
+            status: a.status || null,
+            neededBytes: Number(needed),
+            byteSize: Number(byteSize),
+            maxBytes: Number(maxBytes),
+            totalCredits: Number(credits),
+            activeSeconds: secs,
+            sessionStatus: status,
+            creditsPerKb: Number(creditsPerKb.toFixed(9)),
+            creditsCeiling: Number(ceiling),
+            safeBytes,
+          }, null, 2) + '\n');
+          console.log(lines.join('\n'));
           fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
           NODE
+
+      # artifact 是这份读数的落地副本：step summary 是渲染产物，CLI 抓不到；
+      # 日志会被 90 天清掉、且混在几千行里。标定要「后人能复核这个预算怎么来的」。
+      - name: 读数落盘（artifact）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: calibration-readings
+          path: calibration.json
+          if-no-files-found: warn

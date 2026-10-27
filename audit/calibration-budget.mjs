@@ -3,10 +3,11 @@
 //
 // 为什么标定需要这个数、而不是让它自己去发现：
 //   标定要量的是「把整包送出去花多少 credits」。所以那一发必须真的把整包发出去。
-//   而 ai-review.mjs 在没有 --max-bytes 时会退回 DEFAULT_MAX_BRIEF_BYTES（240000）——
+//   而 ai-review.mjs 在没有 --max-bytes 时会退回 DEFAULT_MAX_BRIEF_BYTES ——
 //   「不设预算」不等于「不设上限」。2026-10-27 实测就是这么翻车的：探针需要 815067 B，
-//   默认预算 240000，于是那一发走了 over-budget 分支、**压根没调用模型**，
-//   状态写的是 over-budget，credits 一个都读不到，而 job 里看上去「真发了一次」是绿的。
+//   当时的默认预算是 240000（现已抬到 480000），于是那一发走了 over-budget 分支、
+//   **压根没调用模型**，状态写的是 over-budget，credits 一个都读不到，
+//   而 job 里看上去「真发了一次」是绿的。
 //
 // 所以这里先用与线上完全相同的那条路（readZip + buildBrief）把 neededBytes 算出来，
 // 标定那一发再把它当 --max-bytes 传进去：上限恰好等于「一条都不略」所需的量，
