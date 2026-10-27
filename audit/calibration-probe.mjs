@@ -10,8 +10,10 @@
 //   标定读的是 `credits / neededBytes`，而 credits 里有一大块是**固定的系统提示成本**，
 //   与 brief 字节数无关。探针越小，固定成本占比越高，按 credits 上限线性外推出来的
 //   字节预算就越小 —— 小探针标出来的预算，上线后会把所有真实包判成 over-budget。
-//   真包文本约 766 KB（见 audit/ai-review.mjs 文件头），所以默认按 780000 B 造，
-//   落出来的 neededBytes 与真包同量级。
+//   真实投稿 device_faker-20260926.zip（969,705 B / 57 条目）的 neededBytes 是 448,301 B
+//   （旧进料形状；改形状后 295,188 B）。探针默认按 780,000 B 文本造，
+//   落出来的 neededBytes 与真包同量级 —— 2026-10-27 实测探针 neededBytes = 815,067 B，
+//   一发花 162.05 credits。
 //
 // 用法：
 //   node audit/calibration-probe.mjs --out <zip 路径> [--text-bytes N]

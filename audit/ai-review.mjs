@@ -133,11 +133,10 @@ export const AI_SCHEMA_VERSIONS_READABLE = Object.freeze([1, AI_SCHEMA_VERSION])
 export const MALICE_EVIDENCE_MAX = 10;
 
 /**
- * D5c 默认预算（字节）。真包约 766 KB，默认值必然装不下 —— 这是有意的。
+ * D5c 默认预算（字节）。2026-10-27 起这个数**有依据**了：依据是一条真实事故 ——
+ * 唯一一次真投稿被 240,000 判 over-budget 拒掉（详见下面 `DEFAULT_MAX_BRIEF_BYTES` 的注释）。
  *
- * ⚠ 这个数字**没有依据**，它是「未标定的保守字节代理」，不是任何 token 换算的结果：
- *   唯一的实测锚点是 qfmodel 的 max_input_tokens = 180,000（见 QFMODEL_MAX_INPUT_TOKENS），
- *   而「1 字节 brief ≈ 多少 token」本模块不知道、也**不许**猜一个当事实写。
+ * 为什么不能按 token 定：本模块不知道「1 字节 brief ≈ 多少 token」，也**不许**猜一个当事实写。
  *   brief 里的行号前缀（`N| `）与中英混排原文都会让字节→token 的比值漂移，
  *   任何系数在没标定之前写进代码都会被后人当既成事实引用。
  * 标定这件事的**真实边界**（2026-10-27 核实，此前这里是错的）：

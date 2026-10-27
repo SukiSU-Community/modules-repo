@@ -41,7 +41,7 @@ on:
         default: ''
         type: string
       probe_text_bytes:
-        description: '现场生成探针时的目标文本字节数（真包约 766 KB，默认 780000）'
+        description: '现场生成探针时的目标文本字节数（真包 neededBytes 448301 B，默认 780000 可落出 815067 B）'
         required: false
         default: '780000'
         type: string
