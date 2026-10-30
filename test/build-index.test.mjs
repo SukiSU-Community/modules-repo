@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   buildIndex, normalizeEntry, isApproved,
-  collectPendingFiles, markApproved, parseArgs, main,
+  collectPendingFiles, markApproved, parseArgs, main, coolapkSourceUrl,
   APPROVAL_FIELD, APPROVED_STATUS, APPROVED_STATUSES,
 } from '../scripts/build-index.mjs';
 import { validateIndex } from '../scripts/validate-index.mjs';
@@ -647,4 +647,136 @@ test('P3：parseArgs 认 --dispositions，默认指向仓库那份', () => {
   const o = parseArgs(['--dispositions', 'D']);
   assert.equal(path.basename(o.dispositionsFile), 'D');
   assert.equal(path.basename(parseArgs([]).dispositionsFile), 'dispositions.json');
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 出处四字段：source / uploader / coolapkUid / submittedAt
+//
+// 这四格是 App「酷安模块详情页」的数据来源，全部**可选**，消费侧的判据是「键在不在」——
+// 所以这里的断言不只要看值对不对，还要看**缺的时候键真的不存在**。`null` 是这里最想抓住的
+// 一种坏：`undefined` 会被 JSON.stringify 静默吞掉（测试在内存里跑绿、发布产物里是另一回事），
+// `null` 则会一路活到线上，让老 App 以为有出处、却渲染出一个空链接。两种都必须在产出那一刻就没有。
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ORIGIN_FIELDS = ['source', 'uploader', 'coolapkUid', 'submittedAt'];
+
+test('出处 ①：四字段齐全时全部进索引（source 规范化成绝对地址、字符串 trim）', () => {
+  const n = normalizeEntry(entry({
+    source: '  https://www.coolapk.com/feed/123456  ',
+    uploader: '  小绿  ',
+    coolapkUid: ' 10086001 ',
+    submittedAt: 1700000000000,
+  }));
+
+  assert.equal(n.ok, true);
+  assert.equal(n.entry.source, 'https://www.coolapk.com/feed/123456');
+  assert.equal(n.entry.uploader, '小绿', '昵称两侧空白要 trim（否则详情页会显示一段看不见的空格）');
+  assert.equal(n.entry.coolapkUid, '10086001', 'UID trim 后才能拼出可点的 coolapk.com/u/<UID>');
+  assert.equal(n.entry.submittedAt, 1700000000000);
+
+  // 老结构一个都没被挤掉
+  for (const f of ['id', 'name', 'author', 'description', 'versions', 'verified']) {
+    assert.equal(f in n.entry, true, `新增字段不能挤掉 ${f}`);
+  }
+  // 多出来的键不能让索引校验器红（App 老版本读新索引走的也是这条路）
+  const { index } = buildIndex({
+    index: emptyIndex,
+    entries: [entry({
+      source: 'https://www.coolapk.com/feed/1', uploader: '小绿', coolapkUid: '10086001', submittedAt: 1700000000000,
+    })],
+  });
+  assert.equal(validateIndex(index).ok, true);
+});
+
+test('出处 ②：四字段全缺失时**整个键不出现**（不是 null，也不是空串）', () => {
+  const m = buildIndex({ index: emptyIndex, entries: [entry()] }).index.modules[0];
+
+  for (const f of ORIGIN_FIELDS) {
+    assert.equal(f in m, false, `${f} 缺失时不许出现在索引里`);
+  }
+  // 序列化后再看一遍：undefined 会被吞掉、null 不会 —— 两种都不许有
+  const json = JSON.stringify(m);
+  assert.equal(json.includes('null'), false, '产物里不许出现 null（老 App 会把它当成「有出处」）');
+  assert.equal(/"(source|uploader|coolapkUid|submittedAt)":/.test(json), false);
+});
+
+test('出处 ③：source 只认酷安站内 http(s)，其余一律丢掉（上游漏校验也不许发出去）', () => {
+  const bad = [
+    'javascript:alert(1)',                                  // 补 scheme 后解析不出合法 host
+    'https://evil.com/x',                                   // 站外
+    'https://coolapk.com.evil.com/x',                       // 后缀伪装，不是子域
+    'https://evil.com/?r=https://www.coolapk.com/feed/1',   // 站内地址只出现在 query 里
+    'data:text/html,<script>alert(1)</script>',
+    '/feed/1',                                              // 相对路径
+    '   ',                                                  // 空白
+  ];
+  for (const s of bad) {
+    assert.equal(coolapkSourceUrl(s), '', `判据本身要拒：${s}`);
+    const m = buildIndex({ index: emptyIndex, entries: [entry({ source: s })] }).index.modules[0];
+    assert.equal('source' in m, false, `非法 source 必须省略：${s}`);
+  }
+
+  // 该放行的：子域、裸域名补 scheme、http
+  assert.equal(coolapkSourceUrl('https://www.coolapk.com/feed/1'), 'https://www.coolapk.com/feed/1');
+  assert.equal(coolapkSourceUrl('https://coolapk.com/feed/1'), 'https://coolapk.com/feed/1');
+  assert.equal(coolapkSourceUrl('www.coolapk.com/feed/1'), 'https://www.coolapk.com/feed/1', '老 pending 存的裸域名要补成绝对地址');
+  assert.equal(coolapkSourceUrl('http://coolapk.com/feed/1'), 'http://coolapk.com/feed/1');
+});
+
+test('出处 ④：submittedAt 收 Worker 的 ISO 字符串（真实 pending 就长这样），也收毫秒；认不出来就省略', () => {
+  // Worker 的 buildPendingJson 写的是 ISO：`new Date(ms).toISOString()`
+  assert.equal(
+    normalizeEntry(entry({ submittedAt: '2026-10-23T00:00:00.000Z' })).entry.submittedAt,
+    Date.parse('2026-10-23T00:00:00.000Z'),
+  );
+  assert.equal(normalizeEntry(entry({ submittedAt: '1700000000000' })).entry.submittedAt, 1700000000000);
+
+  for (const bad of [0, -1, 1.5, NaN, Infinity, '', 'not-a-time', null, undefined, {}, []]) {
+    assert.equal('submittedAt' in normalizeEntry(entry({ submittedAt: bad })).entry, false, `非法值不许写键：${String(bad)}`);
+  }
+});
+
+test('出处 ⑤：老索引条目原样通过 —— 纯转发一个字节不变，重投也不凭空长出新键', () => {
+  const legacy = {
+    id: 'demo_mod',
+    name: 'Demo',
+    author: 'tester',
+    description: 'demo module',
+    versions: [{ version: 'v0.9.0', versionCode: 90, zipUrl: 'https://e/old.zip', size: 1, time: 1, sha256: sha(7) }],
+    verified: false,
+  };
+
+  // ① 只按台账/时间重推导、没有新 pending：老条目必须原样出来
+  const passthrough = buildIndex({ index: { ...emptyIndex, modules: [legacy] }, entries: [] }).index;
+  assert.deepEqual(passthrough.modules[0], legacy, '老索引条目不许被改写');
+
+  // ② 老模块再来一个新版本：只追加版本，**不回填**老条目上缺的出处四格。
+  //    回填是另一个决定（出处以谁为准：首投那个人还是这次重投的人？），这里刻意不做 ——
+  //    免得一次「补字段」把索引里已有的归属关系悄悄换掉。
+  const { index, conflicts } = buildIndex({
+    index: { ...emptyIndex, modules: [legacy] },
+    entries: [entry({ source: 'https://www.coolapk.com/feed/9', uploader: 'alice', coolapkUid: '10086001', submittedAt: 1700000000000 })],
+  });
+  assert.equal(conflicts.length, 0, '出处四格不进 sameMeta，不该被算成元信息冲突');
+  assert.equal(index.modules.length, 1);
+  assert.equal(index.modules[0].versions.length, 2);
+  for (const f of ORIGIN_FIELDS) {
+    assert.equal(f in index.modules[0], false, `${f} 不回填（老条目没有就保持没有）`);
+  }
+});
+
+test('出处 ⑥：uid 进索引 ⇒ 按 uid 的模块级处置开始能抹掉**已在索引里**的模块（副作用，钉住）', () => {
+  const seeded = buildIndex({ index: emptyIndex, entries: [entry({ coolapkUid: '10086001' })] }).index;
+  assert.equal(seeded.modules[0].coolapkUid, '10086001');
+
+  // 以前 normalizeEntry 不投影 uid，索引里的模块身上没有这一格，于是「按人拉黑」只挡得住
+  // **新投稿**、抹不掉已经进去了的模块。这一格公开之后，那条处置才真正落到老模块上。
+  const { index, stats, blocked } = buildIndex({
+    index: seeded,
+    entries: [],
+    dispositions: ledger({ kind: 'deny', coolapkUid: '10086001', reason: 'impersonation', by: 'gh:x@1', at: '2026-10-11T00:00:00Z' }),
+  });
+  assert.equal(index.modules.length, 0);
+  assert.equal(stats.removedModules, 1);
+  assert.equal(blocked[0].via, 'coolapkUid');
 });

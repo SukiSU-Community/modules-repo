@@ -55,6 +55,10 @@ node scripts/fetch-pending-zip.mjs pending/ --out-dir /tmp/zips \
       "name": "模块名",
       "author": "作者",
       "description": "描述",
+      "source": "https://www.coolapk.com/feed/123456",
+      "uploader": "酷安昵称",
+      "coolapkUid": "10086001",
+      "submittedAt": 1700000000000,
       "verified": false,
       "versions": [
         {
@@ -76,16 +80,58 @@ node scripts/fetch-pending-zip.mjs pending/ --out-dir /tmp/zips \
 置真、凭什么置真」重新建出来，而不是由投稿者自己在 pending JSON 里填一个 `true`。
 `versions` 按 `versionCode` 降序，最新版在前。
 
+`source` / `uploader` / `coolapkUid` / `submittedAt` 是**可选**四格，用来给 App 的
+「酷安模块详情页」显示出处与上传者，详见下一小节。
+
+### 出处与上传者（可选四字段）
+
+**四格全部可选，缺了就整个键不出现** —— 不是 `null`，也不是空串：消费侧的判据是「键在不在」，
+而 `null` 会让老 App 以为有出处、却渲染出一个空链接。
+
+| 字段 | 类型 | 含义 | 什么时候省略 |
+|---|---|---|---|
+| `source` | string | 出处（酷安帖子链接） | 不是酷安站内的 http(s) 地址 |
+| `uploader` | string | 上传者的酷安昵称；**不是** `module.prop` 里的 `author` | trim 后为空 |
+| `coolapkUid` | string | 上传者的酷安 UID（`coolapk.com/u/<UID>` 末尾那串数字，可点进去复核） | trim 后为空 |
+| `submittedAt` | number | 提交时间（毫秒时间戳；产物里**只有这一种**形态） | 认不出是什么时间 |
+
+两条规则值得单独写下来：
+
+- **`source` 在索引侧再验一遍。** Worker 的投稿入口已经用 `coolapkSourceUrl()` 收口过（只认
+  `coolapk.com` 及其子域的 http(s) 地址，裸域名补 `https://`），`scripts/build-index.mjs` 里的
+  `coolapkSourceUrl()` 是**同一套判据的第二份实现**，改一侧必须同步改另一侧。理由：索引是公开
+  产物，App 会把它渲染成一个可点的链接；上游只要漏一处校验，`javascript:` 之类的东西就在那里
+  等着被点。`https://coolapk.com.evil.com/…` 与 `https://evil.com/?r=https://www.coolapk.com/…`
+  都不算站内。
+- **「字段缺失」是刻意的降级路径，不是数据没补全。** 老索引里没有这四格，新 App 就整块不显示
+  出处区；反过来，老 App 按 `id` 取字段，多出来的键一律忽略。两边都不需要版本协商，也不需要
+  为「老条目也要有出处」去回填 —— 回填等于替一条历史投稿挑一个出处，而它当时未必填过
+  （真要补，得回 main 的历史提交里翻那枚 pending）。
+
+`validate-index` **不校验**这四格：它们是可选的，缺了不算错；值域由 `build-index` 在写出去的
+那一刻收口，别在两处维护第二份判据。
+
+`submittedAt` 有**三种输入写法，产物里只有一种**：毫秒数字（`1700000000000`）、纯数字字符串
+（`"1700000000000"`，按毫秒理解）、ISO 字符串（`"2026-10-23T00:00:00.000Z"` —— Worker 的
+`buildPendingJson` 写的就是这一种）。三种都收，统一写成毫秒整数：为了一个时间戳逼消费方去猜
+三四种格式，是那种「今天不出错、明年有人踩」的债。
+
 ### pending 条目格式
 
-与上面的模块结构一致，额外多一个审核标记，二选一：
+与上面的模块结构一致（可能多出 `source` / `uploader` / `coolapkUid` / `submittedAt` 这四格，
+那是投稿入口写进去的原始数据；`build-index` 只负责校验与投影，不负责替谁补），额外多一枚**审核章**：
 
 ```json
-{ "approved": true, "id": "…", "versions": [ … ] }
-{ "review": { "approved": true }, "id": "…", "versions": [ … ] }
+{
+  "audit": { "status": "auto-approved", "by": "ci:approve#<owner>/<repo>PR<n>@<headSha12>", "at": "…" },
+  "id": "…",
+  "versions": [ … ]
+}
 ```
 
-未带审核标记的条目会被 `build-index` 直接跳过，不进索引。
+没有 `audit` 章、或章上没有 `by`（无主章）的条目，会被 `build-index` 跳过并计入「未通过」，
+不进索引 —— 判据就是下一节那个 `isApproved()`，只有一份。`{ "approved": true }` 与
+`{ "review": { "approved": true } }` 这两种旧后门**已删**，理由见下一节末尾。
 
 ## 审核标记契约（audit.yml / index.yml ↔ build-index.mjs）
 
@@ -210,11 +256,13 @@ node --test test/publish-from-main.test.mjs
 归属确认不出来时同样是拒，不是放行 —— 服务端故障在这一格等于「更新暂时投不进来」。
 更新与首次收录走**同一套判据**（`audit/risk-rules.mjs` 的 `decide()`），不做跨版本差异比对。
 
-归属记录**不进这个仓库**，只住在服务端：这个仓库是 public，`GOVERNANCE.md` 第 6 节授权公开的
-只有昵称 / 酷安 UID / 出处链接 / 包哈希，而「某个 moduleId 属于某个 UID」是一条新的关联信息
-（连起来就是一张「谁投过哪些模块」的清单），索引消费方也不需要它。代价是这一格**没有给外人
-一条能自己跑一遍的复验命令** —— 与第 3 节那枚钉在公开提交上的机器章不同。详见
-`GOVERNANCE.md` 第 9 节。
+归属记录的**权威副本**住在服务端，不进这个仓库 —— 索引是消费方可缓存的产物，会被镜像、被重建、
+被老客户端长期拿着看，所以「谁能发某个模块的下一版」这格判据不能挂在它身上，得有一份服务端
+说了算的记录。但有一点要直说：`GOVERNANCE.md` 第 6 节授权条目公开 出处 / 上传者昵称 /
+上传者 UID / 提交时间 四格，条目里 moduleId 与 uid 同时出现，于是「谁投过哪些模块」这张清单
+**随索引一起是公开的** —— 公开得与追责方向一致（第 3、4 节的章与公示页本来就按 uid 公开），
+索引里那一格是权威记录的投影，不是判据来源。代价是这一格**没有给外人一条能自己跑一遍的复验
+命令** —— 与第 3 节那枚钉在公开提交上的机器章不同。详见 `GOVERNANCE.md` 第 9 节。
 
 ## main 分支保护 runbook（**必须在新 workflow 上了 main 之后再执行**）
 
