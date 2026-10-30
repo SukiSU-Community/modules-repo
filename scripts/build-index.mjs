@@ -37,6 +37,60 @@ export const DISPOSITIONS_FILE = path.join(REPO_ROOT, DEFAULT_DISPOSITIONS_FILE)
 const SHA256_RE = /^[0-9a-fA-F]{64}$/;
 
 /**
+ * 酷安站内链接的判据 —— 与 Worker 侧 `contrib/worker/src/index.ts` 的 `coolapkSourceUrl()`
+ * 是**同一套语义**：那边是投稿入口的第一道闸，这里是公开产物的最后一道闸。
+ *
+ * 为什么索引侧还要再守一遍：`json/modules.json` 是公开产物，App 会把 `source` 渲染成一个
+ * 可点的链接。只要上游有一处漏校验（改判据、某条分支绕开、老 pending 躺在 main 上没人重跑），
+ * `javascript:alert(1)` 这类值就会原样发出去 —— 那不是一个难看的字段，是一次点击即执行。
+ * 判据不能只有生产者一份，消费侧也得自己验。**改一侧必须同步改另一侧。**
+ *
+ * 语义（与 Worker 逐条对齐）：
+ *   - 空 / 非字符串 -> ''（调用方据此**省略** `source` 键）
+ *   - 没写 scheme（`www.coolapk.com/feed/1`）-> 补 `https://` 再判；老 pending 里存的就是
+ *     这种裸值，丢掉它等于把历史投稿的出处整批抹掉
+ *   - 只认 http / https（顺带挡掉 `javascript:` / `data:`：它们补成 https 后解析不出合法 host）
+ *   - host 必须是 `coolapk.com` 或它的子域；`coolapk.com.evil.com` / `evil.com/coolapk.com/x` 都不算
+ *   - 通过返回 `URL#href` 规范化后的**绝对**地址（App 侧直接拿去 openUri）
+ */
+export function coolapkSourceUrl(raw) {
+  const v = typeof raw === 'string' ? raw.trim() : '';
+  if (!v) return '';
+  let u;
+  try {
+    u = new URL(/^https?:\/\//i.test(v) ? v : `https://${v}`);
+  } catch {
+    return '';
+  }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return '';
+  const host = u.hostname.toLowerCase();
+  if (host !== 'coolapk.com' && !host.endsWith('.coolapk.com')) return '';
+  return u.href;
+}
+
+/**
+ * 把 pending 里的 `submittedAt` 统一成**毫秒时间戳**。
+ *
+ * 两种写法都要收，因为真实数据里两种都存在：Worker 的 `buildPendingJson` 写的是 ISO 字符串
+ * （`new Date(...).toISOString()`），而索引里其它时间字段（`versions[].time`）与任务口径
+ * 都是毫秒数字。输出只有一种：**有限正整数**；认不出来返回 0，调用方据此省略这个键。
+ * 绝不写 `null` —— 那会让「字段不在」这条降级判据失效，老 App 读到 null 会以为有值却算不出来。
+ */
+function submittedAtMs(raw) {
+  if (typeof raw === 'number') return Number.isInteger(raw) && raw > 0 ? raw : 0;
+  if (typeof raw !== 'string') return 0;
+  const s = raw.trim();
+  if (!s) return 0;
+  // 纯数字字符串按毫秒理解（pending 里两种都出现过，别让 "1700000000000" 走 Date.parse）
+  if (/^\d+$/.test(s)) {
+    const n = Number(s);
+    return Number.isInteger(n) && n > 0 ? n : 0;
+  }
+  const t = Date.parse(s);
+  return Number.isInteger(t) && t > 0 ? t : 0;
+}
+
+/**
  * 「通过审核」字段契约 —— audit.yml 与 build-index.mjs 双方唯一约定面。
  *
  * audit.yml 的 publish 步骤在 pending JSON 里写入：
@@ -167,6 +221,20 @@ export function normalizeEntry(raw, source = '<memory>') {
     ? raw.description.trim()
     : fallback('description', `${name} ${latest.version}`, 'name + version');
 
+  // ── 出处与上传者（App 的「酷安模块详情页」要显示「从哪个帖子来的、谁传的」） ──────
+  // 四格全部可选，且**只写有值的键**：App 用「键在不在」判断要不要渲染出处区，
+  // 写成 `null` / `undefined` 会让这条判据失效 —— undefined 还会被 JSON.stringify 静默吞掉，
+  // 于是本地看着对、发布产物里又是另一回事。老 pending 没有这些键，走的就是「省略」这条路。
+  const sourceUrl = coolapkSourceUrl(raw.source);
+  const coolapkUid = isNonEmptyString(raw.coolapkUid) ? raw.coolapkUid.trim() : '';
+  const submittedAt = submittedAtMs(raw.submittedAt);
+
+  // `coolapkUid` 进索引就是**公开**的，这一点已由 GOVERNANCE 第 6 节明确授权（条目公开
+  // 出处 / 上传者昵称 / 上传者 UID / 提交时间 四格），第 9 节第 2 条同时写清了它的边界：
+  // 「某个 moduleId 属于哪个 UID」这张映射随索引公开是可接受的（追责方向与公示页按 uid
+  // 公开的口径一致），但**权威归属记录仍只住服务端** —— 索引里这一格是它的公开投影，
+  // 用途是让 App 显示一个能点进 `coolapk.com/u/<UID>` 复核的上传者，而不是「谁能发下一版」
+  // 的判据来源。
   return {
     ok: true,
     fallbacks,
@@ -175,6 +243,10 @@ export function normalizeEntry(raw, source = '<memory>') {
       name,
       author,
       description,
+      ...(sourceUrl ? { source: sourceUrl } : {}),
+      ...(uploader ? { uploader } : {}),
+      ...(coolapkUid ? { coolapkUid } : {}),
+      ...(submittedAt > 0 ? { submittedAt } : {}),
       versions,
       // `verified` 恒等于投稿者自己在 pending JSON 里填的那个布尔，**不是**「复核过」的标记：
       // 本站没有「人工复核通过后置 true」这一档（见 GOVERNANCE 第 1 节），没有谁有权把它置真。
@@ -237,9 +309,10 @@ export function buildIndex({ index, entries, dispositions = [] }) {
     // 台账命中是「已经判断过了」，把后者计成前者会让 exit 2 挡住 --consume，
     // 于是下一次重建又被同一批已下架的 pending 卡住（自我堵死）。
     //
-    // 匹配用的是**归一化后的条目 + 原始 coolapkUid**：coolapkUid 是追责字段、不进 MMRL 索引，
-    // normalizeEntry 不带它，所以直接用 entry 去匹配会让「按人拉黑」静默失效
-    // —— 判据看着在跑，其实永远匹配不上，这是最难发现的一种坏。
+    // 匹配用的是**归一化后的条目 + 原始 pending 的 coolapkUid**：条目里那一格是 trim 过、
+    // 且值非法（空串 / 非字符串）时会被省略的版本；台账要的是投稿时原样记下的值。
+    // 两边不是同一份事实，所以这里显式覆盖回 raw 那一格 —— 少了这行，「按人拉黑」
+    // 会在 uid 带空白或类型不对时静默失效：判据看着在跑，其实永远匹配不上。
     const hit = matchAny(dispositions, { ...entry, coolapkUid: raw && raw.coolapkUid });
     if (hit) {
       stats.blocked += 1;
