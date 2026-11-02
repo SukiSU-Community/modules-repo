@@ -15,6 +15,7 @@ import { pathToFileURL } from 'node:url';
 import {
   PLEDGE_VERSIONS, proofPrefixFor, checkPendingProof, checkActor, main,
   derivePendingScope, isIngestedPendingPath,
+  isAutoEntry, checkAutoEntry, checkPendingFiles,
   OWNERSHIP_VIAS, canonicalProofSet, proofPrefixForSet, PROOF_PREFIX_LEN_V2,
 } from '../scripts/verify-pending-proof.mjs';
 
@@ -1154,3 +1155,172 @@ test('ledger_actor_ok 从 audit 作业的 output 一路串到 approve 的 env（
   assert.match(block, /ACTOR: \$\{\{ github\.event\.pull_request\.user\.login \}\}/);
 });
 
+/* ─────────────────────────────────────────────────── 自动收录（auto）守卫 · 契约 §3.3 */
+
+// auto 条目**没有** pledge / ownership —— 它不是投稿，是 robot 从 owner 绑定的仓库里
+// 把一个 Release 资产搬进索引。能核的事实只有五条：产物摘要（repoDigest ≡ sha256）、
+// 证据在哪个 Release（repoTag）、来源地址连续（repoUrl / updateJson）、身份连续
+// （coolapkUid / uploader）、以及「只能给已有模块追加版本」。这一节的每条用例都是
+// 「少做其中一件事」的形状 —— 少一条，闸就整条落空。
+
+const AUTO_SHA = 'a'.repeat(64);
+const idxMod = (over = {}) => ({
+  id: 'demo', name: 'Demo', author: 'a', description: 'd',
+  repoUrl: 'https://github.com/o/r', repoVerified: true, repoCheckedAt: 1791600000000,
+  updateJson: 'https://o.example/update.json',
+  uploader: 'u', coolapkUid: '10086001',
+  versions: [{ version: 'v1', versionCode: 1, zipUrl: 'https://e/1.zip', size: 1, time: 1, sha256: 'b'.repeat(64) }],
+  verified: false,
+  ...over,
+});
+const autoIndex = (...over) => ({ name: 'SukiSU-Ultra Modules', lastUpdate: 0, modules: [idxMod(over[0] || {})] });
+
+/** Worker 侧 buildPendingJson 的 auto 形态：没有 pledge/ownership，版本带四格证据。 */
+const autoEntry = (over = {}, vover = {}) => ({
+  id: 'demo', name: 'Demo', author: 'a', description: 'd',
+  repoUrl: 'https://github.com/o/r', repoVerified: true, repoCheckedAt: 1791600000000,
+  updateJson: 'https://o.example/update.json',
+  uploader: 'u', coolapkUid: '10086001',
+  submittedAt: '2026-10-20T00:00:00.000Z',
+  storage: 'github-release-asset', releaseTag: 'demo-v2', assetName: 'demo.zip',
+  versions: [{
+    version: 'v2', versionCode: 2,
+    zipUrl: 'https://github.com/o/r/releases/download/demo-v2/demo.zip',
+    size: 10, time: 1791600000000, sha256: AUTO_SHA,
+    repoTag: 'demo-v2', repoDigest: `sha256:${AUTO_SHA}`, auto: true, autoVia: 'repo',
+    ...vover,
+  }],
+  ...over,
+});
+
+test('自动收录：isAutoEntry 只要有一个版本标了 auto 就走自动分支（混一条都不许蒙混）', () => {
+  assert.equal(isAutoEntry(autoEntry()), true);
+  assert.equal(isAutoEntry(autoEntry({}, { auto: false })), false);
+  assert.equal(isAutoEntry({ id: 'demo' }), false, '没有 versions 的条目不是 auto 条目');
+  assert.equal(isAutoEntry({ versions: 'nope' }), false);
+  assert.equal(isAutoEntry(null), false);
+  assert.equal(isAutoEntry([]), false);
+  // 混一条 auto：整条走自动分支（every 会让「手投版本搭车」正好从这个缝里过去）
+  const mixed = autoEntry({ versions: [...autoEntry().versions, { ...autoEntry().versions[0], versionCode: 3, auto: false }] });
+  assert.equal(isAutoEntry(mixed), true);
+});
+
+test('自动收录：两条合法路径（autoVia=repo / update-json）都要放行', () => {
+  assert.deepEqual(checkAutoEntry(autoEntry(), autoIndex()), { ok: true });
+  const viaUj = autoEntry({ repoUrl: undefined }, { autoVia: 'update-json', repoTag: undefined });
+  assert.deepEqual(checkAutoEntry(viaUj, autoIndex()), { ok: true });
+});
+
+test('自动收录 ①：repoDigest 必须与 zip 的 sha256 是同一个字节摘要', () => {
+  const v = checkAutoEntry(autoEntry({}, { repoDigest: `sha256:${'c'.repeat(64)}` }), autoIndex());
+  assert.equal(v.ok, false);
+  assert.match(v.error, /repoDigest/);
+
+  // 大写 / 带空白都要归一后比较（Worker 写的是小写，但守卫不能依赖对方已经规整过）
+  assert.deepEqual(
+    checkAutoEntry(autoEntry({}, { repoDigest: ` SHA256:${AUTO_SHA.toUpperCase()} ` }), autoIndex()),
+    { ok: true },
+  );
+  // sha256 形状坏了：先拒形状，别用坏值去拼期望串
+  assert.match(checkAutoEntry(autoEntry({}, { sha256: 'xyz' }), autoIndex()).error, /sha256/);
+});
+
+test('自动收录 ②：autoVia=repo 要 repoTag、要 repoUrl 与索引逐字相同', () => {
+  assert.match(checkAutoEntry(autoEntry({}, { repoTag: undefined }), autoIndex()).error, /repoTag/);
+
+  // 条目声称另一个仓库：这是「换主人/换来源」最省事的一条路，必须拒
+  const moved = checkAutoEntry(autoEntry({ repoUrl: 'https://github.com/o/other' }), autoIndex());
+  assert.equal(moved.ok, false);
+  assert.match(moved.error, /repoUrl/);
+
+  // 索引里没绑定仓库，却出现了 repo 来源的新版本：仓库只能由 owner 一次性绑定
+  const unbound = checkAutoEntry(autoEntry(), autoIndex({ repoUrl: undefined }));
+  assert.equal(unbound.ok, false);
+  assert.match(unbound.error, /repoUrl/);
+
+  // 条目自己干脆不写 repoUrl 也不行（缺地址 = 无法证明来源连续）
+  assert.match(checkAutoEntry(autoEntry({ repoUrl: undefined }), autoIndex()).error, /repoUrl/);
+});
+
+test('自动收录 ③：autoVia=update-json 时 updateJson 必须与索引一致（含「索引没有、条目新增」）', () => {
+  const viaUj = (entryOver = {}, idxOver = {}) => checkAutoEntry(
+    autoEntry({ repoUrl: undefined, ...entryOver }, { autoVia: 'update-json', repoTag: undefined }),
+    autoIndex(idxOver),
+  );
+  assert.match(viaUj({ updateJson: 'https://evil.example/update.json' }).error, /updateJson/);
+  // 索引里没有 updateJson、条目里新增了一个：等于用一次自动发版给模块接上新的自更新地址
+  assert.match(viaUj({}, { updateJson: undefined }).error, /updateJson/);
+  // 索引里有、条目里缺：同样不一致（缺省当空串比）
+  const omit = autoEntry({ repoUrl: undefined, updateJson: undefined }, { autoVia: 'update-json', repoTag: undefined });
+  assert.match(checkAutoEntry(omit, autoIndex()).error, /updateJson/);
+});
+
+test('自动收录 ④：身份（coolapkUid / uploader）与索引不一致就拒 —— 不能借自动更新换人', () => {
+  const uid = checkAutoEntry(autoEntry({ coolapkUid: '99999999' }), autoIndex());
+  assert.equal(uid.ok, false);
+  assert.match(uid.error, /coolapkUid/);
+
+  const up = checkAutoEntry(autoEntry({ uploader: 'someone-else' }), autoIndex());
+  assert.equal(up.ok, false);
+  assert.match(up.error, /uploader/);
+
+  // 索引有、条目没有：空 vs 非空，同样一致不了
+  assert.equal(checkAutoEntry(autoEntry({ uploader: undefined }), autoIndex()).ok, false);
+});
+
+test('自动收录 ⑤：索引查不到该模块 / 索引读不到 —— 判不了即拒，不许当成「没有来源要核」', () => {
+  const missing = checkAutoEntry(autoEntry({ id: 'not-there' }), autoIndex());
+  assert.equal(missing.ok, false);
+  assert.match(missing.error, /查不到/);
+
+  // 索引根本没读到（文件缺失/坏 JSON）：这是唯一「读不到就放行会让整条闸消失」的位置
+  for (const idx of [null, undefined, {}, { modules: 'nope' }]) {
+    const v = checkAutoEntry(autoEntry(), idx, { indexError: '索引文件不存在：C:/x/json/modules.json' });
+    assert.equal(v.ok, false, `索引不可用必须拒：${JSON.stringify(idx)}`);
+    assert.match(v.error, /索引/);
+    assert.match(v.error, /索引文件不存在/, '拒的理由要把「为什么读不到」带出来，否则 CI 上只剩一句哑谜');
+  }
+});
+
+test('自动收录 ⑥：一次只能带 1 个版本，且那一个必须自己也是 auto:true', () => {
+  const two = autoEntry({ versions: [...autoEntry().versions, { ...autoEntry().versions[0], versionCode: 3 }] });
+  assert.match(checkAutoEntry(two, autoIndex()).error, /只能带 1 个版本/);
+
+  const empty = autoEntry({ versions: [] });
+  assert.match(checkAutoEntry(empty, autoIndex()).error, /versions/);
+
+  // 混一条手投版本：digest 绑定与「这一版是不是最新」会同时变模糊
+  const manual = autoEntry({}, { auto: false });
+  assert.match(checkAutoEntry(manual, autoIndex()).error, /auto:true/);
+
+  // autoVia 不认识：说不出证据来自哪儿
+  assert.match(checkAutoEntry(autoEntry({}, { autoVia: 'git' }), autoIndex()).error, /autoVia/);
+});
+
+test('自动收录 ⑦：checkPendingFiles 分岔 —— auto 走 §3.3、手投仍要 pledge/ownership', () => {
+  const dir = mk('auto-guard-');
+  // files 参数是**可直接读的路径**（main 里来自 collectJsonFiles），dir 只用来算日志里的相对名。
+  const aFile = write(dir, 'a.json', autoEntry());
+  const manual = structuredClone(autoEntry());
+  for (const k of ['auto', 'autoVia', 'repoDigest', 'repoTag']) delete manual.versions[0][k];
+  const mFile = write(dir, 'manual.json', manual);
+
+  assert.deepEqual(checkPendingFiles(dir, [aFile], { index: autoIndex() }), [], '合法 auto 条目不该要 pledge');
+
+  const hit = checkPendingFiles(dir, [aFile], { index: autoIndex({ repoUrl: 'https://github.com/o/other' }) });
+  assert.equal(hit.length, 1);
+  assert.equal(hit[0].file, 'a.json');
+  assert.match(hit[0].error, /repoUrl/);
+
+  // 不给索引：判不了即拒（main 里 opts.index 永远有值；这里是直接调用的兜底口径）
+  const noIdx = checkPendingFiles(dir, [aFile], {});
+  assert.equal(noIdx.length, 1);
+  assert.match(noIdx[0].error, /索引/);
+
+  // 手投条目一个字都没变：仍然要质押
+  const mf = checkPendingFiles(dir, [mFile], { index: autoIndex() });
+  assert.equal(mf.length, 1);
+  assert.match(mf[0].error, /pledge/);
+
+  rm(dir);
+});

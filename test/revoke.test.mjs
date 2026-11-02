@@ -40,6 +40,7 @@ function sandboxWithModule(id = 'mod_x') {
     index: { name: 'SukiSU-Ultra Modules', lastUpdate: 0, modules: [] },
     entries: [{
       id, name: id, author: 'a', description: 'd',
+      source: 'https://www.coolapk.com/feed/1',
       audit: { status: 'auto-approved', by: 'ci:x', at: '2026-10-01T00:00:00Z', risk: 'low' },
       versions: [{ version: 'v1', versionCode: 1, zipUrl: `https://e/${id}.zip`, size: 1, time: 1, sha256: SHA('c') }],
     }],
@@ -120,6 +121,7 @@ test('只指到产物：抹那一条版本，模块与其它版本留着', async
     index: { name: 'SukiSU-Ultra Modules', lastUpdate: 0, modules: [] },
     entries: [{
       id: 'mod_y', name: 'mod_y', author: 'a', description: 'd',
+      source: 'https://www.coolapk.com/feed/1',
       audit: { status: 'auto-approved', by: 'ci:x', at: '2026-10-01T00:00:00Z', risk: 'low' },
       versions: [
         { version: 'v1', versionCode: 1, zipUrl: 'https://e/1.zip', size: 1, time: 1, sha256: SHA('1') },
