@@ -13,6 +13,12 @@
  *   4. id + versionCode 相同且 sha256 相同 -> 幂等跳过。
  *   5. verified 字段：原样跟随 pending（本站没有人工复核这一档，所以生产上它一直是 false；
  *      要让它变真，得先把「谁有权置真」重新建出来，而不是由投稿者自己填）。
+ *   6. 源码仓库（`repoUrl` 与它的结论 `repoVerified/repoCheckedAt/repoLicense`、以及
+ *      `updateJson`）是**模块级、可覆盖**的：同 id 再投一版时 incoming 带什么就以什么为准，
+ *      因为它来自一次更新的校验。`source` 反过来只补空、不覆盖（第一个帖子是历史事实）。
+ *      `repoCoversLatest` 是派生键（最新版有没有仓库证据 `repoTag`），凡有 `repoUrl` 的模块都写。
+ *   7. `json/repo-state.json`（每日复验结论，可选输入）在**合并与下架之后**贴回模块头：
+ *      只有 `repoUrl` 完全相等才贴，只贴结论（不动版本、不改已有的 `updateJson`）。
  *
  * 审核标记契约（与 contrib/audit/workflows/audit.yml 的唯一约定面）：
  *   APPROVAL_FIELD / APPROVED_STATUS 两个常量就是契约本身 —— audit.yml 的
@@ -33,8 +39,90 @@ export const INDEX_FILE = path.join(REPO_ROOT, 'json', 'modules.json');
 export const CONFLICT_FILE = path.join(REPO_ROOT, 'conflicts.json');
 /** 处置台账（下架/拉黑）。它是推导的**输入**，不是索引的附属说明文字。 */
 export const DISPOSITIONS_FILE = path.join(REPO_ROOT, DEFAULT_DISPOSITIONS_FILE);
+/** 每日复验结论（可选输入，由 verify-repos 那条流水线产出；文件不存在 = 没有这份状态）。 */
+export const REPO_STATE_FILE = path.join(REPO_ROOT, 'json', 'repo-state.json');
 
 const SHA256_RE = /^[0-9a-fA-F]{64}$/;
+/** `sha256:` + 64 位小写十六进制 —— 与 §3.3 digest 校验用的是同一个形状。 */
+const REPO_DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
+/** `autoVia` 的合法取值（契约 §1）：机器人从哪儿证明这个包该被自动收录。 */
+const AUTO_VIAS = ['repo', 'update-json'];
+/** `updateJson` 的长度上限（契约 §3.1）。 */
+const UPDATE_JSON_MAX = 2048;
+/**
+ * owner 段：1-39 位字母数字或连字符，首尾不能是连字符（GitHub 的登录名规则里
+ * 「不能连续两个连字符」这条这里不查 —— 它只会让一个更严格的名字被判非法，
+ * 而我们要挡的是「不是名字的东西」，不是替 GitHub 做命名审查）。
+ */
+const REPO_OWNER_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
+const REPO_NAME_RE = /^[A-Za-z0-9._-]{1,100}$/;
+
+/**
+ * 源码仓库地址的判据 —— 与 Worker 侧 `contrib/worker/src/index.ts` 的 `normalizeRepoUrl()`
+ * 是**同一套语义**（契约 §2.1）：那边是投稿入口的第一道闸，这里是公开产物的最后一道闸。
+ * 改一侧必须同步改另一侧。
+ *
+ * 为什么索引侧还要再守一遍：`repoUrl` 是「这个包的字节能在哪个仓库里复核」的唯一锚点，
+ * 而 `repoCoversLatest`、复验结论回贴、自动收录全拿它做**等值**匹配。一个没归一化的值
+ * （`http://`、`.../tree/main`、`?tab=readme`）不会报错，只会**永远对不上** ——
+ * 绿标永远不亮、复验结论永远贴不上，而且没有任何一处日志会说「为什么没生效」。
+ *
+ * 语义（顺序固定）：
+ *   - 非字符串 / 空 -> ''（调用方据此**省略**这个键）
+ *   - 必须能解析成 URL；协议必须 https；host 必须恰为 github.com（大小写不敏感）；
+ *     不许有端口 / userinfo / query / fragment
+ *   - 路径恰好两段 `<owner>/<repo>`（结尾 `/` 折掉；多一段就是 `.../tree/main` 这类）
+ *   - repo 结尾的 `.git` 折掉（GitHub 的 clone 地址习惯）
+ *   - owner 见 REPO_OWNER_RE；repo 必须是 `[A-Za-z0-9._-]{1,100}` 且不是 `.` / `..`
+ *   - 输出 `https://github.com/<owner>/<repo>`，**大小写原样保留**：匹配是等值比较，
+ *     擅自 lower 会让索引里显示出来的地址与投稿人填的不是同一个字符串。
+ * 归一不出来返回 ''，由调用方决定是「省略」（空）还是「整条拒」（有值但不合法）。
+ */
+export function normalizeRepoUrl(raw) {
+  if (typeof raw !== 'string') return '';
+  const v = raw.trim();
+  if (!v) return '';
+  let u;
+  try {
+    u = new URL(v);
+  } catch {
+    return '';
+  }
+  if (u.protocol !== 'https:') return '';
+  if (u.hostname.toLowerCase() !== 'github.com') return '';
+  // 注意：WHATWG URL 会把默认端口（:443）吃掉，所以这里查不到端口不等于用户没写，
+  // 但输出是规范化地址，那条 :443 不会进索引 —— 与「拒绝端口」的结论一致。
+  if (u.port || u.username || u.password || u.search || u.hash) return '';
+  const segs = u.pathname.split('/').filter((s) => s !== '');
+  if (segs.length !== 2) return '';
+  const [owner, repoRaw] = segs;
+  if (!REPO_OWNER_RE.test(owner)) return '';
+  const repo = repoRaw.toLowerCase().endsWith('.git') ? repoRaw.slice(0, -4) : repoRaw;
+  if (!REPO_NAME_RE.test(repo) || repo === '.' || repo === '..') return '';
+  return `https://github.com/${owner}/${repo}`;
+}
+
+/**
+ * 模块 `updateJson` 的判据（契约 §3.1）：http/https、长度 ≤2048。
+ *
+ * 与 repoUrl 相反，这里**归一不了就省略**而不是整条拒：`updateJson` 只是「这个模块
+ * 能不能自己检查更新」的一个可选地址，地址坏了说明这一格没用了，不说明这条模块是假的。
+ * 但值要**原样保留** —— 它是作者自己写的地址（可能带 query、可能不是 GitHub），
+ * 重写成 `u.href` 会改掉作者实际给的链接。
+ */
+export function normalizeUpdateJson(raw) {
+  if (typeof raw !== 'string') return '';
+  const v = raw.trim();
+  if (!v || v.length > UPDATE_JSON_MAX) return '';
+  let u;
+  try {
+    u = new URL(v);
+  } catch {
+    return '';
+  }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return '';
+  return v;
+}
 
 /**
  * 酷安站内链接的判据 —— 与 Worker 侧 `contrib/worker/src/index.ts` 的 `coolapkSourceUrl()`
@@ -200,13 +288,58 @@ export function normalizeEntry(raw, source = '<memory>') {
     if (!isNonEmptyString(v.sha256) || !SHA256_RE.test(v.sha256)) {
       return fail(`version ${version} 的 sha256 不是 64 位十六进制`);
     }
+    const sha256 = v.sha256.toLowerCase();
+
+    // ── 版本级仓库证据（契约 §1 / §3.1）──────────────────────────────────────
+    // `repoTag` / `repoDigest` 回答「这个包的字节还能在哪儿对上」；`auto` / `autoVia`
+    // 回答「它是不是机器人自动收进来的」。四个键都只在有值时写，绝不写 null。
+    const repoTag = isNonEmptyString(v.repoTag) && v.repoTag.trim().length <= 256 ? v.repoTag.trim() : '';
+    const repoDigestRaw = typeof v.repoDigest === 'string' ? v.repoDigest.trim() : '';
+    const repoDigest = repoDigestRaw.toLowerCase();
+    if (repoDigestRaw && !REPO_DIGEST_RE.test(repoDigest)) {
+      return fail(`version ${version} 的 repoDigest 不是「sha256:<64 位十六进制>」：${repoDigestRaw.slice(0, 80)}`);
+    }
+    // digest 与 sha256 必须是同一个字节摘要。对不上说明「声称的证据」和「这个产物」是两样东西 ——
+    // 而 §3.3 的守卫正是靠这两个值相等来把自动收录钉在 GitHub 的资产上。
+    if (repoDigest && repoDigest !== `sha256:${sha256}`) {
+      return fail(
+        `version ${version} 的 repoDigest 与 sha256 不是同一个包（repoDigest=${repoDigest.slice(0, 20)}…，sha256=${sha256.slice(0, 16)}…）`,
+      );
+    }
+    if (v.auto !== undefined && typeof v.auto !== 'boolean') {
+      return fail(`version ${version} 的 auto 不是布尔：${JSON.stringify(v.auto)}`);
+    }
+    const auto = v.auto === true;
+    const autoVia = typeof v.autoVia === 'string' ? v.autoVia.trim() : '';
+    // 「auto 却说不出 via」「说了 via 却不是 auto」都是**读不懂**的标记，一律拒：
+    // 前者会让 §3.3 的每一条判据都落空（守卫要按 autoVia 分岔），
+    // 后者更像一次降级（把自动收录改写成手投）—— 悄悄接受等于把闸整条跳过。
+    if (auto && !AUTO_VIAS.includes(autoVia)) {
+      return fail(`version ${version} 标了 auto:true 却没有合法的 autoVia（只认 ${AUTO_VIAS.join(' | ')}）`);
+    }
+    if (!auto && autoVia) {
+      return fail(`version ${version} 带 autoVia「${autoVia.slice(0, 40)}」却没有 auto:true —— 自动收录的标记只说了一半，读不懂即拒`);
+    }
+    if (auto && !repoDigest) {
+      return fail(`version ${version} 标了 auto:true 却没有 repoDigest —— 自动收录必须能对上仓库证据`);
+    }
+    if (auto && autoVia === 'repo' && !repoTag) {
+      return fail(`version ${version} 是 autoVia=repo 却没有 repoTag —— 说不清证据在哪个 Release`);
+    }
+
     versions.push({
       version,
       versionCode: v.versionCode,
       zipUrl: v.zipUrl,
       size: v.size,
       time: v.time,
-      sha256: v.sha256.toLowerCase(),
+      sha256,
+      ...(repoTag ? { repoTag } : {}),
+      ...(repoDigest ? { repoDigest } : {}),
+      // 只有 `true` 值得写：false 与缺省同义（手投版本），写出来只会让「是不是自动收录的」
+      // 这个问题多一种答法。
+      ...(auto ? { auto: true } : {}),
+      ...(auto && autoVia ? { autoVia } : {}),
     });
   }
 
@@ -229,6 +362,37 @@ export function normalizeEntry(raw, source = '<memory>') {
   const coolapkUid = isNonEmptyString(raw.coolapkUid) ? raw.coolapkUid.trim() : '';
   const submittedAt = submittedAtMs(raw.submittedAt);
 
+  // ── 来源二选一：酷安帖子 或 源码仓库（契约 §1 / §3.1）───────────────────────
+  // 以前 `source` 是唯一「这条投稿从哪来」的锚。现在允许只给仓库：仓库能给出比一个
+  // 帖子强得多的证据（源码、LICENSE、Release 资产摘要），而帖子只能给出「谁发的」。
+  const repoUrl = normalizeRepoUrl(raw.repoUrl);
+  if (isNonEmptyString(raw.repoUrl) && !repoUrl) {
+    // **整条拒**，不是悄悄省略这个键（契约 §3.1 明写）。作者明确声称了一个仓库，
+    // 删掉它等于把一条假声明洗成「没填」：索引里看不出有人试过，投稿人也不会知道
+    // 自己的仓库为什么没生效 —— 那正是「绿标永远不亮」这类无声故障的起点。
+    return fail(`repoUrl 不是 https://github.com/<owner>/<repo> 形式（收到「${String(raw.repoUrl).trim().slice(0, 80)}」）`);
+  }
+  if (!repoUrl && !sourceUrl) {
+    return fail('source 与 repoUrl 至少要有其中一个 —— 两个都没有时，这条模块在公示里没有任何可点回出处的锚');
+  }
+  // 有仓库就必须有结论：`repoVerified` 是「这台机器验过」，`repoCheckedAt` 是「什么时候验的」。
+  // 只有地址没有结论的条目，在 App 侧会渲染成一个既是绿标又是灰标的暧昧状态 ——
+  // 与其猜，不如让它在 CI 里变成一条可见的 invalid。
+  const repoCheckedAt = typeof raw.repoCheckedAt === 'number' && Number.isFinite(raw.repoCheckedAt) && raw.repoCheckedAt > 0
+    ? Math.floor(raw.repoCheckedAt)
+    : 0;
+  if (repoUrl && (typeof raw.repoVerified !== 'boolean' || repoCheckedAt === 0)) {
+    return fail('repoUrl 存在时 repoVerified(布尔) 与 repoCheckedAt(正数毫秒) 必须同时存在（契约 §1）');
+  }
+  const repoVerified = repoUrl ? raw.repoVerified === true : false;
+  // SPDX 标识符：无 LICENSE / NOASSERTION 一律省略（契约 §1），所以这里只收非空 ≤64 的串。
+  const repoLicense = repoUrl && isNonEmptyString(raw.repoLicense) && raw.repoLicense.trim().length <= 64
+    ? raw.repoLicense.trim()
+    : '';
+  // `updateJson` 形状不对就**省略**（契约 §1「空省略」）：坏地址只说明这一格不能用，
+  // 不说明这条模块有问题 —— 与 repoUrl 的「整条拒」是两种相反方向的取舍，各有各的理由。
+  const updateJson = normalizeUpdateJson(raw.updateJson);
+
   // `coolapkUid` 进索引就是**公开**的，这一点已由 GOVERNANCE 第 6 节明确授权（条目公开
   // 出处 / 上传者昵称 / 上传者 UID / 提交时间 四格），第 9 节第 2 条同时写清了它的边界：
   // 「某个 moduleId 属于哪个 UID」这张映射随索引公开是可接受的（追责方向与公示页按 uid
@@ -247,6 +411,9 @@ export function normalizeEntry(raw, source = '<memory>') {
       ...(uploader ? { uploader } : {}),
       ...(coolapkUid ? { coolapkUid } : {}),
       ...(submittedAt > 0 ? { submittedAt } : {}),
+      // 仓库四格 + 自更新地址：都是**可选**，且只写有值的键（App 用「键在不在」判断绿标）。
+      ...(repoUrl ? { repoUrl, repoVerified, repoCheckedAt, ...(repoLicense ? { repoLicense } : {}) } : {}),
+      ...(updateJson ? { updateJson } : {}),
       versions,
       // `verified` 恒等于投稿者自己在 pending JSON 里填的那个布尔，**不是**「复核过」的标记：
       // 本站没有「人工复核通过后置 true」这一档（见 GOVERNANCE 第 1 节），没有谁有权把它置真。
@@ -257,6 +424,79 @@ export function normalizeEntry(raw, source = '<memory>') {
 }
 
 /**
+ * 把 `json/repo-state.json`（每日复验的结论）贴回索引里的模块头。
+ *
+ * 为什么需要这一层：仓库状态是**时间**的函数（今天公开、明天转私有；今天有 LICENSE、
+ * 明天删了），而索引里的模块头只能由 pending 推导 —— 要改一枚**已经在索引里**的模块，
+ * 过去只有「再发一个版本」这一条路。state 是这条路的例外：它是 CI 复验的产物，不是投稿。
+ *
+ * 三条边界（契约 §3.1），少一条都会让贴回变成「用旧结论给新地址背书」：
+ *   1. 只认 `repoUrl` **完全相等**的模块。地址一换，旧地址上的结论就不再适用于这条模块，
+ *      贴上去等于把「另一个仓库验过」说成「这个仓库验过」。
+ *   2. 只覆盖 `repoVerified` / `repoCheckedAt` / `repoLicense`：state 不知道版本号，
+ *      也不该改版本 —— 版本是 pending 的事。
+ *   3. `updateJson` **只在模块没有时补**：作者写在 module.prop 里的值优先，
+ *      复验脚本只是从 module.prop 里发现了一个此前没记下来的地址（§8：不自动改 updateJson）。
+ *
+ * 返回被改动的模块清单（供 main 打印）。state 读不懂时**不抛**：形状不对就当没有 ——
+ * 但调用方（main）已经在读文件那一步拦掉了坏 JSON，这里只防御「形状对但某条不对」。
+ *
+ * @param {Array<object>} modules 就地修改
+ * @param {object|null} state `{ checkedAt?, modules: { <id>: { repoUrl, repoVerified, repoCheckedAt, repoLicense?, updateJson? } } }`
+ * @returns {Array<{id: string, repoVerified?: boolean, repoCheckedAt?: number, updateJson?: string}>}
+ */
+export function applyRepoState(modules, state) {
+  const changed = [];
+  if (!state || typeof state !== 'object' || Array.isArray(state)) return changed;
+  const mods = state.modules;
+  if (!mods || typeof mods !== 'object' || Array.isArray(mods)) return changed;
+  for (const m of Array.isArray(modules) ? modules : []) {
+    if (!m || typeof m !== 'object') continue;
+    if (!Object.prototype.hasOwnProperty.call(mods, m.id)) continue;
+    const st = mods[m.id];
+    if (!st || typeof st !== 'object' || Array.isArray(st)) continue;
+    const moduleUrl = typeof m.repoUrl === 'string' ? m.repoUrl : '';
+    if (!moduleUrl) continue;
+    // state 里的地址也走同一套归一化：写状态的是另一个脚本，不能假设它已经归一好了。
+    if (normalizeRepoUrl(st.repoUrl) !== moduleUrl) continue;
+
+    // 一条模块只记一条改动：调用方拿 `changed.length` 当「被改写的模块数」用，
+    // 若按格计数，同一个模块改了两格就会在日志里变成两处「改写」。
+    const rec = { id: m.id };
+    let touched = false;
+
+    const checkedAt = typeof st.repoCheckedAt === 'number' && Number.isFinite(st.repoCheckedAt) && st.repoCheckedAt > 0
+      ? Math.floor(st.repoCheckedAt)
+      : 0;
+    if (checkedAt > 0 && typeof st.repoVerified === 'boolean') {
+      const lic = isNonEmptyString(st.repoLicense) && st.repoLicense.trim().length <= 64 ? st.repoLicense.trim() : '';
+      const before = `${m.repoVerified}|${m.repoCheckedAt}|${m.repoLicense ?? ''}`;
+      m.repoVerified = st.repoVerified;
+      m.repoCheckedAt = checkedAt;
+      // 这次没读到 LICENSE 就把旧的 SPDX 删掉：留着一个已不存在的许可证，
+      // 是比不显示更糟的错信息 —— 它会让用户以为这个模块有那个授权。
+      if (lic) m.repoLicense = lic;
+      else delete m.repoLicense;
+      if (`${m.repoVerified}|${m.repoCheckedAt}|${m.repoLicense ?? ''}` !== before) {
+        rec.repoVerified = m.repoVerified;
+        rec.repoCheckedAt = m.repoCheckedAt;
+        touched = true;
+      }
+    }
+
+    const uj = normalizeUpdateJson(st.updateJson);
+    if (uj && !m.updateJson) {
+      m.updateJson = uj;
+      rec.updateJson = uj;
+      touched = true;
+    }
+
+    if (touched) changed.push(rec);
+  }
+  return changed;
+}
+
+/**
  * 合并核心逻辑（纯函数，供单测直接调用）。
  *
  * **处置台账在这里生效，而且是唯一生效的地方。** main() 和 verify-index-pr 的重推导
@@ -264,10 +504,11 @@ export function normalizeEntry(raw, source = '<memory>') {
  * 判据写在 workflow、Worker 或 main() 里任何别处，都会出现两份结果 ——
  * 要么索引 PR 永远判不一致，要么（更糟）判得过而线上留着已下架的模块。
  *
- * @param {{index?: object, entries: Array<object>, dispositions?: Array<object>}} input
- * @returns {{index: object, conflicts: Array<object>, stats: object, fallbacks: Array<object>, blocked: Array<object>}}
+ * @param {{index?: object, entries: Array<object>, dispositions?: Array<object>, repoState?: object|null}} input
+ *   `repoState` 是可选输入（`json/repo-state.json` 的内容），应用边界见 applyRepoState。
+ * @returns {{index: object, conflicts: Array<object>, stats: object, fallbacks: Array<object>, blocked: Array<object>, repoStateChanged: Array<object>}}
  */
-export function buildIndex({ index, entries, dispositions = [] }) {
+export function buildIndex({ index, entries, dispositions = [], repoState = null }) {
   const base = index && typeof index === 'object' && !Array.isArray(index) ? index : {};
   const out = {
     name: typeof base.name === 'string' ? base.name : 'SukiSU-Ultra Modules',
@@ -281,6 +522,7 @@ export function buildIndex({ index, entries, dispositions = [] }) {
     blocked: 0,          // 被台账挡下的投稿条目（不该进索引）
     removedVersions: 0,  // 从既有索引里按台账抹掉的版本（下架生效的那一步）
     removedModules: 0,   // 版本被抹空后连模块一起移除
+    repoStateApplied: 0, // 被复验状态改写的模块数（绿标撤下/重新贴上、许可证变化）
   };
   // 被台账挡下的清单：CI 要把它贴回 PR / 写进日志，否则「为什么没进索引」无人可读。
   const blocked = [];
@@ -355,6 +597,24 @@ export function buildIndex({ index, entries, dispositions = [] }) {
       });
     }
 
+    // ── 模块级仓库字段：**可覆盖**（契约 §3.1）──────────────────────────────
+    // 版本只追加，模块头则相反：老模块补仓库、复验结论变化、作者换了 updateJson，
+    // 都只能靠这条路写进索引（没有第二处会改模块头）。
+    // `source` 是唯一的例外 —— 第一次投稿的那个帖子是历史事实，后来的条目无权改写它，
+    // 所以它只在**已有模块没有**时补一格。
+    if (entry.repoUrl) {
+      existing.repoUrl = entry.repoUrl;
+      existing.repoVerified = entry.repoVerified;
+      existing.repoCheckedAt = entry.repoCheckedAt;
+      // 这次校验没读到 LICENSE 就把旧的 SPDX 删掉：留着一个不存在的许可证比不显示更糟。
+      if (entry.repoLicense) existing.repoLicense = entry.repoLicense;
+      else delete existing.repoLicense;
+    }
+    // `updateJson` 有值才覆盖（空 = module.prop 里没写，不代表作者要删掉这个地址）；
+    // 真要删，得走一次显式的人工改动 —— §8 明确「不自动改 updateJson」。
+    if (entry.updateJson) existing.updateJson = entry.updateJson;
+    if (!existing.source && entry.source) existing.source = entry.source;
+
     for (const v of entry.versions) {
       const hit = existing.versions.find((x) => x.versionCode === v.versionCode);
       if (!hit) {
@@ -421,14 +681,32 @@ export function buildIndex({ index, entries, dispositions = [] }) {
     for (const m of out.modules) byId.set(m.id, m);
   }
 
+  // 复验结论在**合并与下架之后**贴：先定这一版索引有谁，再贴时间性的结论。
+  // 反过来（先贴再下架）会让被下架的模块白贴一次结论，日志里还会出现「贴了又没了」。
+  const stateChanged = applyRepoState(out.modules, repoState);
+  stats.repoStateApplied = stateChanged.length;
+
   // 版本按 versionCode 降序，MMRL 客户端期望最新版在前。
   for (const m of out.modules) {
     m.versions.sort((a, b) => b.versionCode - a.versionCode);
   }
   out.modules.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
+  // `repoCoversLatest` 是**派生**键（契约 §1：不写进 pending，由索引侧算）：
+  // 最新版（versionCode 最大 = 排序后的 versions[0]）到底有没有仓库证据（`repoTag`）。
+  // 有 `repoUrl` 的模块**都写** —— `false` 也是一句结论（「有仓库，但最新版没走仓库」）；
+  // 没有仓库的模块一律不留这个键，App 靠「键在不在」区分这两件事。
+  for (const m of out.modules) {
+    if (m.repoUrl) {
+      const latest = m.versions[0];
+      m.repoCoversLatest = !!(latest && latest.repoTag);
+    } else if (Object.prototype.hasOwnProperty.call(m, 'repoCoversLatest')) {
+      delete m.repoCoversLatest;
+    }
+  }
+
   if (out.modules.length > 0) out.lastUpdate = Date.now();
-  return { index: out, conflicts, stats, fallbacks: allFallbacks, blocked };
+  return { index: out, conflicts, stats, fallbacks: allFallbacks, blocked, repoStateChanged: stateChanged };
 }
 
 function isPendingJson(name) {
@@ -492,6 +770,7 @@ export function collectPendingFiles(dir) {
  *   --pending <dir>        指定 pending 目录（默认 <repo>/pending）
  *   --index <file>         指定索引文件（默认 <repo>/json/modules.json）
  *   --dispositions <file>  指定处置台账（默认 <repo>/json/dispositions.json；不存在=空台账）
+ *   --repo-state <file>    指定复验状态（默认 <repo>/json/repo-state.json；不存在=没有状态）
  */
 export function parseArgs(argv) {
   const opts = {
@@ -500,6 +779,7 @@ export function parseArgs(argv) {
     pendingDir: PENDING_DIR,
     indexFile: INDEX_FILE,
     dispositionsFile: DISPOSITIONS_FILE,
+    repoStateFile: REPO_STATE_FILE,
     _: [],
   };
   for (let i = 0; i < argv.length; i++) {
@@ -509,6 +789,7 @@ export function parseArgs(argv) {
     if (a === '--pending' && i + 1 < argv.length) { opts.pendingDir = path.resolve(argv[++i]); continue; }
     if (a === '--index' && i + 1 < argv.length) { opts.indexFile = path.resolve(argv[++i]); continue; }
     if (a === '--dispositions' && i + 1 < argv.length) { opts.dispositionsFile = path.resolve(argv[++i]); continue; }
+    if (a === '--repo-state' && i + 1 < argv.length) { opts.repoStateFile = path.resolve(argv[++i]); continue; }
     opts._.push(a);
   }
   return opts;
@@ -529,6 +810,27 @@ export function main(argv = process.argv.slice(2)) {
     return 3;
   }
 
+  // 复验状态是**可选输入**：文件不在 = 这份状态还没产出（复验流水线尚未跑过），
+  // 与「台账不存在 = 空台账」同一个口径。但文件在而读不懂时必须停下来：
+  // 把坏 JSON 当「没有状态」，会让上一轮的绿标永远停在原地 —— 复验明明失败了，
+  // 索引却还挂着上一次的「已验证」，而没有任何一处会报错说明这件事。
+  let repoState = null;
+  if (fs.existsSync(opts.repoStateFile)) {
+    try {
+      repoState = JSON.parse(fs.readFileSync(opts.repoStateFile, 'utf8'));
+      if (!repoState || typeof repoState !== 'object' || Array.isArray(repoState)) {
+        throw new Error('顶层不是对象');
+      }
+      if (repoState.modules !== undefined
+        && (repoState.modules === null || typeof repoState.modules !== 'object' || Array.isArray(repoState.modules))) {
+        throw new Error('modules 不是 { <id>: {...} } 形状');
+      }
+    } catch (e) {
+      console.error(`[build-index] 复验状态读不懂，停止合并（不当「没有状态」处理）：${e.message}`);
+      return 3;
+    }
+  }
+
   const current = fs.existsSync(indexFile)
     ? JSON.parse(fs.readFileSync(indexFile, 'utf8'))
     : { name: 'SukiSU-Ultra Modules', lastUpdate: 0, modules: [] };
@@ -536,7 +838,7 @@ export function main(argv = process.argv.slice(2)) {
   const files = collectPendingFiles(pendingDir);
   const entries = [];
   for (const item of files) for (const e of item.entries) entries.push(e);
-  const { index, conflicts, stats, fallbacks, blocked } = buildIndex({ index: current, entries, dispositions });
+  const { index, conflicts, stats, fallbacks, blocked, repoStateChanged } = buildIndex({ index: current, entries, dispositions, repoState });
 
   if (!opts.dryRun) {
     fs.mkdirSync(path.dirname(indexFile), { recursive: true });
@@ -593,7 +895,8 @@ export function main(argv = process.argv.slice(2)) {
     `[build-index] 扫描 ${files.length} 个 pending 文件（${pendingDir}，递归）；` +
       `通过审核 ${stats.approved} / 未通过 ${stats.skipped} / 非法 ${stats.invalid} / 台账挡下 ${stats.blocked}；` +
       `新增模块 ${stats.addedModules}，追加版本 ${stats.addedVersions}，` +
-      `台账抹掉版本 ${stats.removedVersions}（模块整条移除 ${stats.removedModules}），冲突 ${stats.conflicts}`,
+      `台账抹掉版本 ${stats.removedVersions}（模块整条移除 ${stats.removedModules}），` +
+      `复验状态改写 ${stats.repoStateApplied}，冲突 ${stats.conflicts}`,
   );
   if (files.length === 0) {
     console.log('[build-index] 没有待合并的 pending 条目，索引保持不变');
@@ -607,6 +910,19 @@ export function main(argv = process.argv.slice(2)) {
     for (const b of blocked) {
       const vcs = b.removedVersions ? ` 抹掉版本 ${b.removedVersions.join(',')}` : b.versionCode ? ` 版本 ${b.versionCode}` : '';
       console.log(`  - ${b.id}${vcs} via ${b.via}｜reason=${b.reason}｜by=${b.by}｜at=${b.at}`);
+    }
+  }
+
+  // 复验结论的改写也要说出来：绿标消失对用户只是少了一个绿点，对维护者却最容易变成
+  // 「没人知道为什么」。这里把 id 和最终结论打出来，日志本身就是那次撤标的凭据。
+  if (repoStateChanged.length > 0) {
+    console.log(`[build-index] 复验状态改写 ${repoStateChanged.length} 处（来自 repo-state.json）：`);
+    for (const s of repoStateChanged) {
+      const what = [];
+      if (typeof s.repoVerified === 'boolean') what.push(`repoVerified=${s.repoVerified}`);
+      if (typeof s.repoCheckedAt === 'number') what.push(`repoCheckedAt=${new Date(s.repoCheckedAt).toISOString()}`);
+      if (s.updateJson) what.push(`updateJson=${s.updateJson}`);
+      console.log(`  - ${s.id}：${what.join('，')}`);
     }
   }
 

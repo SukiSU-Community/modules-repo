@@ -48,6 +48,22 @@
  *     记在这里是为了让读到这段的人知道 §14.2 的「封死手写路径」说的是 pending 这条路，
  *     而台账那条路的闸门在 kind，不在本脚本。
  *
+ * 第三道（契约 §3.3，随「来源二选一 + 仓库自动更新」一起加）：自动收录条目
+ * （`versions[].auto === true`）走 checkAutoEntry。这一支**没有** pledge / ownership，
+ * 按契约也不该有 —— 它不是投稿，是 CI 机器人替一个**已经存在**的模块追加一版。
+ * 所以它的 (a) 层不是「复算口令」，而是几条可核的事实：
+ *   * digest 绑定：`repoDigest === "sha256:" + <这个 zip 的 sha256>`
+ *   * `autoVia` ∈ {'repo','update-json'}，且每个版本都标了 auto:true（混入手投版本即拒）
+ *   * 身份连续性：`coolapkUid` / `uploader` 与索引里该模块一致
+ *   * 来源连续性：`autoVia=repo` → entry.repoUrl 等于索引绑定的 repoUrl 且 repoTag 非空；
+ *     `autoVia=update-json` → entry.updateJson 与索引逐字相同（§8：不自动改 updateJson）
+ *   * 索引里查不到这个模块 → 拒（新模块必须走投稿）
+ * 它买到的：一条 auto 条目只能更新**已有**模块，且只能从 owner 绑定的仓库/自更新地址来，
+ * 产物还必须与仓库证据同字节。它买不到的：谁拿着 AUTO_PR_KEY 谁就能替任意已有模块发版 ——
+ * 这道闸把「任意模块」收窄成「已有模块」、把「任意 zip」收窄成「与证据同字节的 zip」，
+ * 仅此而已，别把它说成比投稿那两道更强。
+ * 非 auto 条目完全走原来的两道，行为一个字不变。
+ *
  * 作用范围（两处，缺一不可）：
  *   1. 检查的是**传给本脚本的目录**（audit.yml 接 pending-changed/pending，即 locate 用
  *      `git diff --no-renames --diff-filter=AM` 从 base..head 拷出的「本 PR 新增/修改」集合）。
@@ -72,6 +88,7 @@
  *       [--require-actor <login[,login]>] [--actor <login>]
  *       [--scope-base <ref> [--scope-head <ref=HEAD>] [--scope-dir <仓库里的 pending 路径>]
  *        [--cwd <git 仓库目录>]]
+ *       [--index <索引文件，默认同仓 json/modules.json>]
  *
  * 退出码：0 = 全部过（或独立推导确认本 PR 没有任何新增/修改的 pending）；
  * 1 = 任一条目拒 / 来源不符 / 范围推不出或有路径没被拷进来 / 目录空 / 无从判定；2 = 参数错误。
@@ -496,6 +513,137 @@ function collectJsonFiles(dir) {
   return out;
 }
 
+/** 默认索引文件：本脚本所在目录的上一级 json/modules.json（与 build-index 的 INDEX_FILE 同一份）。 */
+export const DEFAULT_INDEX_FILE = path.join(
+  path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'),
+  'json',
+  'modules.json',
+);
+
+/**
+ * 条目是不是「自动收录」（契约 §3.3）：只要有一个版本标了 `auto: true`。
+ *
+ * 判据放在**版本级**而不是模块级，是因为 auto 是版本的属性（这一版是机器人收的），
+ * 模块本身没有「自动」这一说。用 some 而不是 every：一份条目里只要混进一条 auto，
+ * 整条就得走自动那一支的判据 —— 让「混一条手投版本」有地方可躲，等于给这条闸开后门。
+ */
+export function isAutoEntry(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+  return Array.isArray(entry.versions)
+    && entry.versions.some((v) => v && typeof v === 'object' && v.auto === true);
+}
+
+/**
+ * 自动收录条目的判据（契约 §3.3）。返回 `{ok:true}` 或 `{ok:false, error}`。
+ *
+ * 为什么不能拿投稿那两道来判：auto 条目按契约**没有** pledge / ownership —— 它是机器人
+ * 替已有模块追加一版，没有任何人在酷安上签过字。用投稿的判据去判它只会永远红，
+ * 于是这条通道要么被关掉，要么被加一堆例外 —— 后者才是真正危险的东西。
+ *
+ * 这一支的信任锚换成四条**可核**的事实（每条都能在 diff 里看见，不需要任何秘密）：
+ *   1. `repoDigest === "sha256:" + sha256`：pending 里的字节 == 仓库证据里的字节。
+ *      没有它，auto 分支就只剩「名字对得上」—— 谁都能往一个真模块下面塞任意一个 zip。
+ *   2. `autoVia` 只认两个值，且**每个版本**都得是 auto（见 isAutoEntry 的注释）。
+ *   3. 身份连续：coolapkUid / uploader 与索引逐字一致。
+ *   4. 来源连续：repoUrl（autoVia=repo，且 repoTag 非空）/ updateJson（autoVia=update-json）
+ *      与索引逐字一致；索引里没有这个模块 → 拒。
+ *
+ * 注意 #4 用的是**逐字比较**，不在这里再归一化一遍：索引里的 repoUrl 已经由
+ * build-index 归一化过（形状由 validate-index 守），`updateJson` 则是「作者写什么就是什么」。
+ * 拿另一个归一化器再算一次，只会让两边对同一个地址有两种看法 —— 那正是要避免的分歧。
+ * 自动收录脚本照抄索引里的值即可；照抄之外的值本来就该拒。
+ *
+ * @param {object} entry pending 条目
+ * @param {object|null} index 索引文档 `{ modules: [...] }`
+ * @param {{indexError?: string}} [ctx] 索引读不到时的原因（写进错误里，便于排查）
+ */
+export function checkAutoEntry(entry, index, ctx = {}) {
+  const deny = (msg) => ({ ok: false, error: msg });
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+    return deny('pending 条目不是一个对象（自动收录分支同样要求一个对象）');
+  }
+  const id = typeof entry.id === 'string' ? entry.id.trim() : '';
+  if (!id) return deny('自动收录条目缺 id —— 没有 id 就找不到它属于哪个已有模块');
+
+  if (!index || typeof index !== 'object' || !Array.isArray(index.modules)) {
+    const why = typeof ctx.indexError === 'string' && ctx.indexError ? `（${ctx.indexError}）` : '';
+    return deny(`${id}：自动收录条目要在索引里核对来源，但这次拿不到可读的索引${why} —— `
+      + '判不了即拒，不能当成「没有来源要核」');
+  }
+  const mod = index.modules.find((m) => m && typeof m === 'object' && m.id === id);
+  if (!mod) {
+    return deny(`${id}：索引里查不到这个模块 —— 自动收录只能给**已有模块**追加版本（§3.3）。`
+      + '新模块必须走投稿，否则一条 auto 条目就成了「自己声明自己是新模块」的入口');
+  }
+
+  // ── 身份连续性（第 3 条）───────────────────────────────────────────────────────
+  for (const f of ['coolapkUid', 'uploader']) {
+    const want = typeof mod[f] === 'string' ? mod[f].trim() : '';
+    const got = typeof entry[f] === 'string' ? entry[f].trim() : '';
+    if (want !== got) {
+      return deny(`${id}：${f} 与索引里的模块不一致（索引「${want}」/ 条目「${got}」）—— `
+        + 'auto 条目不是投稿，不能借一次自动更新把模块换到别人名下（§3.3）');
+    }
+  }
+
+  // ── 来源连续性（第 4 条）───────────────────────────────────────────────────────
+  // §8：自动收录**不自动改 updateJson**。「索引里没有、条目里新增了一个」同样拒 ——
+  // 那等于用一次自动发版给模块接上一个新的自更新地址，而这一格决定 App 去哪儿问版本。
+  const wantUj = typeof mod.updateJson === 'string' ? mod.updateJson.trim() : '';
+  const gotUj = typeof entry.updateJson === 'string' ? entry.updateJson.trim() : '';
+  if (wantUj !== gotUj) {
+    return deny(`${id}：updateJson 与索引不一致（索引「${wantUj || '(无)'}」/ 条目「${gotUj || '(无)'}」）—— `
+      + '自动收录不自动改 updateJson（契约 §8）；真要改这一格，走人工改索引');
+  }
+
+  const versions = Array.isArray(entry.versions) ? entry.versions : [];
+  if (!versions.length) return deny(`${id}：自动收录条目没有 versions —— 一次自动更新总得带来一个版本`);
+  if (versions.length !== 1) {
+    // 契约 §3.2 的组装形状就是「一次一个版本」。多版本会让 digest 绑定与「这一版是不是最新」
+    // 同时变模糊，而这条路上没有人会去逐条看 diff。
+    return deny(`${id}：自动收录一次只能带 1 个版本（收到 ${versions.length} 个）—— 多版本请分多次提交，否则没人能逐条复核`);
+  }
+  const v = versions[0];
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return deny(`${id}：versions[0] 不是对象`);
+  const label = Number.isInteger(v.versionCode) ? `versionCode=${v.versionCode}` : 'versions[0]';
+  if (v.auto !== true) {
+    return deny(`${id}：${label} 没有 auto:true —— 一份自动收录条目里混入手投版本会绕过整个自动分支的判据`);
+  }
+  if (v.autoVia !== 'repo' && v.autoVia !== 'update-json') {
+    return deny(`${id}：${label} 的 autoVia 不是 repo | update-json（收到 ${JSON.stringify(v.autoVia)}）—— `
+      + '说不出证据来自哪儿，就没法核它是从哪个仓库/地址来的');
+  }
+
+  // ── digest 绑定（第 1 条）：本守卫的核心 ────────────────────────────────────────
+  const sha = typeof v.sha256 === 'string' ? v.sha256.trim().toLowerCase() : '';
+  if (!SHA256_RE.test(sha)) return deny(`${id}：${label} 的 sha256 不是 64 位十六进制：${JSON.stringify(v.sha256)}`);
+  const digest = typeof v.repoDigest === 'string' ? v.repoDigest.trim().toLowerCase() : '';
+  if (digest !== `sha256:${sha}`) {
+    return deny(`${id}：${label} 的 repoDigest 与 zip 的 sha256 对不上（repoDigest「${digest || '(无)'}」，应为「sha256:${sha}」）—— `
+      + '自动收录的产物必须与仓库证据是同一个字节摘要（§3.3）');
+  }
+
+  // ── autoVia 分岔（第 2 条）：repo 要地址连续 + tag；update-json 已在上面比过地址 ──
+  if (v.autoVia === 'repo') {
+    const repoTag = typeof v.repoTag === 'string' ? v.repoTag.trim() : '';
+    if (!repoTag) {
+      return deny(`${id}：${label} 是 autoVia=repo 却没有 repoTag —— 说不清证据在哪个 Release（§3.3）`);
+    }
+    const idxUrl = typeof mod.repoUrl === 'string' ? mod.repoUrl.trim() : '';
+    if (!idxUrl) {
+      return deny(`${id}：索引里这个模块没有 repoUrl，却出现了 autoVia=repo 的新版本 —— `
+        + '仓库只能由 owner 一次性绑定，不能由一次自动更新自证');
+    }
+    const entryUrl = typeof entry.repoUrl === 'string' ? entry.repoUrl.trim() : '';
+    if (entryUrl !== idxUrl) {
+      return deny(`${id}：repoUrl 与索引不一致（索引「${idxUrl}」/ 条目「${entryUrl || '(无)'}」）—— `
+        + '自动收录只能从 owner 绑定的那个仓库发版（§3.3）');
+    }
+  }
+
+  return { ok: true };
+}
+
 /**
  * 逐个文件判定（rel 为相对 dir 的 / 分隔路径）。返回失败列表 [{file, error}]。
  *
@@ -505,7 +653,7 @@ function collectJsonFiles(dir) {
  * 读不懂的那个文件照样进失败列表（原文一字不改），只是它进不了集合 —— 少一枚 ⇒ 剩下的那几枚
  * 复算时对不上前缀 ⇒ 也拒。失效方向是整批红，不是「坏的那枚跳过」。
  */
-export function checkPendingFiles(dir, files) {
+export function checkPendingFiles(dir, files, opts = {}) {
   const failures = [];
   const read = [];
   for (const file of files) {
@@ -522,15 +670,19 @@ export function checkPendingFiles(dir, files) {
   }
   const batch = read.map((r) => r.raw);
   for (const { raw, label } of read) {
-    const v = checkPendingProof(raw, { batch });
+    // 自动收录条目走 §3.3 那一支（见 checkAutoEntry）：它按契约没有 pledge / ownership，
+    // 拿投稿的复算去判它只会永远红。非 auto 条目照旧走原来的两道，一个字不变。
+    const v = isAutoEntry(raw)
+      ? checkAutoEntry(raw, opts.index, opts)
+      : checkPendingProof(raw, { batch });
     if (!v.ok) failures.push({ file: label, error: v.error });
   }
   return failures;
 }
 
 /** 检查一个目录：返回失败列表 [{file, error}]。空目录 = 没有可判的东西，返回空列表。 */
-export function checkPendingDir(dir) {
-  return checkPendingFiles(dir, collectJsonFiles(dir));
+export function checkPendingDir(dir, opts = {}) {
+  return checkPendingFiles(dir, collectJsonFiles(dir), opts);
 }
 
 export function parseArgs(argv) {
@@ -555,10 +707,11 @@ export function main(argv = process.argv.slice(2), deps = {}) {
   if (opts.help) {
     log.log('用法: node verify-pending-proof.mjs <pending 目录> [--require-actor <login[,login]> --actor <login>]');
     log.log('      [--scope-base <ref> [--scope-head <ref=HEAD>] [--scope-dir <仓库里的 pending 路径>] [--cwd <git 仓库目录>]]');
+    log.log('      [--index <索引文件，默认同仓 json/modules.json>（自动收录条目要在它里面核对来源）]');
     return 0;
   }
   if (opts._.length !== 1) {
-    log.error('用法: node verify-pending-proof.mjs <pending 目录> [--require-actor <login[,login]> --actor <login>] [--scope-base <ref> [--scope-head <ref>] [--scope-dir <path>] [--cwd <dir>]]');
+    log.error('用法: node verify-pending-proof.mjs <pending 目录> [--require-actor <login[,login]> --actor <login>] [--scope-base <ref> [--scope-head <ref>] [--scope-dir <path>] [--cwd <dir>]] [--index <索引文件>]');
     return 2; // 参数错（缺目录=调用方写错了命令行，与「判不了」的 1 分开）
   }
   const dir = path.resolve(String(opts._[0]));
@@ -615,8 +768,25 @@ export function main(argv = process.argv.slice(2), deps = {}) {
     });
   }
 
+  // ── 2.5 索引：自动收录条目要在它里面核对来源（§3.3）──
+  // 文件不在 / 读不懂都只**记下原因**，不在这里直接失败：绝大多数 PR 是普通投稿，
+  // 它们根本不需要索引（判据不依赖它），因为一个坏索引文件把它们判红是误伤。
+  // 真遇到 auto 条目时，checkAutoEntry 会把这条原因写进 error —— 判不了即拒。
+  const indexFile = typeof opts.index === 'string' ? path.resolve(opts.index) : DEFAULT_INDEX_FILE;
+  let index = null;
+  let indexError = '';
+  if (fs.existsSync(indexFile)) {
+    try {
+      index = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
+    } catch (e) {
+      indexError = `索引文件读不懂：${indexFile}（${e.message}）`;
+    }
+  } else {
+    indexError = `索引文件不存在：${indexFile}`;
+  }
+
   // ── 3. 逐条复算 ──
-  failures.push(...checkPendingFiles(dir, files));
+  failures.push(...checkPendingFiles(dir, files, { index, indexError }));
 
   // flag 存在但没带值时 parseArgs 记的是布尔 true —— 一律折算成空串，让 checkActor
   // 按 fail closed 处理；把 true 字符串化会变成「允许列表里有 'true'」这种荒唐形状。

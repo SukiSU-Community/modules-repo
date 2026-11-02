@@ -49,8 +49,11 @@ on:
     paths:
       - 'pending/**'
       - 'json/modules.json'
+      - 'json/repo-state.json'
       - 'scripts/build-index.mjs'
       - 'scripts/publish-from-main.mjs'
+      - 'scripts/auto-update.mjs'
+      - 'scripts/verify-repos.mjs'
   # Actions 自己合出来的那次 push **不会**触发后续 workflow：GitHub 刻意不让
   # 用 GITHUB_TOKEN 干的事再引发一条链。实测证据 —— 投稿 PR #4 由 publish 作业
   # squash 合并进 main 之后，只有 pages 构建跑了，Rebuild Index From Main 一次都没启动。

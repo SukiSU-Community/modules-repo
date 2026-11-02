@@ -135,14 +135,15 @@ export function diffIndexes(expected, actual) {
  *   ledgerChanged?: boolean,
  *   changedPaths?: string[],  // 本 PR 改到的所有文件
  *   headEvidence?: string[] | null, // head 上 evidence/ 里的文件名全集（null = 调用方没列，跳过互指认）
- *   allowedPaths?: string[]
+ *   allowedPaths?: string[],
+ *   repoState?: object|null, // base（main）上的 json/repo-state.json；索引 PR 自己不许改它
  * }} input
  */
 export function judgeIndexPr(input) {
   const {
     baseIndex, baseEntries = [], deletedPaths = [], touchedPaths = [], actualIndex, attest,
     dispositions = [], ledgerChanged = false, changedPaths = null, allowedPaths = ALLOWED_INDEX_PR_PATHS,
-    headEvidence = null, seal = null,
+    headEvidence = null, seal = null, repoState = null,
   } = input;
   const fail = (reason, extra = {}) => ({ ok: false, reason, ...extra });
 
@@ -229,7 +230,7 @@ export function judgeIndexPr(input) {
     evidences.push({ path: p, ...a });
   }
 
-  const { index: expected } = buildIndex({ index: baseIndex, entries: approved, dispositions });
+  const { index: expected } = buildIndex({ index: baseIndex, entries: approved, dispositions, repoState });
   const diffs = diffIndexes(expected, actualIndex);
   if (diffs.length) {
     return fail('PR 里的索引与推导结果不一致：\n  - ' + diffs.join('\n  - '), { diffs, evidences });
@@ -616,6 +617,32 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
     return 1;
   }
 
+  // 复验状态（json/repo-state.json）也是推导输入之一：build-index 会用 base（main）上的
+  // 结论回贴 repoVerified/repoCheckedAt/repoLicense。只读 base 那一份 —— 如果本 PR 自己改了
+  // state，下面的 changedPaths 白名单会直接拒（state 不是索引导出物，不能借索引 PR 夹带）。
+  // 读不懂就停住，不按「没有 state」处理：那会把一次坏读取变成一次「所有绿标都撤掉」。
+  const baseStateRead = readJsonAt(cwd, baseRef, 'json/repo-state.json');
+  if (baseStateRead.error) {
+    report.reason = `base 上的 json/repo-state.json 读不懂：${baseStateRead.error}（不当没有 state 处理，停住）`;
+    log.error('[verify-index-pr] ' + report.reason);
+    writeReport();
+    return 1;
+  }
+  const repoState = baseStateRead.present ? baseStateRead.json : null;
+  if (repoState != null && (typeof repoState !== 'object' || Array.isArray(repoState))) {
+    report.reason = 'base 上的 json/repo-state.json 不是 JSON 对象，停住';
+    log.error('[verify-index-pr] ' + report.reason);
+    writeReport();
+    return 1;
+  }
+  if (repoState && repoState.modules !== undefined
+    && (repoState.modules === null || typeof repoState.modules !== 'object' || Array.isArray(repoState.modules))) {
+    report.reason = 'base 上的 json/repo-state.json 的 modules 不是对象，停住';
+    log.error('[verify-index-pr] ' + report.reason);
+    writeReport();
+    return 1;
+  }
+
   const basePending = listPending(cwd, baseRef, pendingDir);
   const headList = listPending(cwd, headRef, pendingDir);
   const headPending = new Set(headList);
@@ -744,7 +771,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   const verdict = judgeIndexPr({
     baseIndex, baseEntries, deletedPaths, touchedPaths, actualIndex,
     attest: (p) => settled.get(p) || { ok: false, reason: '未取证' },
-    dispositions, ledgerChanged, changedPaths, headEvidence, seal,
+    dispositions, ledgerChanged, changedPaths, headEvidence, seal, repoState,
   });
   report.ok = verdict.ok;
   report.reason = verdict.reason;

@@ -1,0 +1,55 @@
+name: 自动更新
+
+# 每天 03:30 UTC（北京时间 11:30）跑一次，也可以在 Actions 页面手动触发。
+# GitHub 只在**默认分支**上按 schedule 触发，所以这个工作流合并进 main 之前不会自动跑。
+on:
+  schedule:
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+
+# 与索引重建、审计互不锁：这里只读 GitHub、写 assets-v1 资产，PR 由 Worker 用 App 身份创建。
+concurrency:
+  group: auto-update
+  cancel-in-progress: false
+
+permissions:
+  # 上传 zip 到索引仓的 assets-v1 Release 需要写 contents。
+  contents: write
+
+jobs:
+  auto-update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # 读仓库、查 Release、上传资产都用这个 token。自带的 GITHUB_TOKEN 就够；
+      # 不需要额外的 PAT（PAT 只在 Worker 创建 PR 时用到）。
+      GITHUB_TOKEN: ${{ github.token }}
+      # 投稿 Worker 的地址；/auto/pr 用它开 PR。在仓库 Variables 里配置。
+      WORKER_BASE: ${{ vars.WORKER_BASE }}
+      # 与 Worker 端 `wrangler secret put AUTO_PR_KEY` 同一个值。在仓库 Secrets 里配置。
+      AUTO_PR_KEY: ${{ secrets.AUTO_PR_KEY }}
+      # 资产存放的 Release tag，默认 assets-v1；需要改时在仓库 Variables 里配 RELEASE_TAG。
+      RELEASE_TAG: ${{ vars.RELEASE_TAG || 'assets-v1' }}
+    steps:
+      - name: 检出索引仓
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 准备 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 扫描并提交自动更新
+        run: node scripts/auto-update.mjs --summary "$RUNNER_TEMP/auto-update.md"
+
+      # 失败也要把已经算出来的摘要贴出来，否则排查要翻整段日志。
+      - name: 写入任务摘要
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/auto-update.md" ]; then
+            cat "$RUNNER_TEMP/auto-update.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '本轮没有产出摘要（脚本在写摘要之前就失败了，见上面的日志）。' >> "$GITHUB_STEP_SUMMARY"
+          fi

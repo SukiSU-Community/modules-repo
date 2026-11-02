@@ -580,7 +580,7 @@ node --test test/build-index.test.mjs   # 只跑这一个文件
 > 注意：`node --test test/`（带目录参数）在 Node 26 上会把 `test/` 当模块去解析而报错，
 > 用不带参数的 `node --test` 或上面的显式文件路径。
 
-覆盖 `build-index` 的三种核心情况：新增模块、追加版本、id 冲突不覆盖。
+覆盖 `build-index` 的三种核心情况：新增模块、追加版本、id 冲突不覆盖。另有 `verify-repos`、`auto-update`、`http-safe`、`zip`、`github-auto-pr` 几组测试：复验的故障语义（404 撤标 / 5xx 保留）、状态无变化时不动时间戳、两条发现路径与 pending 形状、SSRF/重定向/字节数上限、zip 解析与 `/auto/pr` 本地预检。这些测试全部离线，不联网。
 
 > **这些单测由 CI 的 `selftest` 作业跑，而 `approve` 依赖它**（2026-10-11 接上的）：selftest 红
 > → approve 被 skip → required check 不成功 → 投稿与索引都停在门口。之前它们只在本地跑，那正是
@@ -594,6 +594,64 @@ node --test test/build-index.test.mjs   # 只跑这一个文件
 >
 > 另一处坑：母本相关的测试（`AUDIT_COPIES` / `INDEX_COPIES`）在独立 clone 里必须跳过而不是 ENOENT，
 > 因为 `../../audit/workflows/` 只存在于 monorepo 布局。
+
+## 自动更新（每日复验 + 自动发版）
+
+`.github/workflows/auto-update.yml` 每天 03:30 UTC 跑一次（也可在 Actions 页面手动
+`workflow_dispatch`），只执行 `scripts/auto-update.mjs`，一轮里做三件事：
+
+1. **复验**：对索引里每个有 `repoUrl` 的模块跑 `scripts/verify-repos.mjs` 的
+   `verifyReposCore()`（与独立 CLI 同一份实现）。仓库 404/私有 → 撤绿标（`repoVerified=false`）；
+   GitHub 5xx / rate limit → **保留旧状态**（一次宕机不该撤任何人的标）；401/其它 4xx/网络错误
+   → 整个 run 红，不产生半截状态。
+2. **发现新版本**：`repoUrl && repoVerified` 的模块优先看仓库 Release（按 `created_at` 倒序，
+   取第一个带 `.zip` 的），没有可用 Release 或版本没前进时回退到模块的 `updateJson`。
+   两条路径都会下载 zip、解包根目录 `module.prop`，并复核：
+   `id` 与索引一致、`versionCode` 严格大于索引当前最高、包内 `updateJson` 与索引**完全一致**
+   （含从无到有/从有到无）。任一不符 → 拒绝该模块并写原因，绝不带上错误数据开 PR。
+3. **提交**：zip 上传到本仓库的 `assets-v1` Release（asset 名是 `<sha256>.zip`，已存在则复用），
+   然后**一次性** POST 到 Worker 的 `/auto/pr`，带上 `pending/<id>/<versionCode>.json` 与
+   `json/repo-state.json`。上传失败或任何一步抛错，整个 run 红——不会只发一半。
+
+一次最多提交 20 个模块（`/auto/pr` 单次最多 21 个文件，含状态文件）。
+
+### 部署与密钥（都不写进仓库）
+
+| 位置 | 名称 | 作用 |
+|---|---|---|
+| Worker secret | `AUTO_PR_KEY` | `wrangler secret put AUTO_PR_KEY`；`/auto/pr` 用它校验 `X-Auto-Key` |
+| GitHub repo secret | `AUTO_PR_KEY` | 与上面**同值**；workflow 读它传给脚本 |
+| GitHub repo variable | `WORKER_BASE` | Worker 根地址（`vars.WORKER_BASE`） |
+| GitHub repo variable | `RELEASE_TAG`（可选） | 资产 Release 的 tag，默认 `assets-v1` |
+
+还要先做两件事：
+
+- 在仓库里建一个名为 `assets-v1` 的 Release（脚本只往上追加 asset，不负责创建 Release）；
+- 确认 Actions 的 `GITHUB_TOKEN` 有 `contents: write`（workflow 里已经声明，仓库默认权限为只读时
+  需要放开）。
+
+> 定时任务只会在**默认分支**上生效；在特性分支上推 workflow 不会开始每日运行。
+> `AUTO_PR_KEY` 只存在于 secrets 里，脚本从环境变量读取，不会打印、不会写进日志。
+
+### 本地手动跑
+
+```bash
+# 只复验、只打印，不写文件也不开 PR（需要 GITHUB_TOKEN，公开仓库也建议带以免撞 rate limit）
+node scripts/verify-repos.mjs --dry-run
+
+# 复验并更新 json/repo-state.json，但不开 PR
+node scripts/verify-repos.mjs --no-pr
+
+# 完整发现 + 上传 + 开 PR；本地一般用 --dry-run 看会提交什么
+node scripts/auto-update.mjs --dry-run
+node scripts/auto-update.mjs --dry-run --summary /tmp/auto-update.md
+```
+
+`--dry-run` 会打印将要写入的 pending 路径与资产地址（与真跑一致），但不上传、不 POST。
+本地跑 `auto-update.mjs` 还要 `GITHUB_TOKEN` 与 `GITHUB_REPOSITORY=owner/repo`（后者决定 zip
+传到哪个仓库的 `assets-v1`）；`verify-repos.mjs` 同样要求 `GITHUB_TOKEN`（公开仓库不带也容易撞 rate limit）。
+`json/repo-state.json` 由脚本维护，**不要手改**：结论没变时它连 `checkedAt` 都不动，
+所以「没有变化」不会每天开一个只改时间戳的 PR。
 
 ## 处置（下架 / 拉黑）
 

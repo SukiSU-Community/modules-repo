@@ -6,6 +6,7 @@ import path from 'node:path';
 import {
   buildIndex, normalizeEntry, isApproved,
   collectPendingFiles, markApproved, parseArgs, main, coolapkSourceUrl,
+  applyRepoState, normalizeRepoUrl, normalizeUpdateJson,
   APPROVAL_FIELD, APPROVED_STATUS, APPROVED_STATUSES,
 } from '../scripts/build-index.mjs';
 import { validateIndex } from '../scripts/validate-index.mjs';
@@ -27,6 +28,10 @@ function entry(over = {}) {
     name: 'Demo',
     author: 'tester',
     description: 'demo module',
+    // 契约 §1：`source` 与 `repoUrl` 至少要有其中一个，两个都没有的条目直接 invalid。
+    // 夹具默认给一条酷安链接，免得每个用例都得为「让条目合法」写一行与断言无关的东西；
+    // 要测「没有出处」的用例自己显式盖掉（那种条目现在会被拒，见对应用例的注释）。
+    source: 'https://www.coolapk.com/feed/1',
     audit: {
       status: approved ? APPROVED_STATUS : 'needs-human-review',
       by: 'test:ci',
@@ -335,6 +340,7 @@ test('回归 ②：CI 写的 audit.status=auto-approved 必须被 isApproved 认
   // Worker 写出的原始 pending 没有 approved 字段
   const raw = {
     id: 'demo_mod', name: 'Demo', author: 'tester', description: 'd',
+    source: 'https://www.coolapk.com/feed/1',
     versions: [{
       version: 'v1.0.0', versionCode: 100, zipUrl: 'https://example.com/a.zip',
       size: 1024, time: 1700000000000, sha256: sha(1),
@@ -688,8 +694,19 @@ test('出处 ①：四字段齐全时全部进索引（source 规范化成绝对
   assert.equal(validateIndex(index).ok, true);
 });
 
-test('出处 ②：四字段全缺失时**整个键不出现**（不是 null，也不是空串）', () => {
-  const m = buildIndex({ index: emptyIndex, entries: [entry()] }).index.modules[0];
+test('出处 ②：只填了仓库时，出处四格**整个键不出现**（不是 null，也不是空串）', () => {
+  // 契约 §1 要求 source 与 repoUrl 至少一个，所以「四格全缺」现在只能在有仓库的前提下存在 ——
+  // 两个都没有的条目是 invalid（见出处 ③ 末尾那一条）。这里测的仍是同一件事：
+  // 缺值不许变成 null / "" 一路活到线上。
+  const m = buildIndex({
+    index: emptyIndex,
+    entries: [entry({
+      source: undefined,
+      repoUrl: 'https://github.com/acme/demo',
+      repoVerified: true,
+      repoCheckedAt: 1700000000000,
+    })],
+  }).index.modules[0];
 
   for (const f of ORIGIN_FIELDS) {
     assert.equal(f in m, false, `${f} 缺失时不许出现在索引里`);
@@ -712,8 +729,18 @@ test('出处 ③：source 只认酷安站内 http(s)，其余一律丢掉（上�
   ];
   for (const s of bad) {
     assert.equal(coolapkSourceUrl(s), '', `判据本身要拒：${s}`);
-    const m = buildIndex({ index: emptyIndex, entries: [entry({ source: s })] }).index.modules[0];
+    // 出处这一格非法、但填了仓库 ⇒ 条目仍然合法（仓库就是那个可点回去的锚），只是 source 键省略。
+    const m = buildIndex({
+      index: emptyIndex,
+      entries: [entry({
+        source: s, repoUrl: 'https://github.com/acme/demo', repoVerified: true, repoCheckedAt: 1700000000000,
+      })],
+    }).index.modules[0];
     assert.equal('source' in m, false, `非法 source 必须省略：${s}`);
+    // 反过来：唯一那个锚也是非法的，就没有任何可点回去的地方 ⇒ 整条 invalid（契约 §1）。
+    // 静默丢成「没填」是最坏的结局：索引里看不出有人试过，投稿人也不知道自己的链接为什么没生效。
+    const lone = normalizeEntry(entry({ source: s }));
+    assert.equal(lone.ok, false, `唯一出处非法 ⇒ 整条 invalid：${s}`);
   }
 
   // 该放行的：子域、裸域名补 scheme、http
@@ -750,9 +777,10 @@ test('出处 ⑤：老索引条目原样通过 —— 纯转发一个字节不�
   const passthrough = buildIndex({ index: { ...emptyIndex, modules: [legacy] }, entries: [] }).index;
   assert.deepEqual(passthrough.modules[0], legacy, '老索引条目不许被改写');
 
-  // ② 老模块再来一个新版本：只追加版本，**不回填**老条目上缺的出处四格。
-  //    回填是另一个决定（出处以谁为准：首投那个人还是这次重投的人？），这里刻意不做 ——
-  //    免得一次「补字段」把索引里已有的归属关系悄悄换掉。
+  // ② 老模块再来一个新版本：`source` **补空但不覆盖**（契约 §3.1），另外三格不回填。
+  //    分岔的理由是这三格记的是「这一位投稿人」—— 拿重投者的身份去填老模块，
+  //    等于把索引里已有的归属关系悄悄换人。`source` 只是「这个模块从哪个帖子来」，
+  //    老条目没有就是一个可点回去的地址都没有，补上重投者的那一条是净增益。
   const { index, conflicts } = buildIndex({
     index: { ...emptyIndex, modules: [legacy] },
     entries: [entry({ source: 'https://www.coolapk.com/feed/9', uploader: 'alice', coolapkUid: '10086001', submittedAt: 1700000000000 })],
@@ -760,9 +788,17 @@ test('出处 ⑤：老索引条目原样通过 —— 纯转发一个字节不�
   assert.equal(conflicts.length, 0, '出处四格不进 sameMeta，不该被算成元信息冲突');
   assert.equal(index.modules.length, 1);
   assert.equal(index.modules[0].versions.length, 2);
-  for (const f of ORIGIN_FIELDS) {
-    assert.equal(f in index.modules[0], false, `${f} 不回填（老条目没有就保持没有）`);
+  assert.equal(index.modules[0].source, 'https://www.coolapk.com/feed/9', 'source 只补空');
+  for (const f of ['uploader', 'coolapkUid', 'submittedAt']) {
+    assert.equal(f in index.modules[0], false, `${f} 不回填（记的是这一位投稿人，不能换成重投者）`);
   }
+  // 反过来：老条目已经有 source 时，重投者的不许盖掉它（§3.1：只补，不覆盖）
+  const withSource = { ...legacy, source: 'https://www.coolapk.com/feed/old' };
+  const kept = buildIndex({
+    index: { ...emptyIndex, modules: [withSource] },
+    entries: [entry({ source: 'https://www.coolapk.com/feed/new' })],
+  }).index.modules[0];
+  assert.equal(kept.source, 'https://www.coolapk.com/feed/old', '已有 source 不许被覆盖');
 });
 
 test('出处 ⑥：uid 进索引 ⇒ 按 uid 的模块级处置开始能抹掉**已在索引里**的模块（副作用，钉住）', () => {
@@ -779,4 +815,319 @@ test('出处 ⑥：uid 进索引 ⇒ 按 uid 的模块级处置开始能抹掉**
   assert.equal(index.modules.length, 0);
   assert.equal(stats.removedModules, 1);
   assert.equal(blocked[0].via, 'coolapkUid');
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 仓库字段（契约 §1 / §3.1）—— 「来源」与「源码仓库」二选一之后，`repoUrl` 是
+// 「这个包里那几行代码在哪儿能被复核」的唯一锚；`repoCoversLatest` 是派生给 App 的结论；
+// `json/repo-state.json` 是每日复验把**时间性**的结论（还公开吗、许可证变了没）贴回索引
+// 的那条路 —— 它是唯一能改一枚已在索引里的模块、却不经过一次新投稿的入口。
+// ─────────────────────────────────────────────────────────────────────────────
+
+const REPO_OK = { repoUrl: 'https://github.com/acme/demo', repoVerified: true, repoCheckedAt: 1700000000000 };
+const v1 = { version: 'v1', versionCode: 1, zipUrl: 'https://e/1.zip', size: 1, time: 1, sha256: sha(1) };
+const v2 = { version: 'v2', versionCode: 2, zipUrl: 'https://e/2.zip', size: 1, time: 2, sha256: sha(2) };
+
+test('仓库 ①：repoUrl 归一化与 Worker 侧同一套语义（§2.1）', () => {
+  const ok = [
+    ['https://github.com/acme/demo', 'https://github.com/acme/demo'],
+    ['  https://github.com/acme/demo  ', 'https://github.com/acme/demo'],
+    ['https://github.com/acme/demo/', 'https://github.com/acme/demo'],
+    ['https://github.com/acme/demo.git', 'https://github.com/acme/demo'],
+    ['https://github.com/acme/demo.git/', 'https://github.com/acme/demo'],
+    ['https://GitHub.com/acme/demo', 'https://github.com/acme/demo'],
+    // owner/repo 的大小写**原样保留**：状态匹配、复验、自动收录全拿它做等值比较，
+    // 擅自 lower 会让索引里显示的地址与投稿人填的不是同一个串。
+    ['https://github.com/Acme/Demo', 'https://github.com/Acme/Demo'],
+    ['https://github.com/a-1/b_2.c', 'https://github.com/a-1/b_2.c'],
+  ];
+  for (const [raw, want] of ok) assert.equal(normalizeRepoUrl(raw), want, `应归一化成 ${want}：${raw}`);
+
+  const bad = [
+    'http://github.com/acme/demo',            // 只认 https
+    'https://gitlab.com/acme/demo',           // 只认 github.com
+    'https://github.com.evil.com/acme/demo',  // 后缀伪装，不是同一个 host
+    'https://github.com/acme',                // 少一段
+    'https://github.com/acme/demo/tree/main', // 多一段（那是网页地址，不是仓库根）
+    'https://github.com/acme/demo?tab=1',
+    'https://github.com/acme/demo#readme',
+    'https://user:pw@github.com/acme/demo',   // userinfo
+    'https://github.com:8443/acme/demo',      // 端口
+    'github.com/acme/demo',                   // 无协议
+    '/acme/demo',
+    '',
+    '   ',
+    null,
+    undefined,
+    {},
+    42,
+  ];
+  for (const raw of bad) assert.equal(normalizeRepoUrl(raw), '', `应拒：${String(raw)}`);
+
+  // updateJson 只查形状，不做归一化（它是模块作者自己写的地址，原样保留才叫「他写的那个」）
+  assert.equal(normalizeUpdateJson('  https://acme.example/u.json  '), 'https://acme.example/u.json');
+  assert.equal(normalizeUpdateJson('http://acme.example/u.json'), 'http://acme.example/u.json');
+  for (const raw of ['ftp://x/u.json', 'not-a-url', '', '   ', null, `https://e/${'a'.repeat(2048)}`]) {
+    assert.equal(normalizeUpdateJson(raw), '', `应省略：${String(raw).slice(0, 40)}`);
+  }
+});
+
+test('仓库 ②：模块级/版本级仓库字段按 §1 投影，空值省略键', () => {
+  const n = normalizeEntry(entry({
+    ...REPO_OK,
+    repoLicense: ' Apache-2.0 ',
+    updateJson: ' https://acme.example/update.json ',
+    versions: [{ ...v1, repoTag: ' v1 ', repoDigest: `sha256:${sha(1)}`, auto: true, autoVia: 'repo' }],
+  }));
+  assert.equal(n.ok, true, n.error);
+  const m = n.entry;
+  assert.equal(m.repoUrl, 'https://github.com/acme/demo');
+  assert.equal(m.repoVerified, true);
+  assert.equal(m.repoCheckedAt, 1700000000000);
+  assert.equal(m.repoLicense, 'Apache-2.0');
+  assert.equal(m.updateJson, 'https://acme.example/update.json');
+  const v = m.versions[0];
+  assert.equal(v.repoTag, 'v1');
+  assert.equal(v.repoDigest, `sha256:${sha(1)}`);
+  assert.equal(v.auto, true);
+  assert.equal(v.autoVia, 'repo');
+  // `repoCoversLatest` 是索引侧派生键，pending 里不该有（§1 明写「不写进 pending」）
+  assert.equal('repoCoversLatest' in m, false);
+
+  // `repoVerified: false` 是**真结论**（机器验过、结论是不绿），要写出来；其余空值一律省略
+  const bare = normalizeEntry(entry({
+    repoUrl: 'https://github.com/acme/demo', repoVerified: false, repoCheckedAt: 1, repoLicense: '  ', updateJson: '',
+  })).entry;
+  assert.equal(bare.repoVerified, false);
+  assert.equal('repoLicense' in bare, false, '无 LICENSE ⇒ 省略（不写空串，也不写 NOASSERTION）');
+  assert.equal('updateJson' in bare, false, 'module.prop 里没有 ⇒ 省略');
+
+  // 没有仓库时，一个仓库键都不许出现（不是 null、不是 ''）
+  const noRepo = normalizeEntry(entry()).entry;
+  for (const f of ['repoUrl', 'repoVerified', 'repoCheckedAt', 'repoLicense', 'updateJson']) {
+    assert.equal(f in noRepo, false, `${f} 没有值时不许出现`);
+  }
+  assert.equal(JSON.stringify(noRepo).includes('null'), false);
+});
+
+test('仓库 ③：非法仓库字段**整条拒**，不静默降级成「没填」', () => {
+  const cases = [
+    [{ repoUrl: 'http://github.com/acme/demo' }, /repoUrl/],
+    [{ repoUrl: 'https://github.com/acme' }, /repoUrl/],
+    [{ repoUrl: 'https://github.com/acme/demo/tree/main' }, /repoUrl/],
+    // 有地址就必须有结论：只有地址的条目在 App 侧会变成既绿又灰的暧昧状态
+    [{ repoUrl: 'https://github.com/acme/demo', repoVerified: undefined, repoCheckedAt: 1 }, /repoVerified/],
+    [{ repoUrl: 'https://github.com/acme/demo', repoVerified: 'true', repoCheckedAt: 1 }, /repoVerified/],
+    [{ repoUrl: 'https://github.com/acme/demo', repoVerified: true, repoCheckedAt: 0 }, /repoVerified/],
+    [{ repoUrl: 'https://github.com/acme/demo', repoVerified: true, repoCheckedAt: -5 }, /repoVerified/],
+    // 两个锚都没有：公示里没有任何可点回去的地址
+    [{ source: undefined }, /source 与 repoUrl 至少要有其中一个/],
+    // 酷安链接不是合法的，仓库地址也不合法：不能靠「有一格填了」蒙混过关
+    [{ source: 'javascript:void(0)', repoUrl: 'https://gitlab.com/a/b' }, /repoUrl/],
+  ];
+  for (const [over, re] of cases) {
+    const n = normalizeEntry(entry(over));
+    assert.equal(n.ok, false, `应拒：${JSON.stringify(over)}`);
+    assert.match(n.error, re);
+  }
+});
+
+test('仓库 ④：版本级证据必须指向同一个包 —— digest 与 sha256 对不上就拒', () => {
+  const cases = [
+    [{ repoDigest: `sha256:${sha(2)}` }, /不是同一个包/],
+    [{ repoDigest: 'sha256:XYZ' }, /repoDigest/],
+    [{ repoTag: 'v1', auto: true, autoVia: 'repo' }, /repoDigest/],                       // auto 缺 digest
+    [{ repoDigest: `sha256:${sha(1)}`, auto: true }, /autoVia/],                          // auto 说不出 via
+    [{ repoDigest: `sha256:${sha(1)}`, auto: true, autoVia: 'git' }, /autoVia/],
+    [{ repoDigest: `sha256:${sha(1)}`, autoVia: 'repo', repoTag: 'v1' }, /只说了一半/],   // via 却没有 auto
+    [{ repoDigest: `sha256:${sha(1)}`, auto: true, autoVia: 'repo' }, /repoTag/],          // repo 却没有 tag
+    [{ auto: 'yes' }, /auto 不是布尔/],
+  ];
+  for (const [over, re] of cases) {
+    const n = normalizeEntry(entry({ ...REPO_OK, versions: [{ ...v1, ...over }] }));
+    assert.equal(n.ok, false, `应拒：${JSON.stringify(over)}`);
+    assert.match(n.error, re);
+  }
+});
+
+test('仓库 ⑤：同 id 再来一版时模块级仓库字段**可覆盖**，license 跟最新结论走', () => {
+  const seeded = buildIndex({
+    index: emptyIndex,
+    entries: [entry({
+      ...REPO_OK, repoLicense: 'MIT', updateJson: 'https://acme.example/old.json',
+      versions: [{ ...v1, repoTag: 'v1' }],
+    })],
+  }).index;
+  assert.equal(seeded.modules[0].repoLicense, 'MIT');
+
+  const { index, conflicts } = buildIndex({
+    index: seeded,
+    entries: [entry({
+      repoUrl: 'https://github.com/acme/renamed',
+      repoVerified: true,
+      repoCheckedAt: 1800000000000,
+      updateJson: 'https://acme.example/new.json',
+      versions: [v2],
+    })],
+  });
+  assert.equal(conflicts.length, 0);
+  const m = index.modules[0];
+  assert.equal(m.repoUrl, 'https://github.com/acme/renamed', '作者换了仓库地址，索引跟着换（Worker 已验过新仓库）');
+  assert.equal(m.repoCheckedAt, 1800000000000);
+  assert.equal('repoLicense' in m, false, '这次没读到 LICENSE ⇒ 旧的 SPDX 必须消失，不能留一个不存在的许可证');
+  assert.equal(m.updateJson, 'https://acme.example/new.json');
+  assert.equal(m.versions.length, 2);
+});
+
+test('仓库 ⑥：repoCoversLatest 按 versionCode 最大的版本算，没有仓库的模块不留这个键', () => {
+  const withRepo = (versions) => buildIndex({ index: emptyIndex, entries: [entry({ ...REPO_OK, versions })] }).index.modules[0];
+
+  assert.equal(withRepo([{ ...v1, repoTag: 'v1' }]).repoCoversLatest, true);
+  assert.equal(withRepo([v1]).repoCoversLatest, false, '有仓库但最新版没证据 ⇒ false 也要写出来（那是结论）');
+  // 只有低版本有证据、高版本没有：结论按**最高** versionCode 算
+  assert.equal(withRepo([{ ...v1, repoTag: 'v1' }, v2]).repoCoversLatest, false);
+  // 顺序打乱也一样（合并后会按 versionCode 降序排）
+  assert.equal(withRepo([v2, { ...v1, repoTag: 'v1' }]).repoCoversLatest, false);
+
+  const noRepo = buildIndex({ index: emptyIndex, entries: [entry()] }).index.modules[0];
+  assert.equal('repoCoversLatest' in noRepo, false, '没有 repoUrl 就没有「覆盖」这个问题，键不该出现');
+  // 老索引条目本来就没有这个键：纯转发也不许凭空长出来
+  const legacy = { id: 'legacy', name: 'L', author: 'a', description: 'd', verified: false, versions: [v1] };
+  const passthrough = buildIndex({ index: { ...emptyIndex, modules: [legacy] }, entries: [] }).index.modules[0];
+  assert.equal('repoCoversLatest' in passthrough, false);
+});
+
+test('仓库 ⑦：repo-state 只贴到 repoUrl 完全相同的模块上，updateJson 只补不改', () => {
+  const mod = (over = {}) => ({
+    id: 'm1', name: 'M', author: 'a', description: 'd',
+    repoUrl: 'https://github.com/acme/demo', repoVerified: true, repoCheckedAt: 1,
+    versions: [v1], verified: false, ...over,
+  });
+  const ms = () => [mod(), mod({ id: 'm2', repoUrl: 'https://github.com/acme/other' })];
+  const state = {
+    checkedAt: 1800000000000,
+    modules: {
+      m1: {
+        repoUrl: 'https://github.com/acme/demo', repoVerified: false, repoCheckedAt: 1800000000000,
+        repoLicense: 'MIT', updateJson: 'https://acme.example/u.json',
+      },
+      // 地址不匹配（作者把仓库改名/搬走了）⇒ 旧地址上的结论不再适用于这条模块，一个字都不动
+      m2: { repoUrl: 'https://github.com/acme/moved', repoVerified: false, repoCheckedAt: 1800000000000 },
+      // 索引里没有这个 id ⇒ 忽略（state 只能更新已有模块，不能凭空造一个）
+      m3: { repoUrl: 'https://github.com/acme/demo', repoVerified: false, repoCheckedAt: 1 },
+    },
+  };
+
+  const a = ms();
+  const changed = applyRepoState(a, state);
+  assert.equal(a[0].repoVerified, false, '复验说撤标就撤标');
+  assert.equal(a[0].repoCheckedAt, 1800000000000);
+  assert.equal(a[0].repoLicense, 'MIT');
+  assert.equal(a[0].updateJson, 'https://acme.example/u.json');
+  assert.equal(a[1].repoVerified, true, 'repoUrl 不同的模块不许被改写');
+  assert.equal('updateJson' in a[1], false);
+  assert.deepEqual(changed.map((c) => c.id), ['m1']);
+
+  // updateJson 只在模块**没有**时补：作者写在 module.prop 里的那个值优先
+  const b = [mod({ updateJson: 'https://acme.example/authored.json' })];
+  applyRepoState(b, state);
+  assert.equal(b[0].updateJson, 'https://acme.example/authored.json');
+
+  // state 是可选输入：形状坏成什么样都不许炸，也不许改任何东西
+  for (const bad of [null, undefined, {}, { modules: [] }, { modules: { m1: null } }, { modules: { m1: { repoUrl: 'x' } } }]) {
+    const c = ms();
+    assert.doesNotThrow(() => applyRepoState(c, bad), `坏 state 不该抛：${JSON.stringify(bad)}`);
+    assert.equal(c[0].repoCheckedAt, 1, `坏 state 不许改任何东西：${JSON.stringify(bad)}`);
+  }
+});
+
+test('仓库 ⑧：buildIndex 接 repo-state —— 复验结论进索引并记账；不给 state 时逐字段不变', () => {
+  const seeded = buildIndex({
+    index: emptyIndex,
+    entries: [entry({ ...REPO_OK, versions: [v1] })],
+  }).index;
+  assert.equal(seeded.modules[0].repoVerified, true);
+
+  const { index, stats, repoStateChanged } = buildIndex({
+    index: seeded,
+    entries: [],
+    repoState: {
+      checkedAt: 2,
+      modules: { demo_mod: { repoUrl: REPO_OK.repoUrl, repoVerified: false, repoCheckedAt: 1800000000000 } },
+    },
+  });
+  assert.equal(index.modules[0].repoVerified, false);
+  assert.equal(stats.repoStateApplied, 1, '改了几处要能看见（CI 日志是唯一的复核入口）');
+  assert.equal(repoStateChanged.length, 1);
+  assert.equal(repoStateChanged[0].id, 'demo_mod');
+
+  const again = buildIndex({ index: seeded, entries: [] });
+  assert.deepEqual(again.index.modules, seeded.modules, '不传 repoState 时行为必须与从前一致');
+  assert.equal(again.stats.repoStateApplied, 0);
+});
+
+test('仓库 ⑨：main --repo-state —— 坏状态文件退出 3（不当「没有状态」），缺失当没有', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'repo-state-'));
+  const pendingDir = path.join(dir, 'pending');
+  const indexFile = path.join(dir, 'json', 'modules.json');
+  fs.mkdirSync(pendingDir, { recursive: true });
+  fs.mkdirSync(path.dirname(indexFile), { recursive: true });
+  fs.writeFileSync(indexFile, `${JSON.stringify(emptyIndex, null, 2)}\n`, 'utf8');
+  fs.writeFileSync(path.join(pendingDir, 'a.json'), JSON.stringify(entry({ id: 'a_mod' })), 'utf8');
+
+  // 缺文件 = 这套复验还没跑起来（或这个仓库没有这一步），当「没有状态」而不是失败
+  assert.equal(main(['--pending', pendingDir, '--index', indexFile, '--repo-state', path.join(dir, 'nope.json')]), 0);
+
+  // 读不懂的状态是**故障**，不是「没有状态」：静默当空会把复验结论悄悄丢掉，
+  // 于是绿标该撤的撤不掉 —— 那种失败没有日志，只有「怎么还绿着」。
+  const before = fs.readFileSync(indexFile, 'utf8');
+  const bad = path.join(dir, 'bad.json');
+  fs.writeFileSync(bad, '{ not json', 'utf8');
+  assert.equal(main(['--pending', pendingDir, '--index', indexFile, '--repo-state', bad]), 3);
+  assert.equal(fs.readFileSync(indexFile, 'utf8'), before, '读不懂状态时一个字节都不许写');
+
+  const badShape = path.join(dir, 'bad-shape.json');
+  fs.writeFileSync(badShape, JSON.stringify({ modules: [] }), 'utf8');
+  assert.equal(main(['--pending', pendingDir, '--index', indexFile, '--repo-state', badShape]), 3);
+
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('仓库 ⑩：validate-index 校验新字段的类型与依赖（坏值必须报出来，不许静默放行）', () => {
+  const good = buildIndex({
+    index: emptyIndex,
+    entries: [entry({
+      ...REPO_OK, repoLicense: 'MIT', updateJson: 'https://acme.example/u.json',
+      versions: [{ ...v1, repoTag: 'v1', repoDigest: `sha256:${sha(1)}`, auto: true, autoVia: 'repo' }],
+    })],
+  }).index;
+  const clean = validateIndex(good);
+  assert.equal(clean.ok, true, clean.errors.join('；'));
+  assert.equal(good.modules[0].repoCoversLatest, true);
+
+  const mutate = (fn) => {
+    const d = structuredClone(good);
+    fn(d.modules[0]);
+    return validateIndex(d).errors.join('；');
+  };
+  const cases = [
+    [(m) => { m.repoUrl = 'http://github.com/acme/demo'; }, /repoUrl/],
+    [(m) => { m.repoUrl = 'https://github.com/acme/demo/'; }, /repoUrl/],
+    [(m) => { delete m.repoVerified; }, /repoVerified/],
+    [(m) => { m.repoCheckedAt = 0; }, /repoCheckedAt/],
+    [(m) => { m.repoLicense = ''; }, /repoLicense/],
+    [(m) => { m.repoCoversLatest = false; }, /repoCoversLatest/],
+    [(m) => { m.repoCoversLatest = 'yes'; }, /repoCoversLatest/],
+    [(m) => { m.updateJson = 'ftp://x/u.json'; }, /updateJson/],
+    [(m) => { delete m.repoUrl; }, /仓库派生字段|repoUrl/],
+    [(m) => { m.versions[0].repoDigest = `sha256:${sha(9)}`; }, /repoDigest/],
+    [(m) => { m.versions[0].autoVia = 'git'; }, /autoVia/],
+    [(m) => { delete m.versions[0].autoVia; }, /autoVia/],
+    [(m) => { delete m.versions[0].auto; }, /auto/],
+    [(m) => { m.versions[0].repoTag = ''; }, /repoTag/],
+  ];
+  for (const [fn, re] of cases) {
+    const errs = mutate(fn);
+    assert.match(errs, re, `坏值必须报出来：${fn.toString()}`);
+  }
 });

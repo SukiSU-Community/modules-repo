@@ -17,8 +17,10 @@ import { buildIndex, markApproved } from '../scripts/build-index.mjs';
 import { parseDispositions } from '../scripts/dispositions.mjs';
 import { SEAL_PENDING_BY } from '../scripts/revoke.mjs';
 
+// 契约 §1：`source` 与 `repoUrl` 至少一个，两个都没有的条目 build-index 直接判 invalid。
+// 夹具默认带一条酷安链接 —— 它不参与这里的任何断言，只是让条目合法。
 const P = (id, vc = 1, over = {}) => ({
-  id, name: id, author: 'a', description: 'd',
+  id, name: id, author: 'a', description: 'd', source: 'https://www.coolapk.com/feed/1',
   versions: [{ version: `v${vc}`, versionCode: vc, time: 1791600000000 + vc, zipUrl: `https://github.com/o/r/releases/download/t/${'f'.repeat(64)}.zip`, size: 10, sha256: 'f'.repeat(64) }],
   ...over,
 });
@@ -38,6 +40,30 @@ test('正常推导：消费掉已批准条目后，索引与推导一致 → 放
   const v = judgeIndexPr({ ...f, touchedPaths: [], attest: okAttest });
   assert.equal(v.ok, true, v.reason);
   assert.equal(v.consumed.length, 2);
+});
+
+test('repo-state 参与推导：base 上的复验结论会回贴进索引，不传 state 则判不一致', () => {
+  const entry = P('mod_a', 1, {
+    repoUrl: 'https://github.com/o/r',
+    repoVerified: true,
+    repoCheckedAt: 1,
+    repoLicense: 'MIT',
+  });
+  const f = fixture([entry]);
+  const repoState = {
+    checkedAt: 2,
+    modules: {
+      mod_a: { repoUrl: 'https://github.com/o/r', repoVerified: false, repoCheckedAt: 2 },
+    },
+  };
+  const approved = f.baseEntries.map((b) => markApproved(b.entry, { by: 'x', at: 'y' }));
+  const { index } = buildIndex({ index: f.baseIndex, entries: approved, repoState });
+  assert.equal(index.modules[0].repoVerified, false, 'state 应把绿标撤下');
+  const v = judgeIndexPr({ ...f, actualIndex: index, repoState, attest: okAttest });
+  assert.equal(v.ok, true, v.reason);
+  // 同一份索引，不传 state 时必须红：证明 state 真的进了推导，而不是被忽略。
+  const v2 = judgeIndexPr({ ...f, actualIndex: index, attest: okAttest });
+  assert.equal(v2.ok, false);
 });
 
 test('伪造一：改了索引但一个 pending 都没消费 → 拒（这就是手改索引）', () => {
