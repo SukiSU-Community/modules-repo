@@ -54,6 +54,8 @@ node scripts/fetch-pending-zip.mjs pending/ --out-dir /tmp/zips \
       "id": "module_id",
       "name": "模块名",
       "author": "作者",
+      "authorCoolapkUrl": "https://www.coolapk.com/u/123456",
+      "authorGithubUrl": "https://github.com/octocat",
       "description": "描述",
       "source": "https://www.coolapk.com/feed/123456",
       "uploader": "酷安昵称",
@@ -115,6 +117,31 @@ node scripts/fetch-pending-zip.mjs pending/ --out-dir /tmp/zips \
 （`"1700000000000"`，按毫秒理解）、ISO 字符串（`"2026-10-23T00:00:00.000Z"` —— Worker 的
 `buildPendingJson` 写的就是这一种）。三种都收，统一写成毫秒整数：为了一个时间戳逼消费方去猜
 三四种格式，是那种「今天不出错、明年有人踩」的债。
+
+### 作者主页（可选两字段）
+
+`authorCoolapkUrl` / `authorGithubUrl` 是**上传者**替模块作者填的主页（契约 §2）。两格都可选，
+没有就整个键不出现；有值就必须是**归一化后**的形状：
+
+| 字段 | 类型 | 归一化后的形状 |
+|---|---|---|
+| `authorCoolapkUrl` | string | `https://www.coolapk.com/u/<4-12 位数字>` |
+| `authorGithubUrl` | string | `https://github.com/<login>`（login 保留原始大小写） |
+
+- **它只是一句声明，不是身份认证。** 界面必须标注「由上传者填写，未验证」。上传者自己的主页
+  **不落库**：由 `coolapkUid` 派生成 `coolapk.com/u/<UID>`，索引里没有 `uploaderUrl` 这类键。
+- **归一化在 `build-index` 里做，非法值整条拒收**（不是静默丢掉）：`http://` 升级成 https、
+  裸域名补协议、尾斜杠折掉；其它 host、query、fragment、端口（含 `:443` 这类默认端口 ——
+  解析器会把它们吃掉，所以判据在原始串上查一遍）、userinfo、多段路径、酷安
+  `/u/` 后不是 4–12 位纯数字、GitHub 的 `www.github.com` / `.git` / 保留路径（`topics`、
+  `settings` 等）一律判非法。判据在 `scripts/lib/author-links.mjs`，Worker 与网页侧是同一套
+  语义（契约 §3），改一侧必须同步改另一侧。
+- **合并时「带了就覆盖、没带就沿用」**：同 id 再投一版时，新条目没填这两格就保留索引里的旧值
+  ——作者这一版没重填，不等于他要撤销那句声明。索引侧没有「删掉作者链接」这条路，真要撤
+  得走一次人工改动。
+- 老条目没有这两格是正常的：不回溯、不猜（契约 §5.5）。
+- `validate-index` **会校验**这两格（与上面四格不同）：它们最终会被渲染成可点链接，形状不对
+  的值只可能来自「绕过 `build-index` 手改索引」。
 
 ### pending 条目格式
 
@@ -567,7 +594,9 @@ node scripts/validate-index.mjs path/to.json   # 校验指定文件
 检查项：顶层结构、`modules` 数组存在（空数组合法）、每个模块
 `id/name/author/description` 齐全且非空、`verified` 为布尔、
 每个版本 `version/versionCode/zipUrl/size/time/sha256` 齐全且 `zipUrl` 非空、
-`id` 与 `versionCode` 不重复、`sha256` 合法、`zipUrl` 为 http(s)。
+`id` 与 `versionCode` 不重复、`sha256` 合法、`zipUrl` 为 http(s)；
+可选字段 `repoUrl` / `repoDigest` / `repoCoversLatest` 与作者主页两格
+（`authorCoolapkUrl` / `authorGithubUrl`）出现时必须是归一化后的形状。
 退出码 0 通过，1 失败。建议接在 CI 和 pre-commit 上。
 
 ### 跑单测

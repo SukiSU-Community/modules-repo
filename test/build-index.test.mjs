@@ -7,6 +7,7 @@ import {
   buildIndex, normalizeEntry, isApproved,
   collectPendingFiles, markApproved, parseArgs, main, coolapkSourceUrl,
   applyRepoState, normalizeRepoUrl, normalizeUpdateJson,
+  normalizeAuthorCoolapkUrl, normalizeAuthorGithubUrl,
   APPROVAL_FIELD, APPROVED_STATUS, APPROVED_STATUSES,
 } from '../scripts/build-index.mjs';
 import { validateIndex } from '../scripts/validate-index.mjs';
@@ -1129,5 +1130,227 @@ test('仓库 ⑩：validate-index 校验新字段的类型与依赖（坏值必�
   for (const [fn, re] of cases) {
     const errs = mutate(fn);
     assert.match(errs, re, `坏值必须报出来：${fn.toString()}`);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 作者主页（契约 §2 / §3 / §5）—— 两格由**上传者**填给模块作者，只是声明而不是认证；
+// 索引是公开产物，网页与 App 会把它们渲染成可点链接，所以形状必须在写出去那一刻收口
+// （build-index），校验器还要能认出「有人绕过 build-index 手改索引」留下的非归一化值。
+// ─────────────────────────────────────────────────────────────────────────────
+
+test('作者主页 ①：酷安链接归一化（§3.1）', () => {
+  const ok = [
+    ['https://www.coolapk.com/u/123456', 'https://www.coolapk.com/u/123456'],
+    ['http://www.coolapk.com/u/123456', 'https://www.coolapk.com/u/123456'],
+    ['https://coolapk.com/u/123456', 'https://www.coolapk.com/u/123456'],
+    ['www.coolapk.com/u/123456', 'https://www.coolapk.com/u/123456'],
+    ['coolapk.com/u/123456', 'https://www.coolapk.com/u/123456'],
+    ['  https://www.coolapk.com/u/123456/  ', 'https://www.coolapk.com/u/123456'],
+    ['https://WWW.COOLAPK.COM/u/123456', 'https://www.coolapk.com/u/123456'],
+    ['https://www.coolapk.com/u/1234', 'https://www.coolapk.com/u/1234'],
+    ['https://www.coolapk.com/u/123456789012', 'https://www.coolapk.com/u/123456789012'],
+  ];
+  for (const [raw, want] of ok) assert.equal(normalizeAuthorCoolapkUrl(raw), want, `应归一化成 ${want}：${raw}`);
+
+  const bad = [
+    'https://www.coolapk.com/u/123',              // 3 位，不够
+    'https://www.coolapk.com/u/1234567890123',    // 13 位，超长
+    'https://www.coolapk.com/u/12a456',           // 不是纯数字
+    'https://www.coolapk.com/f/123456',           // 那是帖子，不是主页
+    'https://www.coolapk.com/u/123456/extra',     // 多段路径
+    'https://m.coolapk.com/u/123456',             // 站内子域，但输出被钉死在 www
+    'https://www.coolapk.com.evil.com/u/123456',  // 后缀伪装
+    'https://evil.com/u/123456',
+    'https://www.coolapk.com/u/123456?from=app',  // query
+    'https://www.coolapk.com/u/123456#x',         // fragment
+    'https://user:pw@www.coolapk.com/u/123456',   // userinfo
+    'https://www.coolapk.com:8443/u/123456',      // 端口
+    'https://www.coolapk.com:443/u/123456',       // 默认端口也拒：契约把「端口」整个列进拒绝清单
+    'ftp://www.coolapk.com/u/123456',             // 只认 http(s)，http 升级成 https
+    'javascript:alert(1)',
+    'https://www.coolapk.com/u/',
+    '',
+    '   ',
+    null,
+    undefined,
+    {},
+    42,
+  ];
+  for (const raw of bad) assert.equal(normalizeAuthorCoolapkUrl(raw), '', `应拒：${String(raw)}`);
+});
+
+test('作者主页 ①：GitHub 链接归一化（§3.2）', () => {
+  const ok = [
+    ['https://github.com/octocat', 'https://github.com/octocat'],
+    ['http://github.com/octocat', 'https://github.com/octocat'],
+    ['github.com/octocat', 'https://github.com/octocat'],
+    ['https://github.com/octocat/', 'https://github.com/octocat'],
+    ['  https://github.com/octocat/  ', 'https://github.com/octocat'],
+    // login 大小写**原样保留**：展示的是人填的那个串，擅自 lower 就是另一句话。
+    ['https://github.com/OctoCat', 'https://github.com/OctoCat'],
+    ['https://github.com/a', 'https://github.com/a'],
+    ['https://github.com/a-b-c-1', 'https://github.com/a-b-c-1'],
+    [`https://github.com/${'a'.repeat(39)}`, `https://github.com/${'a'.repeat(39)}`],
+  ];
+  for (const [raw, want] of ok) assert.equal(normalizeAuthorGithubUrl(raw), want, `应归一化成 ${want}：${raw}`);
+
+  const bad = [
+    'https://www.github.com/octocat',             // 契约明列
+    'https://github.com/octocat/repo',            // 仓库地址不是用户主页
+    'https://github.com/octocat.git',             // login 不含 `.`
+    'https://github.com/-octocat',                // 首字符是连字符
+    'https://github.com/octocat-',                // 尾字符是连字符
+    'https://github.com/octo--cat',               // 连续 `--`
+    'https://github.com/topics',                  // 保留路径
+    'https://github.com/Settings',                // 保留路径不区分大小写
+    'https://github.com/octo_cat',                // 下划线不是合法 login 字符
+    `https://github.com/${'a'.repeat(40)}`, // 39 是上限
+    'https://github.com/',
+    'https://github.com/octocat?tab=repositories',
+    'https://github.com/octocat#readme',
+    'https://user:pw@github.com/octocat',
+    'https://github.com:8443/octocat',
+    'https://github.com:443/octocat', // 默认端口：WHATWG 会吃掉它，必须靠原始串才拦得住
+    'http://github.com:80/octocat',
+    'https://github.com.evil.com/octocat',
+    'https://gitlab.com/octocat',
+    'javascript:alert(1)',
+    '',
+    '   ',
+    null,
+    undefined,
+    {},
+    42,
+  ];
+  for (const raw of bad) assert.equal(normalizeAuthorGithubUrl(raw), '', `应拒：${String(raw)}`);
+});
+
+test('作者主页 ②：按 §5.3 只投影有值的键，空值省略、不派生 uploaderUrl', () => {
+  const both = normalizeEntry(entry({
+    authorCoolapkUrl: ' http://coolapk.com/u/123456/ ',
+    authorGithubUrl: ' github.com/OctoCat ',
+  })).entry;
+  assert.equal(both.authorCoolapkUrl, 'https://www.coolapk.com/u/123456');
+  assert.equal(both.authorGithubUrl, 'https://github.com/OctoCat');
+  assert.equal('uploaderUrl' in both, false, '上传者主页由 coolapkUid 派生，索引里不落这份键');
+
+  const onlyOne = normalizeEntry(entry({ authorCoolapkUrl: 'https://www.coolapk.com/u/123456' })).entry;
+  assert.equal(onlyOne.authorCoolapkUrl, 'https://www.coolapk.com/u/123456');
+  assert.equal('authorGithubUrl' in onlyOne, false, '没填的那一格不许写空串/undefined');
+
+  const none = normalizeEntry(entry({ authorCoolapkUrl: '', authorGithubUrl: '   ' })).entry;
+  for (const f of ['authorCoolapkUrl', 'authorGithubUrl']) {
+    assert.equal(f in none, false, `空值 ⇒ 省略：${f}`);
+  }
+  assert.equal(validateIndex(buildIndex({ index: emptyIndex, entries: [entry({
+    authorCoolapkUrl: 'https://www.coolapk.com/u/123456', authorGithubUrl: 'https://github.com/OctoCat',
+  })] }).index).ok, true);
+});
+
+test('作者主页 ③：非法值整条拒收，不静默丢（§5.1）', () => {
+  const cases = [
+    [{ authorCoolapkUrl: 'https://www.coolapk.com/u/123' }, /authorCoolapkUrl/],
+    [{ authorCoolapkUrl: 'https://m.coolapk.com/u/123456' }, /authorCoolapkUrl/],
+    [{ authorCoolapkUrl: 'https://evil.com/u/123456' }, /authorCoolapkUrl/],
+    // 读不懂的类型也算「填了」：静默当成没填，投稿人永远看不出自己的链接为什么没生效。
+    [{ authorCoolapkUrl: 123456 }, /authorCoolapkUrl/],
+    [{ authorCoolapkUrl: { url: 'https://www.coolapk.com/u/123456' } }, /authorCoolapkUrl/],
+    [{ authorGithubUrl: 'https://www.github.com/octocat' }, /authorGithubUrl/],
+    [{ authorGithubUrl: 'https://github.com/octocat/repo' }, /authorGithubUrl/],
+    [{ authorGithubUrl: 'https://github.com/topics' }, /authorGithubUrl/],
+    [{ authorGithubUrl: false }, /authorGithubUrl/],
+  ];
+  for (const [over, re] of cases) {
+    const n = normalizeEntry(entry(over));
+    assert.equal(n.ok, false, `应整条拒：${JSON.stringify(over)}`);
+    assert.match(n.error, re);
+
+    const r = buildIndex({ index: emptyIndex, entries: [entry(over)] });
+    assert.equal(r.index.modules.length, 0, '非法值不许进索引');
+    assert.equal(r.stats.invalid, 1);
+    assert.equal(r.conflicts.length, 1, 'invalid 也要进冲突清单，否则 exit 2 时找不到任何记录');
+    assert.match(r.conflicts[0].reason, re);
+  }
+});
+
+test('作者主页 ④：同 id 合并「带了就覆盖、没带就沿用」（§5.2）', () => {
+  const firstEntry = entry({
+    id: 'mod_author',
+    authorCoolapkUrl: 'https://www.coolapk.com/u/111111',
+    authorGithubUrl: 'https://github.com/alice',
+  });
+  const base = buildIndex({ index: emptyIndex, entries: [firstEntry] }).index;
+  assert.equal(base.modules[0].authorCoolapkUrl, 'https://www.coolapk.com/u/111111');
+
+  // 新版两格都没带（含空串 —— pending 里空值就是「没写」，§4.4）⇒ 两格都沿用旧值。
+  const inheritEntry = entry({
+    id: 'mod_author',
+    authorCoolapkUrl: '',
+    versions: [{ ...v1, versionCode: 101, sha256: sha(2) }],
+  });
+  const inherited = buildIndex({ index: base, entries: [inheritEntry] }).index;
+  const m1 = inherited.modules[0];
+  assert.equal(m1.authorCoolapkUrl, 'https://www.coolapk.com/u/111111', '没重填 ≠ 撤销声明，必须继承');
+  assert.equal(m1.authorGithubUrl, 'https://github.com/alice');
+  assert.equal(m1.versions.length, 2);
+  assert.equal(validateIndex(inherited).ok, true);
+
+  // 新版带了一个新值 ⇒ 只覆盖那一格，另一格继续沿用。
+  const overwriteEntry = entry({
+    id: 'mod_author',
+    authorCoolapkUrl: 'https://www.coolapk.com/u/222222',
+    versions: [{ ...v1, versionCode: 102, sha256: sha(3) }],
+  });
+  const overwritten = buildIndex({ index: inherited, entries: [overwriteEntry] }).index;
+  const m2 = overwritten.modules[0];
+  assert.equal(m2.authorCoolapkUrl, 'https://www.coolapk.com/u/222222', '带了就覆盖');
+  assert.equal(m2.authorGithubUrl, 'https://github.com/alice', '没带的那一格不动');
+  assert.equal(validateIndex(overwritten).ok, true);
+
+  // 老模块（索引里压根没有这两格）+ 新条目也不带 ⇒ 不许凭空长出键来（§5.5 不回溯、不猜）。
+  const legacy = buildIndex({ index: emptyIndex, entries: [entry({ id: 'mod_legacy' })] }).index;
+  const stillLegacy = buildIndex({
+    index: legacy,
+    entries: [entry({ id: 'mod_legacy', versions: [{ ...v1, versionCode: 103, sha256: sha(4) }] })],
+  }).index;
+  for (const f of ['authorCoolapkUrl', 'authorGithubUrl']) {
+    assert.equal(f in stillLegacy.modules[0], false, `老条目不许被回溯补字段：${f}`);
+  }
+  assert.equal(validateIndex(stillLegacy).ok, true, '老条目缺这两格必须仍然合法');
+});
+
+test('作者主页 ⑤：validate-index 只认归一化后的形状（§5.4）', () => {
+  const good = buildIndex({ index: emptyIndex, entries: [entry({
+    authorCoolapkUrl: 'http://coolapk.com/u/123456/',
+    authorGithubUrl: 'github.com/OctoCat',
+  })] }).index;
+  const clean = validateIndex(good);
+  assert.equal(clean.ok, true, clean.errors.join('；'));
+  assert.equal(good.modules[0].authorCoolapkUrl, 'https://www.coolapk.com/u/123456');
+  assert.equal(good.modules[0].authorGithubUrl, 'https://github.com/OctoCat', '大小写原样保留');
+
+  const mutate = (fn) => {
+    const d = structuredClone(good);
+    fn(d.modules[0]);
+    return validateIndex(d).errors.join('；');
+  };
+  const cases = [
+    [(m) => { m.authorCoolapkUrl = 'http://www.coolapk.com/u/123456'; }, /authorCoolapkUrl/],
+    [(m) => { m.authorCoolapkUrl = 'https://www.coolapk.com/u/123456/'; }, /authorCoolapkUrl/],
+    [(m) => { m.authorCoolapkUrl = 'coolapk.com/u/123456'; }, /authorCoolapkUrl/],
+    [(m) => { m.authorCoolapkUrl = 'https://www.coolapk.com/u/123'; }, /authorCoolapkUrl/],
+    [(m) => { m.authorCoolapkUrl = ''; }, /authorCoolapkUrl/],
+    [(m) => { m.authorCoolapkUrl = null; }, /authorCoolapkUrl/],
+    [(m) => { m.authorGithubUrl = 'https://www.github.com/octocat'; }, /authorGithubUrl/],
+    [(m) => { m.authorGithubUrl = 'https://github.com/octocat/'; }, /authorGithubUrl/],
+    [(m) => { m.authorGithubUrl = 'https://github.com/topics'; }, /authorGithubUrl/],
+    [(m) => { m.authorGithubUrl = 'https://github.com/octo--cat'; }, /authorGithubUrl/],
+    [(m) => { m.authorGithubUrl = 'https://github.com:443/octocat'; }, /authorGithubUrl/],
+    [(m) => { m.authorGithubUrl = ''; }, /authorGithubUrl/],
+  ];
+  for (const [fn, re] of cases) {
+    const errs = mutate(fn);
+    assert.match(errs, re, `手改出来的非规范值必须报出来：${fn.toString()}`);
   }
 });

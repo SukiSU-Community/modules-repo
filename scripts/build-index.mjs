@@ -17,7 +17,9 @@
  *      `updateJson`）是**模块级、可覆盖**的：同 id 再投一版时 incoming 带什么就以什么为准，
  *      因为它来自一次更新的校验。`source` 反过来只补空、不覆盖（第一个帖子是历史事实）。
  *      `repoCoversLatest` 是派生键（最新版有没有仓库证据 `repoTag`），凡有 `repoUrl` 的模块都写。
- *   7. `json/repo-state.json`（每日复验结论，可选输入）在**合并与下架之后**贴回模块头：
+ *   7. 作者主页（`authorCoolapkUrl` / `authorGithubUrl`，契约 §5.2）也是模块级，但只**补**不撤：
+ *      incoming 带了就覆盖，没带就保留旧值 —— 作者这一版没重填，不等于他要撤销那句声明。
+ *   8. `json/repo-state.json`（每日复验结论，可选输入）在**合并与下架之后**贴回模块头：
  *      只有 `repoUrl` 完全相等才贴，只贴结论（不动版本、不改已有的 `updateJson`）。
  *
  * 审核标记契约（与 contrib/audit/workflows/audit.yml 的唯一约定面）：
@@ -31,6 +33,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { DEFAULT_DISPOSITIONS_FILE, filterVersions, isModuleLevel, loadDispositions, matchAny } from './dispositions.mjs';
+import { normalizeAuthorCoolapkUrl, normalizeAuthorGithubUrl } from './lib/author-links.mjs';
+
+// 作者主页的两条判据放在 lib 里，与 validate-index.mjs 共用同一份实现（契约 §5.1 / §5.4）：
+// 「生产端这么归一、校验端这么验」必须是同一句话，抄两份必然漂。
+export { normalizeAuthorCoolapkUrl, normalizeAuthorGithubUrl };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, '..');
@@ -228,6 +235,20 @@ function isNonEmptyString(v) {
   return typeof v === 'string' && v.trim().length > 0;
 }
 
+/**
+ * 「这一格确实填了东西」—— 空值（`undefined` / `null` / 空白串）算没填，其余都算填了。
+ *
+ * 与 `isNonEmptyString` 的差别只有后半句：数字、对象这些**读不懂**的值也算「填了」。
+ * 它们后面会被归一化函数判成 `''`，于是调用方会把整条投稿拒掉 —— 而不是当成「没填」
+ * 静默略过。对作者主页这种「填错了本人还能改、被静默吞掉就再也看不见」的字段，
+ * 这个区分就是契约 §5.1 那句「不静默丢」。
+ */
+function isProvided(v) {
+  if (v === undefined || v === null) return false;
+  if (typeof v === 'string') return v.trim().length > 0;
+  return true;
+}
+
 function sameMeta(a, b) {
   return a.name === b.name && a.author === b.author && a.description === b.description;
 }
@@ -354,6 +375,23 @@ export function normalizeEntry(raw, source = '<memory>') {
     ? raw.description.trim()
     : fallback('description', `${name} ${latest.version}`, 'name + version');
 
+  // ── 作者主页（契约 §3 / §5.1）────────────────────────────────────────────
+  // 两格都是**上传者填写的声明**（界面必须标注「未验证」），最终会被网页与 App 渲染成
+  // 可点链接。所以：填了就必须能归一化，归一不了**整条拒**，不静默丢掉 ——
+  // 丢掉等于把一条填错的声明洗成「没填」，投稿人再也看不出自己的链接为什么没生效。
+  // 与 `updateJson` 的「坏了就省略」是相反的取舍，理由在契约 §5.1 里：这里是可点的链接，
+  // 那里只是一个可选的更新源。
+  const authorCoolapkUrl = normalizeAuthorCoolapkUrl(raw.authorCoolapkUrl);
+  if (isProvided(raw.authorCoolapkUrl) && !authorCoolapkUrl) {
+    return fail(
+      `authorCoolapkUrl 不是 https://www.coolapk.com/u/<4-12 位数字> 形式（收到「${String(raw.authorCoolapkUrl).trim().slice(0, 80)}」）`,
+    );
+  }
+  const authorGithubUrl = normalizeAuthorGithubUrl(raw.authorGithubUrl);
+  if (isProvided(raw.authorGithubUrl) && !authorGithubUrl) {
+    return fail(`authorGithubUrl 不是 https://github.com/<用户名> 形式（收到「${String(raw.authorGithubUrl).trim().slice(0, 80)}」）`);
+  }
+
   // ── 出处与上传者（App 的「酷安模块详情页」要显示「从哪个帖子来的、谁传的」） ──────
   // 四格全部可选，且**只写有值的键**：App 用「键在不在」判断要不要渲染出处区，
   // 写成 `null` / `undefined` 会让这条判据失效 —— undefined 还会被 JSON.stringify 静默吞掉，
@@ -406,6 +444,9 @@ export function normalizeEntry(raw, source = '<memory>') {
       id,
       name,
       author,
+      // 作者主页：可选，只写有值的键（消费侧用「键在不在」判断要不要画链接）。
+      ...(authorCoolapkUrl ? { authorCoolapkUrl } : {}),
+      ...(authorGithubUrl ? { authorGithubUrl } : {}),
       description,
       ...(sourceUrl ? { source: sourceUrl } : {}),
       ...(uploader ? { uploader } : {}),
@@ -596,6 +637,13 @@ export function buildIndex({ index, entries, dispositions = [], repoState = null
         action: '不覆盖，交人工确认',
       });
     }
+
+    // ── 模块级作者主页：**新条目带了就覆盖，没带就保留**（契约 §5.2）──────────────
+    // 归一化之后的空值会被 `normalizeEntry` 省略，所以「没带」= 这一版没填（或填的是空），
+    // 那就沿用旧值 —— 作者主页是模块级声明，不该被「作者这次懒得重填」清掉。
+    // 索引侧没有「删掉作者链接」这条路：真要撤，得走一次人工改动（同 updateJson 的口径）。
+    if (entry.authorCoolapkUrl) existing.authorCoolapkUrl = entry.authorCoolapkUrl;
+    if (entry.authorGithubUrl) existing.authorGithubUrl = entry.authorGithubUrl;
 
     // ── 模块级仓库字段：**可覆盖**（契约 §3.1）──────────────────────────────
     // 版本只追加，模块头则相反：老模块补仓库、复验结论变化、作者换了 updateJson，
