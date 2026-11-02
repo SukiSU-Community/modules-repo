@@ -14,6 +14,10 @@
  * 是同一个字节摘要，`repoCoversLatest` 必须与最新版本相符（它是派生键，手改索引时
  * 最容易留下一句错话）。
  *
+ * 作者主页两格（`authorCoolapkUrl` / `authorGithubUrl`，契约 §3 / §5.4）同样可选，
+ * 但出现就必须是**归一化后的**固定形状：它们会被渲染成可点链接，`http://`、裸域名、
+ * 尾斜杠这类值说明有人绕过了 build-index 直接改索引。
+ *
  * 用法：node scripts/validate-index.mjs [文件路径]
  * 退出码 0 = 通过，1 = 有错误。
  */
@@ -21,6 +25,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { normalizeAuthorCoolapkUrl, normalizeAuthorGithubUrl } from './lib/author-links.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, '..');
@@ -65,6 +71,22 @@ export function validateIndex(doc) {
       else seenIds.set(m.id, i);
     }
     if (typeof m.verified !== 'boolean') push(`${at} verified 必须是布尔值`);
+
+    // ── 作者主页（契约 §3 / §5.4）─────────────────────────────────────────────
+    // 两格可选：老条目没有它们是正常的（§5.5 不回溯、不猜）。但只要出现，就必须**已经是**
+    // 归一化形状 —— `http://`、裸域名、尾斜杠、`www.github.com`、保留路径这些在 §3 里都是
+    // 不合格的输入，出现在公开索引里只说明有人绕过 build-index 手改过。判据直接复用生产端
+    // 那份归一化函数：这里校验的是「它是不是一个不动点」，两边不会漂。
+    for (const [field, normalize, shape] of [
+      ['authorCoolapkUrl', normalizeAuthorCoolapkUrl, 'https://www.coolapk.com/u/<4-12 位数字>'],
+      ['authorGithubUrl', normalizeAuthorGithubUrl, 'https://github.com/<用户名>'],
+    ]) {
+      if (!hasOwn(m, field)) continue;
+      const v = m[field];
+      if (typeof v !== 'string' || v.trim() === '' || normalize(v) !== v) {
+        push(`${at} ${field} 必须是归一化后的 ${shape}：${JSON.stringify(v).slice(0, 80)}`);
+      }
+    }
 
     // ── 源码仓库 / 自更新地址（契约 §1）─────────────────────────────────────
     // 全部可选：老模块没有这些键是正常的。但只要出现就必须成组、必须是归一化形状 ——
