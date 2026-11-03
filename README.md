@@ -212,6 +212,11 @@ https://cdn.jsdelivr.net/gh/SukiSU-Community/modules-repo@main/json/proxies.json
 代理只负责加速这一跳。所以列表必须能**远程更新** —— 代理今天能用不代表下周还能用，把列表编译进
 App 就等于把「下载能不能成功」赌在某一家免费服务上。
 
+**生效方式：远程非空就整份替换内置。** App 侧的合并规则是「远程 `proxies.json` 加载成功、
+解析出至少一条 → 以远程为准；内置的 4 条只在拉取失败、文档坏掉、远程列表为空时兜底」。
+所以**删掉一条远程条目是真的会生效**，不会被内置那条原地顶回来。反过来说，改完 json 却发现
+App 里没变化，先查 CDN 缓存（见「合并之后：CDN 必须失效」），而不是怀疑 App 没读这份文件。
+
 结构（`schemaVersion: 1`）：
 
 | 字段 | 类型 | 必填 | 约束 | 说明 |
@@ -221,10 +226,10 @@ App 就等于把「下载能不能成功」赌在某一家免费服务上。
 | `proxies` | array | 是 | 非空，≤ 32 条 | 按推荐顺序排列（实测快的在前） |
 | `proxies[].id` | string | 是 | `^[a-z0-9][a-z0-9-]{1,31}$`，全局唯一 | 稳定标识，改地址时保持不变 |
 | `proxies[].name` | string | 是 | 非空，≤ 40 字符 | 展示名，通常就是 host |
-| `proxies[].baseUrl` | string | 是 | `https://` 开头、只有 host、全局唯一 | 拼接前缀，不能带 path / query / fragment / userinfo，只允许 443 端口 |
+| `proxies[].baseUrl` | string | 是 | `https://` 开头、只有 host、≤ 128 字符、纯 ASCII 域名、全局唯一 | 拼接前缀，不能带 path / query / fragment / userinfo，只允许 443 端口；不得是 IDN / 带下划线主机 / GitHub 自己的下载域名 |
 | `proxies[].note` | string | 否 | ≤ 60 字符 | 一句人话备注（实测速度、稳定性、节点位置） |
 
-三条硬规则：
+四条硬规则：
 
 1. **只收 `https://` 且没有路径的地址**：App 做的是字符串拼接，`baseUrl` 后面直接跟 GitHub 原地址。
    多一个 `/path`、`?query`、`#fragment`、`user:pass@` 或非 443 端口，拼出来就不再是「代理 + 原地址」，
@@ -236,6 +241,11 @@ App 就等于把「下载能不能成功」赌在某一家免费服务上。
    `gitproxy.click` 不收录；下次想加回来，先自己实测再改。
 3. **App 只会把它当前缀**：形如 `https://gh-proxy.org/https://github.com/...`，GitHub 原地址保持不变。
    因此 `baseUrl` 只允许 scheme + host，不能以 `/` 结尾，也不能再包含第二段 `https://`。
+4. **规则与 App 端 `ProxyUrl.isValidBaseUrl` 保持一致，索引只会更严、不会更松**：长度 ≤ 128、host
+   必须是 App 能解析的 ASCII 域名（IDN 先转 punycode）、不能与 GitHub 自己的下载域名重名、`id`
+   不能是保留的 `direct` —— 这几类 App 解析时会**静默丢弃**，索引这边必须先报错，否则就是
+   「保存成功、用户端少一条」。反过来 App 对尾斜杠和大写 scheme 更宽容（`trimEnd('/')` + 忽略
+   大小写），索引仍一律拒：同一个代理两种写法会让判重和人工核对都失真。
 
 校验：
 
@@ -727,12 +737,15 @@ node scripts/validate-proxies.mjs --selftest     # 跑内置负例自测（不�
 ```
 
 检查项：顶层 `schemaVersion` 必须是数字 `1`、`lastUpdate` 是真实存在的 `yyyy-MM-dd`；`proxies` 是非空数组且
-≤ 32 条；每条 `id` 匹配 `^[a-z0-9][a-z0-9-]{1,31}$` 且全局唯一、`name` 非空且 ≤ 40 字符、可选 `note`
-≤ 60 字符；`baseUrl` 必须 `https://` 开头且**只有 host**（无 path / query / fragment / userinfo / 非 443
-端口），host 非空且不含空格，并按 host 全局唯一（大小写、显式 `:443` 算同一个）。错误信息带条目下标与
-字段名（如 `proxies[1].baseUrl 只能有 host，不能带路径`），照着改即可。退出码 0 通过，1 失败。
-`--selftest` 会验证 http 地址、带路径、重复 id、重复 baseUrl、坏日期、缺 `proxies`、非 443 端口七条负例
-都能被挡住，适合改完校验器后先跑一遍。
+≤ 32 条；每条 `id` 匹配 `^[a-z0-9][a-z0-9-]{1,31}$`、全局唯一、且不能是保留的 `direct`；`name` 非空且
+≤ 40 字符、可选 `note` ≤ 60 字符；`baseUrl` 必须 `https://` 开头、≤ 128 字符且**只有 host**（无 path /
+query / fragment / userinfo / 非 443 端口），host 是纯 ASCII 域名（IDN 先转 punycode；不许下划线、空域名段、
+首尾点、连字符打头收尾），不得是 GitHub 自己的下载域名（`github.com` 等三条，App 解析时直接丢弃），并按
+host 全局唯一（大小写、显式 `:443` 算同一个）。错误信息带条目下标与字段名（如
+`proxies[1].baseUrl 只能有 host，不能带路径`），照着改即可。退出码 0 通过，1 失败。
+`--selftest` 会验证 12 条负例（http、带路径、重复 id、重复 baseUrl、坏日期、缺 `proxies`、非 443 端口、
+超长 `baseUrl`、下划线主机、IDN、GitHub 下载主机、保留 id `direct`）都能被挡住，适合改完校验器后先跑一遍。
+CI 的 `selftest` 作业会同时跑真实文件与 `--selftest`（见「跑单测」）。
 
 ### 跑单测
 
@@ -907,11 +920,14 @@ node scripts/revoke.mjs --id <探针id> --version-code <n> --sha256 <64hex> \
 
 ### 合并之后：CDN 必须失效
 
-`merge-index` 在 `gh pr merge` 之后紧跟一步 `node scripts/purge-cdn.mjs`。
+`merge-index` 在 `gh pr merge` 之后紧跟一步 `node scripts/purge-cdn.mjs`。默认清四份下游会按
+`@main` 远程读取的手改数据：`json/modules.json`、`json/dispositions.json`、`json/proxies.json`、
+`json/columns.json` —— 清单就是脚本里的 `DEFAULT_FILES`，以后新增这类文件改那里，别只在 CI 里写死。
 理由是一条实测：**下架的生效速度由 CDN 的 TTL 决定，而不是由 main 决定** ——
 索引 PR #34 把 `json/modules.json` 推空之后近 50 分钟，
 `https://cdn.jsdelivr.net/gh/SukiSU-Community/modules-repo@main/json/modules.json`
-仍然返回下架前的 4 个模块，也就是订阅那个地址的 App 照样能装到已被下架的包。
+仍然返回下架前的 4 个模块，也就是订阅那个地址的 App 照样能装到已被下架的包。代理列表同理：
+删掉一条失效代理，缓存没清的时候用户最长七天还在用它。
 
 - 只内置 jsDelivr 一家：它的 purge 是公开 GET、不需要凭据（往 CI 里塞一把能改 CDN 的钥匙，
   比这一步省下的麻烦贵得多）。别的镜像把地址放进 repo variable `CDN_PURGE_URLS`（逗号分隔），

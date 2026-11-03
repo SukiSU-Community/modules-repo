@@ -1843,6 +1843,14 @@ jobs:
       - name: 跑仓库单测（test/ 与 audit/ 下的 *.test.mjs）
         shell: bash
         run: node --test
+      # 单测锁的是「校验器规则」；下面两步是拿仓库里那份真实 json 跑一遍 + 跑内置负例自测。
+      # 分开写是为了让红的时候一眼看出是数据坏了（改 json 的人自己就能修）还是规则退化了。
+      - name: 校验 json/proxies.json（App 下载代理的数据契约）
+        shell: bash
+        run: node scripts/validate-proxies.mjs
+      - name: 代理列表校验器自测（内置负例必须仍被挡住）
+        shell: bash
+        run: node scripts/validate-proxies.mjs --selftest
 
   # -------------------------------------------------------------------
   # 批准闸：把「扫完了」和「可以合并」拆成两个 check。

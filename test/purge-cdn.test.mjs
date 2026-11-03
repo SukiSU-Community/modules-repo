@@ -9,7 +9,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { purgeTargets, purgeAll, main, parseArgs } from '../scripts/purge-cdn.mjs';
+import { purgeTargets, purgeAll, main, parseArgs, DEFAULT_FILES } from '../scripts/purge-cdn.mjs';
 
 const REPO = 'o/r';
 
@@ -34,14 +34,24 @@ const silentLog = () => {
   return { log: { log: (s) => lines.push(String(s)), error: (s) => lines.push(String(s)), warn: (s) => lines.push(String(s)) }, lines };
 };
 
-test('purgeTargets：默认清索引与台账两份，地址按仓库与分支拼', () => {
+test('purgeTargets：默认清索引、台账、代理列表、专栏四份，地址按仓库与分支拼', () => {
   const t = purgeTargets({ repo: REPO });
-  assert.equal(t.length, 2);
   assert.deepEqual(
     t.map((x) => x.url),
-    ['https://cdn.jsdelivr.net/gh/o/r@main/json/modules.json', 'https://cdn.jsdelivr.net/gh/o/r@main/json/dispositions.json']
+    DEFAULT_FILES.map((f) => `https://cdn.jsdelivr.net/gh/o/r@main/${f}`)
   );
   for (const x of t) assert.equal(x.purgeUrl, x.url.replace('https://cdn.', 'https://purge.'));
+});
+
+test('DEFAULT_FILES：下游按 @main 远程读的四份手改数据一个都不能漏', () => {
+  // 漏一份的后果不是「少清一次缓存」，而是那条改动在用户手里最长七天不生效：
+  // 维护者删掉一条失效代理 / 改完专栏步骤却看到旧内容，会以为是自己改错了。
+  assert.deepEqual(DEFAULT_FILES, [
+    'json/modules.json',
+    'json/dispositions.json',
+    'json/proxies.json',
+    'json/columns.json',
+  ]);
 });
 
 test('purgeTargets：没有仓库就不凭空造目标', () => {
@@ -76,9 +86,9 @@ test('purgeAll：finished 与 scheduled 都算发起成功', async () => {
   });
   const { log } = silentLog();
   const r = await purgeAll(targets, { fetchImpl: impl, log });
-  assert.equal(r.ok.length, 2);
+  assert.equal(r.ok.length, targets.length, '每个目标都要发出去，漏一个就是漏清一份');
   assert.equal(r.failed.length, 0);
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, targets.length);
   assert.ok(calls.every((c) => c.init.signal), '必须带超时，否则 CI 会挂在一次没有回音的 GET 上');
 });
 
