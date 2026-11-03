@@ -16,13 +16,15 @@
 ```
 repo/
 ├── json/
-│   └── modules.json      # 唯一发布物，GitHub Pages 直接托管，必须始终合法 JSON
+│   ├── modules.json      # 模块索引，GitHub Pages 直接托管，必须始终合法 JSON
+│   └── columns.json      # 商店「专栏」内容（人工维护，见下文），app 侧展示 + 按可执行字段执行
 ├── pending/
 │   └── *.json            # 待合并条目，一个文件可含单条对象或数组
 │                         # 以 . 开头的文件（如 .example.json）是模板，不参与合并
 ├── scripts/
 │   ├── build-index.mjs   # pending -> json/modules.json（递归扫 pending）
 │   ├── validate-index.mjs# 校验 json/modules.json
+│   ├── validate-columns.mjs  # 校验 json/columns.json
 │   └── fetch-pending-zip.mjs  # 读 pending 元数据 -> 下载 zip，供 audit 扫描
 ├── test/
 │   └── build-index.test.mjs
@@ -142,6 +144,57 @@ node scripts/fetch-pending-zip.mjs pending/ --out-dir /tmp/zips \
 - 老条目没有这两格是正常的：不回溯、不猜（契约 §5.5）。
 - `validate-index` **会校验**这两格（与上面四格不同）：它们最终会被渲染成可点链接，形状不对
   的值只可能来自「绕过 `build-index` 手改索引」。
+
+### json/columns.json（商店专栏）
+
+`json/columns.json` 是 App 模块商店「专栏」的数据源，与 `modules.json` **同目录、同 baseUrl、同次发布**。
+它不是模块索引，**不进 `build-index`**：专栏是人工维护的编排内容（哪些专题、按什么顺序、每一步装什么），
+不存在「投稿→合并」的流水线。
+
+结构（`schemaVersion: 1`）：
+
+```
+columns[]                    专栏
+└── topics[]                 专题（一个专题 = 一套可验证的配置方案）
+    ├── evidence             必填。没有证据的专题不允许上架
+    ├── keybox               可选。keybox 直链登记：url / sha256 / lastVerifiedAt（没有可信来源就别写）
+    ├── verifyHints[]        验收提示（人话，App 直接展示）
+    └── steps[]              步骤（kind: installModule / writeConfig / writeFile / runCommand / verify / reboot / askUser）
+        ├── source           upstream{repo, assetPattern, pinnedVersion, sha256} / store{moduleId} / askUser
+        └── 可执行字段        command / filePath / fileContent / checkId / confirm
+```
+
+四条硬规则：
+
+1. **每个 topic 必须有 `evidence`**（`verifiedAt` / `device` / `kernel` / `source` / `note`）。App 端按
+   `verifiedAt` 算时效：≤90 天绿标、91–180 天黄标、>180 天灰标。缺证据的专题校验直接报错，不是警告。
+2. **`source.kind = upstream` 记的是「我们锁定并核对过的上游版本」**，不是绿标 —— 上游模块不在本仓的
+   来源／绿标体系里（见契约 §9.2）。`kind = askUser` 的步骤必须把「去哪拿」写进 `note`。
+3. **步骤除了「说」还能「做」**：`runCommand` 必须有 `command`；`writeFile` / `writeConfig` 必须有
+   绝对路径 `filePath` 与非空 `fileContent`（支持 `${keybox}` 占位符，由用户选中的本地文件替换）；
+   `verify` 可选 `checkId`（九个自动检查项之一，见下表）；任何步骤都可带 `confirm`，App 执行前先弹
+   二次确认。**没填可执行字段的步骤仍然只是展示 + 手动操作**，所以「不确定就退化 `askUser`」永远是
+   安全的写法。
+4. **`command` 与 `fileContent` 等同远程下发可执行内容，必须人工 review**：禁止通配删除、写块设备、
+   `mkfs`、`reboot -f`、把根目录权限改成 777 —— 这几类已进校验器的危险命令黑名单，命中即报错。
+
+步骤可执行字段（与 App 侧 `RepoColumnStep` / `RepoColumnKeybox` 一一对应）：
+
+| 字段 | 适用 kind | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `command` | `runCommand`（必填） | 非空字符串；多条命令用 `&&` 串联；命中危险命令黑名单即报错 | 由 root shell 原样执行 |
+| `filePath` | `writeFile` / `writeConfig`（必填） | 必须以 `/` 开头；不许 `..`、通配符、根目录 `/`、以 `/` 结尾 | 目标文件绝对路径 |
+| `fileContent` | `writeFile` / `writeConfig`（必填） | 非空字符串；支持 `${keybox}` 占位符 | 原样写入，不做换行／转义加工 |
+| `checkId` | `verify`（可选） | 九选一：`root-manager` / `zygisk-next` / `denylist-policy` / `hma-config` / `target-list` / `keybox-valid` / `hybrid-mount` / `pathmask` / `adb-disabled` | 让 App 自动跑对应检查，省掉人工对照 |
+| `confirm` | 任意 kind（可选） | 非空字符串 | 执行前的二次确认文案；空串等于没确认，校验会报错 |
+| `keybox` | topic 级（可选） | `url` 必须 `https://`；`sha256` 64 位小写十六进制；`lastVerifiedAt` 真实 `yyyy-MM-dd`；可选 `providerNote` / `disclaimer` | 只在有可信直链 + 能校验时才登记；没有就别写这个字段 |
+
+校验：
+
+```bash
+node scripts/validate-columns.mjs                # 校验 json/columns.json
+node scripts/validate-columns.mjs path/to.json   # 校验指定文件
+```
 
 ### pending 条目格式
 
@@ -598,6 +651,23 @@ node scripts/validate-index.mjs path/to.json   # 校验指定文件
 可选字段 `repoUrl` / `repoDigest` / `repoCoversLatest` 与作者主页两格
 （`authorCoolapkUrl` / `authorGithubUrl`）出现时必须是归一化后的形状。
 退出码 0 通过，1 失败。建议接在 CI 和 pre-commit 上。
+
+### 校验专栏
+
+```bash
+node scripts/validate-columns.mjs                # 校验 json/columns.json
+node scripts/validate-columns.mjs path/to.json   # 校验指定文件
+```
+
+检查项：顶层 `schemaVersion/name/updatedAt`、每个专栏的 `id/title/subtitle/description/accent/icon/order`、
+`accent` 与 `icon` 必须在白名单内（与 App 侧枚举一一对应）、每个专题必须有 `evidence` 且 `verifiedAt`
+是真实日期、`riskLevel` / `layers` / 步骤 `kind` / `source.kind` 取值合法、`upstream` 步骤的
+`repo` 必须是 `owner/repo` 形状且带 `assetPattern`、`store` 步骤必须带 `moduleId`、
+`askUser` 步骤必须把获取方式写进 `note`。可执行字段另有几条硬检查：`runCommand` 必须有非空 `command`，
+且不命中危险命令黑名单（通配删除根目录、`dd if=` 写设备、`mkfs`、写 `/dev/block`、`reboot -f`、
+`chmod -R 777 /`）；`writeFile` / `writeConfig` 必须有绝对路径 `filePath`（不许 `..`、通配符、根目录）
+与非空 `fileContent`；`checkId` 必须在九项白名单内且只允许出现在 `verify` 步骤；`confirm` 给了就不能
+是空串；topic 级 `keybox` 的 `url` / `sha256` / `lastVerifiedAt` 形状不对直接报错。退出码 0 通过，1 失败。
 
 ### 跑单测
 

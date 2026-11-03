@@ -1,0 +1,424 @@
+{
+  "schemaVersion": 1,
+  "name": "SukiSU 精选专栏",
+  "updatedAt": "2026-11-04",
+  "columns": [
+    {
+      "id": "hide-env",
+      "title": "隐藏环境必刷",
+      "subtitle": "把 root 和 Bootloader 藏干净，银行与游戏才肯放行",
+      "description": "一套经过社区实测的隐藏环境配置。每一项都能单独看、单独装；商店不打包整合包，也不替你点确认。",
+      "accent": "root",
+      "icon": "shield",
+      "order": 1,
+      "topics": [
+        {
+          "id": "self-check",
+          "title": "环境自检",
+          "summary": "先搞清楚现在到底漏在哪。只装两个检测器：春秋 Native Check 查得最细，Duck Detector 专查路径和端口。",
+          "riskLevel": "low",
+          "layers": [],
+          "requires": ["能安装第三方 APK"],
+          "evidence": {
+            "verifiedAt": "2026-08-17",
+            "device": "多机型",
+            "kernel": "不限定",
+            "source": "酷安 @泛彼柏舟y 73287937、@JeTeeZnTmaxQwQ 的春秋检测点文档",
+            "note": "社区实测汇总，非本站验证"
+          },
+          "steps": [
+            {
+              "id": "install-chunqiu",
+              "title": "安装春秋 Native Check",
+              "kind": "askUser",
+              "optional": false,
+              "note": "在酷安搜索「春秋 Native Check」下载安装（当前 2.8.x）。它是目前圈内事实上的通过标准，报错会按检测点逐条列出。它不在 GitHub release 上，商店拿不到可校验的直链，只能由你自己从酷安/官网获取。",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "install-duck",
+              "title": "安装 Duck Detector",
+              "kind": "askUser",
+              "optional": false,
+              "note": "在酷安搜索「Duck Detector」（当前 1.9.x）。它补的是春秋覆盖不到的路径与端口专项，Scene 一类工具的痕迹主要靠它暴露。同样不在 GitHub release 上，需自行从酷安/官网获取。",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "run-check",
+              "title": "两个都跑一遍，把红项截图",
+              "kind": "verify",
+              "optional": false,
+              "note": "先跑春秋再跑 Duck。红项就是这次要补的地方；全绿说明这套环境已经能过绝大多数 App 的检测。",
+              "checkId": "root-manager",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            }
+          ],
+          "verifyHints": [
+            "春秋全绿 = 当前最严的一关过了",
+            "Duck 只报路径/端口，路径红项靠 pathmask 补",
+            "两个都装完再重启一次，结果才稳"
+          ]
+        },
+        {
+          "id": "pass-bank",
+          "title": "过银行 / 金融 App",
+          "summary": "银行主要查三样：root 在不在、应用列表里有没有可疑工具、系统属性完不完整。这一套按白名单思路做，默认全机看不见 root，只给需要 root 的工具开后门。",
+          "riskLevel": "medium",
+          "layers": ["L1", "L2", "L5"],
+          "requires": ["已 root（KernelSU / SukiSU / APatch）", "Android 13 及以上", "能安装 LSPosed"],
+          "evidence": {
+            "verifiedAt": "2026-08-17",
+            "device": "小米 8e5 平台 / 红米",
+            "kernel": "6.1.x",
+            "source": "酷安 @泛彼柏舟y 73287937、@小青泽 70938266 与 71026412",
+            "note": "社区实测汇总，非本站验证"
+          },
+          "steps": [
+            {
+              "id": "zygisk-next",
+              "title": "安装 ZygiskNext",
+              "kind": "installModule",
+              "optional": false,
+              "note": "后面所有隐藏都建立在 Zygisk 之上。如果管理器自带的 Zygisk 已经开着，先关掉它再装，别两个同时跑。",
+              "source": {
+                "kind": "upstream",
+                "repo": "Dr-TSNG/ZygiskNext",
+                "assetPattern": "*.zip",
+                "pinnedVersion": "1.5.0",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "lsposed",
+              "title": "安装 LSPosed",
+              "kind": "installModule",
+              "optional": false,
+              "note": "HMA-OSS 和 FuseFixer 都是 Xposed 模块，没有 LSPosed 跑不起来。装完在 LSPosed 设置里打开「点按劫持缓解」和「Xposed API 调用保护」。",
+              "source": {
+                "kind": "upstream",
+                "repo": "LSPosed/LSPosed",
+                "assetPattern": "*.zip",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "hma-oss",
+              "title": "安装 HMA-OSS",
+              "kind": "installModule",
+              "optional": false,
+              "note": "负责隐藏应用列表。刷入后在 LSPosed 里启用，再导入一份配置 json（入口叫「还原配置」，不是「备份」）。",
+              "source": {
+                "kind": "upstream",
+                "repo": "frknkrc44/HMA-OSS",
+                "assetPattern": "*.zip",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "configure-zygisk",
+              "title": "配置 ZygiskNext 的排除策略",
+              "kind": "writeFile",
+              "optional": false,
+              "note": "打开 ZygiskNext 模块页：排除列表策略选「仅还原挂载」，开启「使用匿名内存」；如果你的版本有「使用 Zygisk Next 链接器（实验性）」，也一起打开。下面这次写入就是把「排除列表策略」落到配置文件上（2 = 仅还原挂载，1 = 使用排除列表，0 = 关闭）；「使用匿名内存」这类开关仍然要在模块页里手动打开。",
+              "filePath": "/data/adb/zygisksu/denylist_enforce",
+              "fileContent": "2\n",
+              "confirm": "将把 /data/adb/zygisksu/denylist_enforce 写成 2（仅还原挂载），原文件会先备份、可回滚，重启后生效。继续？",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "hma-whitelist",
+              "title": "把 HMA 配成白名单模式",
+              "kind": "askUser",
+              "optional": false,
+              "note": "在管理器里打开「将非 Root 应用视为排除列表」，全机就默认检测不到 root；再去「超级用户列表」把需要 root 的工具（MT 管理器、Scene、终端）单独放行。银行、交管、游戏直接打开就能用。这一步只做指引：这两个开关存在管理器自己的配置里，绕过界面去改容易把超级用户列表弄坏，所以不下发文件写入。",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "fuse-fixer",
+              "title": "安装 FuseFixer（可选）",
+              "kind": "askUser",
+              "optional": true,
+              "note": "Xposed 模块，专门隐藏软件本身，仓库暂未收录。装了以后在 LSPosed 里启用，勾默认作用域，参数不用改。不装也能过大部分银行。",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "close-adb",
+              "title": "关掉 ADB 与 USB 调试",
+              "kind": "runCommand",
+              "optional": true,
+              "note": "执行 settings put global adb_enabled 0 和 setprop persist.sys.usb.config none。部分银行会检查调试通道是否开着。",
+              "command": "settings put global adb_enabled 0 && setprop persist.sys.usb.config none",
+              "confirm": "关掉后 adb 连接（含有线/无线调试）会立刻断开，USB 也会退成仅充电，需要重新去开发者选项里打开。确认执行？",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "reboot",
+              "title": "重启",
+              "kind": "reboot",
+              "optional": false,
+              "note": "Zygisk 模块和 LSPosed 作用域都要重启才生效。管理器类应用配完记得从后台划掉，不然它自己会带着 root 痕迹挂在后台。",
+              "confirm": "重启会中断当前所有任务与连接（下载、通话、没保存的编辑都会丢），并需要重新解锁。确认现在重启？",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            }
+          ],
+          "verifyHints": [
+            "银行打开不再弹 root 提示",
+            "系统服务类 App（交管、税务）能正常登录",
+            "微信/支付宝的支付页面不报警",
+            "跑一遍春秋，L1/L2 层应该全绿"
+          ]
+        },
+        {
+          "id": "pass-integrity",
+          "title": "谷歌三绿 / Play Integrity",
+          "summary": "这一层要动密钥材料。商店不内置、不托管、也不写死 keybox 的下载地址（没有可信直链就不登记），keybox 需要你自备；这一层也是全网唯一没人敢给你打包票的。",
+          "riskLevel": "high",
+          "layers": ["L3"],
+          "requires": ["已通过「过银行」或至少完成 L1 隐藏", "接受密钥随时可能失效"],
+          "evidence": {
+            "verifiedAt": "2026-08-17",
+            "device": "小米 8e5 平台",
+            "kernel": "6.1.x",
+            "source": "酷安 @泛彼柏舟y 73287937、@小青泽 70938266",
+            "note": "社区实测汇总，非本站验证；keybox 通常来自公共泄露材料"
+          },
+          "steps": [
+            {
+              "id": "tricky-store",
+              "title": "安装 TrickyStore 或 TEESimulator",
+              "kind": "installModule",
+              "optional": false,
+              "note": "两者二选一：TrickyStore 靠 leaf 证书 hack，TEESimulator 走 Keystore Binder 拦截做完整 TEE 模拟。TEESimulator 更新更活跃，且声明会替代 TrickyStore。",
+              "source": {
+                "kind": "upstream",
+                "repo": "5ec1cff/TrickyStore",
+                "assetPattern": "*.zip",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "tee-simulator",
+              "title": "改用 TEESimulator（替代 TrickyStore）",
+              "kind": "installModule",
+              "optional": true,
+              "note": "和上一步二选一：已经装了 TrickyStore 就跳过本步，两者都会拦截 Keystore，同时装会互相抢，反而更容易掉认证。TEESimulator 更新更活跃，也声明最终会替代 TrickyStore；本专题后面的 keybox 与 target.txt 两步对两者通用。",
+              "source": {
+                "kind": "upstream",
+                "repo": "JingMatrix/TEESimulator",
+                "assetPattern": "*.zip",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "keybox",
+              "title": "导入 keybox",
+              "kind": "writeFile",
+              "optional": false,
+              "note": "keybox 需要自备：公共 keybox 随时可能被 Google 吊销，本专栏不登记下载直链（没有可信来源就不写死），所以这一步由你选择本地的 keybox.xml，管理器原样写入下面的路径。放之前先确认文件来源可靠，它属于敏感密钥材料。",
+              "filePath": "/data/adb/tricky_store/keybox.xml",
+              "fileContent": "${keybox}",
+              "confirm": "将把你选中的 keybox.xml 内容写到 /data/adb/tricky_store/keybox.xml，覆盖原文件（会先备份）。确认这个 keybox 来源可信，再继续。",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "target-txt",
+              "title": "配 target.txt",
+              "kind": "writeFile",
+              "optional": false,
+              "note": "把要过认证的应用包名写进 /data/adb/tricky_store/target.txt。包名后加「!」表示强制走生成流程，适合 TEE 已经损坏的设备。下面先写入 GMS 与 Play 商店这两个必填包名，执行完你可以再手动追加别的应用。",
+              "filePath": "/data/adb/tricky_store/target.txt",
+              "fileContent": "com.google.android.gms\ncom.android.vending\n",
+              "confirm": "将把 /data/adb/tricky_store/target.txt 覆盖为 GMS + Play 商店两行（原文件会先备份）。如果你之前在这里写过别的包名，请先记下来，写完后手动补回去。继续？",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "pif",
+              "title": "安装 PlayIntegrityFork",
+              "kind": "installModule",
+              "optional": false,
+              "note": "补设备指纹（PIF）。注意它和旧的 PlayIntegrityFix 冲突，两个只能留一个。",
+              "source": {
+                "kind": "upstream",
+                "repo": "osm0sis/PlayIntegrityFork",
+                "assetPattern": "*.zip",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "verify-integrity",
+              "title": "用 Play Integrity API Checker 验收",
+              "kind": "verify",
+              "optional": false,
+              "note": "三项全绿（MEETS_BASIC_INTEGRITY / MEETS_DEVICE_INTEGRITY / MEETS_STRONG_INTEGRITY）才算过。密钥有效期一般到 2033 年，但设备指纹和补丁日期会先过期。",
+              "checkId": "keybox-valid",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            }
+          ],
+          "verifyHints": [
+            "三绿 = BASIC + DEVICE + STRONG 都过",
+            "密钥材料请自备：TrickyStore 目录下放 keybox.xml，或由发行方提供的直链导入",
+            "只有一绿且提示安装包信息不符，通常是 PIF 没装或版本太旧",
+            "改 keybox 和 target.txt 不用重启，改 system.prop 要重启"
+          ]
+        },
+        {
+          "id": "hide-manager",
+          "title": "藏掉管理器本体",
+          "summary": "最后一步，也最容易被忘：root 管理器自己就是一个显眼的证据。改包名、藏图标、清掉它留下的痕迹。",
+          "riskLevel": "low",
+          "layers": ["L2", "L5"],
+          "requires": ["已完成前面的隐藏"],
+          "evidence": {
+            "verifiedAt": "2026-08-17",
+            "device": "小米 8e5 平台",
+            "kernel": "6.1.x",
+            "source": "酷安 @小青泽 70938266",
+            "note": "社区实测汇总，非本站验证"
+          },
+          "steps": [
+            {
+              "id": "rename-package",
+              "title": "给管理器换个包名和图标",
+              "kind": "askUser",
+              "optional": false,
+              "note": "在管理器设置里生成随机包名，图标可以伪装成「设置」之类的系统应用。别用默认名字，那是第一个被扫到的目标。",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "hide-icon",
+              "title": "藏掉桌面图标",
+              "kind": "askUser",
+              "optional": true,
+              "note": "提前给它「桌面快捷方式」权限，再用马甲包名打开。第一次打开弹「权限丢失」是正常的——绝对不要点「修复安装」，重新打开就行。",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "clean-traces",
+              "title": "清掉残留痕迹",
+              "kind": "runCommand",
+              "optional": true,
+              "note": "常见的漏点：/sdcard 和 /data/local/tmp 下的 .sh/.json/.xml 文件、MT 管理器的备份配置、以及管理器自己留下的日志目录。检查一遍，别让检测器顺着文件找到你。自动执行只会清掉下面这两个本工具自己的目录；/sdcard 下的历史脚本、MT 备份和下载目录里的模块包请自己逐个确认后再删——那是用户数据区，任何一键清理都可能误删，本专栏不下发通配删除。",
+              "command": "rm -rf /data/local/tmp/hide_env /data/adb/.config/hide_env/backup",
+              "confirm": "只会删除这两个明确目录：/data/local/tmp/hide_env 和 /data/adb/.config/hide_env/backup，不会碰 /sdcard。删前请确认里面没有你还需要的文件。继续？",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            }
+          ],
+          "verifyHints": [
+            "在应用列表里已经找不到管理器的原名",
+            "春秋的「应用列表」一项不再报管理器包名",
+            "/sdcard 根目录没有明显的脚本残留"
+          ]
+        }
+      ]
+    }
+  ]
+}
