@@ -17,7 +17,8 @@
 repo/
 ├── json/
 │   ├── modules.json      # 模块索引，GitHub Pages 直接托管，必须始终合法 JSON
-│   └── columns.json      # 商店「专栏」内容（人工维护，见下文），app 侧展示 + 按可执行字段执行
+│   ├── columns.json      # 商店「专栏」内容（人工维护，见下文），app 侧展示 + 按可执行字段执行
+│   └── proxies.json      # 商店 GitHub 下载代理列表（人工维护，App 侧可远程更新）
 ├── pending/
 │   └── *.json            # 待合并条目，一个文件可含单条对象或数组
 │                         # 以 . 开头的文件（如 .example.json）是模板，不参与合并
@@ -25,6 +26,7 @@ repo/
 │   ├── build-index.mjs   # pending -> json/modules.json（递归扫 pending）
 │   ├── validate-index.mjs# 校验 json/modules.json
 │   ├── validate-columns.mjs  # 校验 json/columns.json
+│   ├── validate-proxies.mjs  # 校验 json/proxies.json（下载代理列表）
 │   └── fetch-pending-zip.mjs  # 读 pending 元数据 -> 下载 zip，供 audit 扫描
 ├── test/
 │   └── build-index.test.mjs
@@ -194,6 +196,53 @@ columns[]                    专栏
 ```bash
 node scripts/validate-columns.mjs                # 校验 json/columns.json
 node scripts/validate-columns.mjs path/to.json   # 校验指定文件
+```
+
+### json/proxies.json（下载代理）
+
+`json/proxies.json` 是模块商店给 **GitHub Release 下载**用的代理前缀列表，与 `modules.json`、`columns.json`
+**同目录、同发布路径**。App 从 CDN 拉取这一份：
+
+```text
+https://cdn.jsdelivr.net/gh/SukiSU-Community/modules-repo@main/json/proxies.json
+```
+
+拿到列表后，App 把代理前缀直接拼在 GitHub 原地址前面，形如
+`https://gh-proxy.org/https://github.com/<owner>/<repo>/releases/download/...`；原地址本身一字不改，
+代理只负责加速这一跳。所以列表必须能**远程更新** —— 代理今天能用不代表下周还能用，把列表编译进
+App 就等于把「下载能不能成功」赌在某一家免费服务上。
+
+结构（`schemaVersion: 1`）：
+
+| 字段 | 类型 | 必填 | 约束 | 说明 |
+| --- | --- | --- | --- | --- |
+| `schemaVersion` | number | 是 | 必须等于 `1` | 结构版本，当前只认 `1` |
+| `lastUpdate` | string | 是 | 真实日期 `yyyy-MM-dd` | 最后核实日期，也是「这版列表什么时候还有效」的线索 |
+| `proxies` | array | 是 | 非空，≤ 32 条 | 按推荐顺序排列（实测快的在前） |
+| `proxies[].id` | string | 是 | `^[a-z0-9][a-z0-9-]{1,31}$`，全局唯一 | 稳定标识，改地址时保持不变 |
+| `proxies[].name` | string | 是 | 非空，≤ 40 字符 | 展示名，通常就是 host |
+| `proxies[].baseUrl` | string | 是 | `https://` 开头、只有 host、全局唯一 | 拼接前缀，不能带 path / query / fragment / userinfo，只允许 443 端口 |
+| `proxies[].note` | string | 否 | ≤ 60 字符 | 一句人话备注（实测速度、稳定性、节点位置） |
+
+三条硬规则：
+
+1. **只收 `https://` 且没有路径的地址**：App 做的是字符串拼接，`baseUrl` 后面直接跟 GitHub 原地址。
+   多一个 `/path`、`?query`、`#fragment`、`user:pass@` 或非 443 端口，拼出来就不再是「代理 + 原地址」，
+   而是一个谁都不认识的 URL。`http://` 一律不收 —— 下载的是可执行 zip，明文链路等于把「装什么」
+   交给中间人。
+2. **代理会失效，所以列表要能远程更新**：每次增删都改 `lastUpdate`，并让 jsDelivr 缓存失效（见
+   「合并之后：CDN 必须失效」）。
+   实测不通的 `ghfast.top`、`github.moeyy.xyz`、`gh.api.99988866.xyz` 和不支持 Range 请求的
+   `gitproxy.click` 不收录；下次想加回来，先自己实测再改。
+3. **App 只会把它当前缀**：形如 `https://gh-proxy.org/https://github.com/...`，GitHub 原地址保持不变。
+   因此 `baseUrl` 只允许 scheme + host，不能以 `/` 结尾，也不能再包含第二段 `https://`。
+
+校验：
+
+```bash
+node scripts/validate-proxies.mjs                # 校验 json/proxies.json
+node scripts/validate-proxies.mjs path/to.json   # 校验指定文件
+node scripts/validate-proxies.mjs --selftest     # 跑内置负例自测（不读文件）
 ```
 
 ### pending 条目格式
@@ -668,6 +717,22 @@ node scripts/validate-columns.mjs path/to.json   # 校验指定文件
 `chmod -R 777 /`）；`writeFile` / `writeConfig` 必须有绝对路径 `filePath`（不许 `..`、通配符、根目录）
 与非空 `fileContent`；`checkId` 必须在九项白名单内且只允许出现在 `verify` 步骤；`confirm` 给了就不能
 是空串；topic 级 `keybox` 的 `url` / `sha256` / `lastVerifiedAt` 形状不对直接报错。退出码 0 通过，1 失败。
+
+### 校验代理列表
+
+```bash
+node scripts/validate-proxies.mjs                # 校验 json/proxies.json
+node scripts/validate-proxies.mjs path/to.json   # 校验指定文件
+node scripts/validate-proxies.mjs --selftest     # 跑内置负例自测（不读文件）
+```
+
+检查项：顶层 `schemaVersion` 必须是数字 `1`、`lastUpdate` 是真实存在的 `yyyy-MM-dd`；`proxies` 是非空数组且
+≤ 32 条；每条 `id` 匹配 `^[a-z0-9][a-z0-9-]{1,31}$` 且全局唯一、`name` 非空且 ≤ 40 字符、可选 `note`
+≤ 60 字符；`baseUrl` 必须 `https://` 开头且**只有 host**（无 path / query / fragment / userinfo / 非 443
+端口），host 非空且不含空格，并按 host 全局唯一（大小写、显式 `:443` 算同一个）。错误信息带条目下标与
+字段名（如 `proxies[1].baseUrl 只能有 host，不能带路径`），照着改即可。退出码 0 通过，1 失败。
+`--selftest` 会验证 http 地址、带路径、重复 id、重复 baseUrl、坏日期、缺 `proxies`、非 443 端口七条负例
+都能被挡住，适合改完校验器后先跑一遍。
 
 ### 跑单测
 

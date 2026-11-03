@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "lastUpdate": "2026-11-04",
+  "proxies": [
+    { "id": "gh-proxy-org", "name": "gh-proxy.org", "baseUrl": "https://gh-proxy.org", "note": "实测最快" },
+    { "id": "gh-proxy-com", "name": "gh-proxy.com", "baseUrl": "https://gh-proxy.com", "note": "稳定" },
+    { "id": "ghproxy-net", "name": "ghproxy.net", "baseUrl": "https://ghproxy.net", "note": "速度波动较大" },
+    { "id": "hk-gh-proxy", "name": "hk.gh-proxy.com", "baseUrl": "https://hk.gh-proxy.com", "note": "境外节点，偏慢" }
+  ]
+}
