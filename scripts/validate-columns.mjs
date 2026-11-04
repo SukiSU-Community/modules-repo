@@ -44,6 +44,8 @@ export const ACCENTS = ['root', 'hide', 'integrity', 'tool'];
 export const ICONS = ['shield', 'list', 'key', 'tool'];
 export const RISK_LEVELS = ['low', 'medium', 'high'];
 export const LAYERS = ['L1', 'L2', 'L3', 'L4', 'L5'];
+/** 档位：day = 日用级，integrity = 三绿，game = 游戏（不推荐），tool = 工具。 */
+export const TIERS = ['day', 'integrity', 'game', 'tool'];
 export const STEP_KINDS = [
   'installModule',
   'installApp',
@@ -240,6 +242,30 @@ export function validateColumns(doc) {
     if (!ICONS.includes(col.icon)) {
       push(`${at} icon 必须是 ${ICONS.join(' / ')} 之一，实际是 ${JSON.stringify(col.icon)}`);
     }
+    // guide 是可选的「怎么选」引导：给了就每条都要有标题和正文，档位不能重复也不能乱写。
+    if (col.guide !== undefined) {
+      if (!Array.isArray(col.guide)) {
+        push(`${at} guide 必须是数组（不需要就不写这个字段）`);
+      } else {
+        const seenTiers = new Set();
+        col.guide.forEach((g, gi) => {
+          const gat = `${at}.guide[${gi}]`;
+          if (!isObject(g)) {
+            push(`${gat} 不是对象`);
+            return;
+          }
+          if (!nonEmpty(g.title)) push(`${gat} 缺少/为空字段 title`);
+          if (!nonEmpty(g.body)) push(`${gat} 缺少/为空字段 body`);
+          if (g.tier !== undefined && g.tier !== '') {
+            if (!TIERS.includes(g.tier)) {
+              push(`${gat}.tier 必须是 ${TIERS.join(' / ')} 之一，实际是 ${JSON.stringify(g.tier)}`);
+            }
+            if (seenTiers.has(g.tier)) push(`${gat}.tier 重复：${g.tier}`);
+            seenTiers.add(g.tier);
+          }
+        });
+      }
+    }
     if (typeof col.order !== 'number' || !Number.isFinite(col.order)) {
       push(`${at} order 必须是数字`);
     }
@@ -265,6 +291,10 @@ export function validateColumns(doc) {
       }
       if (!RISK_LEVELS.includes(topic.riskLevel)) {
         push(`${tat} riskLevel 必须是 ${RISK_LEVELS.join(' / ')} 之一`);
+      }
+      // tier 只是展示用的档位标签，可以不写；写了就必须是白名单里的值。
+      if (topic.tier !== undefined && topic.tier !== '' && !TIERS.includes(topic.tier)) {
+        push(`${tat}.tier 必须是 ${TIERS.join(' / ')} 之一，实际是 ${JSON.stringify(topic.tier)}`);
       }
       if (!Array.isArray(topic.layers)) {
         push(`${tat} layers 必须是数组（没有可写空数组）`);

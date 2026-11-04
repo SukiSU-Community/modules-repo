@@ -8,6 +8,23 @@
       "title": "隐藏环境必刷",
       "subtitle": "把 root 和 Bootloader 藏干净，银行与游戏才肯放行",
       "description": "一套经过社区实测的隐藏环境配置。每一项都能单独看、单独装；商店不打包整合包，也不替你点确认。",
+      "guide": [
+        {
+          "tier": "day",
+          "title": "日用级：只想让银行、支付、交管这类 App 不再因为 root 退出",
+          "body": "装三个模块、写一份配置、重启一次。不碰密钥材料，也不需要你准备任何文件。绝大多数人做到这一档就够用了，做完请先跑一遍自检。"
+        },
+        {
+          "tier": "integrity",
+          "title": "三绿：Google Play 认证报错，或者银行硬要三项全绿",
+          "body": "在日用级之上再加一层密钥伪造（TEESimulator + keybox + 指纹模块）。代价是 keybox 属于泄露的 Google 认证材料，随时可能被吊销；商店不提供、不托管、不代下，来源要你自己找。"
+        },
+        {
+          "tier": "game",
+          "title": "游戏级：本商店不推荐，也不提供",
+          "body": "反作弊每天都在更新，没有任何配置能长期稳定；本商店也不做规避封禁、修改设备指纹这类事。想打游戏，回锁 Bootloader 是最省心的答案。"
+        }
+      ],
       "accent": "root",
       "icon": "shield",
       "order": 1,
@@ -15,6 +32,7 @@
         {
           "id": "self-check",
           "title": "环境自检",
+          "tier": "tool",
           "summary": "先搞清楚现在到底漏在哪。商店默认一个检测器都不装——清单里勾选你想要的，点一键执行就会装（Duck 能直接装；春秋闭源、官方只走群和网盘，只能点「打开官方页面」自己取包）。推荐两个都装：春秋查得最细，Duck 专查路径和端口。",
           "riskLevel": "low",
           "layers": [],
@@ -85,6 +103,7 @@
         {
           "id": "pass-bank",
           "title": "过银行 / 金融 App",
+          "tier": "day",
           "summary": "银行主要查三样：root 在不在、应用列表里有没有可疑工具、系统属性完不完整。这一套按白名单思路做，默认全机看不见 root，只给需要 root 的工具开后门。",
           "riskLevel": "medium",
           "layers": ["L1", "L2", "L5"],
@@ -251,6 +270,7 @@
         {
           "id": "pass-integrity",
           "title": "谷歌三绿 / Play Integrity",
+          "tier": "integrity",
           "summary": "这一层要动密钥材料。商店不内置、不托管、也不写死 keybox 的下载地址（没有可信直链就不登记），keybox 需要你自备；这一层也是全网唯一没人敢给你打包票的。",
           "riskLevel": "high",
           "layers": ["L3"],
@@ -371,6 +391,7 @@
         {
           "id": "hide-manager",
           "title": "藏掉管理器本体",
+          "tier": "day",
           "summary": "最后一步，也最容易被忘：root 管理器自己就是一个显眼的证据。先说清楚：SukiSU 没有改包名、藏图标这类马甲功能（那是 Magisk Alpha 的做法），能做的是把它从 HMA 的可见名单里抹掉，再清掉它留下的痕迹。",
           "riskLevel": "low",
           "layers": ["L2", "L5"],

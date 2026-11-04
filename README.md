@@ -157,7 +157,9 @@ node scripts/fetch-pending-zip.mjs pending/ --out-dir /tmp/zips \
 
 ```
 columns[]                    专栏
+├── guide[]                  可选。「怎么选」引导：一条一档（tier: day / integrity / game + title + body）
 └── topics[]                 专题（一个专题 = 一套可验证的配置方案）
+    ├── tier                 可选。档位标签（day / integrity / game / tool），界面上显示成徽章
     ├── evidence             必填。没有证据的专题不允许上架
     ├── keybox               可选。keybox 直链登记：url / sha256 / lastVerifiedAt（没有可信来源就别写）
     ├── verifyHints[]        验收提示（人话，App 直接展示）
@@ -196,6 +198,12 @@ columns[]                    专栏
    摆一个「升级到 vX」按钮，用户点了才带 `force` 覆盖安装。所以 `source.moduleId` 请写模块的**真实 id**
    （zip 内 `module.prop` 的 `id=`），不要写显示名；留空不会出错，但 App 得先把整个包下载下来才认得出
    已装，白费一次流量。
+
+6. **`guide` 与 `tier` 只影响「看得懂」，不影响「能不能装」**。`guide` 是专栏顶部的「怎么选」说明，
+   一条一档，文案要写给完全不懂的人看：装什么、能过什么、代价是什么，别写实现细节。`topic.tier`
+   是专题卡上的档位徽章，取值 `day`（日用级，过银行）/ `integrity`（三绿，过 Google 认证）/
+   `game`（游戏，本店不推荐也不提供）/ `tool`（工具，例如检测器）。两者都不参与执行，写错只会
+   界面上难看，不会让向导跑错；校验器只拦取值非法与 `guide` 档位重复。
 
 步骤可执行字段（与 App 侧 `RepoColumnStep` / `RepoColumnKeybox` 一一对应）：
 
@@ -747,7 +755,9 @@ node scripts/validate-columns.mjs path/to.json   # 校验指定文件
 与非空 `fileContent`；`writeHmaConfig` 的 `fileContent` 必须能解析成对象、带 `templateName` 与
 非空 `template.appList`、`scope` 的每个值都是对象、`disabledHooks` 每项都有 `className` + `methodName`；
 `checkId` 必须在九项白名单内且只允许出现在 `verify` 步骤；`confirm` 给了就不能
-是空串；topic 级 `keybox` 的 `url` / `sha256` / `lastVerifiedAt` 形状不对直接报错。退出码 0 通过，1 失败。
+是空串；topic 级 `keybox` 的 `url` / `sha256` / `lastVerifiedAt` 形状不对直接报错；`guide` 必须是数组、
+每条都有 `title` 与 `body`、`tier` 不重复；`topic.tier` 与 `guide[].tier` 取值必须在
+`day / integrity / game / tool` 内。退出码 0 通过，1 失败。
 
 ### 校验代理列表
 
