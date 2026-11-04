@@ -46,6 +46,7 @@ export const RISK_LEVELS = ['low', 'medium', 'high'];
 export const LAYERS = ['L1', 'L2', 'L3', 'L4', 'L5'];
 export const STEP_KINDS = [
   'installModule',
+  'installApp',
   'writeConfig',
   'writeFile',
   'runCommand',
@@ -325,6 +326,22 @@ export function validateColumns(doc) {
             else if (!nonEmpty(step.confirm)) push(`${sat}.confirm 给了就不能是空串（空串等于没做二次确认）`);
           }
 
+          // link 是「官方渠道入口」：点了只打开浏览器，不执行任何东西，所以只做形状校验。
+          // 但必须 https —— http 页面在真机上会被当明文，中间人换掉下载地址就等于投毒。
+          if (step.link !== undefined) {
+            if (typeof step.link !== 'string') {
+              push(`${sat}.link 必须是字符串`);
+            } else if (nonEmpty(step.link)) {
+              if (!/^https:\/\/[^\s]+$/i.test(step.link)) {
+                push(`${sat}.link 必须是 https 地址，实际是 ${JSON.stringify(step.link)}`);
+              } else if (step.link.length > 512) {
+                push(`${sat}.link 太长（上限 512 字符）`);
+              }
+            } else {
+              push(`${sat}.link 给了就不能是空串（不需要就整个字段删掉）`);
+            }
+          }
+
           if (!isObject(step.source)) {
             push(`${sat} 缺少 source 对象`);
             return;
@@ -332,6 +349,9 @@ export function validateColumns(doc) {
           const src = step.source;
           if (!SOURCE_KINDS.includes(src.kind)) {
             push(`${sat}.source.kind 必须是 ${SOURCE_KINDS.join(' / ')} 之一`);
+          }
+          if (step.kind === 'installApp' && src.kind === 'askUser') {
+            push(`${sat} 是 installApp，source 必须给出可下载的来源（upstream / updateJson / store）`);
           }
           if (src.kind === 'upstream') {
             if (!REPO_SHAPE_RE.test(String(src.repo ?? ''))) {

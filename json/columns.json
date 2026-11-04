@@ -15,7 +15,7 @@
         {
           "id": "self-check",
           "title": "环境自检",
-          "summary": "先搞清楚现在到底漏在哪。只装两个检测器：春秋 Native Check 查得最细，Duck Detector 专查路径和端口。",
+          "summary": "先搞清楚现在到底漏在哪。只装两个检测器：春秋 Native Check 查得最细，Duck Detector 专查路径和端口。Duck 商店能直接装；春秋闭源、官方只走群和网盘，商店给你官方入口。",
           "riskLevel": "low",
           "layers": [],
           "requires": ["能安装第三方 APK"],
@@ -29,10 +29,11 @@
           "steps": [
             {
               "id": "install-chunqiu",
-              "title": "安装春秋 Native Check",
+              "title": "安装春秋 Native Check（官方渠道）",
               "kind": "askUser",
               "optional": false,
-              "note": "在酷安搜索「春秋 Native Check」下载安装（当前 2.8.x）。它是目前圈内事实上的通过标准，报错会按检测点逐条列出。它不在 GitHub release 上，商店拿不到可校验的直链，只能由你自己从酷安/官网获取。",
+              "note": "春秋闭源，官方只通过 QQ 群（738834258 / 1022646824）和迅雷网盘发放，没有可程序访问的直链，商店不代下也不代装。点下面的「打开官方页面」去官方网盘取包，包名是 chunqiu.safe——别用来路不明的第三方包。它是目前圈内事实上的通过标准，报错会按检测点逐条列出。",
+              "link": "https://pan.xunlei.com/s/VOSCXZEqHQ_1l5vJgWWrulefA1?pwd=pdg6",
               "source": {
                 "kind": "askUser",
                 "repo": "",
@@ -44,14 +45,14 @@
             },
             {
               "id": "install-duck",
-              "title": "安装 Duck Detector",
-              "kind": "askUser",
+              "title": "安装 Duck Detector（官方开源版）",
+              "kind": "installApp",
               "optional": false,
-              "note": "在酷安搜索「Duck Detector」（当前 1.9.x）。它补的是春秋覆盖不到的路径与端口专项，Scene 一类工具的痕迹主要靠它暴露。同样不在 GitHub release 上，需自行从酷安/官网获取。",
+              "note": "Duck Detector 开源在 GitHub（eltavine/Duck-Detector-Refactoring），商店直接取它的最新 nightly 构建并交给系统安装器，你只需在弹窗里确认。它补的是春秋覆盖不到的路径与端口专项，Scene 一类工具的痕迹主要靠它暴露。",
               "source": {
-                "kind": "askUser",
-                "repo": "",
-                "assetPattern": "",
+                "kind": "upstream",
+                "repo": "eltavine/Duck-Detector-Refactoring",
+                "assetPattern": "Duck.Detector-*.apk",
                 "pinnedVersion": "",
                 "sha256": "",
                 "moduleId": ""
