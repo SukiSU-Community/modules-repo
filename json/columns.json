@@ -128,7 +128,7 @@
               "source": {
                 "kind": "upstream",
                 "repo": "Dr-TSNG/ZygiskNext",
-                "assetPattern": "*.zip",
+                "assetPattern": "Zygisk-Next-*-release.zip",
                 "pinnedVersion": "",
                 "sha256": "",
                 "moduleId": "zygisksu"
@@ -159,10 +159,10 @@
               "source": {
                 "kind": "upstream",
                 "repo": "frknkrc44/HMA-OSS",
-                "assetPattern": "*.zip",
+                "assetPattern": "HMA-OSS-ZYGISK-*-release.zip",
                 "pinnedVersion": "",
                 "sha256": "",
-                "moduleId": ""
+                "moduleId": "hma_oss_zygisk"
               }
             },
             {
@@ -307,14 +307,14 @@
               "title": "安装 TEESimulator",
               "kind": "installModule",
               "optional": false,
-              "note": "这一层只需要一个密钥模块。TEESimulator 走 Keystore Binder 拦截做完整 TEE 模拟，更新更活跃（最新 v4.0，2026-08），作者声明它会取代 TrickyStore。注意它的模块 id 就是 tricky_store，与 TrickyStore 是同一个模块位：装第二个只会覆盖第一个，不会双装，也不用先卸载。",
+              "note": "这一层只需要一个密钥模块。TEESimulator 走 Keystore Binder 拦截做完整 TEE 模拟，更新更活跃（最新 v4.0，2026-08），作者声明它会取代 TrickyStore。注意 v4.0 的模块 id 是 teesim、数据目录是 /data/adb/teesim，和 TrickyStore（tricky_store / /data/adb/tricky_store）是两套独立安装——不会互相覆盖，所以「两个都装」真的会同时存在、互相抢 Keystore 请求，别这么干：这一层只需要一个密钥模块。",
               "source": {
                 "kind": "upstream",
                 "repo": "JingMatrix/TEESimulator",
-                "assetPattern": "*.zip",
+                "assetPattern": "TEESimulator-*-release.zip",
                 "pinnedVersion": "",
                 "sha256": "",
-                "moduleId": "tricky_store"
+                "moduleId": "teesim"
               }
             },
             {
@@ -326,7 +326,7 @@
               "source": {
                 "kind": "upstream",
                 "repo": "5ec1cff/TrickyStore",
-                "assetPattern": "*.zip",
+                "assetPattern": "Tricky-Store-*-release.zip",
                 "pinnedVersion": "",
                 "sha256": "",
                 "moduleId": "tricky_store"
@@ -337,8 +337,8 @@
               "title": "导入 keybox",
               "kind": "writeFile",
               "optional": false,
-              "note": "向导会先自动取一份：从 MeowDump 的 GitHub Release 镜像下载（走商店的下载加速），解码后校验结构（AndroidAttestation 根节点、Keybox、DeviceID、ecdsa/rsa 密钥对），不合格就换下一条路，全都不行才要求你选本地文件。keybox 是泄露的 Google 认证材料，随时可能被吊销——这条路只能保证「取到一份结构完整且没被中间人改过」的，不保证明天还能过检测。写进 /data/adb/tricky_store/keybox.xml 这一处即可：TEESimulator、TrickyStore、TEESimulator-RS 都读它。",
-              "filePath": "/data/adb/tricky_store/keybox.xml",
+              "note": "向导会先自动取一份：从 MeowDump 的 GitHub Release 镜像下载（走商店的下载加速），解码后校验结构（AndroidAttestation 根节点、Keybox、DeviceID、ecdsa/rsa 密钥对），不合格就换下一条路，全都不行才要求你选本地文件。keybox 是泄露的 Google 认证材料，随时可能被吊销——这条路只能保证「取到一份结构完整且没被中间人改过」的，不保证明天还能过检测。默认写 /data/adb/teesim/keybox.xml（TEESimulator v4.0 的路径）；如果你在这一层选的是 TrickyStore，它在 /data/adb/tricky_store/keybox.xml 或自己的 WebUI 里找密钥，那就把路径换成那处，或者用 TEESimulator 的 WebUI 让它把 keybox 拖进去。装的是 TEESimulator 时它安装期会顺手从 tricky_store 目录 adopt 一份，所以先写哪一处都不至于白写。",
+              "filePath": "/data/adb/teesim/keybox.xml",
               "fileContent": "${keybox}",
               "confirm": "将把 keybox.xml 内容写到 /data/adb/tricky_store/keybox.xml，覆盖原文件（会先备份到回滚账本）。自动获取的内容已经过结构校验；如果你是自己选的文件，请确认来源可信，再继续。",
               "source": {
@@ -354,8 +354,8 @@
               "id": "target-txt",
               "title": "配 target.txt",
               "kind": "writeFile",
-              "optional": false,
-              "note": "把要过认证的应用包名写进 /data/adb/tricky_store/target.txt。包名后加「!」表示强制走生成流程，适合 TEE 已经损坏的设备。下面先写入 GMS 与 Play 商店这两个必填包名，执行完你可以再手动追加别的应用。",
+              "optional": true,
+              "note": "只在你选的是 TrickyStore 时需要：把要过认证的应用包名写进 /data/adb/tricky_store/target.txt，包名后加「!」表示强制走生成流程（适合 TEE 已损坏的设备）。装的是 TEESimulator v4.0 的话它不读这个文件——应用清单在 /data/adb/teesim/config.json 的 profiles[].apps 里，用它的 WebUI 勾选，所以这一步可以跳过。",
               "filePath": "/data/adb/tricky_store/target.txt",
               "fileContent": "com.google.android.gms\ncom.android.vending\n",
               "confirm": "将把 /data/adb/tricky_store/target.txt 覆盖为 GMS + Play 商店两行（原文件会先备份）。如果你之前在这里写过别的包名，请先记下来，写完后手动补回去。继续？",
@@ -446,7 +446,7 @@
               "kind": "runCommand",
               "optional": true,
               "note": "常见的漏点：/sdcard 和 /data/local/tmp 下的 .sh/.json/.xml 文件、MT 管理器的备份配置、以及管理器自己留下的日志目录。检查一遍，别让检测器顺着文件找到你。自动执行只会清掉下面这两个本工具自己的目录；/sdcard 下的历史脚本、MT 备份和下载目录里的模块包请自己逐个确认后再删——那是用户数据区，任何一键清理都可能误删，本专栏不下发通配删除。",
-              "command": "rm -rf /data/local/tmp/hide_env /data/adb/.config/hide_env/backup",
+              "command": "rm -rf /data/local/tmp/hide_env",
               "confirm": "只会删除这两个明确目录：/data/local/tmp/hide_env 和 /data/adb/.config/hide_env/backup，不会碰 /sdcard。删前请确认里面没有你还需要的文件。继续？",
               "source": {
                 "kind": "askUser",
