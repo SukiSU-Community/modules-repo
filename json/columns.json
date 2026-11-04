@@ -51,7 +51,7 @@
               "kind": "installApp",
               "optional": false,
               "optIn": true,
-              "note": "春秋闭源，官方只走 Telegram 频道 @Suxiaomingpd（当前 4.6.2 / 2026-10-23）和官方迅雷网盘。商店这里登记的是同一版本的社区转载包（蓝奏云直链），下载后会先核对 sha256，字节对不上就中止、不会装——但它毕竟是第三方网盘，不是官方渠道，介意就点下面的「打开官方页面」自己去官方取；直链哪天失效也走那条路。包名 com.chunqiunativecheck；同一频道还发 Luna 检测器（luna.safe.luna），别下错。",
+              "note": "春秋闭源，官方只走 Telegram 频道 @Suxiaomingpd（当前 4.6.2 / 2026-10-23）和官方迅雷网盘。商店这里转存了同一版本的整包（GitHub Releases，可走下载加速），下载后会先核对 sha256，字节对不上就中止、不会装。这不是官方渠道，介意就点下面的「打开官方页面」自己去官方取。包名 com.chunqiunativecheck；同一频道还发 Luna 检测器（luna.safe.luna），别下错。",
               "link": "https://t.me/Suxiaomingpd",
               "source": {
                 "kind": "direct",
@@ -60,7 +60,7 @@
                 "pinnedVersion": "",
                 "sha256": "1ca92901b74ff658988a4859d8cd2c6f20e45f722a88bc0361e9d33ee5a72866",
                 "moduleId": "",
-                "url": "https://h1050.lanosso.com/1d78d29a064171b39c7b173eef4dd7c7/6aeaf9ec/2026/10/24/b975cfa759b8792d7ef7369f37de202a.apk?fn=%E6%98%A5%E7%A7%8BNativeCheck-4.6.2(75).apk"
+                "url": "https://github.com/SukiSU-Community/modules-repo/releases/download/mirror-chunqiu-4.6.2/ChunqiuNativeCheck-4.6.2.apk"
               }
             },
             {

@@ -177,7 +177,7 @@ columns[]                    专栏
    用 GitHub API 直连返回的 asset digest 校验，索引里不必也不该写死哈希 —— 否则官方一发新版就会卡住
    等人核对。`kind = updateJson` 用于「不在 GitHub 发版但官方提供 update.json」的模块（如 LSPosed）：
    `url` 指向 update.json，App 读它的 `zipUrl` 下载、按 `versionCode` 命名。`kind = direct` 用于
-   **第三方网盘 / 官方网盘的固定直链**（例如春秋检测的蓝奏云包）：这里没有任何上游版本信息可查，
+   **固定直链**（第三方网盘、官方网盘，或我们自己在 Releases 里做的镜像，例如春秋检测）：这里没有任何上游版本信息可查，
    所以 `sha256` 是硬要求——没登记哈希，App 直接拒绝下载，链接被换成别的包时也无从发现。这类地址
    不在商店的来源体系里，`note` 必须写明「是不是官方渠道、要不要自己核对」，链接失效时用户还有
    `link` 那条路。`kind = askUser` 的步骤必须把「去哪拿」写进 `note`。
