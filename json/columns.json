@@ -23,7 +23,7 @@
             "verifiedAt": "2026-08-17",
             "device": "多机型",
             "kernel": "不限定",
-            "source": "酷安 @泛彼柏舟y 73287937、@JeTeeZnTmaxQwQ 的春秋检测点文档",
+            "source": "酷安 @泛彼柏舟y 73287937、@JeTeeZnTmaxQwQ 的春秋检测点文档、TG 频道 @Suxiaomingpd",
             "note": "社区实测汇总，非本站验证"
           },
           "steps": [
@@ -32,8 +32,8 @@
               "title": "安装春秋 Native Check（官方渠道）",
               "kind": "askUser",
               "optional": false,
-              "note": "春秋闭源，官方只通过 QQ 群（738834258 / 1022646824）和迅雷网盘发放，没有可程序访问的直链，商店不代下也不代装。点下面的「打开官方页面」去官方网盘取包，包名是 chunqiu.safe——别用来路不明的第三方包。它是目前圈内事实上的通过标准，报错会按检测点逐条列出。",
-              "link": "https://pan.xunlei.com/s/VOSCXZEqHQ_1l5vJgWWrulefA1?pwd=pdg6",
+              "note": "春秋闭源，官方发布在 Telegram 频道 @Suxiaomingpd（春秋/luna Detector，当前春秋 Native Check 4.6.2 / 2026-10-23）。连不上 TG 可用官方迅雷网盘 https://pan.xunlei.com/s/VOSCXZEqHQ_1l5vJgWWrulefA1?pwd=pdg6 。商店拿不到可程序访问的直链，所以不代下也不代装——点「打开官方页面」自己去官方渠道取包。注意包名是 chunqiu.safe，同一频道也发 Luna 检测器（luna.safe.luna），别下错。",
+              "link": "https://t.me/Suxiaomingpd",
               "source": {
                 "kind": "askUser",
                 "repo": "",
