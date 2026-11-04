@@ -161,7 +161,7 @@ columns[]                    专栏
     ├── evidence             必填。没有证据的专题不允许上架
     ├── keybox               可选。keybox 直链登记：url / sha256 / lastVerifiedAt（没有可信来源就别写）
     ├── verifyHints[]        验收提示（人话，App 直接展示）
-    └── steps[]              步骤（kind: installModule / installApp / writeConfig / writeFile / runCommand / verify / reboot / askUser）
+    └── steps[]              步骤（kind: installModule / installApp / writeConfig / writeFile / writeHmaConfig / runCommand / verify / reboot / askUser）
         ├── source           upstream{repo, assetPattern, pinnedVersion, sha256} / updateJson{url, moduleId} / store{moduleId} / askUser
         └── 可执行字段        command / filePath / fileContent / checkId / confirm / link
 ```
@@ -179,6 +179,10 @@ columns[]                    专栏
 3. **步骤除了「说」还能「做」**：`installModule` 刷模块 zip，`installApp` 下 APK 并交给系统安装器
    （商店不代点确认）；`runCommand` 必须有 `command`；`writeFile` / `writeConfig` 必须有
    绝对路径 `filePath` 与非空 `fileContent`（支持 `${keybox}` 占位符，由用户选中的本地文件替换）；
+   `writeHmaConfig` 的 `fileContent` 是一份 **HMA-OSS 配置包**（`templateName` + `template.appList`
+   + `scope` + 可选 `globals` / `disabledHooks`），App 会把它**合并**进设备上
+   `/data/misc/hide_my_applist_*/config.json`——`configVersion` 一律沿用设备上那份的值（版本不符
+   HMA 会静默不加载），已有模板 / 已配过的目标应用 / 用户改过的全局开关全部保留，只补缺失项；
    `verify` 可选 `checkId`（九个自动检查项之一，见下表）；任何步骤都可带 `confirm`，App 执行前先弹
    二次确认。任何步骤也可带 `link`（https 官方渠道地址）：界面会给一个「打开」按钮，点了只开浏览器，
    用于「官方只肯走群/网盘发、拿不到可编程直链」的东西（例如春秋检测）。**没填可执行字段的步骤仍然
@@ -199,6 +203,7 @@ columns[]                    专栏
 | `command` | `runCommand`（必填） | 非空字符串；多条命令用 `&&` 串联；命中危险命令黑名单即报错 | 由 root shell 原样执行 |
 | `filePath` | `writeFile` / `writeConfig`（必填） | 必须以 `/` 开头；不许 `..`、通配符、根目录 `/`、以 `/` 结尾 | 目标文件绝对路径 |
 | `fileContent` | `writeFile` / `writeConfig`（必填） | 非空字符串；支持 `${keybox}` 占位符 | 原样写入，不做换行／转义加工 |
+| `fileContent` | `writeHmaConfig`（必填） | 合法 JSON 对象；必须带 `templateName` 与非空 `template.appList`；`scope` 的每个值都要是对象 | 合并进设备上的 HMA 配置，不是整体覆盖 |
 | `checkId` | `verify`（可选） | 九选一：`root-manager` / `zygisk-next` / `denylist-policy` / `hma-config` / `target-list` / `keybox-valid` / `hybrid-mount` / `pathmask` / `adb-disabled` | 让 App 自动跑对应检查，省掉人工对照 |
 | `confirm` | 任意 kind（可选） | 非空字符串 | 执行前的二次确认文案；空串等于没确认，校验会报错 |
 | `keybox` | topic 级（可选） | `url` 必须 `https://`；`sha256` 64 位小写十六进制；`lastVerifiedAt` 真实 `yyyy-MM-dd`；可选 `providerNote` / `disclaimer` | 只在有可信直链 + 能校验时才登记；没有就别写这个字段 |
@@ -737,7 +742,9 @@ node scripts/validate-columns.mjs path/to.json   # 校验指定文件
 `askUser` 步骤必须把获取方式写进 `note`。可执行字段另有几条硬检查：`runCommand` 必须有非空 `command`，
 且不命中危险命令黑名单（通配删除根目录、`dd if=` 写设备、`mkfs`、写 `/dev/block`、`reboot -f`、
 `chmod -R 777 /`）；`writeFile` / `writeConfig` 必须有绝对路径 `filePath`（不许 `..`、通配符、根目录）
-与非空 `fileContent`；`checkId` 必须在九项白名单内且只允许出现在 `verify` 步骤；`confirm` 给了就不能
+与非空 `fileContent`；`writeHmaConfig` 的 `fileContent` 必须能解析成对象、带 `templateName` 与
+非空 `template.appList`、`scope` 的每个值都是对象、`disabledHooks` 每项都有 `className` + `methodName`；
+`checkId` 必须在九项白名单内且只允许出现在 `verify` 步骤；`confirm` 给了就不能
 是空串；topic 级 `keybox` 的 `url` / `sha256` / `lastVerifiedAt` 形状不对直接报错。退出码 0 通过，1 失败。
 
 ### 校验代理列表

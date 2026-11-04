@@ -49,6 +49,7 @@ export const STEP_KINDS = [
   'installApp',
   'writeConfig',
   'writeFile',
+  'writeHmaConfig',
   'runCommand',
   'verify',
   'reboot',
@@ -144,6 +145,50 @@ export function checkWritePath(filePath) {
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const nonEmpty = (v) => typeof v === 'string' && v.trim() !== '';
+
+/**
+ * 检查 writeHmaConfig 的配置包。
+ *
+ * 执行器会把它合并进设备上 HMA-OSS 的 config.json（目录名带随机后缀，不能写死）：模板写进
+ * `templates[templateName]`，`scope` 的每个 key 是一个目标应用，`globals` 里的键按「缺失才补」
+ * 合并。这里只查结构，不查内容对不对（包名是否真实存在由执行时的设备决定）。
+ */
+export function checkHmaConfigPack(raw) {
+  if (!nonEmpty(raw)) return 'fileContent 必须是非空字符串';
+  let pack;
+  try {
+    pack = JSON.parse(raw);
+  } catch (e) {
+    return `不是合法 JSON（${e.message}）`;
+  }
+  if (!isObject(pack)) return '顶层必须是对象';
+  if (pack.configVersion !== undefined && !(Number.isInteger(pack.configVersion) && pack.configVersion > 0)) {
+    return 'configVersion 如果给了，必须是正整数';
+  }
+  if (!nonEmpty(pack.templateName)) return '缺少 templateName';
+  const tpl = pack.template;
+  if (!isObject(tpl)) return '缺少 template 对象';
+  if (tpl.isWhitelist !== undefined && typeof tpl.isWhitelist !== 'boolean') return 'template.isWhitelist 必须是布尔值';
+  if (!Array.isArray(tpl.appList) || tpl.appList.length === 0) return 'template.appList 必须是非空数组';
+  if (tpl.appList.some((p) => !nonEmpty(p))) return 'template.appList 里必须都是非空字符串包名';
+  if (pack.scope !== undefined) {
+    if (!isObject(pack.scope)) return 'scope 必须是对象（key 是目标应用包名）';
+    for (const [target, cfg] of Object.entries(pack.scope)) {
+      if (!nonEmpty(target)) return 'scope 里有空的包名 key';
+      if (!isObject(cfg)) return `scope["${target}"] 必须是对象`;
+    }
+  }
+  if (pack.globals !== undefined && !isObject(pack.globals)) return 'globals 必须是对象';
+  if (pack.disabledHooks !== undefined) {
+    if (!Array.isArray(pack.disabledHooks)) return 'disabledHooks 必须是数组';
+    for (const hook of pack.disabledHooks) {
+      if (!isObject(hook)) return 'disabledHooks 里每一项都必须是对象';
+      if (!nonEmpty(hook.className)) return 'disabledHooks 每项必须有 className';
+      if (!nonEmpty(hook.methodName)) return 'disabledHooks 每项必须有 methodName';
+    }
+  }
+  return null;
+}
 
 /** yyyy-MM-dd 且真存在（2 月 30 日之类要挡住）。 */
 function isRealDate(s) {
@@ -306,9 +351,17 @@ export function validateColumns(doc) {
             if (!nonEmpty(step.fileContent)) {
               push(`${sat} 是 ${step.kind}，fileContent 必须是非空字符串`);
             }
+          } else if (step.kind === 'writeHmaConfig') {
+            // 执行器会把 fileContent 当「配置包」合并进设备上的 HMA config.json，坏 JSON 会让这步
+            // 直接失败，所以这里先按结构查一遍。
+            if (step.filePath !== undefined) {
+              push(`${sat} 是 writeHmaConfig，不该带 filePath（路径由执行器在设备上探测）`);
+            }
+            const packProblem = checkHmaConfigPack(step.fileContent);
+            if (packProblem) push(`${sat}.fileContent 不是合法的 HMA 配置包：${packProblem}`);
           } else if (step.filePath !== undefined || step.fileContent !== undefined) {
             // 死字段：填了也不会被执行器读到，留着只会误导下一个编辑者。
-            push(`${sat} 只有 writeFile / writeConfig 才能带 filePath / fileContent`);
+            push(`${sat} 只有 writeFile / writeConfig / writeHmaConfig 才能带可执行内容字段`);
           }
 
           if (step.checkId !== undefined) {
