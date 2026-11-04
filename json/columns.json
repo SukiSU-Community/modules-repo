@@ -170,10 +170,27 @@
               "title": "配置 ZygiskNext 的排除策略",
               "kind": "writeFile",
               "optional": false,
-              "note": "打开 ZygiskNext 模块页：排除列表策略选「仅还原挂载」，开启「使用匿名内存」；如果你的版本有「使用 Zygisk Next 链接器（实验性）」，也一起打开。再打开「将非 Root 应用视为排除列表」——这是最省事的一档：全机默认读不到 root，只有你在超级用户列表里放行的应用例外，银行和游戏直接打开就行。下面这次写入就是把「排除列表策略」落到配置文件上（2 = 仅还原挂载，1 = 使用排除列表，0 = 关闭）；「使用匿名内存」这类开关仍然要在模块页里手动打开。",
+              "note": "打开 ZygiskNext 模块页：排除列表策略选「仅还原挂载」，开启「使用匿名内存」；如果你的版本有「使用 Zygisk Next 链接器（实验性）」，也一起打开。这两项在模块自己的页面上没有独立开关时，就靠下面的「默认卸载模块」和这一步的配置文件生效：全机默认读不到模块挂载，只有你在超级用户里放行的应用例外。下面这次写入就是把「排除列表策略」落到配置文件上（2 = 仅还原挂载，1 = 使用排除列表，0 = 关闭）；「使用匿名内存」这类开关仍然要在模块页里手动打开。",
               "filePath": "/data/adb/zygisksu/denylist_enforce",
               "fileContent": "2\n",
               "confirm": "将把 /data/adb/zygisksu/denylist_enforce 写成 2（仅还原挂载），原文件会先备份、可回滚，重启后生效。继续？",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "harden-manager",
+              "title": "核对并打开管理器的隐藏开关",
+              "kind": "runCommand",
+              "optional": false,
+              "note": "把管理器自己的隐藏开关拨到位：内核级卸载模块、隐藏 SELinux、AVC 伪装、隐藏可疑挂载要开；SU 日志、ADB Root、只允许 ADB 拿 root、传统 SU 命令要关。命令先读当前值，已经是目标值的就不动，所以重复执行没有副作用。隐藏 SELinux 和隐藏可疑挂载改完要重启才生效。",
+              "command": "set_f() { cur=$(ksud feature get \"$1\" 2>/dev/null | grep \"^Value:\" | cut -d\" \" -f2); [ \"$cur\" = \"$2\" ] || ksud feature set \"$1\" \"$2\" >/dev/null 2>&1; }\nset_f kernel_umount 1\nset_f selinux_hide 1\nset_f avc_spoof 1\nset_f mount_hide 1\nset_f sulog 0\nset_f adb_root 0\nset_f shell_su_adb_only 0\nset_f su_compat 0\necho \"manager features aligned\"",
+              "confirm": "这会修改管理器的功能开关：把隐藏相关四项打开，把会留痕迹的四项关掉（其中「传统 SU 命令」关掉后，依赖 /system/bin/su 的老应用会失效）。继续？",
               "source": {
                 "kind": "askUser",
                 "repo": "",
