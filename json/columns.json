@@ -112,14 +112,14 @@
             },
             {
               "id": "lsposed",
-              "title": "安装 LSPosed",
-              "kind": "installModule",
-              "optional": false,
-              "note": "HMA-OSS 和 FuseFixer 都是 Xposed 模块，没有 LSPosed 跑不起来。装完在 LSPosed 设置里打开「点按劫持缓解」和「Xposed API 调用保护」。",
+              "title": "可选：装 Xposed 框架（只在要用 FuseFixer 时）",
+              "kind": "askUser",
+              "optional": true,
+              "note": "先澄清：HMA-OSS 是 Zygisk 模块，不需要 Xposed，前面几步做完就已经能隐藏应用列表了。只有可选的 FuseFixer 才需要 Xposed 框架。另外 LSPosed 官方最新 release 停在 2023-10 的 v1.9.2，Android 14 以后大概率不兼容，本专栏不替你锁这个版本：要用请自己去找仍在维护的分支（例如 JingMatrix/Vector）拿对应你系统的构建。装好后在框架设置里打开「点按劫持缓解」和「Xposed API 调用保护」。",
               "source": {
-                "kind": "upstream",
-                "repo": "LSPosed/LSPosed",
-                "assetPattern": "*.zip",
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
                 "pinnedVersion": "",
                 "sha256": "",
                 "moduleId": ""
@@ -130,7 +130,7 @@
               "title": "安装 HMA-OSS",
               "kind": "installModule",
               "optional": false,
-              "note": "负责隐藏应用列表。刷入后在 LSPosed 里启用，再导入一份配置 json（入口叫「还原配置」，不是「备份」）。",
+              "note": "负责隐藏应用列表。它是 Zygisk 模块（不是 Xposed 模块），刷入后由 ZygiskNext 加载；配置走它自己的 WebUI，用 KsuWebUI 打开，导入配置 json 的入口叫「还原配置」，不是「备份」。",
               "source": {
                 "kind": "upstream",
                 "repo": "frknkrc44/HMA-OSS",
@@ -145,7 +145,7 @@
               "title": "配置 ZygiskNext 的排除策略",
               "kind": "writeFile",
               "optional": false,
-              "note": "打开 ZygiskNext 模块页：排除列表策略选「仅还原挂载」，开启「使用匿名内存」；如果你的版本有「使用 Zygisk Next 链接器（实验性）」，也一起打开。下面这次写入就是把「排除列表策略」落到配置文件上（2 = 仅还原挂载，1 = 使用排除列表，0 = 关闭）；「使用匿名内存」这类开关仍然要在模块页里手动打开。",
+              "note": "打开 ZygiskNext 模块页：排除列表策略选「仅还原挂载」，开启「使用匿名内存」；如果你的版本有「使用 Zygisk Next 链接器（实验性）」，也一起打开。再打开「将非 Root 应用视为排除列表」——这是最省事的一档：全机默认读不到 root，只有你在超级用户列表里放行的应用例外，银行和游戏直接打开就行。下面这次写入就是把「排除列表策略」落到配置文件上（2 = 仅还原挂载，1 = 使用排除列表，0 = 关闭）；「使用匿名内存」这类开关仍然要在模块页里手动打开。",
               "filePath": "/data/adb/zygisksu/denylist_enforce",
               "fileContent": "2\n",
               "confirm": "将把 /data/adb/zygisksu/denylist_enforce 写成 2（仅还原挂载），原文件会先备份、可回滚，重启后生效。继续？",
@@ -245,14 +245,14 @@
           },
           "steps": [
             {
-              "id": "tricky-store",
-              "title": "安装 TrickyStore 或 TEESimulator",
+              "id": "tee-simulator",
+              "title": "安装 TEESimulator",
               "kind": "installModule",
               "optional": false,
-              "note": "两者二选一：TrickyStore 靠 leaf 证书 hack，TEESimulator 走 Keystore Binder 拦截做完整 TEE 模拟。TEESimulator 更新更活跃，且声明会替代 TrickyStore。",
+              "note": "这一层只需要一个密钥模块。TEESimulator 走 Keystore Binder 拦截做完整 TEE 模拟，更新更活跃（最新 v4.0，2026-08），作者声明它会取代 TrickyStore。注意它的模块 id 就是 tricky_store，与 TrickyStore 是同一个模块位：装第二个只会覆盖第一个，不会双装，也不用先卸载。",
               "source": {
                 "kind": "upstream",
-                "repo": "5ec1cff/TrickyStore",
+                "repo": "JingMatrix/TEESimulator",
                 "assetPattern": "*.zip",
                 "pinnedVersion": "",
                 "sha256": "",
@@ -260,14 +260,14 @@
               }
             },
             {
-              "id": "tee-simulator",
-              "title": "改用 TEESimulator（替代 TrickyStore）",
+              "id": "tricky-store",
+              "title": "可选：换成 TrickyStore",
               "kind": "installModule",
               "optional": true,
-              "note": "和上一步二选一：已经装了 TrickyStore 就跳过本步，两者都会拦截 Keystore，同时装会互相抢，反而更容易掉认证。TEESimulator 更新更活跃，也声明最终会替代 TrickyStore；本专题后面的 keybox 与 target.txt 两步对两者通用。",
+              "note": "只在 TEESimulator 于你机型上不工作时再试。TrickyStore 已停更（最新 1.4.1，2025-11，且 1.1.0 起闭源），靠 leaf 证书 hack 实现。它和 TEESimulator 共用同一个模块 id（tricky_store），装它会直接覆盖 TEESimulator，不需要先卸载；后面的 keybox 与 target.txt 两步对两者通用。",
               "source": {
                 "kind": "upstream",
-                "repo": "JingMatrix/TEESimulator",
+                "repo": "5ec1cff/TrickyStore",
                 "assetPattern": "*.zip",
                 "pinnedVersion": "",
                 "sha256": "",
@@ -352,7 +352,7 @@
         {
           "id": "hide-manager",
           "title": "藏掉管理器本体",
-          "summary": "最后一步，也最容易被忘：root 管理器自己就是一个显眼的证据。改包名、藏图标、清掉它留下的痕迹。",
+          "summary": "最后一步，也最容易被忘：root 管理器自己就是一个显眼的证据。先说清楚：SukiSU 没有改包名、藏图标这类马甲功能（那是 Magisk Alpha 的做法），能做的是把它从 HMA 的可见名单里抹掉，再清掉它留下的痕迹。",
           "riskLevel": "low",
           "layers": ["L2", "L5"],
           "requires": ["已完成前面的隐藏"],
@@ -365,26 +365,11 @@
           },
           "steps": [
             {
-              "id": "rename-package",
-              "title": "给管理器换个包名和图标",
+              "id": "hma-hide-manager",
+              "title": "把管理器从 HMA 的可见名单里抹掉",
               "kind": "askUser",
               "optional": false,
-              "note": "在管理器设置里生成随机包名，图标可以伪装成「设置」之类的系统应用。别用默认名字，那是第一个被扫到的目标。",
-              "source": {
-                "kind": "askUser",
-                "repo": "",
-                "assetPattern": "",
-                "pinnedVersion": "",
-                "sha256": "",
-                "moduleId": ""
-              }
-            },
-            {
-              "id": "hide-icon",
-              "title": "藏掉桌面图标",
-              "kind": "askUser",
-              "optional": true,
-              "note": "提前给它「桌面快捷方式」权限，再用马甲包名打开。第一次打开弹「权限丢失」是正常的——绝对不要点「修复安装」，重新打开就行。",
+              "note": "SukiSU Ultra 的设置里没有「随机包名 / 隐藏图标」，不用去找——那是 Magisk Alpha 的马甲方案。这里要做的相反：打开 HMA-OSS 的 WebUI，把检测器加进作用域，让它们读到的应用列表里没有 SukiSU 管理器。做完回退出来重进一次 HMA 让它生效。",
               "source": {
                 "kind": "askUser",
                 "repo": "",
