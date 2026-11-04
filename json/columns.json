@@ -15,7 +15,7 @@
         {
           "id": "self-check",
           "title": "环境自检",
-          "summary": "先搞清楚现在到底漏在哪。只装两个检测器：春秋 Native Check 查得最细，Duck Detector 专查路径和端口。Duck 商店能直接装；春秋闭源、官方只走群和网盘，商店给你官方入口。",
+          "summary": "先搞清楚现在到底漏在哪。商店默认一个检测器都不装——清单里勾选你想要的，点一键执行就会装（Duck 能直接装；春秋闭源、官方只走群和网盘，只能点「打开官方页面」自己取包）。推荐两个都装：春秋查得最细，Duck 专查路径和端口。",
           "riskLevel": "low",
           "layers": [],
           "requires": ["能安装第三方 APK"],
@@ -49,6 +49,7 @@
               "kind": "installApp",
               "optional": false,
               "note": "Duck Detector 开源在 GitHub（eltavine/Duck-Detector-Refactoring），商店直接取它的最新 nightly 构建并交给系统安装器，你只需在弹窗里确认。它补的是春秋覆盖不到的路径与端口专项，Scene 一类工具的痕迹主要靠它暴露。",
+            "optIn": true,
               "source": {
                 "kind": "upstream",
                 "repo": "eltavine/Duck-Detector-Refactoring",

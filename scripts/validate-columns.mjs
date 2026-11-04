@@ -395,6 +395,12 @@ export function validateColumns(doc) {
             }
           }
 
+          // optIn：默认不装、由用户在向导里勾选后才执行的步骤（自检检测器就是这类）。
+          // 只允许布尔；写成字符串 "true" 会被 App 当成 false，等于白写。
+          if (step.optIn !== undefined && typeof step.optIn !== 'boolean') {
+            push(`${sat}.optIn 必须是布尔值，实际是 ${JSON.stringify(step.optIn)}`);
+          }
+
           if (!isObject(step.source)) {
             push(`${sat} 缺少 source 对象`);
             return;

@@ -163,7 +163,7 @@ columns[]                    专栏
     ├── verifyHints[]        验收提示（人话，App 直接展示）
     └── steps[]              步骤（kind: installModule / installApp / writeConfig / writeFile / writeHmaConfig / runCommand / verify / reboot / askUser）
         ├── source           upstream{repo, assetPattern, pinnedVersion, sha256} / updateJson{url, moduleId} / store{moduleId} / askUser
-        └── 可执行字段        command / filePath / fileContent / checkId / confirm / link
+        └── 可执行字段        command / filePath / fileContent / checkId / confirm / link / optIn
 ```
 
 四条硬规则：
@@ -185,8 +185,9 @@ columns[]                    专栏
    HMA 会静默不加载），已有模板 / 已配过的目标应用 / 用户改过的全局开关全部保留，只补缺失项；
    `verify` 可选 `checkId`（九个自动检查项之一，见下表）；任何步骤都可带 `confirm`，App 执行前先弹
    二次确认。任何步骤也可带 `link`（https 官方渠道地址）：界面会给一个「打开」按钮，点了只开浏览器，
-   用于「官方只肯走群/网盘发、拿不到可编程直链」的东西（例如春秋检测）。**没填可执行字段的步骤仍然
-   只是展示 + 手动操作**，所以「不确定就退化 `askUser`」永远是安全的写法。
+   用于「官方只肯走群/网盘发、拿不到可编程直链」的东西（例如春秋检测）。带 `optIn: true` 的步骤
+   默认不执行，向导里会显示勾选框，勾了才进一键执行。**没填可执行字段的步骤仍然只是展示 + 手动操作**，
+   所以「不确定就退化 `askUser`」永远是安全的写法。
 4. **`command` 与 `fileContent` 等同远程下发可执行内容，必须人工 review**：禁止通配删除、写块设备、
    `mkfs`、`reboot -f`、把根目录权限改成 777 —— 这几类已进校验器的危险命令黑名单，命中即报错。
 5. **已装即跳过；上游有新版时提示升级**。`installModule` / `installApp` 先看设备上有没有（模块看
@@ -206,6 +207,7 @@ columns[]                    专栏
 | `fileContent` | `writeHmaConfig`（必填） | 合法 JSON 对象；必须带 `templateName` 与非空 `template.appList`；`scope` 的每个值都要是对象 | 合并进设备上的 HMA 配置，不是整体覆盖 |
 | `checkId` | `verify`（可选） | 九选一：`root-manager` / `zygisk-next` / `denylist-policy` / `hma-config` / `target-list` / `keybox-valid` / `hybrid-mount` / `pathmask` / `adb-disabled` | 让 App 自动跑对应检查，省掉人工对照 |
 | `confirm` | 任意 kind（可选） | 非空字符串 | 执行前的二次确认文案；空串等于没确认，校验会报错 |
+| `optIn` | 任意 kind（可选） | 布尔；缺省 `false` | `true` = 默认不装，用户在向导里勾选后才执行。用在「装哪些工具由用户自己定」的步骤（自检检测器）；勾选状态按专题存在本地，不勾视为已完成而不是失败 |
 | `keybox` | topic 级（可选） | `url` 必须 `https://`；`sha256` 64 位小写十六进制；`lastVerifiedAt` 真实 `yyyy-MM-dd`；可选 `providerNote` / `disclaimer` | 只在有可信直链 + 能校验时才登记；没有就别写这个字段 |
 
 校验：
