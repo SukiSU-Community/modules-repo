@@ -16,13 +16,17 @@
 ```
 repo/
 ├── json/
-│   └── modules.json      # 唯一发布物，GitHub Pages 直接托管，必须始终合法 JSON
+│   ├── modules.json      # 模块索引，GitHub Pages 直接托管，必须始终合法 JSON
+│   ├── columns.json      # 商店「专栏」内容（人工维护，见下文），app 侧展示 + 按可执行字段执行
+│   └── proxies.json      # 商店 GitHub 下载代理列表（人工维护，App 侧可远程更新）
 ├── pending/
 │   └── *.json            # 待合并条目，一个文件可含单条对象或数组
 │                         # 以 . 开头的文件（如 .example.json）是模板，不参与合并
 ├── scripts/
 │   ├── build-index.mjs   # pending -> json/modules.json（递归扫 pending）
 │   ├── validate-index.mjs# 校验 json/modules.json
+│   ├── validate-columns.mjs  # 校验 json/columns.json
+│   ├── validate-proxies.mjs  # 校验 json/proxies.json（下载代理列表）
 │   └── fetch-pending-zip.mjs  # 读 pending 元数据 -> 下载 zip，供 audit 扫描
 ├── test/
 │   └── build-index.test.mjs
@@ -142,6 +146,114 @@ node scripts/fetch-pending-zip.mjs pending/ --out-dir /tmp/zips \
 - 老条目没有这两格是正常的：不回溯、不猜（契约 §5.5）。
 - `validate-index` **会校验**这两格（与上面四格不同）：它们最终会被渲染成可点链接，形状不对
   的值只可能来自「绕过 `build-index` 手改索引」。
+
+### json/columns.json（商店专栏）
+
+`json/columns.json` 是 App 模块商店「专栏」的数据源，与 `modules.json` **同目录、同 baseUrl、同次发布**。
+它不是模块索引，**不进 `build-index`**：专栏是人工维护的编排内容（哪些专题、按什么顺序、每一步装什么），
+不存在「投稿→合并」的流水线。
+
+结构（`schemaVersion: 1`）：
+
+```
+columns[]                    专栏
+└── topics[]                 专题（一个专题 = 一套可验证的配置方案）
+    ├── evidence             必填。没有证据的专题不允许上架
+    ├── keybox               可选。keybox 直链登记：url / sha256 / lastVerifiedAt（没有可信来源就别写）
+    ├── verifyHints[]        验收提示（人话，App 直接展示）
+    └── steps[]              步骤（kind: installModule / writeConfig / writeFile / runCommand / verify / reboot / askUser）
+        ├── source           upstream{repo, assetPattern, pinnedVersion, sha256} / store{moduleId} / askUser
+        └── 可执行字段        command / filePath / fileContent / checkId / confirm
+```
+
+四条硬规则：
+
+1. **每个 topic 必须有 `evidence`**（`verifiedAt` / `device` / `kernel` / `source` / `note`）。App 端按
+   `verifiedAt` 算时效：≤90 天绿标、91–180 天黄标、>180 天灰标。缺证据的专题校验直接报错，不是警告。
+2. **`source.kind = upstream` 记的是「我们锁定并核对过的上游版本」**，不是绿标 —— 上游模块不在本仓的
+   来源／绿标体系里（见契约 §9.2）。`kind = askUser` 的步骤必须把「去哪拿」写进 `note`。
+3. **步骤除了「说」还能「做」**：`runCommand` 必须有 `command`；`writeFile` / `writeConfig` 必须有
+   绝对路径 `filePath` 与非空 `fileContent`（支持 `${keybox}` 占位符，由用户选中的本地文件替换）；
+   `verify` 可选 `checkId`（九个自动检查项之一，见下表）；任何步骤都可带 `confirm`，App 执行前先弹
+   二次确认。**没填可执行字段的步骤仍然只是展示 + 手动操作**，所以「不确定就退化 `askUser`」永远是
+   安全的写法。
+4. **`command` 与 `fileContent` 等同远程下发可执行内容，必须人工 review**：禁止通配删除、写块设备、
+   `mkfs`、`reboot -f`、把根目录权限改成 777 —— 这几类已进校验器的危险命令黑名单，命中即报错。
+
+步骤可执行字段（与 App 侧 `RepoColumnStep` / `RepoColumnKeybox` 一一对应）：
+
+| 字段 | 适用 kind | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `command` | `runCommand`（必填） | 非空字符串；多条命令用 `&&` 串联；命中危险命令黑名单即报错 | 由 root shell 原样执行 |
+| `filePath` | `writeFile` / `writeConfig`（必填） | 必须以 `/` 开头；不许 `..`、通配符、根目录 `/`、以 `/` 结尾 | 目标文件绝对路径 |
+| `fileContent` | `writeFile` / `writeConfig`（必填） | 非空字符串；支持 `${keybox}` 占位符 | 原样写入，不做换行／转义加工 |
+| `checkId` | `verify`（可选） | 九选一：`root-manager` / `zygisk-next` / `denylist-policy` / `hma-config` / `target-list` / `keybox-valid` / `hybrid-mount` / `pathmask` / `adb-disabled` | 让 App 自动跑对应检查，省掉人工对照 |
+| `confirm` | 任意 kind（可选） | 非空字符串 | 执行前的二次确认文案；空串等于没确认，校验会报错 |
+| `keybox` | topic 级（可选） | `url` 必须 `https://`；`sha256` 64 位小写十六进制；`lastVerifiedAt` 真实 `yyyy-MM-dd`；可选 `providerNote` / `disclaimer` | 只在有可信直链 + 能校验时才登记；没有就别写这个字段 |
+
+校验：
+
+```bash
+node scripts/validate-columns.mjs                # 校验 json/columns.json
+node scripts/validate-columns.mjs path/to.json   # 校验指定文件
+```
+
+### json/proxies.json（下载代理）
+
+`json/proxies.json` 是模块商店给 **GitHub Release 下载**用的代理前缀列表，与 `modules.json`、`columns.json`
+**同目录、同发布路径**。App 从 CDN 拉取这一份：
+
+```text
+https://cdn.jsdelivr.net/gh/SukiSU-Community/modules-repo@main/json/proxies.json
+```
+
+拿到列表后，App 把代理前缀直接拼在 GitHub 原地址前面，形如
+`https://gh-proxy.org/https://github.com/<owner>/<repo>/releases/download/...`；原地址本身一字不改，
+代理只负责加速这一跳。所以列表必须能**远程更新** —— 代理今天能用不代表下周还能用，把列表编译进
+App 就等于把「下载能不能成功」赌在某一家免费服务上。
+
+**生效方式：远程非空就整份替换内置。** App 侧的合并规则是「远程 `proxies.json` 加载成功、
+解析出至少一条 → 以远程为准；内置的 4 条只在拉取失败、文档坏掉、远程列表为空时兜底」。
+所以**删掉一条远程条目是真的会生效**，不会被内置那条原地顶回来。反过来说，改完 json 却发现
+App 里没变化，先查 CDN 缓存（见「合并之后：CDN 必须失效」），而不是怀疑 App 没读这份文件。
+
+结构（`schemaVersion: 1`）：
+
+| 字段 | 类型 | 必填 | 约束 | 说明 |
+| --- | --- | --- | --- | --- |
+| `schemaVersion` | number | 是 | 必须等于 `1` | 结构版本，当前只认 `1` |
+| `lastUpdate` | string | 是 | 真实日期 `yyyy-MM-dd` | 最后核实日期，也是「这版列表什么时候还有效」的线索 |
+| `proxies` | array | 是 | 非空，≤ 32 条 | 按推荐顺序排列（实测快的在前） |
+| `proxies[].id` | string | 是 | `^[a-z0-9][a-z0-9-]{1,31}$`，全局唯一 | 稳定标识，改地址时保持不变 |
+| `proxies[].name` | string | 是 | 非空，≤ 40 字符 | 展示名，通常就是 host |
+| `proxies[].baseUrl` | string | 是 | `https://` 开头、只有 host、≤ 128 字符、纯 ASCII 域名、全局唯一 | 拼接前缀，不能带 path / query / fragment / userinfo，只允许 443 端口；不得是 IDN / 带下划线主机 / GitHub 自己的下载域名 |
+| `proxies[].note` | string | 否 | ≤ 60 字符 | 一句人话备注（实测速度、稳定性、节点位置） |
+
+四条硬规则：
+
+1. **只收 `https://` 且没有路径的地址**：App 做的是字符串拼接，`baseUrl` 后面直接跟 GitHub 原地址。
+   多一个 `/path`、`?query`、`#fragment`、`user:pass@` 或非 443 端口，拼出来就不再是「代理 + 原地址」，
+   而是一个谁都不认识的 URL。`http://` 一律不收 —— 下载的是可执行 zip，明文链路等于把「装什么」
+   交给中间人。
+2. **代理会失效，所以列表要能远程更新**：每次增删都改 `lastUpdate`，并让 jsDelivr 缓存失效（见
+   「合并之后：CDN 必须失效」）。
+   实测不通的 `ghfast.top`、`github.moeyy.xyz`、`gh.api.99988866.xyz` 和不支持 Range 请求的
+   `gitproxy.click` 不收录；下次想加回来，先自己实测再改。
+3. **App 只会把它当前缀**：形如 `https://gh-proxy.org/https://github.com/...`，GitHub 原地址保持不变。
+   因此 `baseUrl` 只允许 scheme + host，不能以 `/` 结尾，也不能再包含第二段 `https://`。
+4. **规则与 App 端 `ProxyUrl.isValidBaseUrl` 保持一致，索引只会更严、不会更松**：长度 ≤ 128、host
+   必须是 App 能解析的 ASCII 域名（IDN 先转 punycode）、不能与 GitHub 自己的下载域名重名、`id`
+   不能是保留的 `direct` —— 这几类 App 解析时会**静默丢弃**，索引这边必须先报错，否则就是
+   「保存成功、用户端少一条」。反过来 App 对尾斜杠和大写 scheme 更宽容（`trimEnd('/')` + 忽略
+   大小写），索引仍一律拒：同一个代理两种写法会让判重和人工核对都失真。
+
+校验：
+
+```bash
+node scripts/validate-proxies.mjs                # 校验 json/proxies.json
+node scripts/validate-proxies.mjs path/to.json   # 校验指定文件
+node scripts/validate-proxies.mjs --selftest     # 跑内置负例自测（不读文件）
+```
 
 ### pending 条目格式
 
@@ -599,6 +711,42 @@ node scripts/validate-index.mjs path/to.json   # 校验指定文件
 （`authorCoolapkUrl` / `authorGithubUrl`）出现时必须是归一化后的形状。
 退出码 0 通过，1 失败。建议接在 CI 和 pre-commit 上。
 
+### 校验专栏
+
+```bash
+node scripts/validate-columns.mjs                # 校验 json/columns.json
+node scripts/validate-columns.mjs path/to.json   # 校验指定文件
+```
+
+检查项：顶层 `schemaVersion/name/updatedAt`、每个专栏的 `id/title/subtitle/description/accent/icon/order`、
+`accent` 与 `icon` 必须在白名单内（与 App 侧枚举一一对应）、每个专题必须有 `evidence` 且 `verifiedAt`
+是真实日期、`riskLevel` / `layers` / 步骤 `kind` / `source.kind` 取值合法、`upstream` 步骤的
+`repo` 必须是 `owner/repo` 形状且带 `assetPattern`、`store` 步骤必须带 `moduleId`、
+`askUser` 步骤必须把获取方式写进 `note`。可执行字段另有几条硬检查：`runCommand` 必须有非空 `command`，
+且不命中危险命令黑名单（通配删除根目录、`dd if=` 写设备、`mkfs`、写 `/dev/block`、`reboot -f`、
+`chmod -R 777 /`）；`writeFile` / `writeConfig` 必须有绝对路径 `filePath`（不许 `..`、通配符、根目录）
+与非空 `fileContent`；`checkId` 必须在九项白名单内且只允许出现在 `verify` 步骤；`confirm` 给了就不能
+是空串；topic 级 `keybox` 的 `url` / `sha256` / `lastVerifiedAt` 形状不对直接报错。退出码 0 通过，1 失败。
+
+### 校验代理列表
+
+```bash
+node scripts/validate-proxies.mjs                # 校验 json/proxies.json
+node scripts/validate-proxies.mjs path/to.json   # 校验指定文件
+node scripts/validate-proxies.mjs --selftest     # 跑内置负例自测（不读文件）
+```
+
+检查项：顶层 `schemaVersion` 必须是数字 `1`、`lastUpdate` 是真实存在的 `yyyy-MM-dd`；`proxies` 是非空数组且
+≤ 32 条；每条 `id` 匹配 `^[a-z0-9][a-z0-9-]{1,31}$`、全局唯一、且不能是保留的 `direct`；`name` 非空且
+≤ 40 字符、可选 `note` ≤ 60 字符；`baseUrl` 必须 `https://` 开头、≤ 128 字符且**只有 host**（无 path /
+query / fragment / userinfo / 非 443 端口），host 是纯 ASCII 域名（IDN 先转 punycode；不许下划线、空域名段、
+首尾点、连字符打头收尾），不得是 GitHub 自己的下载域名（`github.com` 等三条，App 解析时直接丢弃），并按
+host 全局唯一（大小写、显式 `:443` 算同一个）。错误信息带条目下标与字段名（如
+`proxies[1].baseUrl 只能有 host，不能带路径`），照着改即可。退出码 0 通过，1 失败。
+`--selftest` 会验证 12 条负例（http、带路径、重复 id、重复 baseUrl、坏日期、缺 `proxies`、非 443 端口、
+超长 `baseUrl`、下划线主机、IDN、GitHub 下载主机、保留 id `direct`）都能被挡住，适合改完校验器后先跑一遍。
+CI 的 `selftest` 作业会同时跑真实文件与 `--selftest`（见「跑单测」）。
+
 ### 跑单测
 
 ```bash
@@ -772,11 +920,14 @@ node scripts/revoke.mjs --id <探针id> --version-code <n> --sha256 <64hex> \
 
 ### 合并之后：CDN 必须失效
 
-`merge-index` 在 `gh pr merge` 之后紧跟一步 `node scripts/purge-cdn.mjs`。
+`merge-index` 在 `gh pr merge` 之后紧跟一步 `node scripts/purge-cdn.mjs`。默认清四份下游会按
+`@main` 远程读取的手改数据：`json/modules.json`、`json/dispositions.json`、`json/proxies.json`、
+`json/columns.json` —— 清单就是脚本里的 `DEFAULT_FILES`，以后新增这类文件改那里，别只在 CI 里写死。
 理由是一条实测：**下架的生效速度由 CDN 的 TTL 决定，而不是由 main 决定** ——
 索引 PR #34 把 `json/modules.json` 推空之后近 50 分钟，
 `https://cdn.jsdelivr.net/gh/SukiSU-Community/modules-repo@main/json/modules.json`
-仍然返回下架前的 4 个模块，也就是订阅那个地址的 App 照样能装到已被下架的包。
+仍然返回下架前的 4 个模块，也就是订阅那个地址的 App 照样能装到已被下架的包。代理列表同理：
+删掉一条失效代理，缓存没清的时候用户最长七天还在用它。
 
 - 只内置 jsDelivr 一家：它的 purge 是公开 GET、不需要凭据（往 CI 里塞一把能改 CDN 的钥匙，
   比这一步省下的麻烦贵得多）。别的镜像把地址放进 repo variable `CDN_PURGE_URLS`（逗号分隔），

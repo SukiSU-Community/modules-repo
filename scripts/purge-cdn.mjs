@@ -18,8 +18,9 @@
  *
  * 用法：
  *   node scripts/purge-cdn.mjs [--repo owner/name] [--branch main]
- *        [--file json/modules.json --file json/dispositions.json]
- *        [--extra <csv>] [--dry-run]
+ *        [--file <path>]... [--extra <csv>] [--dry-run]
+ *
+ * 不给 --file 时清「下游会按 @main 远程读取的那四份手改数据」，清单见 DEFAULT_FILES。
  *
  * 只用 node: 内置模块（本仓库硬约束）。
  */
@@ -31,12 +32,30 @@ const JSDELIVR_CDN = 'cdn.jsdelivr.net';
 const JSDELIVR_PURGE = 'purge.jsdelivr.net';
 
 /**
+ * 默认要清的四份公开数据。
+ *
+ * 判据不是「仓库里有哪些 json」，而是「哪些文件会被下游按 @main 直接读、读旧了会出事」：
+ *   - modules.json / dispositions.json：索引与处置台账（下架生效速度由 CDN 决定，见文件头）；
+ *   - proxies.json：代理列表由 App 远程拉取，远程非空就整份替换内置。漏清缓存时
+ *     「删掉一条失效代理」在用户手里最长要等到 TTL 过期才生效，维护者会误以为改错了；
+ *   - columns.json：商店专栏同理，改完步骤却看到旧内容最容易被误判成「没发布」。
+ *
+ * 新增这类文件时**加在这里**，别只在 CI 里写死路径：merge-index 调的就是不带参数的脚本。
+ */
+export const DEFAULT_FILES = [
+  'json/modules.json',
+  'json/dispositions.json',
+  'json/proxies.json',
+  'json/columns.json',
+];
+
+/**
  * 算出要清哪些地址。
  *
  * 本站的发布口径就是 jsDelivr（大陆直连 raw.githubusercontent 不稳），所以默认目标
  * 按 GITHUB_REPOSITORY 拼出来即可，不需要额外配置。
  */
-export function purgeTargets({ repo, branch = 'main', files = ['json/modules.json', 'json/dispositions.json'], extra = [] } = {}) {
+export function purgeTargets({ repo, branch = 'main', files = DEFAULT_FILES, extra = [] } = {}) {
   const out = [];
   if (repo && /^[^/]+\/[^/]+$/.test(repo)) {
     for (const f of files) {
@@ -142,7 +161,7 @@ export async function main(argv = process.argv.slice(2), deps = {}) {
   const env = deps.env ?? process.env;
   if (opts.help) {
     log.log(`用法: node purge-cdn.mjs [--repo owner/name] [--branch main] [--file <path>]... [--extra <csv>] [--dry-run]
-   清掉 CDN 上那份公开索引与台账的缓存。默认目标按 GITHUB_REPOSITORY 拼 jsDelivr 地址。`);
+   清掉 CDN 上那几份公开数据的缓存（默认：${DEFAULT_FILES.join('、')}）。默认目标按 GITHUB_REPOSITORY 拼 jsDelivr 地址。`);
     return 0;
   }
   const repo = opts.repo || env.GITHUB_REPOSITORY || '';
