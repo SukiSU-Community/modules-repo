@@ -24,10 +24,19 @@
  *     dd 写块设备、mkfs、写 /dev/block、reboot -f、chmod -R 777 /）；
  *   - writeFile / writeConfig 必须有绝对路径 filePath（不许 ..、通配符、根目录）
  *     和非空 fileContent；fileContent 允许 ${keybox} 占位符；
- *   - verify 的 checkId 只能取 App 侧 ColumnCheckIds 的九个值之一，且只允许出现在
+ *   - writeFile / writeConfig 的 filePath 还禁止落在只读系统分区前缀下（/system、
+ *     /system_ext、/vendor、/product、/odm、/boot、/init）：那些挂载点是 EROFS 或启动镜像，
+ *     写入必失败，而失败发生在用户设备上；/data/adb、/data/misc 仍是合法落点；
+ *   - installModule 的 source.kind 只能是 upstream / updateJson / direct —— 执行器
+ *     ColumnModuleFetcher.resolveOrThrow() 的 `store` 分支直接 throw，`askUser` 没有字节
+ *     可交给 ksud；installModule 的资产必须是 .zip（assetPattern，或 direct 的 url），
+ *     installApp 反过来必须是 .apk，否则要等 ksud 读 module.prop / 系统安装器读包时才炸；
+ *   - direct 的 sha256 按原样匹配小写 hex（不再先 toLowerCase），大写 hex 直接拒绝；
+ *   - verify 的 checkId 必填且只能取 App 侧 ColumnCheckIds 的九个值之一，且只允许出现在
  *     verify 步骤上；confirm 给了就不能是空串（空串等于没确认）。
  *
  * 用法：node scripts/validate-columns.mjs [文件路径]
+ *       node scripts/validate-columns.mjs --selftest   # 跑内置负例自测（不读文件）
  * 退出码 0 = 通过，1 = 有错误。
  */
 
@@ -58,6 +67,23 @@ export const STEP_KINDS = [
   'askUser',
 ];
 export const SOURCE_KINDS = ['upstream', 'store', 'askUser', 'updateJson', 'direct'];
+
+/**
+ * installModule 的 source.kind 白名单。
+ *
+ * 执行器 ColumnModuleFetcher.resolveOrThrow() 只实现了 upstream / updateJson / direct 三条下载
+ * 路径：`store` 分支是**直接 throw**（P1 阶段没有 moduleId → 下载地址的查询接口），`askUser`
+ * 则根本没有字节可以交给 ksud。索引里写 store 能过校验、到用户点「执行」才炸，所以这里先拦。
+ */
+export const MODULE_SOURCE_KINDS = ['upstream', 'updateJson', 'direct'];
+
+/**
+ * 只读系统分区前缀。这些挂载点要么是 EROFS（只读），要么在启动镜像里，writeFile / writeConfig
+ * 写进去必然失败 —— 而失败发生在用户设备上，不是在校验时。按路径段边界匹配，所以
+ * `/system_ext` 不会被 `/system` 误伤，`/systemx` 也不会；`/init` 额外覆盖 `/init.rc` 这类
+ * 启动脚本（它们是同一个只读根上的文件）。
+ */
+export const READONLY_SYSTEM_PREFIXES = ['/system', '/system_ext', '/vendor', '/product', '/odm', '/boot', '/init'];
 
 /**
  * verify 步骤可选的自动检查项，与 App 侧 ColumnExecution.kt 的 ColumnCheckIds 一一对应。
@@ -130,8 +156,27 @@ export function findDangerousCommand(command) {
 }
 
 /**
+ * 路径是否落在只读系统分区上：命中则返回那个前缀，否则 null。
+ *
+ * 按路径段边界比对，所以 `/system_ext/...` 命中 `/system_ext` 而不是 `/system`，`/systemx` 一个都不命中；
+ * `/init` 是例外：它本身是启动镜像里的文件，`/init.rc` 这类同根脚本用「前缀 + 点」一起覆盖。
+ */
+export function findReadonlyPrefix(filePath) {
+  if (typeof filePath !== 'string' || !filePath.startsWith('/')) return null;
+  let p = filePath;
+  while (p.endsWith('/')) p = p.slice(0, -1);
+  for (const pre of READONLY_SYSTEM_PREFIXES) {
+    if (p === pre || p.startsWith(pre + '/')) return pre;
+    if (pre === '/init' && p.startsWith('/init.')) return pre;
+  }
+  return null;
+}
+
+/**
  * 写入路径必须是绝对路径，且不许 .. 跳转、通配符、根目录本身或以 / 结尾。
  * 这些写法在「远程下发」的场景里等同于把整台设备的写入权交出去。
+ * 另外不许落在只读系统分区（/system、/vendor、/boot 这类 EROFS 或启动镜像）：
+ * 那些地方写不进去，失败却发生在用户设备上；/data/adb、/data/misc 是合法落点。
  * 返回问题描述，合法时返回 null。
  */
 export function checkWritePath(filePath) {
@@ -142,6 +187,8 @@ export function checkWritePath(filePath) {
   if (filePath.split('/').some((seg) => seg === '..')) return '不允许 .. 上级跳转';
   if (/[*?[\]]/.test(filePath)) return '不允许通配符（* ? [ ]）';
   if (filePath.endsWith('/')) return '不能以 / 结尾（那是目录不是文件）';
+  const readonly = findReadonlyPrefix(filePath);
+  if (readonly) return `不能写只读系统分区 ${readonly}（EROFS / 启动镜像，写入必失败）`;
   return null;
 }
 
@@ -198,6 +245,47 @@ function isRealDate(s) {
   const [y, m, d] = s.split('-').map(Number);
   const dt = new Date(Date.UTC(y, m - 1, d));
   return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
+/** 取 URL 末段的文件名（去掉 query / fragment），不是 https 地址时返回空串。 */
+function urlBasename(u) {
+  const s = String(u ?? '').trim();
+  if (!/^https:\/\/[^\s]+$/i.test(s)) return '';
+  const noQuery = s.split('#')[0].split('?')[0];
+  const seg = noQuery.split('/').filter(Boolean).pop() ?? '';
+  return seg;
+}
+
+/**
+ * 下载资产的扩展名必须和步骤类型对得上：installModule 的字节最终交给 ksud 当模块 zip 解包，
+ * installApp 的字节交给系统安装器当 apk 解析。装错格式的失败点在用户设备上（ksud 读
+ * module.prop 失败 / 安装器报「解析包出错」），索引里看不出来，所以这里按来源逐条查：
+ *   - upstream：assetPattern 是匹配规则，必须自身以 `.zip` / `.apk` 结尾；
+ *   - direct：url 末段就是真实文件名，按它查；
+ *   - updateJson：url 指向版本清单 JSON，资产名由清单里的字段给，索引侧没有名字可查，跳过；
+ *   - store / askUser：没有可下载资产，跳过。
+ * 返回问题描述，合法时返回 null。
+ */
+export function checkAssetExtension(stepKind, src) {
+  const want = stepKind === 'installModule' ? '.zip' : stepKind === 'installApp' ? '.apk' : null;
+  if (!want) return null;
+  const label = stepKind === 'installModule' ? '模块包' : '安装包';
+  if (src.kind === 'upstream') {
+    const pattern = String(src.assetPattern ?? '').trim();
+    if (!pattern.toLowerCase().endsWith(want)) {
+      return `assetPattern 必须匹配 ${want} 文件（${label}），实际是 ${JSON.stringify(src.assetPattern)}`;
+    }
+    return null;
+  }
+  if (src.kind === 'direct') {
+    const name = urlBasename(src.url);
+    if (!name) return null; // url 本身不合法，由 direct 分支单独报错
+    if (!name.toLowerCase().endsWith(want)) {
+      return `url 指向的文件必须是 ${want}（${label}），实际是 ${JSON.stringify(name)}`;
+    }
+    return null;
+  }
+  return null;
 }
 
 /**
@@ -402,6 +490,10 @@ export function validateColumns(doc) {
                 `${sat}.checkId 必须是 ${CHECK_IDS.join(' / ')} 之一，实际是 ${JSON.stringify(step.checkId)}`,
               );
             }
+          } else if (step.kind === 'verify') {
+            // verify 是「让用户/执行器确认某项通过」的步骤，没有 checkId 就只剩一段说明文字，
+            // 执行器只能原样回显 note（ColumnStepRunnerImpl.verify() 从不真跑检查），等于死步骤。
+            push(`${sat} 是 verify，checkId 必填（${CHECK_IDS.join(' / ')} 之一）`);
           }
 
           if (step.confirm !== undefined) {
@@ -439,6 +531,16 @@ export function validateColumns(doc) {
           if (!SOURCE_KINDS.includes(src.kind)) {
             push(`${sat}.source.kind 必须是 ${SOURCE_KINDS.join(' / ')} 之一`);
           }
+          if (step.kind === 'installModule' && !MODULE_SOURCE_KINDS.includes(src.kind)) {
+            // 执行器的 resolveOrThrow() 对 store / askUser 直接 throw：能过校验，到用户点「执行」才炸。
+            push(
+              `${sat} 是 installModule，source.kind 只能是 ${MODULE_SOURCE_KINDS.join(' / ')}（执行器不支持 ${JSON.stringify(src.kind)}）`,
+            );
+          }
+          if (step.kind === 'installModule' || step.kind === 'installApp') {
+            const extProblem = checkAssetExtension(step.kind, src);
+            if (extProblem) push(`${sat}.source ${extProblem}`);
+          }
           if (step.kind === 'installApp' && src.kind === 'askUser') {
             push(`${sat} 是 installApp，source 必须给出可下载的来源（upstream / updateJson / store / direct）`);
           }
@@ -449,7 +551,9 @@ export function validateColumns(doc) {
             if (!/^https:\/\/[^\s]+$/i.test(u)) {
               push(`${sat}.source.url 必须是 https 直链，实际是 ${JSON.stringify(src.url)}`);
             }
-            const h = String(src.sha256 ?? '').trim().toLowerCase();
+            // 按原样匹配，不做大小写归一：执行器是 `sha256.trim().lowercase()` 之后再比，
+            // 索引里写大写 hex 会被这里放过去、到设备上却因归一化差异对不上，所以校验侧要更严。
+            const h = String(src.sha256 ?? '').trim();
             if (!/^[0-9a-f]{64}$/.test(h)) {
               push(`${sat}.source.sha256 必须是 64 位小写十六进制（direct 来源强制要求哈希）`);
             }
@@ -506,20 +610,239 @@ export function validateColumnsFile(file = DEFAULT_COLUMNS) {
   return validateColumns(doc);
 }
 
+// ── 内置负例自测 ────────────────────────────────────────────────────────────
+// 校验器的价值在于「坏数据进不来」，而不是「好数据能过」。下面每条负例都必须被挡住，
+// 少挡一条就说明规则退化了 —— 用 --selftest 跑一遍，不需要联网、不读仓库文件。
+
+function selfTestBase() {
+  // 每次都造一份新对象：负例靠 mutate 改嵌套字段，共享引用会让改动串到别的步骤上。
+  const askUserSource = () => ({
+    kind: 'askUser',
+    repo: '',
+    assetPattern: '',
+    pinnedVersion: '',
+    sha256: '',
+    moduleId: '',
+  });
+  return {
+    schemaVersion: 1,
+    name: '自测专栏',
+    updatedAt: '2026-11-04',
+    columns: [
+      {
+        id: 'selftest',
+        title: '自测',
+        subtitle: '内置负例用',
+        description: '只在 --selftest 里存在',
+        accent: 'root',
+        icon: 'shield',
+        order: 1,
+        topics: [
+          {
+            id: 'selftest-topic',
+            title: '自测专题',
+            summary: '覆盖新增的 6 类规则',
+            riskLevel: 'low',
+            layers: ['L1'],
+            requires: ['无'],
+            evidence: {
+              verifiedAt: '2026-11-04',
+              device: '自测',
+              kernel: '自测',
+              source: '自测',
+              note: '自测',
+            },
+            verifyHints: ['自测'],
+            steps: [
+              {
+                id: 'mod',
+                title: '装模块',
+                kind: 'installModule',
+                optional: false,
+                note: '',
+                source: {
+                  kind: 'upstream',
+                  repo: 'Dr-TSNG/ZygiskNext',
+                  assetPattern: 'Zygisk-Next-*-release.zip',
+                  pinnedVersion: '',
+                  sha256: '',
+                  moduleId: 'zygisksu',
+                },
+              },
+              {
+                id: 'app',
+                title: '装应用',
+                kind: 'installApp',
+                optional: false,
+                note: '',
+                source: {
+                  kind: 'upstream',
+                  repo: 'eltavine/Duck-Detector-Refactoring',
+                  assetPattern: 'Duck.Detector-*.apk',
+                  pinnedVersion: '',
+                  sha256: '',
+                  moduleId: '',
+                },
+              },
+              {
+                id: 'direct-app',
+                title: '直链装应用',
+                kind: 'installApp',
+                optional: false,
+                note: '',
+                source: {
+                  kind: 'direct',
+                  repo: '',
+                  assetPattern: '',
+                  pinnedVersion: '',
+                  sha256: '1ca92901b74ff658988a4859d8cd2c6f20e45f722a88bc0361e9d33ee5a72866',
+                  moduleId: '',
+                  url: 'https://example.com/mirror/ChunqiuNativeCheck-4.6.2.apk',
+                },
+              },
+              {
+                id: 'write',
+                title: '写文件',
+                kind: 'writeFile',
+                optional: false,
+                note: '自测用',
+                filePath: '/data/adb/zygisksu/denylist_enforce',
+                fileContent: '1\n',
+                source: askUserSource(),
+              },
+              {
+                id: 'check',
+                title: '自检',
+                kind: 'verify',
+                optional: false,
+                note: '自测用',
+                checkId: 'root-manager',
+                source: askUserSource(),
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+const SELF_TEST_CASES = [
+  {
+    label: 'installModule 用 store 来源',
+    expect: /是 installModule，source\.kind 只能是 upstream \/ updateJson \/ direct/,
+    mutate(doc) {
+      doc.columns[0].topics[0].steps[0].source.kind = 'store';
+    },
+  },
+  {
+    label: 'installModule 资产不是 zip',
+    expect: /assetPattern 必须匹配 \.zip/,
+    mutate(doc) {
+      doc.columns[0].topics[0].steps[0].source.assetPattern = 'Zygisk-Next-*-release.apk';
+    },
+  },
+  {
+    label: 'installApp 资产不是 apk',
+    expect: /assetPattern 必须匹配 \.apk/,
+    mutate(doc) {
+      doc.columns[0].topics[0].steps[1].source.assetPattern = 'Duck.Detector-*.zip';
+    },
+  },
+  {
+    label: 'installApp 直链指向 zip',
+    expect: /url 指向的文件必须是 \.apk/,
+    mutate(doc) {
+      doc.columns[0].topics[0].steps[2].source.url =
+        'https://example.com/mirror/ChunqiuNativeCheck-4.6.2.zip';
+    },
+  },
+  {
+    label: 'writeFile 写 /system',
+    expect: /不能写只读系统分区 \/system/,
+    mutate(doc) {
+      doc.columns[0].topics[0].steps[3].filePath = '/system/etc/hosts';
+    },
+  },
+  {
+    label: 'writeFile 写 /init.rc',
+    expect: /不能写只读系统分区 \/init/,
+    mutate(doc) {
+      doc.columns[0].topics[0].steps[3].filePath = '/init.rc';
+    },
+  },
+  {
+    label: 'direct sha256 大写',
+    expect: /sha256 必须是 64 位小写十六进制/,
+    mutate(doc) {
+      const s = doc.columns[0].topics[0].steps[2].source;
+      s.sha256 = s.sha256.toUpperCase();
+    },
+  },
+  {
+    label: 'verify 缺 checkId',
+    expect: /是 verify，checkId 必填/,
+    mutate(doc) {
+      delete doc.columns[0].topics[0].steps[4].checkId;
+    },
+  },
+];
+
+/**
+ * 跑内置负例自测：正例必须过，每条负例必须被自己的 expect 命中。
+ * 不在这里设 process.exitCode：由 CLI 入口决定退出码，测试里 import 也不会污染 --test 进程。
+ */
+export function runSelfTest(log = console) {
+  log.log('专栏数据校验自测：');
+  let failures = 0;
+
+  const positive = validateColumns(selfTestBase());
+  if (positive.ok) {
+    log.log('  ✓ 正例（1 个专栏 / 1 个专题 / 5 步合法步骤）通过');
+  } else {
+    failures += 1;
+    log.error(`  ✗ 正例本应通过，却报错：${JSON.stringify(positive.errors)}`);
+  }
+
+  for (const testCase of SELF_TEST_CASES) {
+    const doc = selfTestBase();
+    testCase.mutate(doc);
+    const result = validateColumns(doc);
+    const hit = result.errors.find((e) => testCase.expect.test(e));
+    if (!result.ok && hit) {
+      log.log(`  ✓ ${testCase.label}：已挡住（${hit}）`);
+    } else {
+      failures += 1;
+      log.error(`  ✗ ${testCase.label}：没挡住（errors=${JSON.stringify(result.errors)}）`);
+    }
+  }
+
+  if (failures > 0) {
+    log.error(`自测失败：${failures} 项`);
+    return failures;
+  }
+  log.log(`自测通过：${SELF_TEST_CASES.length} 条负例全部被挡住，正例通过`);
+  return 0;
+}
+
 const invokedDirectly =
   process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 if (invokedDirectly) {
-  const file = process.argv[2] ? path.resolve(process.argv[2]) : DEFAULT_COLUMNS;
-  const result = validateColumnsFile(file);
-  if (result.ok) {
-    console.log(
-      `✓ ${path.relative(REPO_ROOT, file)} 通过：${result.columnCount} 个专栏 / ` +
-        `${result.topicCount} 个专题 / ${result.stepCount} 步`,
-    );
+  if (process.argv.includes('--selftest')) {
+    if (runSelfTest() > 0) process.exitCode = 1;
   } else {
-    console.error(`✗ ${path.relative(REPO_ROOT, file)} 有 ${result.errors.length} 处问题：`);
-    for (const e of result.errors) console.error(`  - ${e}`);
-    process.exitCode = 1;
+    const file = process.argv[2] ? path.resolve(process.argv[2]) : DEFAULT_COLUMNS;
+    const result = validateColumnsFile(file);
+    if (result.ok) {
+      console.log(
+        `✓ ${path.relative(REPO_ROOT, file)} 通过：${result.columnCount} 个专栏 / ` +
+          `${result.topicCount} 个专题 / ${result.stepCount} 步`,
+      );
+    } else {
+      console.error(`✗ ${path.relative(REPO_ROOT, file)} 有 ${result.errors.length} 处问题：`);
+      for (const e of result.errors) console.error(`  - ${e}`);
+      process.exitCode = 1;
+    }
   }
 }

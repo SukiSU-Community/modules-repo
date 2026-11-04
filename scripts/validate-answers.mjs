@@ -19,10 +19,12 @@
  *           updatedAt(yyyy-MM-dd 且真实存在，且不早于 sourceUpdatedAt), entries[] }
  *   entry { id, title, aliases[], chapter, detect, cause, fix[], deviceTypes[], link }
  *   外加：entries 1–1000 条；id 全仓唯一、kebab-case；title 非空且全仓不重复；
- *         aliases 1–32 条、互不重复、单条 ≤ 80 字符；chapter 非空；detect / cause 是
- *         字符串（可为空，手册里确实有只写判据不写原因的条目）且 ≤ 400 字符；
- *         fix 至少 1 条非空、单条 ≤ 200 字符；deviceTypes 只能取四个设备型枚举；
- *         link 必须 https。
+ *         aliases 1–32 条、全仓唯一、单条 4–80 字符、不能是纯数字、不能是自身 title
+ *         的碎片；chapter 只能取手册的 11 个大章之一；detect / cause 是字符串
+ *         （可为空，手册里确实有只写判据不写原因的条目）且 ≤ 400 字符；
+ *         fix 至少 1 条非空、长度不设上限、不得带截断标记「…」；fixKind 缺省
+ *         `specific`，显式写了就必须是 `specific` / `generic`；deviceTypes 只能取
+ *         四个设备型枚举；link 必须 https。
  *
  * 口径来源：本仓 json/ 下其它文件的既有约定（columns.json 的一条一步、proxies.json
  * 的「索引只能更严不能更松」）+ 解析脚本 scripts（构建期在仓库外，不入库）。
@@ -50,12 +52,36 @@ export const MAX_ENTRIES = 1000;
 /** detect / cause 是「摘录」，超了就是没摘干净 —— AI 读到的会是被截断的半句话。 */
 export const MAX_DETECT_CHARS = 400;
 export const MAX_CAUSE_CHARS = 400;
-/** fix 要能被 App 一条一条展示，超过一屏的修法本来也该拆成多步。 */
-export const MAX_FIX_ITEM_CHARS = 200;
 /** 检测项名都很短，超过这个长度基本是把整段正文塞进标题了。 */
 export const MAX_TITLE_CHARS = 120;
 export const MAX_ALIAS_COUNT = 32;
 export const MAX_ALIAS_CHARS = 80;
+/** 太短的 alias（USB / apps / 2222）什么都检索不到，只会把无关条目拉到结果里。 */
+export const MIN_ALIAS_CHARS = 4;
+/** 转写时硬截断留下的标记：出现在 fix 里就说明修法被切成了半句话。 */
+export const TRUNCATION_MARK = '…';
+
+/**
+ * 手册的 11 个大章。chapter 只能取其中之一：App 侧按章分组展示，写错一个字
+ * 就会多出一个只有一条的空章，或者让整章条目从分组里消失。
+ * 顺序与手册正文一致，改顺序不影响语义。
+ */
+export const CHAPTERS = Object.freeze([
+  '一、属性、构建信息与文本配置',
+  '二、挂载视图与文件系统一致性',
+  '三、进程、命名空间与权限状态',
+  '四、内核接口直调与反调试 / 反注入行为',
+  '五、二进制与内存映射完整性',
+  '六、SELinux 策略、AVC 与审计通道',
+  '七、Keystore / KeyMint / TEE',
+  '八、包管理、应用可见性与安装痕迹',
+  '九、时序、页驻留与差分侧信道',
+  '十、本地服务与终端形态',
+  '附：未归入上述判据的词条',
+]);
+
+/** fix 的来源口径：specific = 手册给了针对本条的修法；generic = 只有「通用排查方法」。 */
+export const FIX_KINDS = Object.freeze(['specific', 'generic']);
 /** 与 App 侧 DeviceType 枚举一一对应；顺序不影响语义。 */
 export const DEVICE_TYPES = Object.freeze(['unlocked', 'fake-relock', 'ramdisk', 'self-signed']);
 /** kebab-case：小写字母/数字分段，段间单个连字符（例 avb-version-2-0）。 */
@@ -63,6 +89,9 @@ export const ID_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+/** alias / title 的比较键：去掉所有空白并小写，`Mount Detector` 与 `mountdetector` 视为同一个。 */
+const aliasKey = (s) => s.replace(/\s+/gu, '').toLowerCase();
 
 /** yyyy-MM-dd 且真存在（2 月 30 日之类要挡住）。 */
 export function isRealDate(s) {
@@ -153,6 +182,7 @@ export function validateAnswers(doc) {
 
   const seenIds = new Map();
   const seenTitles = new Map();
+  const seenAliasesGlobal = new Map();
 
   doc.entries.forEach((entry, i) => {
     const at = `entries[${i}]`;
@@ -193,6 +223,8 @@ export function validateAnswers(doc) {
     }
 
     // ── aliases：AI 检索的入口，宁多勿少，但不能是垃圾 ─────────────────────
+    // 全仓唯一是硬约束：同一个 alias 指向两条时，检索结果全看遍历顺序，
+    // 换个解析脚本就换一条答案 —— 冲突时该由人工决定留给 title 最接近的那条。
     if (!Array.isArray(entry.aliases)) {
       push(`${at}.aliases 必须是字符串数组`);
     } else if (entry.aliases.length === 0) {
@@ -201,6 +233,7 @@ export function validateAnswers(doc) {
       push(`${at}.aliases 最多 ${MAX_ALIAS_COUNT} 条（当前 ${entry.aliases.length} 条）`);
     } else {
       const seenAliases = new Map();
+      const titleKey = typeof entry.title === 'string' ? aliasKey(entry.title) : '';
       entry.aliases.forEach((alias, j) => {
         const aliasAt = `${at}.aliases[${j}]`;
         if (typeof alias !== 'string') {
@@ -214,17 +247,44 @@ export function validateAnswers(doc) {
         if (alias.length > MAX_ALIAS_CHARS) {
           push(`${aliasAt} 过长：${alias.length} 字符（上限 ${MAX_ALIAS_CHARS}）`);
         }
-        const key = alias.toLowerCase();
+        if (alias.trim().length < MIN_ALIAS_CHARS) {
+          push(
+            `${aliasAt} 过短：${JSON.stringify(alias)}（至少 ${MIN_ALIAS_CHARS} 字符；` +
+              'USB / apps / 2222 这类缩写检索不到东西，反而会把无关条目拉进结果）',
+          );
+        } else if (/^\d+$/.test(alias.trim())) {
+          push(`${aliasAt} 不能是纯数字：${JSON.stringify(alias)}`);
+        } else if (titleKey && aliasKey(alias) !== titleKey && titleKey.includes(aliasKey(alias))) {
+          push(
+            `${aliasAt} 是 title 的碎片：${JSON.stringify(alias)}` +
+              `（title 里已经有的词不必再当 alias，检索时和 title 精确命中是同一件事）`,
+          );
+        }
+        const key = aliasKey(alias);
         if (seenAliases.has(key)) {
           push(`${aliasAt} 与 aliases[${seenAliases.get(key)}] 重复：${alias}`);
         } else {
           seenAliases.set(key, j);
+          const owner = seenAliasesGlobal.get(key);
+          if (owner) {
+            push(
+              `${aliasAt} 与 entries[${owner.i}]（${owner.id}）的 aliases 重复：${alias}` +
+                '（同一 alias 全仓只能出现一次，请留给 title 最接近的那一条）',
+            );
+          } else {
+            seenAliasesGlobal.set(key, { i, id: entry.id });
+          }
         }
       });
     }
 
-    // ── chapter：手册大章，App 用来分组展示 ────────────────────────────────
-    requireNonEmptyString(entry.chapter, at, 'chapter', errors);
+    // ── chapter：手册大章，App 用来分组展示；只认手册里真实存在的 11 章 ──────
+    if (requireNonEmptyString(entry.chapter, at, 'chapter', errors) && !CHAPTERS.includes(entry.chapter)) {
+      push(
+        `${at}.chapter 不是手册的大章：${JSON.stringify(entry.chapter)}` +
+          `（只能是 ${CHAPTERS.length} 个之一：${CHAPTERS.join(' / ')}）`,
+      );
+    }
 
     // ── detect / cause：原文摘录，允许为空（手册里有只写判据、不写原因的条目）──
     for (const [field, limit] of [
@@ -241,6 +301,8 @@ export function validateAnswers(doc) {
     }
 
     // ── fix：唯一「必须能照着做」的字段，空数组等于让 AI 自己编 ─────────────
+    // 不设长度上限：手册原文有多长就记多长。截断会把修法切在半句话上
+    // （如停在「- APat…」），拆成多条又会改 id 与匹配语义，两者都不能接受。
     if (!Array.isArray(entry.fix)) {
       push(`${at}.fix 必须是字符串数组`);
     } else if (entry.fix.length === 0) {
@@ -256,10 +318,21 @@ export function validateAnswers(doc) {
           push(`${itemAt} 不能为空（要么删掉这一条，要么写清楚怎么做）`);
           return;
         }
-        if (item.length > MAX_FIX_ITEM_CHARS) {
-          push(`${itemAt} 过长：${item.length} 字符（上限 ${MAX_FIX_ITEM_CHARS}，请拆成多条）`);
+        if (item.includes(TRUNCATION_MARK)) {
+          push(
+            `${itemAt} 含截断标记「${TRUNCATION_MARK}」：原文被截断了，补全整段` +
+              '（不要拆成多条 —— 拆条会改 id 与匹配语义）',
+          );
         }
       });
+    }
+
+    // ── fixKind：区分「手册给了具体修法」与「只有通用排查方法」，缺省 specific ──
+    if (entry.fixKind !== undefined && !FIX_KINDS.includes(entry.fixKind)) {
+      push(
+        `${at}.fixKind 只能是 ${FIX_KINDS.join(' / ')}（缺省视为 specific）` +
+          `，实际是 ${JSON.stringify(entry.fixKind)}`,
+      );
     }
 
     // ── deviceTypes：App 按设备型筛选用，写错一个字整类红项就消失 ────────────
@@ -324,7 +397,7 @@ function selfTestBase() {
       {
         id: 'bootloader-unlock',
         title: 'Bootloader unlock / 解锁属性',
-        aliases: ['Bootloader unlock', '解锁属性', 'ro.boot.flash.locked'],
+        aliases: ['Bootloader unlock / 解锁属性', 'ro.boot.flash.locked', '解锁状态'],
         chapter: '一、属性、构建信息与文本配置',
         detect: '读取 `ro.boot.flash.locked` 等属性，0 表示已解锁。',
         cause: '',
@@ -335,7 +408,7 @@ function selfTestBase() {
       {
         id: 'avb-version-2-0',
         title: 'avb校验异常 avb=2.0',
-        aliases: ['avb', 'avb=2.0', 'ro.boot.avb_version'],
+        aliases: ['ro.boot.vbmeta.avb_version', 'vbmeta 版本不符'],
         chapter: '一、属性、构建信息与文本配置',
         detect: '',
         cause: 'ro.boot.avb_version 与实际 vbmeta 版本不一致。',
@@ -422,10 +495,11 @@ const SELF_TEST_CASES = [
     },
   },
   {
-    label: 'fix 单条超长',
-    expect: /entries\[0\]\.fix\[0\] 过长/,
+    // 长度不再是「过长」，而是「截断」：手册原文有多长就记多长，带 … 就是半句话。
+    label: 'fix 含截断标记',
+    expect: /entries\[0\]\.fix\[0\] 含截断标记/,
     mutate(doc) {
-      doc.entries[0].fix = ['刷'.repeat(201)];
+      doc.entries[0].fix = ['- APat…'];
     },
   },
   {
@@ -447,6 +521,51 @@ const SELF_TEST_CASES = [
     expect: /entries\[0\]\.aliases 至少要有一条/,
     mutate(doc) {
       doc.entries[0].aliases = [];
+    },
+  },
+  {
+    // 大章写错一个字，App 分组里就会多出一个空章 / 少一整章。
+    label: 'chapter 不是手册大章',
+    expect: /entries\[0\]\.chapter 不是手册的大章/,
+    mutate(doc) {
+      doc.entries[0].chapter = '一、属性与构建信息';
+    },
+  },
+  {
+    label: 'alias 过短',
+    expect: /entries\[0\]\.aliases\[0\] 过短/,
+    mutate(doc) {
+      doc.entries[0].aliases = ['USB', 'ro.boot.flash.locked'];
+    },
+  },
+  {
+    label: 'alias 是纯数字',
+    expect: /entries\[0\]\.aliases\[0\] 不能是纯数字/,
+    mutate(doc) {
+      doc.entries[0].aliases = ['2222', 'ro.boot.flash.locked'];
+    },
+  },
+  {
+    // title 里已经有的词当 alias 等于没写：检索时和 title 精确命中是同一件事。
+    label: 'alias 是 title 的碎片',
+    expect: /entries\[0\]\.aliases\[0\] 是 title 的碎片/,
+    mutate(doc) {
+      doc.entries[0].aliases = ['解锁属性', 'ro.boot.flash.locked'];
+    },
+  },
+  {
+    // 同一 alias 指向两条 = 检索结果看遍历顺序，换个解析脚本就换一条答案。
+    label: 'alias 跨条目重复',
+    expect: /entries\[1\]\.aliases\[0\] 与 entries\[0\]（bootloader-unlock）的 aliases 重复/,
+    mutate(doc) {
+      doc.entries[1].aliases = ['ro.boot.flash.locked'];
+    },
+  },
+  {
+    label: 'fixKind 非法',
+    expect: /entries\[0\]\.fixKind 只能是 specific \/ generic/,
+    mutate(doc) {
+      doc.entries[0].fixKind = 'general';
     },
   },
 ];

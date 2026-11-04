@@ -290,7 +290,7 @@
           "id": "pass-integrity",
           "title": "谷歌三绿 / Play Integrity",
           "tier": "integrity",
-          "summary": "这一层要动密钥材料。商店不内置、不托管、也不写死 keybox 的下载地址（没有可信直链就不登记），keybox 需要你自备；这一层也是全网唯一没人敢给你打包票的。",
+          "summary": "这一层要动密钥材料。商店自己不存 keybox（那是别人的 Google 认证材料），但向导会试着从公开镜像自动取一份并校验结构，取不到才让你自选本地文件——所以多数人不需要自己去搜。这一层也是全网唯一没人敢给你打包票的：Google 吊销随时生效。",
           "riskLevel": "high",
           "layers": ["L3"],
           "requires": ["已通过「过银行」或至少完成 L1 隐藏", "接受密钥随时可能失效"],
