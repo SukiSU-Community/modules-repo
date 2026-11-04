@@ -112,10 +112,10 @@
             },
             {
               "id": "lsposed",
-              "title": "可选：装 Xposed 框架（只在要用 FuseFixer 时）",
+              "title": "安装 LSPosed",
               "kind": "askUser",
-              "optional": true,
-              "note": "先澄清：HMA-OSS 是 Zygisk 模块，不需要 Xposed，前面几步做完就已经能隐藏应用列表了。只有可选的 FuseFixer 才需要 Xposed 框架。另外 LSPosed 官方最新 release 停在 2023-10 的 v1.9.2，Android 14 以后大概率不兼容，本专栏不替你锁这个版本：要用请自己去找仍在维护的分支（例如 JingMatrix/Vector）拿对应你系统的构建。装好后在框架设置里打开「点按劫持缓解」和「Xposed API 调用保护」。",
+              "optional": false,
+              "note": "必备步骤。LSPosed 2.x（当前 v2.2.1 / build 7912，支持 Android 9～17）只通过官方 Telegram 频道 @lsposed 发布；GitHub 上的最新 release 还停在 2023-10 的 v1.9.2，所以这一步商店不能代装——没有可校验的官方安装包。请从官方频道下载 zygisk 版，在管理器里「从本地安装」，重启后在框架设置里打开「点按劫持缓解」和「Xposed API 调用保护」。HMA-OSS 本身是 Zygisk 模块、不需要 Xposed，但 FuseFixer 这类模块要。",
               "source": {
                 "kind": "askUser",
                 "repo": "",
