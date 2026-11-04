@@ -57,7 +57,7 @@ export const STEP_KINDS = [
   'reboot',
   'askUser',
 ];
-export const SOURCE_KINDS = ['upstream', 'store', 'askUser', 'updateJson'];
+export const SOURCE_KINDS = ['upstream', 'store', 'askUser', 'updateJson', 'direct'];
 
 /**
  * verify 步骤可选的自动检查项，与 App 侧 ColumnExecution.kt 的 ColumnCheckIds 一一对应。
@@ -440,7 +440,19 @@ export function validateColumns(doc) {
             push(`${sat}.source.kind 必须是 ${SOURCE_KINDS.join(' / ')} 之一`);
           }
           if (step.kind === 'installApp' && src.kind === 'askUser') {
-            push(`${sat} 是 installApp，source 必须给出可下载的来源（upstream / updateJson / store）`);
+            push(`${sat} 是 installApp，source 必须给出可下载的来源（upstream / updateJson / store / direct）`);
+          }
+          // direct：第三方网盘或官方网盘的固定直链。这里没有上游版本信息可查，唯一能锁死的就是字节，
+          // 所以 sha256 是硬要求 —— 没有哈希就不许走这条通道（链接被换包时无从发现）。
+          if (src.kind === 'direct') {
+            const u = String(src.url ?? '');
+            if (!/^https:\/\/[^\s]+$/i.test(u)) {
+              push(`${sat}.source.url 必须是 https 直链，实际是 ${JSON.stringify(src.url)}`);
+            }
+            const h = String(src.sha256 ?? '').trim().toLowerCase();
+            if (!/^[0-9a-f]{64}$/.test(h)) {
+              push(`${sat}.source.sha256 必须是 64 位小写十六进制（direct 来源强制要求哈希）`);
+            }
           }
           if (src.kind === 'upstream') {
             if (!REPO_SHAPE_RE.test(String(src.repo ?? ''))) {

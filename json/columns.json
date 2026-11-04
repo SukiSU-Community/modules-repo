@@ -47,18 +47,20 @@
           "steps": [
             {
               "id": "install-chunqiu",
-              "title": "安装春秋 Native Check（官方渠道）",
-              "kind": "askUser",
+              "title": "安装春秋 Native Check",
+              "kind": "installApp",
               "optional": false,
-              "note": "春秋闭源，官方发布在 Telegram 频道 @Suxiaomingpd（春秋/luna Detector，当前春秋 Native Check 4.6.2 / 2026-10-23）。连不上 TG 可用官方迅雷网盘 https://pan.xunlei.com/s/VOSCXZEqHQ_1l5vJgWWrulefA1?pwd=pdg6 。商店拿不到可程序访问的直链，所以不代下也不代装——点「打开官方页面」自己去官方渠道取包。注意包名是 chunqiu.safe，同一频道也发 Luna 检测器（luna.safe.luna），别下错。",
+              "optIn": true,
+              "note": "春秋闭源，官方只走 Telegram 频道 @Suxiaomingpd（当前 4.6.2 / 2026-10-23）和官方迅雷网盘。商店这里登记的是同一版本的社区转载包（蓝奏云直链），下载后会先核对 sha256，字节对不上就中止、不会装——但它毕竟是第三方网盘，不是官方渠道，介意就点下面的「打开官方页面」自己去官方取；直链哪天失效也走那条路。包名 com.chunqiunativecheck；同一频道还发 Luna 检测器（luna.safe.luna），别下错。",
               "link": "https://t.me/Suxiaomingpd",
               "source": {
-                "kind": "askUser",
+                "kind": "direct",
                 "repo": "",
                 "assetPattern": "",
                 "pinnedVersion": "",
-                "sha256": "",
-                "moduleId": ""
+                "sha256": "1ca92901b74ff658988a4859d8cd2c6f20e45f722a88bc0361e9d33ee5a72866",
+                "moduleId": "",
+                "url": "https://h1050.lanosso.com/1d78d29a064171b39c7b173eef4dd7c7/6aeaf9ec/2026/10/24/b975cfa759b8792d7ef7369f37de202a.apk?fn=%E6%98%A5%E7%A7%8BNativeCheck-4.6.2(75).apk"
               }
             },
             {

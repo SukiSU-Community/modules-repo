@@ -164,7 +164,7 @@ columns[]                    专栏
     ├── keybox               可选。keybox 直链登记：url / sha256 / lastVerifiedAt（没有可信来源就别写）
     ├── verifyHints[]        验收提示（人话，App 直接展示）
     └── steps[]              步骤（kind: installModule / installApp / writeConfig / writeFile / writeHmaConfig / runCommand / verify / reboot / askUser）
-        ├── source           upstream{repo, assetPattern, pinnedVersion, sha256} / updateJson{url, moduleId} / store{moduleId} / askUser
+        ├── source           upstream{repo, assetPattern, pinnedVersion, sha256} / updateJson{url, moduleId} / direct{url, sha256} / store{moduleId} / askUser
         └── 可执行字段        command / filePath / fileContent / checkId / confirm / link / optIn
 ```
 
@@ -176,8 +176,11 @@ columns[]                    专栏
    （见契约 §9.2）。`pinnedVersion` 留空 = 跟随最新（当前默认），写了才锁到某个 tag；`sha256` 留空时
    用 GitHub API 直连返回的 asset digest 校验，索引里不必也不该写死哈希 —— 否则官方一发新版就会卡住
    等人核对。`kind = updateJson` 用于「不在 GitHub 发版但官方提供 update.json」的模块（如 LSPosed）：
-   `url` 指向 update.json，App 读它的 `zipUrl` 下载、按 `versionCode` 命名。`kind = askUser` 的步骤
-   必须把「去哪拿」写进 `note`。
+   `url` 指向 update.json，App 读它的 `zipUrl` 下载、按 `versionCode` 命名。`kind = direct` 用于
+   **第三方网盘 / 官方网盘的固定直链**（例如春秋检测的蓝奏云包）：这里没有任何上游版本信息可查，
+   所以 `sha256` 是硬要求——没登记哈希，App 直接拒绝下载，链接被换成别的包时也无从发现。这类地址
+   不在商店的来源体系里，`note` 必须写明「是不是官方渠道、要不要自己核对」，链接失效时用户还有
+   `link` 那条路。`kind = askUser` 的步骤必须把「去哪拿」写进 `note`。
 3. **步骤除了「说」还能「做」**：`installModule` 刷模块 zip，`installApp` 下 APK 并交给系统安装器
    （商店不代点确认）；`runCommand` 必须有 `command`；`writeFile` / `writeConfig` 必须有
    绝对路径 `filePath` 与非空 `fileContent`（支持 `${keybox}` 占位符，由用户选中的本地文件替换）；
@@ -748,7 +751,7 @@ node scripts/validate-columns.mjs path/to.json   # 校验指定文件
 检查项：顶层 `schemaVersion/name/updatedAt`、每个专栏的 `id/title/subtitle/description/accent/icon/order`、
 `accent` 与 `icon` 必须在白名单内（与 App 侧枚举一一对应）、每个专题必须有 `evidence` 且 `verifiedAt`
 是真实日期、`riskLevel` / `layers` / 步骤 `kind` / `source.kind` 取值合法、`upstream` 步骤的
-`repo` 必须是 `owner/repo` 形状且带 `assetPattern`、`updateJson` 步骤必须有 https 的 `url`、`store` 步骤必须带 `moduleId`、`installApp` 必须有可下载的来源（不能是 `askUser`）、`link` 必须是 https 地址、
+`repo` 必须是 `owner/repo` 形状且带 `assetPattern`、`updateJson` 步骤必须有 https 的 `url`、`direct` 步骤必须有 https 直链且 `sha256` 是 64 位小写十六进制、`store` 步骤必须带 `moduleId`、`installApp` 必须有可下载的来源（不能是 `askUser`）、`link` 必须是 https 地址、
 `askUser` 步骤必须把获取方式写进 `note`。可执行字段另有几条硬检查：`runCommand` 必须有非空 `command`，
 且不命中危险命令黑名单（通配删除根目录、`dd if=` 写设备、`mkfs`、写 `/dev/block`、`reboot -f`、
 `chmod -R 777 /`）；`writeFile` / `writeConfig` 必须有绝对路径 `filePath`（不许 `..`、通配符、根目录）
