@@ -84,7 +84,8 @@
               "title": "两个都跑一遍，把红项截图",
               "kind": "verify",
               "optional": false,
-              "note": "先跑春秋再跑 Duck。红项就是这次要补的地方；全绿说明这套环境已经能过绝大多数 App 的检测。",
+              "note": "先跑春秋再跑 Duck。红项就是这次要补的地方；全绿说明这套环境已经能过绝大多数 App 的检测。有红项时点下面的按钮打开《春秋检测器问题解决方案》，按红项名字找「检测方式 / 异常原因 / 排查与解决办法」，它按设备类型（真解锁 / 假回锁 / 免解 / 自签）分开写。",
+              "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/",
               "checkId": "root-manager",
               "source": {
                 "kind": "askUser",
@@ -371,7 +372,8 @@
               "title": "用 Play Integrity API Checker 验收",
               "kind": "verify",
               "optional": false,
-              "note": "三项全绿（MEETS_BASIC_INTEGRITY / MEETS_DEVICE_INTEGRITY / MEETS_STRONG_INTEGRITY）才算过。密钥有效期一般到 2033 年，但设备指纹和补丁日期会先过期。",
+              "note": "三项全绿（MEETS_BASIC_INTEGRITY / MEETS_DEVICE_INTEGRITY / MEETS_STRONG_INTEGRITY）才算过。密钥有效期一般到 2033 年，但设备指纹和补丁日期会先过期。哪一项红就去《春秋检测器问题解决方案》的「七、Keystore / KeyMint / TEE」一章对照排查——那边把「avb 校验异常」这类红项的成因点名到具体文件和属性。",
+              "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/",
               "checkId": "keybox-valid",
               "source": {
                 "kind": "askUser",
@@ -411,7 +413,8 @@
               "title": "把管理器从 HMA 的可见名单里抹掉",
               "kind": "askUser",
               "optional": false,
-              "note": "SukiSU Ultra 的设置里没有「随机包名 / 隐藏图标」，不用去找——那是 Magisk Alpha 的马甲方案。这里要做的相反：打开 HMA-OSS 的 WebUI，把检测器加进作用域，让它们读到的应用列表里没有 SukiSU 管理器。做完回退出来重进一次 HMA 让它生效。",
+              "note": "SukiSU Ultra 的设置里没有「随机包名 / 隐藏图标」，不用去找——那是 Magisk Alpha 的马甲方案。这里要做的相反：打开 HMA-OSS 的 WebUI，把检测器加进作用域，让它们读到的应用列表里没有 SukiSU 管理器。这一步不是可选项：com.sukisu.ultra 本身就在春秋检测器的风险包名单里（《春秋检测器问题解决方案》附录 A 列了 85 个包名，管理器、KsuWebUI、HMA 本体、Termux 全在），光装管理器就会被记一笔。做完回退出来重进一次 HMA 让它生效。",
+              "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/",
               "source": {
                 "kind": "askUser",
                 "repo": "",
