@@ -185,6 +185,12 @@ columns[]                    专栏
    只是展示 + 手动操作**，所以「不确定就退化 `askUser`」永远是安全的写法。
 4. **`command` 与 `fileContent` 等同远程下发可执行内容，必须人工 review**：禁止通配删除、写块设备、
    `mkfs`、`reboot -f`、把根目录权限改成 777 —— 这几类已进校验器的危险命令黑名单，命中即报错。
+5. **已装即跳过；上游有新版时提示升级**。`installModule` / `installApp` 先看设备上有没有（模块看
+   `/data/adb/modules/<moduleId>`，APK 看包名），已装就跳过而不是重装 —— 重装会覆盖用户在模块 WebUI
+   里的配置。跳过时 App 会顺手查一次上游版本（8 秒超时，查不到就按「不知道」处理）：有新版就在这一步
+   摆一个「升级到 vX」按钮，用户点了才带 `force` 覆盖安装。所以 `source.moduleId` 请写模块的**真实 id**
+   （zip 内 `module.prop` 的 `id=`），不要写显示名；留空不会出错，但 App 得先把整个包下载下来才认得出
+   已装，白费一次流量。
 
 步骤可执行字段（与 App 侧 `RepoColumnStep` / `RepoColumnKeybox` 一一对应）：
 

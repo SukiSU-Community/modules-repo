@@ -108,7 +108,7 @@
                 "assetPattern": "*.zip",
                 "pinnedVersion": "",
                 "sha256": "",
-                "moduleId": ""
+                "moduleId": "zygisksu"
               }
             },
             {
@@ -258,7 +258,7 @@
                 "assetPattern": "*.zip",
                 "pinnedVersion": "",
                 "sha256": "",
-                "moduleId": ""
+                "moduleId": "tricky_store"
               }
             },
             {
@@ -273,7 +273,7 @@
                 "assetPattern": "*.zip",
                 "pinnedVersion": "",
                 "sha256": "",
-                "moduleId": ""
+                "moduleId": "tricky_store"
               }
             },
             {
@@ -324,7 +324,7 @@
                 "assetPattern": "*.zip",
                 "pinnedVersion": "",
                 "sha256": "",
-                "moduleId": ""
+                "moduleId": "playintegrityfix"
               }
             },
             {
