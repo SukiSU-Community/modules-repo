@@ -105,7 +105,7 @@
                 "kind": "upstream",
                 "repo": "Dr-TSNG/ZygiskNext",
                 "assetPattern": "*.zip",
-                "pinnedVersion": "1.5.0",
+                "pinnedVersion": "",
                 "sha256": "",
                 "moduleId": ""
               }
@@ -113,16 +113,17 @@
             {
               "id": "lsposed",
               "title": "安装 LSPosed",
-              "kind": "askUser",
+              "kind": "installModule",
               "optional": false,
-              "note": "必备步骤。LSPosed 2.x（当前 v2.2.1 / build 7912，支持 Android 9～17）只通过官方 Telegram 频道 @lsposed 发布；GitHub 上的最新 release 还停在 2023-10 的 v1.9.2，所以这一步商店不能代装——没有可校验的官方安装包。请从官方频道下载 zygisk 版，在管理器里「从本地安装」，重启后在框架设置里打开「点按劫持缓解」和「Xposed API 调用保护」。HMA-OSS 本身是 Zygisk 模块、不需要 Xposed，但 FuseFixer 这类模块要。",
+              "note": "必备步骤。LSPosed 2.x 不在 GitHub 发版（那边停在 2023-10 的 v1.9.2），只通过官方 Telegram 频道公告；但官方维护了 update.json（https://lsposed.zip/update.json），商店读它就能直接装最新版，不用你手动下载。装完重启，在框架设置里打开「点按劫持缓解」和「Xposed API 调用保护」。HMA-OSS 本身是 Zygisk 模块、不需要 Xposed，但 FuseFixer 这类模块要。",
               "source": {
-                "kind": "askUser",
+                "kind": "updateJson",
                 "repo": "",
                 "assetPattern": "",
                 "pinnedVersion": "",
                 "sha256": "",
-                "moduleId": ""
+                "moduleId": "zygisk_lsposed",
+                "url": "https://lsposed.zip/update.json"
               }
             },
             {

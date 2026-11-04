@@ -53,7 +53,7 @@ export const STEP_KINDS = [
   'reboot',
   'askUser',
 ];
-export const SOURCE_KINDS = ['upstream', 'store', 'askUser'];
+export const SOURCE_KINDS = ['upstream', 'store', 'askUser', 'updateJson'];
 
 /**
  * verify 步骤可选的自动检查项，与 App 侧 ColumnExecution.kt 的 ColumnCheckIds 一一对应。
@@ -337,6 +337,7 @@ export function validateColumns(doc) {
             if (!REPO_SHAPE_RE.test(String(src.repo ?? ''))) {
               push(`${sat}.source.repo 必须是 owner/repo 形状，实际是 ${JSON.stringify(src.repo)}`);
             }
+            // pinnedVersion 可以空：空 = 每次取最新 release（用户要求永远拿最新版）。
             if (!nonEmpty(src.assetPattern)) push(`${sat}.source 缺 assetPattern（upstream 必须有）`);
             if (nonEmpty(src.sha256) && !SHA256_RE.test(src.sha256)) {
               push(`${sat}.source.sha256 不是合法的 64 位十六进制`);
@@ -344,6 +345,13 @@ export function validateColumns(doc) {
           }
           if (src.kind === 'store' && !nonEmpty(src.moduleId)) {
             push(`${sat}.source 缺 moduleId（store 必须有）`);
+          }
+          if (src.kind === 'updateJson') {
+            const url = String(src.url ?? '');
+            if (!nonEmpty(url)) push(`${sat}.source 缺 url（updateJson 必须有）`);
+            else if (!/^https:\/\/[^\s]+$/i.test(url)) {
+              push(`${sat}.source.url 必须是 https 地址，实际是 ${JSON.stringify(src.url)}`);
+            }
           }
           if (src.kind === 'askUser') {
             // 用户自己去找的组件没有下载地址，但必须留下「去哪找」的线索，否则这条步骤等于没说。
