@@ -18,7 +18,8 @@ repo/
 ├── json/
 │   ├── modules.json      # 模块索引，GitHub Pages 直接托管，必须始终合法 JSON
 │   ├── columns.json      # 商店「专栏」内容（人工维护，见下文），app 侧展示 + 按可执行字段执行
-│   └── proxies.json      # 商店 GitHub 下载代理列表（人工维护，App 侧可远程更新）
+│   ├── proxies.json      # 商店 GitHub 下载代理列表（人工维护，App 侧可远程更新）
+│   └── chunqiu-answers.json  # 春秋检测红项的「判据 / 原因 / 修法」解释层（生成自第三方手册）
 ├── pending/
 │   └── *.json            # 待合并条目，一个文件可含单条对象或数组
 │                         # 以 . 开头的文件（如 .example.json）是模板，不参与合并
@@ -27,6 +28,7 @@ repo/
 │   ├── validate-index.mjs# 校验 json/modules.json
 │   ├── validate-columns.mjs  # 校验 json/columns.json
 │   ├── validate-proxies.mjs  # 校验 json/proxies.json（下载代理列表）
+│   ├── validate-answers.mjs  # 校验 json/chunqiu-answers.json（春秋红项手册）
 │   └── fetch-pending-zip.mjs  # 读 pending 元数据 -> 下载 zip，供 audit 扫描
 ├── test/
 │   └── build-index.test.mjs
@@ -283,6 +285,66 @@ App 里没变化，先查 CDN 缓存（见「合并之后：CDN 必须失效」�
 node scripts/validate-proxies.mjs                # 校验 json/proxies.json
 node scripts/validate-proxies.mjs path/to.json   # 校验指定文件
 node scripts/validate-proxies.mjs --selftest     # 跑内置负例自测（不读文件）
+```
+
+### json/chunqiu-answers.json（春秋红项手册）
+
+`json/chunqiu-answers.json` 是 App 侧 AI 的**解释层**：用户在春秋检测里看到一个红项，App 拿红项名
+（或 `aliases` 里的关键词）在这一份里找一条，再把「它在查什么 / 为什么红 / 怎么修」讲给他听。
+它和 `columns.json` 是两条不同的轴，别互相替代：
+
+- `columns.json` 是**操作步骤** —— 先装什么、再刷什么、哪一步可以跳过，回答「我该做哪些事」；
+- `chunqiu-answers.json` 是**解释** —— 这一条判据查的是什么、为什么会被点亮、按手册该怎么处理，
+  回答「我为什么红了、这一条怎么弄」。
+
+两者都是人工整理的内容，都不参与 `modules.json` 的索引构建，App 从同一层 CDN 路径拉取：
+
+```text
+https://cdn.jsdelivr.net/gh/SukiSU-Community/modules-repo@main/json/chunqiu-answers.json
+```
+
+**数据来源与许可**：内容摘自第三方开源手册
+[`mingzun09/Chunqiu-Detector-Problem-solution`](https://github.com/mingzun09/Chunqiu-Detector-Problem-solution)
+（MIT）。措辞一律按原文摘录，不改判据、不替作者补充结论 —— 这份数据的价值就在于「它跟手册说的是
+同一件事」。**作者要求删除时整份移除**（本文件、本节文档、App 内置兜底一起走），不做「保留一部分」
+的协商。
+
+结构（`schemaVersion: 1`）：
+
+| 字段 | 类型 | 必填 | 约束 | 说明 |
+| --- | --- | --- | --- | --- |
+| `schemaVersion` | number | 是 | 必须等于 `1` | 结构版本，当前只认 `1` |
+| `source` | string | 是 | `https://` 地址 | 上游手册仓库，删改时要能追回去 |
+| `sourceUpdatedAt` | string | 是 | 真实日期 `yyyy-MM-dd` | 手册最后一次改动日期 |
+| `updatedAt` | string | 是 | 真实日期，且不早于 `sourceUpdatedAt` | 本次生成日期 |
+| `entries` | array | 是 | 1–1000 条 | 一条红项一条，按手册章节顺序排列 |
+| `entries[].id` | string | 是 | kebab-case，全局唯一 | 稳定标识，App 深链 / 缓存键用它（改文案别改 id） |
+| `entries[].title` | string | 是 | 非空、≤ 120 字符、全局不重复 | 手册里的检测项名，用户看到的就是它 |
+| `entries[].aliases` | string[] | 是 | 1–32 条、互不重复、单条 ≤ 80 字符 | AI 检索入口：英文名、属性名、包名、中文关键词 |
+| `entries[].chapter` | string | 是 | 非空 | 手册大章（如「一、属性、构建信息与文本配置」） |
+| `entries[].detect` | string | 是 | 可为空，≤ 400 字符 | 检测方式 / 判据的原文摘录 |
+| `entries[].cause` | string | 是 | 可为空，≤ 400 字符 | 异常原因的原文摘录 |
+| `entries[].fix` | string[] | 是 | 至少 1 条，单条 ≤ 200 字符 | 排查与解决办法，按原文分点拆开 |
+| `entries[].deviceTypes` | string[] | 是 | 只能取 `unlocked` / `fake-relock` / `ramdisk` / `self-signed` | 设备型（真解锁 / 假回锁 / 免解 / 自签），原文没区分就留空数组 |
+| `entries[].link` | string | 是 | `https://` 地址 | 手册站点，App 里是「查看完整说明」的跳转 |
+
+两条读法约定，避免 AI 把「手册没写」讲成「没有风险」：
+
+1. **`cause` 为空是正常的，不是数据缺失**：手册有一半条目只写判据、不单列原因（例如「可执行段
+   CRC 与磁盘不符」——判据本身就是原因）。App 侧提示词要按「`cause` 为空则用 `detect` 解释」处理。
+2. **`fix` 里的「手册未给出独立解决办法…」是如实标注**：手册对这些条目就是空白或写「待补充」。
+   我们记下这句话，而不是让模型自由发挥；AI 回答时应说明「手册没给具体修法」，再给通用排查路径。
+
+更新方式：手册改动后，重跑仓库外的解析脚本（`build_answers.py`，**不入库**）覆盖本文件，同时改
+`sourceUpdatedAt` / `updatedAt`，跑一遍下面的校验，最后按「合并之后：CDN 必须失效」清缓存。
+**不要手改生成物** —— 下次重跑会被原样冲掉；要改口径就改脚本。
+
+校验：
+
+```bash
+node scripts/validate-answers.mjs                # 校验 json/chunqiu-answers.json
+node scripts/validate-answers.mjs path/to.json   # 校验指定文件
+node scripts/validate-answers.mjs --selftest     # 跑内置负例自测（不读文件）
 ```
 
 ### pending 条目格式
@@ -954,9 +1016,10 @@ node scripts/revoke.mjs --id <探针id> --version-code <n> --sha256 <64hex> \
 
 ### 合并之后：CDN 必须失效
 
-`merge-index` 在 `gh pr merge` 之后紧跟一步 `node scripts/purge-cdn.mjs`。默认清四份下游会按
+`merge-index` 在 `gh pr merge` 之后紧跟一步 `node scripts/purge-cdn.mjs`。默认清五份下游会按
 `@main` 远程读取的手改数据：`json/modules.json`、`json/dispositions.json`、`json/proxies.json`、
-`json/columns.json` —— 清单就是脚本里的 `DEFAULT_FILES`，以后新增这类文件改那里，别只在 CI 里写死。
+`json/columns.json`、`json/chunqiu-answers.json` —— 清单就是脚本里的 `DEFAULT_FILES`，以后新增这类
+文件改那里，别只在 CI 里写死。
 理由是一条实测：**下架的生效速度由 CDN 的 TTL 决定，而不是由 main 决定** ——
 索引 PR #34 把 `json/modules.json` 推空之后近 50 分钟，
 `https://cdn.jsdelivr.net/gh/SukiSU-Community/modules-repo@main/json/modules.json`

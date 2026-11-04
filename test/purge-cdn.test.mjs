@@ -34,7 +34,7 @@ const silentLog = () => {
   return { log: { log: (s) => lines.push(String(s)), error: (s) => lines.push(String(s)), warn: (s) => lines.push(String(s)) }, lines };
 };
 
-test('purgeTargets：默认清索引、台账、代理列表、专栏四份，地址按仓库与分支拼', () => {
+test('purgeTargets：默认清索引、台账、代理列表、专栏、春秋红项五份，地址按仓库与分支拼', () => {
   const t = purgeTargets({ repo: REPO });
   assert.deepEqual(
     t.map((x) => x.url),
@@ -43,7 +43,7 @@ test('purgeTargets：默认清索引、台账、代理列表、专栏四份，�
   for (const x of t) assert.equal(x.purgeUrl, x.url.replace('https://cdn.', 'https://purge.'));
 });
 
-test('DEFAULT_FILES：下游按 @main 远程读的四份手改数据一个都不能漏', () => {
+test('DEFAULT_FILES：下游按 @main 远程读的五份手改数据一个都不能漏', () => {
   // 漏一份的后果不是「少清一次缓存」，而是那条改动在用户手里最长七天不生效：
   // 维护者删掉一条失效代理 / 改完专栏步骤却看到旧内容，会以为是自己改错了。
   assert.deepEqual(DEFAULT_FILES, [
@@ -51,6 +51,7 @@ test('DEFAULT_FILES：下游按 @main 远程读的四份手改数据一个都不
     'json/dispositions.json',
     'json/proxies.json',
     'json/columns.json',
+    'json/chunqiu-answers.json',
   ]);
 });
 

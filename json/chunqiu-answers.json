@@ -1,0 +1,2630 @@
+{
+  "schemaVersion": 1,
+  "source": "https://github.com/mingzun09/Chunqiu-Detector-Problem-solution",
+  "sourceUpdatedAt": "2026-11-02",
+  "updatedAt": "2026-11-05",
+  "entries": [
+    {
+      "id": "bootloader-unlock",
+      "title": "Bootloader unlock / 解锁属性",
+      "aliases": [
+        "Bootloader unlock / 解锁属性",
+        "Bootloader unlock",
+        "解锁属性",
+        "ro.boot.flash.locked",
+        "ro.boot.verifiedbootstate",
+        "ro.boot.vbmeta.device_state",
+        "真解锁设备",
+        "假回锁设备",
+        "免解设备",
+        "自签设备"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "读取 bootloader 锁定状态相关属性 / 认证结果 —— `ro.boot.flash.locked`、`ro.boot.verifiedbootstate`、`ro.boot.vbmeta.device_state` 等（`0` / `orange` / `unlocked` 表示已解锁）。",
+      "cause": "",
+      "fix": [
+        "真解锁设备：使用密钥模块把解锁状态对检测器隐藏，并按「模块正确配置」把检测器加入包名列表（target 列表实时生效，无需重启）；",
+        "假回锁 / 免解 / 自签设备：设备对外本就是“已锁定（locked & green）”，通常不会命中此项（该状态由启动链早期方案，如 efisp 一类提供）。",
+        "组合方案见 `启动状态异常`；另有反馈 iQoo/Vivo 橘子 5 不报、橘子 6 报（未确认是否误报）。"
+      ],
+      "deviceTypes": [
+        "unlocked",
+        "fake-relock",
+        "ramdisk",
+        "self-signed"
+      ],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "qi-dong-zhuang-tai-yi-chang",
+      "title": "启动状态异常",
+      "aliases": [
+        "启动状态异常",
+        "ro.boot.verifiedbootstate",
+        "/data/adb/service.d/",
+        "v307",
+        "v5.0",
+        "beta1",
+        "真解锁设备"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "读取 verified boot 状态（如 `ro.boot.verifiedbootstate`）与预期比对。",
+      "cause": "",
+      "fix": [
+        "[真解锁设备] Bootloader（ABL）解锁标志已被真实置位，系统放行未经签名校验的底层镜像并允许刷写。该设备的解锁状态会如实反映在系统底层属性与 KeyMint 硬件级凭据（Attestation）中。 社区在测试中的组合尝试：更新 密钥模块(-v307) + TS 插件 v5.0-beta1 → 管理器设置里关闭「卸载模块（内核级）」→ Zygisk 实现模块 设为「仅还原挂载」→ 冻…"
+      ],
+      "deviceTypes": [
+        "unlocked"
+      ],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "avb-2-0",
+      "title": "avb校验异常 avb=2.0",
+      "aliases": [
+        "avb校验异常 avb=2.0",
+        "ro.boot.vbmeta.avb_version",
+        "avb_version=2.0",
+        "/data/adb/modules/",
+        "system.prop",
+        "post-fs-data.sh",
+        "customize.sh",
+        "/data/adb/service.d/",
+        "hash.sh",
+        "resetprop: command not found",
+        "ro.boot.avb_version",
+        "avb校验异常"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "读取 `ro.boot.vbmeta.avb_version` 等 vbmeta 属性并与预期比对。",
+      "cause": "某些模块会强制修改 vbmeta 属性造成此问题，包括但不限于：\n1. 改机型模块\n2. Play Integrity 修复/过检类模块（如 Integrity Box、各类 PIF 衍生版/整合包，此类模块为了模拟回锁常在安装或开机脚本中硬编码写入 `avb_version=2.0`）",
+      "fix": [
+        "定位并排查问题模块： - 打开 MT 管理器，进入 `/data/adb/modules/` 目录。 - 搜索文件内容：`avb_version`。 - 排查命中的模块文件（如 `system.prop`、`post-fs-data.sh`、`customize.sh` 等），找到是哪个模块在注入该属性，修改对应值、注释相关设置，或直接卸载/禁用该问题模块。",
+        "排查并修复开机常驻服务脚本（常见于 Integrity Box 等模块）： - 检查 `/data/adb/service.d/` 目录下是否存在 `hash.sh`（或其他自启脚本）。 - 打开并查找是否包含： sh \"$RESETPROP\" ro.boot.vbmeta.avb_version \"2.0\" - 将其修改为： sh \"$RESETPROP\" ro.boot.vbmeta.avb…",
+        "命令行临时修改（单次开机即时生效）： - 若环境支持 `resetprop`（Magisk 环境或已配置对应 PATH 的终端），可尝试在终端直接执行： sh su -c resetprop -n ro.boot.avb_version 1.3 - *注意：`resetprop` 直接修改的是内存属性，手机重启后便会失效；且 KernelSU 环境下的终端通常未将 resetprop 加入全局…"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "usb-tiao-shi-yi-kai-qi",
+      "title": "USB 调试已开启",
+      "aliases": [
+        "USB 调试已开启",
+        "USB",
+        "runFormalUsbDebuggingCheck",
+        "adbd",
+        "adbroot",
+        "adb_data_file",
+        "su -c settings put global adb_enabled 0",
+        "/data/adb/service.d/",
+        "/proc/*/fdinfo",
+        "mnt_id",
+        "调试已开启"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "native 方法 `runFormalUsbDebuggingCheck`；静态产物中未见 `adb_enabled` 一类设置项串，推测与 `adbd` / `adbroot` / `adb_data_file` 相关的 SELinux 规则族有关（与 SELinux 规则探测同源），具体判据待确认。",
+      "cause": "",
+      "fix": [
+        "关闭 USB 调试（`su -c settings put global adb_enabled 0`）；可写入 `/data/adb/service.d/` 实现开机自动关闭。",
+        "关系：与 `fdinfo mnt 采样异常（c）` 都涉及 USB 调试，但判据不同——那条看的是 `/proc/*/fdinfo` 的 `mnt_id` 残留。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "di-san-fang-nei-he",
+      "title": "第三方内核",
+      "aliases": [
+        "第三方内核"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "内核版本信息命中预设特征名单。\n\n内核信息符合预设信息名单。",
+      "cause": "",
+      "fix": [
+        "伪装内核信息解决。 用 SUSFS 伪装内核名称。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "di-san-fang-rom-zi-bian-yi-nei-he",
+      "title": "第三方rom/自编译内核",
+      "aliases": [
+        "第三方rom/自编译内核",
+        "第三方rom",
+        "自编译内核",
+        "rom",
+        "-Dirty"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "内核版本号后缀带 `-Dirty` 等自编译特征。\n\n第三方 ROM 标记。\n\n内核版本号后缀带有 `-Dirty`。",
+      "cause": "",
+      "fix": [
+        "伪装内核信息解决。 用 SUSFS 伪装内核名称。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "tampered-kernel",
+      "title": "Tampered kernel / 伪装内核",
+      "aliases": [
+        "Tampered kernel / 伪装内核",
+        "Tampered kernel",
+        "伪装内核",
+        "post-fs-data"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "读取内核 uname（版本字符串、构建时间）与预设名单 / 基线比对；内核信息被伪装（SUSFS 等）后的一致性判定也在本条。",
+      "cause": "",
+      "fix": [
+        "使用 SUSFS 等内核级方案隐藏内核名称；伪装内核时把启动阶段选为 `post-fs-data`；",
+        "也可还原未修改的 boot.img。",
+        "开发者原话：原厂系统 + LKM 模式下出现即为误报。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "jian-ce-dao-nei-he-ban-ben-qi-pian",
+      "title": "检测到内核版本欺骗：%1$s",
+      "aliases": [
+        "检测到内核版本欺骗",
+        "uname(2)",
+        "uname -r",
+        "/proc/version"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "",
+      "cause": "`uname(2)`、`uname -r` 子进程、`/proc/version` 三路 release 字符串不一致",
+      "fix": [
+        "尝试使用SUSFS伪装内核版本或其他手段"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "property-modified",
+      "title": "Property Modified（数字代表几处属性修改）",
+      "aliases": [
+        "Property Modified（数字代表几处属性修改）",
+        "Property Modified",
+        "/dev/__properties__/",
+        "prop_area",
+        "/data/adb/service.d/",
+        "shamiko_Plus.sh",
+        "resetprop -n",
+        "mingzun09",
+        "数字代表几处属性修改"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "扫描属性区空洞：`/dev/__properties__/` 下属性文件的权限 / 属主 / 大小与对应 SELinux context，以及属性区是否存在未被使用的空洞（`prop_area` 重叠 / 空洞）——出现空洞说明属性被动态修改过。",
+      "cause": "",
+      "fix": [
+        "隐藏被修改的属性可使用仓库提供的 shamiko_Plus.sh（https://github.com/mingzun09/Chunqiu-Detector-Problem-solution/blob/main/File/shamiko_Plus.sh） 文件添加并移动到 `/data/adb/service.d/` 目录下，确认该脚本有执行权限后重启，尝试解决。 注意：`shamiko_P…"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "found-property",
+      "title": "Found property",
+      "aliases": [
+        "Found property",
+        "persist.logd.size.crash",
+        "persist.logd.size.system",
+        "persist.logd.size.main",
+        "mingzun09"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "检查 `persist.logd.size` / `persist.logd.size.crash` / `persist.logd.size.system` / `persist.logd.size.main` 是否被设置为非空（非空即命中；这几个属性是日志缓冲区设置，部分模块/脚本会写入）。",
+      "cause": "",
+      "fix": [
+        "执行此sh（https://github.com/mingzun09/Chunqiu-Detector-Problem-solution/blob/main/File/Found%20property.sh）尝试解决。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "rom-detected",
+      "title": "ROM detected",
+      "aliases": [
+        "ROM detected"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "系统 / 机型特征命中第三方 ROM 名单。\n\n检测到第三方 ROM。\n\n部分三方 rom 特征符合。",
+      "cause": "",
+      "fix": [
+        "可自行尝试伪装。 用 SUSFS 伪装内核名称。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "rom-detected-a",
+      "title": "ROM detected (a)",
+      "aliases": [
+        "ROM detected (a)",
+        "vendor_sepolicy.cil",
+        "vendor_file_contexts",
+        "hal_lineage",
+        "hal_aospa",
+        ".lineage",
+        ".aospa"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "",
+      "cause": "`vendor_sepolicy.cil` / `vendor_file_contexts` 含 `hal_lineage`、`hal_aospa`、`.lineage`、`.aospa`。\n\n常见于自定义/移植系统/ROM上，仅供开发者参考改进，无解决方案",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "vold-ge-li-yi-kai-qi",
+      "title": "Vold隔离已开启",
+      "aliases": [
+        "Vold隔离已开启",
+        "Vold",
+        "Miscellaneous Check(3)",
+        "persist.sys.vold_app_data_isolation_enabled"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "读取 `persist.sys.vold_app_data_isolation_enabled`（HMA / 应用隐藏模块 的 Vold appdata 隔离会写这个属性）。",
+      "cause": "",
+      "fix": [
+        "关闭HMA/HMAOSS设置终端Vold app data隔离",
+        "如果关闭重启后还存在 `persist.sys.vold_app_data_isolation_enabled=0`",
+        "su shell执行 `resetprop -p --delete persist.sys.vold_app_data_isolation_enabled` 然后重启即可 注意（待作者确认）：与 `Miscellaneous Check(3)` 互相牵制，见该条说明。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "miscellaneous-check-a",
+      "title": "Miscellaneous Check（a）",
+      "aliases": [
+        "Miscellaneous Check（a）",
+        "Miscellaneous Check",
+        "dalvik.vm.dex2oat-flags"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "检查 dex2oat 相关标志（如 `dalvik.vm.dex2oat-flags`）；LSP / Xposed 类模块往往会修改它们。",
+      "cause": "",
+      "fix": [
+        "检测到 dex2oat（通常是 LSP 的问题，更换/更新 LSP 模块）。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "miscellaneous-check-2",
+      "title": "Miscellaneous Check(2)",
+      "aliases": [
+        "Miscellaneous Check(2)",
+        "Miscellaneous Check"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "设备 / 机型篡改检测（改机型模块常见触发）。\n\n检测设备篡改/机型篡改。\n\n改机型模块导致? 自行排查。",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "miscellaneous-check-3",
+      "title": "Miscellaneous Check(3)",
+      "aliases": [
+        "Miscellaneous Check(3)",
+        "Miscellaneous Check"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "改机 / 隔离相关检测（如 Vold appdata 隔离的影响）。\n\n改机检测？",
+      "cause": "",
+      "fix": [
+        "以下方案可能过时：开启过“隐藏应用列表(HMA)”的 Vold appdata 隔离？ 注意（待作者确认）：本项与 `Vold隔离已开启` 互相牵制——开启 HMA/应用隐藏模块 的 Vold appdata 隔离可能解本项，但会触发 `Vold隔离已开启`（该属性被写入）；请按更优先的一条取舍。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "gms-bei-ping-bi",
+      "title": "GMS 被屏蔽",
+      "aliases": [
+        "GMS 被屏蔽",
+        "GMS",
+        "persist.sys.pixelprops.gms",
+        "persist.sys.spoof.gms",
+        "persist.sys.pihooks.disable.gms",
+        "my_product",
+        "oplus_google_cn_gms_features.xml",
+        "被屏蔽"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "检查 ROM 侧“屏蔽 GMS”的特征文件与可执行文件 —— `/my_product/etc/permissions/oplus_google_cn_gms_features.xml`（OPPO / 一加国内机型，检测器会直接 `access` 该路径）、`/system/bin/gmsc`；另有 PIF 类属性 `persist.sys.pihooks.disable.gms`、`persist.sys.pixelprops.gms`、`persist.sys.spoof.gms`。",
+      "cause": "",
+      "fix": [
+        "检查是否用应用隐藏模块隐藏了系统组件（Google 服务套件），或排查 ROM 侧 GMS 问题。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "jian-ce-shi-bai",
+      "title": "检测失败",
+      "aliases": [
+        "检测失败"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "该条检测本身未成功完成（环境限制 / 超时等），不是“命中”；可重试或忽略。",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "lineageos-detection",
+      "title": "LineageOS detection",
+      "aliases": [
+        "LineageOS detection"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "正在运行LineageOS系统，会检测到很多有关属性特征",
+      "cause": "",
+      "fix": [
+        "可尝试使用susfs（如果有）对检测到的特征数据进行隐藏伪装"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "hook-resetprop-modified",
+      "title": "[hook]Resetprop modified",
+      "aliases": [
+        "[hook]Resetprop modified"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "属性被 resetprop 类工具动态改写。\n\nresetprop 被修改。\n\n未知。",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "di-san-fang-rom-2",
+      "title": "第三方ROM（2）",
+      "aliases": [
+        "第三方ROM（2）",
+        "第三方ROM",
+        "ROM"
+      ],
+      "chapter": "一、属性、构建信息与文本配置",
+      "detect": "第三方 ROM 特征（第二组）。\n\n暂时未知",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "gua-zai-jian-xi",
+      "title": "挂载间隙",
+      "aliases": [
+        "挂载间隙"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "检查挂载组 ID / peer-group 表的连续性：组 ID 出现跳跃（如 1,2,3,6,7…）或 peer-group 表不一致（存在被隐藏的挂载点）即命中。\n\n在此判断方法中，当挂载组 ID 增长不连续时（例如 1,2,3,6,7,8...）判定为存在隐藏 root 行为；反之，当挂载组 ID 增长连续（例如 1,2,3,4,5,6,7...）则正常。\n\n当 Magisk 系切换 namespace 时将出现此现象，而对于 KernelSU 系/APatch 系，如果使用了某些具有绑定挂载功能的模块也可能出现此现象。",
+      "cause": "",
+      "fix": [
+        "Magisk 系：使用 Magisk Alpha 可解决，原理未知。",
+        "Kernel 系/APatch 系：尝试更换\"元模块\"解决或者更新 ROOT 管理器。",
+        "如果问题仍存在，请检查具有绑定挂载功能的系统模块，以及系统是否原生存在此现象。",
+        "*注意*：在少数 ROM 中原生存在此现象，如果属于这种情况请忽略此条目。 更换元模块（如 Hybrid-Mount，见序章「相关模块推荐」）/ 更新 root 管理器并重新修补；使用 Scene 的话请更新 Scene。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mountinfo",
+      "title": "mountinfo",
+      "aliases": [
+        "mountinfo",
+        "Mountinfo view drift"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "在进程早期先拍一次 mountinfo 快照，之后与运行期视图对照，两者不一致即命中（`Mountinfo view drift`）。\n\n小米设备通常在开机后系统高占用时，打开检测器会出现此检测项。\n刚开机时命中多半是快照期误差：开机后等 20 秒~5 分钟再测。",
+      "cause": "",
+      "fix": [
+        "通过两种手段获取出来的挂载视图不一样。可能存在隐瞒的问题,有时某服务处理不及时就会报（极早 mountinfo 快照 vs 后期对照）"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "yi-chang-gua-zai",
+      "title": "异常挂载",
+      "aliases": [
+        "异常挂载",
+        "/proc/self/exe"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "`(\"/proc/self/exe\")` 指向路径的与 mountinfo 中预期值存在矛盾",
+      "fix": [
+        "排查挂载类模块，尝试更换元模块解决"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "gua-zai-shi-tu-bu-yi-zhi",
+      "title": "挂载视图不一致",
+      "aliases": [
+        "挂载视图不一致"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "与上词条原理差不多，但校对appzygote不一致",
+      "fix": [
+        "排查挂载类模块，尝试更换元模块解决"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mount-detectde-1",
+      "title": "Mount Detectde(1)",
+      "aliases": [
+        "Mount Detectde(1)",
+        "Mount Detectde"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "/system存在挂载行为",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mount-detector-2",
+      "title": "Mount Detector(2)",
+      "aliases": [
+        "Mount Detector(2)",
+        "Mount Detector"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mount-detector-3",
+      "title": "Mount Detector(3)",
+      "aliases": [
+        "Mount Detector(3)",
+        "Mount Detector"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mount-detector-4",
+      "title": "Mount Detector(4)",
+      "aliases": [
+        "Mount Detector(4)",
+        "Mount Detector"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mount-detector-5",
+      "title": "Mount Detector(5)",
+      "aliases": [
+        "Mount Detector(5)",
+        "Mount Detector"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mount-detector-6",
+      "title": "Mount Detector(6)",
+      "aliases": [
+        "Mount Detector(6)",
+        "Mount Detector"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mount-detector-7",
+      "title": "Mount Detector(7)",
+      "aliases": [
+        "Mount Detector(7)",
+        "Mount Detector"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "检测到挂载推荐使用NoMount元模块或者按照检测提示对系统修改的模块尝试关闭解决"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mount-detector-8",
+      "title": "Mount Detector(8)",
+      "aliases": [
+        "Mount Detector(8)",
+        "Mount Detector"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mount-detector-9",
+      "title": "Mount Detector(9)",
+      "aliases": [
+        "Mount Detector(9)",
+        "Mount Detector"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mount-detector-10",
+      "title": "Mount Detector(10)",
+      "aliases": [
+        "Mount Detector(10)"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mount-detector-11",
+      "title": "Mount Detector(11)",
+      "aliases": [
+        "Mount Detector(11)"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "bu-yi-zhi-de-gua-zai-1",
+      "title": "不一致的挂载(1)",
+      "aliases": [
+        "不一致的挂载(1)",
+        "不一致的挂载"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "bu-yi-zhi-de-gua-zai-2",
+      "title": "不一致的挂载(2)",
+      "aliases": [
+        "不一致的挂载(2)",
+        "不一致的挂载"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "bu-yi-zhi-de-gua-zai-3",
+      "title": "不一致的挂载(3)",
+      "aliases": [
+        "不一致的挂载(3)",
+        "不一致的挂载"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "bu-yi-zhi-de-gua-zai-4",
+      "title": "不一致的挂载(4)",
+      "aliases": [
+        "不一致的挂载(4)",
+        "不一致的挂载"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "bu-yi-zhi-de-gua-zai-5",
+      "title": "不一致的挂载(5)",
+      "aliases": [
+        "不一致的挂载(5)",
+        "不一致的挂载"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "bu-yi-zhi-de-gua-zai-6",
+      "title": "不一致的挂载(6)",
+      "aliases": [
+        "不一致的挂载(6)",
+        "不一致的挂载"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "gua-zai-yi-chang-x",
+      "title": "挂载异常(X)",
+      "aliases": [
+        "挂载异常(X)",
+        "挂载异常",
+        "suspicious mount entry",
+        "/dev/block/...",
+        "/dev/block/xxx",
+        "2222",
+        "Futile hide 04",
+        "Mount loophole",
+        "Magic Mount"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "挂载表扫描（`verdict=hit: peer-group table inconsistency (hidden mount points)`、`suspicious mount entry`、overlay 检测等），命中后会把具体 `/dev/block/...` 或模块名放进展开详情。",
+      "cause": "",
+      "fix": [
+        "检测到某些模块 / 应用的挂载。 KSU · LKM：按条目展开给出的 `/dev/block/xxx` 路径用 PathMask 隐藏后热重载；GKI + SUSFS：在 SUSFS 中写入对应隐藏路径；GKI 无 SUSFS：参考 LKM 方案；其它管理器暂无方案。 若展开内容里出现 overlay 字样 → 更换元模块（如 Hybrid-Mount，见序章「相关模块推荐」）；若确定是某模块…"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "data-local-tmp-futile-hide-1-2-04-2222",
+      "title": "/data/local/tmp 元数据异常族（Futile hide / 1 / 2 / 04 / 2222）",
+      "aliases": [
+        "data/local/tmp 元数据异常族（Futile hide / 1 / 2 / 04 / 2222）",
+        "2222",
+        "Futile hide",
+        "Futile hide 1",
+        "Futile hide 2",
+        "Futile hide 04",
+        "su -c rm -rf /data/local/tmp",
+        "Suspicious Surroundings (a)/(b)/(c)",
+        "/data/local/tmp denied",
+        "元数据异常族"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "都属于对 `/data/local/tmp` 目录元数据（时间戳 / inode / 属主 / 权限）的异常判定，app 内是 5 条独立文案：\n- `Futile hide`：目录时间戳被修改；\n- `Futile hide 1` / `Futile hide 2` / `Futile hide 04`：同类元数据异常的不同变体；\n- `2222`：与挂载 / 元数据相关的变体。",
+      "cause": "",
+      "fix": [
+        "`su -c rm -rf /data/local/tmp` → 重启 → 再按 `Suspicious Surroundings (a)/(b)/(c)`（属主 / inode / 权限）逐项修复；`Futile hide 1` 也可以先重启再测。",
+        "关系：与 `Suspicious Surroundings`、`/data/local/tmp denied` 同一族，处理手段相同。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "inconsistent-mount-debug-ramdisk",
+      "title": "Inconsistent mount / 不一致的挂载（debug_ramdisk）",
+      "aliases": [
+        "Inconsistent mount / 不一致的挂载（debug_ramdisk）",
+        "Inconsistent mount",
+        "不一致的挂载（debug_ramdisk）",
+        "/proc/self/exe",
+        "statfs",
+        "su -c umount /debug_ramdisk",
+        "不一致的挂载"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "把 `/proc/self/exe` 解析出的挂载与 `statfs` 得到的文件系统类型做比对，类型不一致即命中；另有 `/debug_ramdisk` 挂载视图不一致的变体。",
+      "cause": "",
+      "fix": [
+        "`su -c umount /debug_ramdisk`。",
+        "备注：部分设备存在暂未修复的误报现象（3.4 版本已修复其中一部分）。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "magic-mount",
+      "title": "Magic Mount",
+      "aliases": [
+        "Magic Mount"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "检查 magic mount（模块对系统的挂载改写）痕迹。\n\n检测到 Magic Mount",
+      "cause": "",
+      "fix": [
+        "请尝试排除某些针对系统修改的模块，使用某些模块隐藏这个问题（比如 Zygisk 实现模块 中的排除策略）。 同上：Zygisk 实现模块「仅还原挂载」/ 更换元模块（如 Hybrid-Mount，见序章「相关模块推荐」）。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mount-loophole",
+      "title": "Mount loophole",
+      "aliases": [
+        "Mount loophole"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "检查系统修改类模块的 magic mount 是否对系统分区生效。\n\nMagic Mount 对系统修改模块挂载生效",
+      "cause": "",
+      "fix": [
+        "但挂载需要其他模块来隐藏（可选择 SusFS/Zygisk 实现模块）",
+        "使用 Zygisk 实现模块 的排除策略 > 仅还原挂载，并配置排除列表 / 开启默认卸载模块对其实施隐藏。 使用 Zygisk 实现模块 排除策略「仅还原挂载」；或更换元模块（社区推荐 元模块）。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "data-local-tmp-denied",
+      "title": "/data/local/tmp denied",
+      "aliases": [
+        "data/local/tmp denied",
+        "/data/local/tmp"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "检查 `/data/local/tmp` 是否可访问（权限 / 是否存在）。",
+      "cause": "",
+      "fix": [
+        "目录 `/data/local/tmp` 拒绝访问，文件夹权限设置问题? 文件夹不存在? 同上：删除该目录后重启，再按新出现的条目处理。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mt-mt2",
+      "title": "MT管理器（MT2文件夹）/异常文件",
+      "aliases": [
+        "MT管理器（MT2文件夹）/异常文件",
+        "MT管理器（MT2文件夹）",
+        "异常文件",
+        "/storage/emulated/0/MT2/",
+        ".xml",
+        "MT管理器",
+        "MT2文件夹"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "检查 `/storage/emulated/0/MT2/`、boot.img、`.xml` 等文件。\n\n异常文件：检测到根目录下的“mt2”文件夹与 boot.img / “.xml”异常文件。",
+      "cause": "",
+      "fix": [
+        "“mt2”可在 MT 管理器设置中对 MT2 路径自定义修改解决（记得删除旧文件夹）。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "yi-chang-wen-jian",
+      "title": "异常文件",
+      "aliases": [
+        "异常文件",
+        "/dev",
+        "/data/local/tmp",
+        "/storage/emulated/0",
+        "input_devices",
+        "cleaner_starter",
+        "mount_mask",
+        "mount_mark",
+        "horae_control.log",
+        "gpu_freq_table.conf",
+        "swap_config.conf"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "在 `/dev`、`/data`、`/data/local/tmp`、`/storage/emulated/0` 等位置匹配高危文件名与外挂特征（清单见附录 B）。\n`/dev` 和 `/data/local/tmp`\n1. 重命名/删除相关目录文件。",
+      "cause": "",
+      "fix": [
+        "2. 排查并删除以下高危路径： text /data/local/stryker /data/system/appretention /data/local/tmp/luckys /data/local/tmp/input_devices /data/local/tmp/hyperceiler /data/local/tmp/simplehook /data/local/tmp/disabled…"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "suspicious-surroundings-a",
+      "title": "Suspicious Surroundings (a)",
+      "aliases": [
+        "Suspicious Surroundings (a)",
+        "su -c chown shell:shell /data/local/tmp"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "对 `/data/local/tmp` 做元数据检查：目录属组是否为 `shell`。\n\n`/data/local/tmp` 文件夹所有组异常。",
+      "cause": "",
+      "fix": [
+        "所有组改为 shell。 社区实测：该条判的是 `/data/local/tmp` 的属主 / 属组异常（原文档写的“所有组异常”与之对应）；统一改回 shell 即可：`su -c chown shell:shell /data/local/tmp`。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "suspicious-surroundings-b",
+      "title": "Suspicious Surroundings（b）",
+      "aliases": [
+        "Suspicious Surroundings（b）",
+        "Suspicious Surroundings",
+        "su -c restorecon -RF /data/local/tmp"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "检查 `/data/local/tmp` 的 inode 值是否偏高（社区实测阈值为 > 10000；该目录曾被删除 / 重建时 inode 会异常增大）。",
+      "cause": "",
+      "fix": [
+        "（任选其一）：",
+        "恢复出厂设置；",
+        "使用内核级隐藏把该路径的 inode 伪装成小于 1000；",
+        "使用 Inode-Hijacker（https://github.com/YiJieqwq/Inode-Hijacker/releases） 脚本（下载执行即可；执行不了的换老 release）。",
+        "注意：使用 Inode-Hijacker 之后，如果出现有线投屏（如 Scrcpy）不可用，执行 `su -c restorecon -RF /data/local/tmp` 恢复即可。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "looper-fd",
+      "title": "Looper fd图异常",
+      "aliases": [
+        "Looper fd图异常",
+        "Looper",
+        "/proc/self/fd",
+        "readlink",
+        "fd图异常"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "读取本进程 fd 目标（`/proc/self/fd` + `readlink`），把 fd 图（打开的文件 / socket / 匿名 inode）与预期做对比。",
+      "cause": "",
+      "fix": [
+        "暂时未知 部分老内核可能出现此检测项，修复方法暂时未知。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "fdinfo-mnt-c",
+      "title": "fdinfo mnt 采样异常（c）",
+      "aliases": [
+        "fdinfo mnt 采样异常（c）",
+        "fdinfo mnt 采样异常",
+        "mnt",
+        "/proc/*/fdinfo",
+        "mnt_id",
+        "采样异常"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "读取 `/proc/*/fdinfo` 中的 `mnt_id` 做抽样统计，与挂载视图交叉验证；USB 调试残留或临时挂载容易触发。",
+      "cause": "",
+      "fix": [
+        "大概率为检测到 USB 调试痕迹，小概率误报。可使用脚本调试痕迹消除（https://github.com/YiJieqwq/ADB-Trace-Cleaner/releases）尝试解决。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "suspicious-surroundings-c",
+      "title": "Suspicious Surroundings（c）",
+      "aliases": [
+        "Suspicious Surroundings（c）",
+        "Suspicious Surroundings",
+        "su -c chmod 771 /data/local/tmp"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "检查 `/data/local/tmp` 的权限是否为默认值（771）。\n\n`/data/local/tmp` 的权限被修改（默认 771）。",
+      "cause": "",
+      "fix": [
+        "重新设置权限。 权限改回默认：`su -c chmod 771 /data/local/tmp`。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "dev-cpuset-appopt",
+      "title": "/dev/cpuset/AppOpt",
+      "aliases": [
+        "dev/cpuset/AppOpt",
+        "/data/swap_config.conf",
+        "/data/encore/*_cpu_gov",
+        "/data/local/tmp/yshell"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "该路径属“线程 / 调度模块挂载”的特征签名（与 `/data/swap_config.conf`、`/data/encore/*_cpu_gov`、`/data/local/tmp/yshell` 等在同一张特征表里），目录存在即报。",
+      "cause": "",
+      "fix": [
+        "检测到线程 / 调度类模块的挂载。 卸载对应线程模块。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "system-bin-fastboot-adb",
+      "title": "/system/bin/fastboot 和 /system/bin/adb",
+      "aliases": [
+        "system/bin/fastboot 和 /system/bin/adb",
+        "fastboot 和",
+        "fastboot",
+        "/system/bin/adb"
+      ],
+      "chapter": "二、挂载视图与文件系统一致性",
+      "detect": "对系统可执行文件做异常存在性检查（`/system/bin/adb` 已确认在特征表内，`fastboot` 待确认），常见于小米官改包。",
+      "cause": "",
+      "fix": [
+        "检测到异常可执行文件（常见于小米官改包）。 刷回官方包；或用 PathMask 隐藏这两个文件。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "ben-jin-cheng-root-quan-xian-yi-chang",
+      "title": "本进程 Root 权限异常",
+      "aliases": [
+        "本进程 Root 权限异常",
+        "Root",
+        "本进程",
+        "权限异常"
+      ],
+      "chapter": "三、进程、命名空间与权限状态",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "yi-chang-jin-cheng-0000-pid",
+      "title": "异常进程0000（pid）",
+      "aliases": [
+        "异常进程0000（pid）",
+        "异常进程0000",
+        "ps -ef | grep <pid>",
+        "PPid",
+        "tgid",
+        "%1$s"
+      ],
+      "chapter": "三、进程、命名空间与权限状态",
+      "detect": "同上（审计日志泄露）；0000 为该进程 pid，可用 `ps -ef | grep <pid>` 反查。\n\n0000 代表的是进程的 pid\n\n你可以尝试使用 shell 指令以 root 执行 `ps -ef | grep 数字id` 来查找对应 pid 进程，通常是拥有 root 权限的守护进程（如 lspd 进程、Tricky-Store 进程）\n\nnative 判据是 cgroup 内进程组扫描 + PPID 聚类：先枚举 cgroup 中的进程归属，再按 `PPid` 将进程聚成父子组；同一进程组内一旦出现异常归属（父进程、uid 或 cgroup 层级与预期不符），会对该组内每个异常 `tgid` 逐个生成一条 `异常进程 %1$s`。\n\n所以同一次扫描可能连续出现多个同组条目，`%1$s` 取自各 `tgid` 的进程名或 cmdline（取不到时为空串）。只改进程名或只…",
+      "cause": "",
+      "fix": [
+        "此检测依赖安全漏洞，更新安全补丁到 2026/01/01 可显著降低检出率，但目前无法完全解决，此安全漏洞将在 Google 正式发布 Android 17 后完全修复。",
+        "安全补丁更新往往伴随系统更新，如果因为不想更新系统而无法更新安全补丁，可以忽略此条目。",
+        "双开应用有时可以使此检测方案失效，但不会实质上解决此安全漏洞，所以双开应用不应被视为可行的方法。",
+        "会有误报现象"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "zygote-cun-zai-yi-chang",
+      "title": "Zygote 存在异常",
+      "aliases": [
+        "Zygote 存在异常",
+        "Zygote",
+        "readproc_gid_3009=present/missing",
+        "INET_GID",
+        "AID_READPROC",
+        "存在异常"
+      ],
+      "chapter": "三、进程、命名空间与权限状态",
+      "detect": "读取本进程（应用 zygote 子进程）的 GID 列表，检查 GID 3009（AID_READPROC）是否存在（探针输出 `readproc_gid_3009=present/missing`）→ 缺失即命中（该 GID 缺失的致因尚不能确认）。",
+      "cause": "",
+      "fix": [
+        "（社区说法）应用自身 zygote 的补充 GID 被限制。 在HMA-OSS模块中对春秋检测关闭「限制 zygote 权限」里的 `INET_GID`。",
+        "补充：该开关按黑名单移除用户勾选的补充 GID（HMA-OSS 的可选项为 1015 / 1023 / 1032 / 1077 / 1078 / 1079 / 3003 / 9997 共 8 项，不含 3009）。本条的判据确定为「GID 3009 缺失」，但致因是否来自该开关尚不能确认。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "zygote-test-1-app",
+      "title": "zygote test (1) / App Zygote 分叉顺序异常",
+      "aliases": [
+        "zygote test (1) / App Zygote 分叉顺序异常",
+        "zygote test (1)",
+        "App Zygote 分叉顺序异常",
+        "App",
+        "/dev/socket/logdw",
+        "prepare/parent/child",
+        "app_zygote",
+        "分叉顺序异常"
+      ],
+      "chapter": "三、进程、命名空间与权限状态",
+      "detect": "app_zygote（应用 zygote）内的 fork 顺序探针 —— 用 `/dev/socket/logdw` 打开日志 socket 取 identity / cookie，按 `prepare/parent/child`、父子存活与 fd 关闭顺序判断是否存在 Zygisk 早于 app-zygote 注入 的残留；属侧信道类，不稳定。",
+      "cause": "",
+      "fix": [
+        "打开 Zygisk 实现模块的「链接器功能」与「匿名内存功能」；排除列表策略设为「仅还原挂载」；不稳定时可直接重测。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "obb-mu-lu-cun-zai-yi-chang",
+      "title": "OBB 目录存在异常",
+      "aliases": [
+        "OBB 目录存在异常",
+        "OBB",
+        "statx",
+        "newfstatat",
+        "openat_chain",
+        "self_obb_path_visible",
+        "inconsistent_read_only_views",
+        "INET_GID",
+        "目录存在异常"
+      ],
+      "chapter": "三、进程、命名空间与权限状态",
+      "detect": "用多种只读方式读取应用自身的 OBB 路径并比对结果：`statx` / `newfstatat` / `openat_chain`（探针 `self_obb_path_visible`、`inconsistent_read_only_views`）→ 各视图不一致（说明有模块在拦截 / 隐藏该路径）即命中。",
+      "cause": "",
+      "fix": [
+        "安装了试图阻止检测器扫盘的模块。 暂按误报理解；可在 应用隐藏模块 中对春秋检测开启「限制 zygote 权限」（除 `INET_GID` 外全开）。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "she-bei-wei-mo-ni-qi",
+      "title": "设备为模拟器",
+      "aliases": [
+        "设备为模拟器",
+        "/dev/goldfish_pipe",
+        "/dev/qemu_pipe",
+        "/dev/socket/genyd",
+        "/sys/qemu_trace",
+        "ranchu",
+        "genymotion",
+        "bluestacks",
+        "ldplayer",
+        "nox",
+        "memu",
+        "ttvm",
+        "vbox",
+        "vmware",
+        "android/os/BatteryManager",
+        "android/telephony/TelephonyManager"
+      ],
+      "chapter": "三、进程、命名空间与权限状态",
+      "detect": "检查模拟器 / 虚拟化特征，如 `/dev/goldfish_pipe`、`/dev/qemu_pipe`、`/dev/socket/genyd`、`/sys/qemu_trace` 等，以及 `goldfish` / `ranchu` / `qemu` / `genymotion` / `bluestacks` / `ldplayer` / `nox` / `memu` / `ttvm` / `vbox` / `vmware` 等机型关键字；同时引用 `android/os/BatteryManager` 与 `android/telephony/TelephonyManager`，即也会参考电量 / 充电状态与 SIM 状态。",
+      "cause": "",
+      "fix": [
+        "先卸载重装检测器；避免在未插 SIM 卡 + 满电 + 充电的状态下测试。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "jian-ce-yun-xing-huan-jing-ke-yi-rong-qi-duo-kai",
+      "title": "检测运行环境可疑 / 容器 / 多开",
+      "aliases": [
+        "检测运行环境可疑 / 容器 / 多开",
+        "检测运行环境可疑",
+        "容器",
+        "多开",
+        "/proc/self/cgroup",
+        "^0::/uid_\\d+/pid_\\d+$",
+        "^0::/apps/uid_\\d+/pid_\\d+$",
+        "parallel_ok=",
+        "signal_parallel_access_mismatch=",
+        "parallel_ok",
+        "signal_parallel_access_mismatch"
+      ],
+      "chapter": "三、进程、命名空间与权限状态",
+      "detect": "校验 `/proc/self/cgroup` 的路径格式是否匹配 `^0::/uid_\\d+/pid_\\d+$` 或 `^0::/apps/uid_\\d+/pid_\\d+$`（两个正则直接内置在代码里），并结合 parallel / clone 相关探针（`parallel_ok=`、`signal_parallel_access_mismatch=`）；格式异常或探针不一致即命中。",
+      "cause": "",
+      "fix": [
+        "检测到应用处于多开 / 沙盒 / 容器环境。 卸载重装春秋检测；不要对春秋检测使用应用双开。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "huan-jing-wei-zao",
+      "title": "环境伪造",
+      "aliases": [
+        "环境伪造",
+        "persist.sys.pihooks_*",
+        "persist.sys.pixelprops.*",
+        "persist.sys.spoof.gms",
+        "persist.sys.pihooks_",
+        "persist.sys.pixelprops.",
+        "persist.sys.pixelprops"
+      ],
+      "chapter": "三、进程、命名空间与权限状态",
+      "detect": "不同复现条件下触发面不同——① 刷入审计日志补丁类内核方案后触发（见下）；② 也有反馈指向属性伪装类模块（`persist.sys.pihooks_*`、`persist.sys.pixelprops.*`、`persist.sys.spoof.gms` 等，待验证）；自查线索：本进程 maps 中是否出现 PIF / IntegrityFix / PixelProps 相关模块。\n\n旧设备（4系内核）可能误报？",
+      "cause": "",
+      "fix": [
+        "已知触发面： - 刷入审计日志补丁类内核方案后触发 → 卸载该模块； - 属性伪装类模块（PIF / pihooks / pixelprops / spoof 类）也可能触发（待验证）→ 用 `getprop | grep -iE \"pihooks|pixelprops|spoof\"` 检查是否存在属性伪装残留，定位到对应模块后处理，或对检测器隐藏相关属性； - 部分自定义 / 移植 ROM 自…"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "uid-namespace-mismatch",
+      "title": "UID Namespace mismatch（同 UID 命名空间不一致）",
+      "aliases": [
+        "UID Namespace mismatch（同 UID 命名空间不一致）",
+        "Namespace",
+        "UID namespace mismatch for same UID",
+        "命名空间不一致"
+      ],
+      "chapter": "三、进程、命名空间与权限状态",
+      "detect": "同一 UID 下的 user namespace 视图不一致（`UID namespace mismatch for same UID`）。",
+      "cause": "",
+      "fix": [
+        "处理：检查隐藏框架是否改动了 namespace；更换 / 更新元模块后重测。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mount-namespace-anomaly",
+      "title": "Mount Namespace（挂载命名空间）/ Mount namespace anomaly",
+      "aliases": [
+        "Mount Namespace（挂载命名空间）/ Mount namespace anomaly",
+        "Mount Namespace（挂载命名空间）",
+        "Mount namespace anomaly",
+        "Namespace",
+        "debug_ramdisk",
+        "挂载命名空间"
+      ],
+      "chapter": "三、进程、命名空间与权限状态",
+      "detect": "挂载命名空间视图异常（`Mount namespace anomaly`）；与 `不一致的挂载/debug_ramdisk`、`挂载间隙` 相关但判据不同（这里比的是 namespace 视图，不是挂载表 / statfs）。",
+      "cause": "",
+      "fix": [
+        "处理：同挂载类（Zygisk 实现模块「仅还原挂载」/ 更换元模块（如 Hybrid-Mount）/ PathMask、SUSFS 隐藏）。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "pid-namespace-anomaly",
+      "title": "PID Namespace（进程命名空间）/ PID namespace anomaly",
+      "aliases": [
+        "PID Namespace（进程命名空间）/ PID namespace anomaly",
+        "PID Namespace（进程命名空间）",
+        "PID namespace anomaly",
+        "Namespace",
+        "进程命名空间"
+      ],
+      "chapter": "三、进程、命名空间与权限状态",
+      "detect": "进程命名空间视图异常（`PID namespace anomaly`）。",
+      "cause": "",
+      "fix": [
+        "处理：检查隐藏框架 / 元模块对 namespace 的改动，更新后重测。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "tiao-shi-qi-yi-lian-jie",
+      "title": "调试器已连接",
+      "aliases": [
+        "调试器已连接"
+      ],
+      "chapter": "四、内核接口直调与反调试 / 反注入行为",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "tiao-shi-huan-jing-ke-neng-shi-mian-jie-suo-she",
+      "title": "调试环境可能是免解锁设备",
+      "aliases": [
+        "调试环境可能是免解锁设备",
+        "/proc",
+        "免解设备"
+      ],
+      "chapter": "四、内核接口直调与反调试 / 反注入行为",
+      "detect": "`/proc` 三路不一致，或 dumpable=1/2。",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [
+        "ramdisk"
+      ],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "fa-xian-dong-tai-cha-zhuang-zu-jian",
+      "title": "发现动态插桩组件",
+      "aliases": [
+        "发现动态插桩组件"
+      ],
+      "chapter": "四、内核接口直调与反调试 / 反注入行为",
+      "detect": "判定 Frida 类运行时组件存在",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "found-ksu",
+      "title": "Found ksu/免解设备",
+      "aliases": [
+        "Found ksu/免解设备",
+        "Found ksu",
+        "免解设备",
+        "getppid() > 5000",
+        "/proc/self/status",
+        "Seccomp: 0",
+        "pm clear",
+        "pm hide",
+        "/data/adb",
+        "/proc/fs",
+        "KernelSU loop device"
+      ],
+      "chapter": "四、内核接口直调与反调试 / 反注入行为",
+      "detect": "KSU 免解（越狱）模式特征，或发现 ksu 相关进程 / 设备（热重启后会出现，可选择重启一次尝试解决）\n\n4.6.2 的判据是进程内两项状态异常，满足任一即命中：\n\n- `getppid() > 5000`：正常 App 进程的父进程应是启动早期创建、pid 通常远低于 5000 的 system zygote；父 pid 过大说明父进程并非预期 zygote，常见于注入或重定父进程；\n- `/proc/self/status` 中 `Seccomp: 0`：正常 App 进程应在 seccomp 过滤模式下运行（该字段通常为 `2`）；为 `0` 表示过滤未启用。\n\n该条为本地判定：飞行模式 + `pm clear` 后仍可复现。`pm hide` 掉 KSU 管理器、在 App 的 mount namespace 里把 `/data/adb` bind 成空目录、隐藏 `/pro…",
+      "cause": "",
+      "fix": [
+        "发现 KSU 处于免解（越狱）模式，或发现 ksu 相关进程等因素。",
+        "不推荐使用免解（越狱）模式，因此不提供解决方案。"
+      ],
+      "deviceTypes": [
+        "ramdisk"
+      ],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "kernelsu-loop-device",
+      "title": "KernelSU loop device",
+      "aliases": [
+        "/proc/fs/jbd2",
+        "loop*-8",
+        "/proc/fs/ext4/<dev>",
+        "KernelSU loop device: %1$s",
+        "loopN",
+        "sdc*"
+      ],
+      "chapter": "四、内核接口直调与反调试 / 反注入行为",
+      "detect": "检查是否存在 KernelSU 特征的 loop 设备挂载。\n\n检测到 KSU\n判据是 jbd2 与 ext4 两处同时命中：\n\n1. 枚举 `/proc/fs/jbd2`，匹配形如 `loop*-8` 的条目（即 loop 设备上的 ext4 日志项）；\n2. 对每个匹配项去掉 `-8` 后缀得到 `<dev>`，确认 `/proc/fs/ext4/<dev>` 同时存在；\n3. 两者同时成立才输出 `KernelSU loop device: %1$s`，`%1$s` 为对应设备名。\n\n只在 `/proc/fs/ext4` 下看到 `loopN` 不足以命中本详情；`/proc/fs/jbd2` 里只有 `sdc*` 等非 loop 条目时也不成立。主进程通常看不到 `/proc/fs`，复验应在能读取该挂载视图的隔离服务或 zygote 域进行。",
+      "cause": "",
+      "fix": [
+        "更新你的管理器并重新修补 更新管理器并重新修补；或关闭/更换元模块（如 Hybrid-Mount，见序章「相关模块推荐」）。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "kernelsu-detected",
+      "title": "kernelsu detected",
+      "aliases": [
+        "kernelsu detected",
+        "KernelSU_group"
+      ],
+      "chapter": "四、内核接口直调与反调试 / 反注入行为",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "更新管理器至最新CI（https://t.me/KernelSU_group/3234/497395）"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "folkpatch-apatch",
+      "title": "找到 FolkPatch/APatch",
+      "aliases": [
+        "找到 FolkPatch/APatch",
+        "找到 FolkPatch",
+        "APatch",
+        "FolkPatch",
+        "找到"
+      ],
+      "chapter": "四、内核接口直调与反调试 / 反注入行为",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "apkey-hide",
+      "title": "发现 APKey_Hide 类隐藏行为",
+      "aliases": [
+        "发现 APKey_Hide 类隐藏行为",
+        "APKey_Hide",
+        "发现",
+        "类隐藏行为"
+      ],
+      "chapter": "四、内核接口直调与反调试 / 反注入行为",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "suspicious-surroundings",
+      "title": "Suspicious Surroundings",
+      "aliases": [
+        "Suspicious Surroundings",
+        "/data/local/tmp"
+      ],
+      "chapter": "四、内核接口直调与反调试 / 反注入行为",
+      "detect": "环境类异常检查（`/data/local/tmp` 元数据、可疑进程 / 服务等）。\n\n检测到 APatch",
+      "cause": "",
+      "fix": [
+        "更新 APatch，并加载 KernelPatch 隐藏模块（如 NoHello.kpm，见序章「相关模块推荐」）。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "seccomp-guo-lv-yi-kai-qi",
+      "title": "seccomp过滤已开启",
+      "aliases": [
+        "seccomp过滤已开启",
+        "seccomp",
+        "longze777"
+      ],
+      "chapter": "四、内核接口直调与反调试 / 反注入行为",
+      "detect": "使用此项目并构建模块刷入解决https://github.com/longze777/UID-",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "pu-tong-ying-yong-netlink-ce-lve-shi-xiao",
+      "title": "普通应用 NETLINK 策略失效",
+      "aliases": [
+        "普通应用 NETLINK 策略失效",
+        "NETLINK_SOCK_DIAG",
+        "untrusted_app",
+        "AF_UNIX",
+        "普通应用",
+        "策略失效"
+      ],
+      "chapter": "四、内核接口直调与反调试 / 反注入行为",
+      "detect": "— untrusted_app 域发 `NETLINK_SOCK_DIAG` dump 请求，收到 AF_UNIX diag 回复（本应被策略拒绝）。",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "netlink-socket-anomaly",
+      "title": "Netlink socket anomaly",
+      "aliases": [
+        "Netlink socket anomaly",
+        "socket(AF_NETLINK)",
+        "send"
+      ],
+      "chapter": "四、内核接口直调与反调试 / 反注入行为",
+      "detect": "`socket(AF_NETLINK)` 失败或 `send` 短写。",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "found-lsphook-framework",
+      "title": "Found LSPHook Framework",
+      "aliases": [
+        "Found LSPHook Framework"
+      ],
+      "chapter": "四、内核接口直调与反调试 / 反注入行为",
+      "detect": "检查 LSPosed / LSPatch 一类框架的运行痕迹。\n\n检测到 LSPHook Framework",
+      "cause": "",
+      "fix": [
+        "某些 xp 模块修改导致，也可卸载更换 LSP 模块。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "malicious-hook",
+      "title": "Malicious Hook",
+      "aliases": [
+        "Malicious Hook"
+      ],
+      "chapter": "五、二进制与内存映射完整性",
+      "detect": "可执行段内存 CRC 与磁盘同段 CRC 不符。",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "critical-libc-inline-hook",
+      "title": "Critical libc inline hook",
+      "aliases": [
+        "Critical libc inline hook"
+      ],
+      "chapter": "五、二进制与内存映射完整性",
+      "detect": "内存映射不完整（前 16 字节与 libc 文件同偏移字节比对）",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "evil-module",
+      "title": "Evil Module",
+      "aliases": [
+        "Evil Module",
+        "libart.so"
+      ],
+      "chapter": "五、二进制与内存映射完整性",
+      "detect": "指针不在 libart.so 映射内或为空",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "evil-service",
+      "title": "Evil Service",
+      "aliases": [
+        "Evil Service",
+        "/proc/net/unix",
+        "/sys/fs/selinux",
+        "/proc/self/fd",
+        "/apex",
+        "/system/framework",
+        "/data/misc",
+        "/data/system",
+        "/data/local/tmp",
+        "/storage/emulated/0/",
+        "shamiko",
+        "suius",
+        "suidaemon",
+        "ssssss",
+        "suidaem",
+        "/data/local/tmp/",
+        "sandhook*",
+        "pumpcin*",
+        "Sui",
+        "sandhook",
+        "sandcore",
+        "pumpcin",
+        "taiwan",
+        "tricky",
+        "EDXposed",
+        "lsposed",
+        "/dev/binderfs/<name>",
+        "NO",
+        "binder-control",
+        "YES"
+      ],
+      "chapter": "五、二进制与内存映射完整性",
+      "detect": "— 目录名、Binder fd、`/proc/net/unix` 中出现 lsposed/sui/sandhook/pumpcin 等标记（模块残留）\n\n关于 lsp, shizuku 还有一些 xp 模块的修改检测。\nnative 判据分四层，但只有第一层参与裁决：\n\n1. 目录名扫描：遍历 `/dev/binderfs`、`/dev`、`/sys/fs/selinux`、`/proc/self/fd`、`/apex`、`/system/framework`、`/data/misc`、`/data/system`、`/data/local/tmp`、`/storage/emulated/0/`、`/data/`，命中关键词即点亮对应族：\n\n- Sui：`shamiko`、`Shamiko`、`内核`、`调度`、`suius`、`suidaemon`、`ssssss`、`suidaem`…",
+      "cause": "",
+      "fix": [
+        "清理：`/data/local/tmp/` 下的 `sandhook*`、`pumpcin*`、`shamiko`、`suidaemon`、`suius` 一类目录/文件属模块卸载后的残留，删掉后重启复扫多数会消失（本条判的是“残留物证”，不是“服务正在运行”）。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "hook-suspicious-library-injection",
+      "title": "[Hook] Suspicious library injection",
+      "aliases": [
+        "[Hook] Suspicious library injection"
+      ],
+      "chapter": "五、二进制与内存映射完整性",
+      "detect": "检查库注入痕迹（zygisk / riru / xposed 常见特征）。\n\n(zygisk/riru/xposed)\n\n检测到 HOOK，自行排查原因，因素过多。",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "hook-native-bridge-detected-emulator-cross-arch",
+      "title": "[Hook] Native Bridge detected (emulator/cross-arch)",
+      "aliases": [
+        "[Hook] Native Bridge detected (emulator/cross-arch)",
+        "libnativebridge.so",
+        "NativeBridgeError()"
+      ],
+      "chapter": "五、二进制与内存映射完整性",
+      "detect": "— `libnativebridge.so` 的 `NativeBridgeError()` 返回 true。",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "zygisk-detected",
+      "title": "Zygisk detected",
+      "aliases": [
+        "Zygisk detected"
+      ],
+      "chapter": "五、二进制与内存映射完整性",
+      "detect": "检查 Zygisk 注入痕迹（匿名可执行映射、进程环境、模块入口等）。",
+      "cause": "",
+      "fix": [
+        "检测到 Zygisk，通常是 magisk 自带的 zygisk 导致（关闭解决）或者其他原因。",
+        "升级 Zygisk 实现模块(http://github.com/Dr-TSNG/ZygiskNext)。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "zygisk-detector-2",
+      "title": "Zygisk detector(2)",
+      "aliases": [
+        "Zygisk detector(2)",
+        "Zygisk detector",
+        "[stack]",
+        "MAGISK_INJ_1"
+      ],
+      "chapter": "五、二进制与内存映射完整性",
+      "detect": "— `[stack]` 末端 1000 字节含 `MAGISK_INJ_1` 标记",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "lsposed-detected",
+      "title": "LSPosed Detected（%1$d）",
+      "aliases": [
+        "LSPosed Detected（）",
+        "LSPosed",
+        "Detected"
+      ],
+      "chapter": "五、二进制与内存映射完整性",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "nei-cun-yi-chang",
+      "title": "内存异常",
+      "aliases": [
+        "内存异常",
+        "clear_refs",
+        "smaps",
+        "MADV_COLD"
+      ],
+      "chapter": "五、二进制与内存映射完整性",
+      "detect": "页驻留 / 软脏位类探针（`clear_refs`、`smaps`、`MADV_COLD`），用于发现隐藏或异常映射。",
+      "cause": "",
+      "fix": [
+        "清除检测器数据后若还存在，那么请开 Issues 并提供你的模块列表信息以及使用了哪些 xp 模块，我有时间会研究的。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "dirty-device-a",
+      "title": "Dirty Device(a)",
+      "aliases": [
+        "Dirty Device(a)",
+        "Dirty Device",
+        "/storage/emulated/0/",
+        "/sdcard"
+      ],
+      "chapter": "五、二进制与内存映射完整性",
+      "detect": "检测 `/storage/emulated/0/`（`/sdcard`）下名字含 `sh` 的文件夹 / 文件，以及外挂相关的文件 / 驱动（部分版本还会结合“替换密钥行为”一起判定）。",
+      "cause": "",
+      "fix": [
+        "这条的含义就是「检测到设备上存在游戏外挂相关文件」→ 自己删掉即可；删除后重启再测。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "zygote-check",
+      "title": "zygote check（%1$d）",
+      "aliases": [
+        "zygote check（）",
+        "zygote",
+        "check",
+        "/mnt",
+        "/data_mirror",
+        "data_mirror"
+      ],
+      "chapter": "五、二进制与内存映射完整性",
+      "detect": "某路径下ctime 早于取样时钟、`/mnt` 下 tmpfs 目录非空、mountinfo id 缺口（apex/art、`/data_mirror` 等）按位上报\n此项存在不稳定性",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "abnormal-environment-k",
+      "title": "Abnormal Environment(k)",
+      "aliases": [
+        "Abnormal Environment(k)",
+        "Abnormal Environment"
+      ],
+      "chapter": "六、SELinux 策略、AVC 与审计通道",
+      "detect": "更新最新CI管理器解决",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "selinux-policy-root",
+      "title": "检测SELinux Policy时发现可疑问题 / 检测到ROOT权限",
+      "aliases": [
+        "检测SELinux Policy时发现可疑问题 / 检测到ROOT权限",
+        "检测SELinux Policy时发现可疑问题",
+        "检测到ROOT权限",
+        "Policy",
+        "ROOT",
+        "app_zygote",
+        "…context_oracle_sentinel:s0",
+        "…_sentinel_file:s0",
+        "/sys/fs/selinux/access",
+        "avdSeqNo",
+        "selinux_check_access",
+        "getfilecon",
+        "Repeatability",
+        "shell -> su",
+        "apatch",
+        "enforcing is not 1",
+        "deny_unknown is not 1",
+        "unexpected version",
+        "sequence/policyload unexpected",
+        "ksu_file",
+        "lsposed_file",
+        "magisk_file",
+        "/sys/fs/selinux/status",
+        "seqno",
+        "EINVAL",
+        "/sys/fs/selinux/policy",
+        "context_oracle_sentinel",
+        "mingzun09",
+        "GKI2",
+        "SELinux_Hook.kpm",
+        "selinux_hook",
+        "selinux_magisk_access_filter"
+      ],
+      "chapter": "六、SELinux 策略、AVC 与审计通道",
+      "detect": "1. 以本进程（预期位于 `app_zygote` 域）的 context 作为“载体”，用哨兵 context（`…context_oracle_sentinel:s0` / `…_sentinel_file:s0`）建立正控制 / 负控制 / 文件控制三组对照；\n\n2. 查询走 raw selinuxfs 写（直接操作 `/sys/fs/selinux/access`，不走 libselinux），并校验内核回填的 `avdSeqNo`；\n\n3. 用 `selinux_check_access` / `getfilecon` 与 raw 结果交叉比对，加扰动后再比对一次，并检查重复性（`Repeatability`）；\n\n4. 直接探测根相关规则是否仍被 live policy 接受（`shell -> su` 转换、`magisk` / `ksu` / `apatch` 域、`ks…",
+      "cause": "（命中时详情会给出）：`enforcing is not 1`、`deny_unknown is not 1`、`unexpected version`、`sequence/policyload unexpected`、`direct syscall and libc views disagree (PLT-hook residue)`。",
+      "fix": [
+        "检测方式参考：DirtySepolicy（https://github.com/LSPosed/DirtySepolicy）；",
+        "本条的判定点是「应用 zygote 拥有访问 `/sys/fs/selinux/access` 的权限」，需要让 root 管理器或内核侧隐藏 SELinux 修改： - root 实现的自带能力（可用于 KernelSU 系 / APatch 系）：升级到最新版本，开启「隐藏 SELinux 修改」（KSU 系需重新修补镜像或重新进行免解（越狱）后重启）。 - 内核版本支持范围： - APat…",
+        "*以上方案补充整理自 741afb7 的上游 PR #45（https://github.com/mingzun09/Chunqiu-Detector-Problem-solution/pull/45）；兼容性说明沿用该贡献，并非本站独立真机验证。*",
+        "关系：`SELinux 状态指纹可疑`、`SELinux 状态通道不一致`、`设备获取 Root 权限 / 异常模块` 属于同一套判据族（不同版本的不同切面），本文档已合并到本条。"
+      ],
+      "deviceTypes": [
+        "ramdisk"
+      ],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "root-jin-cheng",
+      "title": "ROOT进程",
+      "aliases": [
+        "ROOT进程",
+        "ROOT",
+        "logcat -b events",
+        "auditd",
+        "/proc/*/attr/current"
+      ],
+      "chapter": "六、SELinux 策略、AVC 与审计通道",
+      "detect": "通过 AVC 审计日志（`logcat -b events` 中的 `auditd` 记录）与 `/proc/*/attr/current` 交叉，找出以 root 相关 context 运行的进程。\n\n检测 Zygote 环境?\n\n通过审计日志漏洞读取 (avc)",
+      "cause": "",
+      "fix": [
+        "可使用内核级隐藏功能（SusFS 等）或审计日志补丁类内核方案",
+        "Android 安全更新 2025/09/01 已修复（不准确但结果是这样的）"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "ju-you-root-quan-xian-de-jin-cheng",
+      "title": "具有ROOT权限的进程",
+      "aliases": [
+        "具有ROOT权限的进程",
+        "ROOT",
+        "avc: denied",
+        "magisk",
+        "proc_modules"
+      ],
+      "chapter": "六、SELinux 策略、AVC 与审计通道",
+      "detect": "— logcat 的 `avc: denied` 出现 `su`/`magisk`/`proc_modules` 域\nKSU热重启后会出现（再重启一次尝试解决\n越狱设备常见\n不推荐使用越狱模式，所以不提供解决方案",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "wei-zhuang-cheng-te-quan-ying-yong-de-root-jin",
+      "title": "伪装成特权应用的root进程",
+      "aliases": [
+        "伪装成特权应用的root进程",
+        "root",
+        "avc: denied"
+      ],
+      "chapter": "六、SELinux 策略、AVC 与审计通道",
+      "detect": "`avc: denied` 中 app 域访异常",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "current-app-root-domain-trace",
+      "title": "Current-app-root-domain-trace",
+      "aliases": [
+        "Current-app-root-domain-trace",
+        "untrusted_app",
+        "/proc",
+        "attr/current",
+        "cmdline",
+        "comm",
+        "auditd",
+        "logcat",
+        "tcontext=u:r:ksu:s0",
+        "proc_pid_avc_context_leak"
+      ],
+      "chapter": "六、SELinux 策略、AVC 与审计通道",
+      "detect": "以 `untrusted_app` 身份遍历 `/proc` 的 PID，逐个读 `attr/current`、`cmdline`、`comm`（正常应全被 SELinux 拒绝），随后去 `auditd` / `logcat` 里翻 AVC denied 记录，出现 `tcontext=u:r:ksu:s0` 一类即命中（探针 `proc_pid_avc_context_leak`）。",
+      "cause": "",
+      "fix": [
+        "以 `untrusted_app` 身份遍历 `/proc` 的 PID，逐个尝试读取 `attr/current`、`cmdline`、`comm`（正常情况下应全部被 SELinux 拒绝），随后翻 `auditd`/`logcat` 的 AVC denied 记录，若出现 `tcontext=u:r:ksu:s0` 一类即可命中。 KSU · LKM：刷入对应版本的 PathMask 并开…"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "fa-xian-yi-chang-mo-kuai",
+      "title": "发现异常模块",
+      "aliases": [
+        "发现异常模块",
+        "/system/bin/encore_profiler",
+        "/data/encore/default_cpu_gov",
+        "/data/encore/custom_default_cpu_gov",
+        "/data/local/tmp/encore_logo.png"
+      ],
+      "chapter": "六、SELinux 策略、AVC 与审计通道",
+      "detect": "命中温控 / 调度 / 优化类模块的特征签名，其中最常见的是 Encore Tweaks 家族：管理端应用、`/system/bin/encore_profiler`、`/data/encore/default_cpu_gov`、`/data/encore/custom_default_cpu_gov`、`/data/local/tmp/encore_logo.png`；命中时会分别报 `Encore 管理端已安装 / Encore Tweaks 模块 / Encore Tweaks 可能` 等文案。",
+      "cause": "",
+      "fix": [
+        "排查并卸载相关模块（此类条目多为概率命中，可多重启几次再测）。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "cun-zai-mo-kuai-xiu-gai-chun-qiu",
+      "title": "存在模块修改春秋",
+      "aliases": [
+        "存在模块修改春秋"
+      ],
+      "chapter": "六、SELinux 策略、AVC 与审计通道",
+      "detect": "对比本进程被修改的痕迹（策略 / 注入 / 挂载）与预期。",
+      "cause": "",
+      "fix": [
+        "使用 IsolPolicy 模块后出现，关闭作用域或者卸载模块解决。",
+        "并不是只有模块，比如旧版ksu启用了隐藏SELinux修改也算，请尝试跟进相关 root 管理器最新 CI 来解决此问题。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "aosp-mi-yao",
+      "title": "AOSP密钥",
+      "aliases": [
+        "AOSP密钥",
+        "AOSP",
+        "/data/adb/tricky_store/",
+        "keybox.xml"
+      ],
+      "chapter": "七、Keystore / KeyMint / TEE",
+      "detect": "keybox 使用 AOSP 测试根（而非厂商 / Google 正式根）签发。",
+      "cause": "",
+      "fix": [
+        "更换 `/data/adb/tricky_store/` 目录下的 `keybox.xml` 文件。",
+        "也可选择刷入 TS 插件，重启后打开模块的 webUI 界面进行密钥配置。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "boot-hash",
+      "title": "Boot Hash不匹配",
+      "aliases": [
+        "Boot Hash不匹配",
+        "ro.boot.vbmeta.digest",
+        "VerifiedBootHash",
+        "Hash不匹配",
+        "真解锁设备"
+      ],
+      "chapter": "七、Keystore / KeyMint / TEE",
+      "detect": "比对 boot / vbmeta 的 hash（如 `ro.boot.vbmeta.digest`）与基线值。\n\nboot 镜像的 Hash 不匹配。",
+      "cause": "",
+      "fix": [
+        "通常真解锁设备的 hash 会变成 0000，使用 Native detector（https://t.me/rootdetector/49） 获取正确的 hash 后使用密钥模块并使用 TS 插件 配置 hash 解决。 打开密钥认证，取 `VerifiedBootHash` 的值，用 TS 插件写入。"
+      ],
+      "deviceTypes": [
+        "unlocked"
+      ],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "zheng-shu-yi-bei-diao-xiao-crl",
+      "title": "证书已被吊销(CRL)",
+      "aliases": [
+        "证书已被吊销(CRL)",
+        "证书已被吊销",
+        "CRL",
+        "/data/adb/tricky_store/",
+        "keybox.xml"
+      ],
+      "chapter": "七、Keystore / KeyMint / TEE",
+      "detect": "证书序列号命中吊销列表（本地静态库或在线查询）。",
+      "cause": "",
+      "fix": [
+        "更换 `/data/adb/tricky_store/` 目录下的 `keybox.xml` 文件"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mi-yao-cuan-gai-zheng-shu-lian-cuan-gai-x",
+      "title": "密钥篡改 / 证书链篡改(x)",
+      "aliases": [
+        "密钥篡改 / 证书链篡改(x)",
+        "密钥篡改 / 证书链篡改",
+        "密钥篡改",
+        "证书链篡改(x)",
+        "ro.secureboot.lockstate",
+        "ro.lenovo.series",
+        "ro.lewa.version",
+        "ro.meizu.product.model",
+        "ro.miui.ui.version.name",
+        "ro.vivo.os.build.display.id",
+        "unlocked",
+        "证书链篡改"
+      ],
+      "chapter": "七、Keystore / KeyMint / TEE",
+      "detect": "- 密钥篡改：密钥 / 证书链属性一致性判定未通过，命中时会给出分组；\n- 证书链篡改(x)：Java 层读取系统属性 `ro.secureboot.lockstate`（该属性与 `ro.lenovo.series`、`ro.lewa.version`、`ro.meizu.product.model`、`ro.miui.ui.version.name`、`ro.vivo.os.build.display.id` 等厂商 ROM 属性在同一张表里），取到 `unlocked` 即命中。",
+      "cause": "- 128：最常见。密钥模块在一加 / 高通设备上默认使用“证书链生成模式”时容易出现；\n- 其它分组（如 q、b）原因暂未公开。",
+      "fix": [
+        "密钥篡改：更换 / 更新密钥模块，并按「模块正确配置」完成配置（target 列表、安全补丁日期、boot hash）；",
+        "证书链篡改(x)：`su -c '/data/adb/ksud' resetprop ro.secureboot.lockstate locked`（Magisk 用 `resetprop`）。",
+        "关系：与 `密钥证明未完成或链不一致` 同属证书链 / 密钥一致性族。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "tee-sun-huai",
+      "title": "TEE 损坏",
+      "aliases": [
+        "TEE 损坏",
+        "TEE",
+        "/data/adb/tricky_store/target.txt",
+        "com.google.android.gms",
+        "com.android.vending",
+        "TRICKY_DATA",
+        "损坏"
+      ],
+      "chapter": "七、Keystore / KeyMint / TEE",
+      "detect": "TEE 侧密钥 / 证书链不完整或不可用。",
+      "cause": "",
+      "fix": [
+        "使用密钥模块解决，搭配 TS 插件。",
+        "刷入后请重启，开机后打开模块的 webUI 进行配置。",
+        "TEE 损坏的设备请使用生成证书链模式。 在 `/data/adb/tricky_store/target.txt` 中给本检测器包名加 `!`（表示强制处理），并可用脚本批量写入： su TRICKY_DATA=\"/data/adb/tricky_store\" { echo \"com.google.android.gms!\"; echo \"com.android.vending!\"; pm l…"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "tee-huan-jing-bu-ke-xin",
+      "title": "TEE环境不可信",
+      "aliases": [
+        "TEE环境不可信",
+        "TEE",
+        "com.tencent.soter.soterserver"
+      ],
+      "chapter": "七、Keystore / KeyMint / TEE",
+      "detect": "检查 Tencent Soter 服务程序是否存在 + 其服务属性状态，两者交叉验证 Soter key 是否被屏蔽（四象限判定，见下）。\n\n来自 Tencent 的 SoterService（https://github.com/Tencent/soter）\n作用: 微信的指纹支付等。\n\n通过检查文件来判断是否存在 Soter 服务程序以及判断其服务点属性状态来交叉验证是否存在 Soter key 被屏蔽的情况。\n1. 服务点属性状态异常 + Soter 服务程序存在 -> Soter 被屏蔽（异常）\n\n2. 服务点属性状态异常 + Soter 服务程序不存在 -> 此设备原生不支持 Soter 服务（正常）\n\n3. 服务点属性状态正常 + Soter 服务程序存在 -> 此设备支持 Soter（正常）\n\n4. 服务点属性状态正常 + Soter 服务程序不存在 -> 不可能",
+      "cause": "",
+      "fix": [
+        "使用 SusFS 或 PathMask（https://github.com/Andrea-lyz/LKM-PathMask） 隐藏相关服务路径，并使用HMA对检测器隐藏 “com.tencent.soter.soterserver” 系统程序，尝试解决",
+        "*注意*：PathMask 并不专注于环境隐藏，请慎用。",
+        "*原理*：目前在技术上我们无法模拟 Soter 服务，但可以隐藏 Soter 相关文件来伪造第 2 种情况。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "tee-wei-zao",
+      "title": "TEE 伪造",
+      "aliases": [
+        "TEE 伪造",
+        "TEE",
+        "伪造"
+      ],
+      "chapter": "七、Keystore / KeyMint / TEE",
+      "detect": "证书链 / 密钥属性显示 TEE 行为被模拟。",
+      "cause": "",
+      "fix": [
+        "使用密钥模块解决（证书链生成模式）。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "tee-wei-zao-2",
+      "title": "TEE 伪造(2)",
+      "aliases": [
+        "TEE 伪造(2)",
+        "TEE 伪造",
+        "TEE",
+        "SIGN + ATTEST_KEY",
+        "-3",
+        "-49",
+        "Keystore2",
+        "伪造"
+      ],
+      "chapter": "七、Keystore / KeyMint / TEE",
+      "detect": "通过 Keystore2 反射创建同时具备 `SIGN + ATTEST_KEY` 用途的密钥：正常设备应拒绝这种混合用途（如 `-3`）；若密钥能正常签名，但“带 challenge / 不带 challenge”两组子证书签发都失败（如 `-49`），判为 TEE 伪造(2)。\n\n先确认普通签名、纯 ATTEST_KEY 密钥签发子证书都正常。\n通过 Keystore2 创建同时具有 SIGN + ATTEST_KEY 用途的密钥。\n如果它能正常签名，但有、无挑战两组测试中，签发子证书都返回 -49，就报 “TEE 伪造(2)”。\n创建时正常拒绝混合用途（如正常机的 -3），或两种能力都正常，都不会报。",
+      "cause": "",
+      "fix": [
+        "更换 / 更新密钥模块（见序章「相关模块推荐」与「模块正确配置」），配置后重启复测。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "tee-wei-zao-3",
+      "title": "Tee伪造3",
+      "aliases": [
+        "Tee伪造3",
+        "Tee"
+      ],
+      "chapter": "七、Keystore / KeyMint / TEE",
+      "detect": "在TEE损坏设备上使用了Tricky-Store模块模拟TEE行为被侦测",
+      "cause": "",
+      "fix": [
+        "可等待模块更新修复或者搭配使用OhMyKeymint 模块，尝试解决"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "tee-2-c",
+      "title": "Tee伪造(2-c)",
+      "aliases": [
+        "Tee伪造(2-c)",
+        "Tee伪造",
+        "Tee"
+      ],
+      "chapter": "七、Keystore / KeyMint / TEE",
+      "detect": "在TEE损坏设备上使用了TEESimulator/RS模块模拟TEE行为被侦测",
+      "cause": "",
+      "fix": [
+        "可等待模块更新修复或者搭配使用OhMyKeymint模块，尝试解决"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "zhao-dao-le-teesimulator",
+      "title": "找到了 TEESimulator",
+      "aliases": [
+        "找到了 TEESimulator",
+        "TEESimulator",
+        "找到了"
+      ],
+      "chapter": "七、Keystore / KeyMint / TEE",
+      "detect": "AES解密时序差\n更换更好的TEE模拟模块或等待模块更新",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "trickystore-hook-2",
+      "title": "TrickyStore Hook/2",
+      "aliases": [
+        "TrickyStore Hook/2",
+        "TrickyStore Hook"
+      ],
+      "chapter": "七、Keystore / KeyMint / TEE",
+      "detect": "对比 Keystore 返回的证书链 / 密钥属性与真机 TEE 特征差异（含侧信道方式，不稳定）。\n\n侧信道（不稳定）重新打开或许消失",
+      "cause": "",
+      "fix": [
+        "更换密钥模块（如 TEESimulator-RS / OhMyKeymint）"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "found-oh-my-keymint",
+      "title": "FOUND oh my keymint",
+      "aliases": [
+        "FOUND oh my keymint",
+        "Keystore2"
+      ],
+      "chapter": "七、Keystore / KeyMint / TEE",
+      "detect": "",
+      "cause": "混合用途密钥两次生成返回 Keystore2",
+      "fix": [
+        "更新模块"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "tampered-attestation-key-x-16-31",
+      "title": "Tampered Attestation Key(X)（含 16 / 31）",
+      "aliases": [
+        "Tampered Attestation Key(X)（含 16 / 31）",
+        "Tampered Attestation Key(X)",
+        "16",
+        "31",
+        "KeyUsage",
+        "KeyPurpose",
+        "APPLICATION_ID",
+        "USER_ID",
+        "teeEnforced",
+        "mingzun09",
+        "tricky_store",
+        "security_patch.txt",
+        "假回锁设备"
+      ],
+      "chapter": "七、Keystore / KeyMint / TEE",
+      "detect": "对密钥证明证书链做 20+ 类标签一致性校验，例如：叶证书 `KeyUsage` 与扩展 `KeyPurpose` 是否矛盾、叶证书签名算法与签发钥算法是否一致、证书内的安全补丁标签与系统属性是否一致、无 challenge 却带 `APPLICATION_ID`、`USER_ID` 出现在 `teeEnforced`、厂商占位 tag 仍成功签发等；命中时会给出具体标签编号。",
+      "cause": "- 15：HanAttest 链不一致（与 TeeSim 常量不同源，但同在 mask 里）\n- 16：HanAttest 链不一致一族（多为误报）\n- 18：厂商占位 KeyMint tag 仍成功输出密钥\n- 23：叶证书 KeyUsage 与扩展内 KeyPurpose 矛盾\n- 24：Binder 超长 alias / 大事务探针异常\n- 25：叶证书 SigAlg 与签发钥算法不符\n- 26：证书 patch 标签与系统属性不一致（见下方脚本）\n- 27：USER_ID 出现在 teeEnforced\n- 29：无 challenge 却有 APPLICATION_ID\n- 30：敏感设备标识类 attest 未被拒绝（如 SERIAL）\n- 31：安全补丁日期异常（国内厂商统一为 YYYY-MM-01；Lenovo / 努比亚会更新到 05 日期；pixel / Samsun…",
+      "fix": [
+        "26：执行此脚本（https://github.com/mingzun09/Chunqiu-Detector-Problem-solution/blob/main/File/Tampered%20Attestation%20Key(26）Pass.sh) 写入 `/data/adb/tricky_store/security_patch.txt`；",
+        "小米 / 红米注意：2026-03 前后更新的系统，其构建时间与安全补丁时间本身就不一致，不管是否 root 都会报（26）→ 无视即可；魔改版密钥模块、一键隐藏模块、部分改机模块也会导致，换回原版或卸载；",
+        "16 / 31：纯误报居多（假回锁、未 root 也可能概率命中）→ 重测或直接无视。"
+      ],
+      "deviceTypes": [
+        "fake-relock"
+      ],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "trustedcert-zheng-shu-cuan-gai",
+      "title": "TrustedCert 证书篡改",
+      "aliases": [
+        "TrustedCert 证书篡改",
+        "TrustedCert",
+        "证书篡改"
+      ],
+      "chapter": "七、Keystore / KeyMint / TEE",
+      "detect": "TrustedCertificateEntry 读回字节与原始字节不等",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "fa-xian-trickystore-lei-si-mo-kuai",
+      "title": "发现TrickyStore/类似模块",
+      "aliases": [
+        "发现TrickyStore/类似模块",
+        "发现TrickyStore",
+        "类似模块",
+        "TrickyStore",
+        "tricky_store",
+        "security_patch.txt"
+      ],
+      "chapter": "七、Keystore / KeyMint / TEE",
+      "detect": "证书链为模块生成（合成链），与真实 TEE 链特征不符。",
+      "cause": "",
+      "fix": [
+        "尝试1：更换密钥模块（如 TEESimulator-RS / OhMyKeymint）",
+        "尝试2：把 `/data/adb/tricky_store/security_patch.txt` 文件删除"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mi-yao-zheng-ming-wei-wan-cheng-huo-lian-bu-yi",
+      "title": "密钥证明未完成或链不一致",
+      "aliases": [
+        "密钥证明未完成或链不一致"
+      ],
+      "chapter": "七、Keystore / KeyMint / TEE",
+      "detect": "密钥证明证书链不完整或与预期链不一致。",
+      "cause": "",
+      "fix": [
+        "使用密钥模块并配置后尝试解决"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "fa-xian-root-guan-li-qi",
+      "title": "发现 ROOT 管理器",
+      "aliases": [
+        "发现 ROOT 管理器",
+        "ROOT",
+        "runRootManagerIntentChecks",
+        "<queries>",
+        "me.bmax.apatch.magica.LAUNCH",
+        "ksu://",
+        "Suspicious Surroundings",
+        "SU binary detected",
+        "发现",
+        "管理器",
+        "免解设备"
+      ],
+      "chapter": "八、包管理、应用可见性与安装痕迹",
+      "detect": "native 方法 `runRootManagerIntentChecks` —— 用 Intent / 包可见性（`<queries>`）探测 root 管理器是否安装或能否响应（对应新版 manifest 新增的 `me.bmax.apatch.magica.LAUNCH`、KSU `magica.LAUNCH`、`ksu://` 等条目）。",
+      "cause": "",
+      "fix": [
+        "使用应用隐藏模块把 root 管理器对检测器隐藏即可（见「相关模块推荐」与「模块正确配置」）。",
+        "关系：与 `Found ksu/免解设备`、`Suspicious Surroundings`、`SU binary detected`、`检测SELinux Policy时发现可疑问题 / 检测到ROOT权限` 同属“ROOT 痕迹”类，可能同时命中。"
+      ],
+      "deviceTypes": [
+        "ramdisk"
+      ],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "risk-apps",
+      "title": "风险应用 / Risk apps‘软件包名’",
+      "aliases": [
+        "风险应用 / Risk apps‘软件包名’",
+        "风险应用",
+        "Risk apps‘软件包名’",
+        "Risk",
+        "apps",
+        "/storage/emulated/0/Android/data/",
+        "pm list packages",
+        "INET_GID",
+        "www.coolapk1s.com",
+        "apps‘软件包名’"
+      ],
+      "chapter": "八、包管理、应用可见性与安装痕迹",
+      "detect": "读取 `/storage/emulated/0/Android/data/` 下的目录名以获取已安装包名（普通应用通常没有该权限），在可绕过时借助 Unicode 零宽字符绕过读取限制（并非固定手段），再与风险名单比对（名单见附录 A）。\n\n4.6.2 同时使用两条通道匹配内置风险包名表：\n\n- `pm list packages`：解析包管理器返回的已安装包名；\n- `/sdcard/Android/data/<包名>`：枚举外部数据目录名，按 `<包名>` 与风险表比对；目录名中夹入零宽字符（如 U+200B / U+200C / U+200D / U+FEFF）时也会做归一化处理，不能靠零宽字符绕过。\n\n`pm hide <包名>` 后该包从风险列表消失，只证明包管理器通道生效，不能据此推断目录通道不存在；反之，删掉 `/sdcard/Android/data/<包名>` 也只压掉…",
+      "cause": "",
+      "fix": [
+        "有效组合：应用隐藏模块黑名单模式 + 零宽读取修复方案（FuseFixer（https://github.com/5ec1cff/FuseFixer））；部分机型开启作用域后可能卡开机，安全模式关掉即可；",
+        "只想让春秋这一项通过：在应用隐藏模块里对检测春秋检测打开「限制 zygote 权限」，除 `INET_GID` 外全开；",
+        "这类判定手段未知的条目，也可用应用隐藏模块把可疑应用对检测器隐藏。",
+        "具体操作教程可参考：https://www.coolapk1s.com/feed/74811869"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "yin-cang-ying-yong-lie-biao",
+      "title": "隐藏应用列表",
+      "aliases": [
+        "隐藏应用列表"
+      ],
+      "chapter": "八、包管理、应用可见性与安装痕迹",
+      "detect": "目录名命中风险表但 `pm` 未列出对应包（仅在无风险应用时展示）",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "hma-huo-xu-cun-zai",
+      "title": "HMA或许存在",
+      "aliases": [
+        "HMA或许存在",
+        "HMA",
+        "Scene_Hide"
+      ],
+      "chapter": "八、包管理、应用可见性与安装痕迹",
+      "detect": "检查是否存在 HMA（隐藏应用列表）相关服务 / 包特征，而检测器自身看不到对应应用。",
+      "cause": "",
+      "fix": [
+        "疑似检测旧版使用 Scene_Hide-eBPF 模块行为（检测不到 scene 应用程序存在，但检测到相关服务）",
+        "分支项目/拉取更新重新构建模块并刷入/从Releases中下载（https://github.com/Andrea-lyz/Scene-Port-Hider-by-eBPF） 若为老版本/破解版/非官方 Scene：参考 Scene-Port-Hider-by-eBPF（https://github.com/Andrea-lyz/Scene-Port-Hider-by-eBPF）；官方版…"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "su-binary-detected",
+      "title": "SU binary detected",
+      "aliases": [
+        "SU binary detected",
+        "/apex/com.android.virt/bin/su"
+      ],
+      "chapter": "八、包管理、应用可见性与安装痕迹",
+      "detect": "在常见路径下检测 su / 类似二进制文件。",
+      "cause": "",
+      "fix": [
+        "检测到 SU 二进制文件（检测到 ROOT） iQoo/Vivo 用户注意：`/apex/com.android.virt/bin/su` 会被命中 → 移走该文件或去掉其执行位。 通用原则：不要给春秋检测 root 权限。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "mount-detector-14",
+      "title": "Mount Detector(14)",
+      "aliases": [
+        "Mount Detector(14)"
+      ],
+      "chapter": "八、包管理、应用可见性与安装痕迹",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "手册原文标注「待补充」，暂无公开解决办法；可先按「通用排查方法」做最小集二分定位。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "yin-cang-ying-yong-lie-biao-sheng-xiao-2",
+      "title": "隐藏应用列表生效2",
+      "aliases": [
+        "隐藏应用列表生效2",
+        "www.coolapk1s.com"
+      ],
+      "chapter": "八、包管理、应用可见性与安装痕迹",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "更新hma/hma_oss至最新版 HMA更新频道（https://t.me/HideMyApplist/175） HMA_OSS更新频道（https://t.me/buggychat/121613） 刷入此模块解决fgetpriority（https://t.me/buggychat/135951?single） 如果是隐藏应用列表生效，那请关闭对春秋检测的“伪装安装来源”",
+        "具体解决操作参考：https://www.coolapk1s.com/feed/74811646"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "zhao-dao-le-hma-de-dui-zai-chu-li",
+      "title": "找到了HMA的堆栽处理",
+      "aliases": [
+        "找到了HMA的堆栽处理",
+        "HMA"
+      ],
+      "chapter": "八、包管理、应用可见性与安装痕迹",
+      "detect": "",
+      "cause": "",
+      "fix": [
+        "HMA更新频道（https://t.me/HideMyApplist/175） HMA_OSS更新频道（https://t.me/buggychat/121613）"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "abnormal-environment",
+      "title": "Abnormal Environment",
+      "aliases": [
+        "Abnormal Environment",
+        "No-read control: 0→0 kB, expected",
+        "Read control: 0→4 kB, expected",
+        "Target call: 0→4 kB, unexpected read",
+        "cmd",
+        "Consistency: n/n",
+        "faccessat",
+        "newfstatat : statx > 1.2",
+        "ksu_kp_sidechannel_zh.md"
+      ],
+      "chapter": "九、时序、页驻留与差分侧信道",
+      "detect": "（与仓库内 KSU/APatch 侧信道说明 一致）：\n- APatch / KernelPatch：①“懒分配页”探测——把一个“懒分配”（只占虚拟地址、尚未映射物理页）的页地址当作 superkey 所在地址发起鉴权请求，KernelPatch 解引用该地址时会把该页实际映射/读入，检测器随后检查该页是否被映射即可判定 KernelPatch 是否存在；②鉴权时延探测——提前拟定一个“范围内 cmd”和一个“范围外 cmd”，分别发起鉴权，多次测量取总和使比值稳定，两者耗时比值大于约 2 即判定存在。\n 界面上该条目的输出是页级 kB 对照（如 `No-read control: 0→0 kB, expected` / `Read control: 0→4 kB, expected` / `Target call: 0→4 kB, unexpected read`）与多轮一致性（`C…",
+      "cause": "",
+      "fix": [
+        "解决办法（KernelSU 系）：更新你的 KernelSU 管理器并重新修补（LKM 工作模式）或重新集成（GKI 和 Non-GKI 工作模式）。",
+        "解决办法（APatch 系）：",
+        "嵌入 / 加载 NoHello.kpm（模块链接见序章「相关模块推荐」），并把检测器加入排除列表 —— 该 KPM 可以在 KernelPatch 判断 `cmd` 值之前先判断发起鉴权请求的应用是否在排除列表内，若是则禁止鉴权。",
+        "未来版本的 APatch 会引入基于签名的鉴权方法，对于不符合签名却发起了鉴权的应用直接拒绝鉴权请求。目前没有完全实现，需要再等一段时间。",
+        "解决办法（KPatch-Next）：更新 KPatch-Next 驱动到 0.13.5-2。",
+        "原理：旧版 KPatch-Next 完全继承了 KernelPatch 的鉴权方式，所以在 APatch 上可行的侧信道检测方法在旧版 KPatch-Next 上也同样可行；但最新版 KPatch-Next 以判断用户态 kpatch-android 组件的 uid 实现鉴权，不再会被侧信道检测。 社区实测：这一条不稳定、概率出现，同版本管理器在不同设备可能一报一不报（可尝试降级管理器）；APa…"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "fa-xian-apatch-de-jian-quan-mi-yao",
+      "title": "发现APatch 的鉴权密钥",
+      "aliases": [
+        "发现APatch 的鉴权密钥",
+        "APatch",
+        "No-read control",
+        "0→0 kB",
+        "Read control",
+        "0→4 kB",
+        "Target call",
+        "0→4 kB, unexpected read",
+        "Argument layouts",
+        "Consistency: n/n",
+        "Page size",
+        "has_preset_superkey()",
+        "auth_superkey()",
+        "Probe duration",
+        "Abnormal Environment",
+        "bmax121",
+        "has_preset_superkey",
+        "auth_superkey",
+        "L395",
+        "L434",
+        "ksu_kp_sidechannel_zh.md",
+        "发现APatch",
+        "的鉴权密钥"
+      ],
+      "chapter": "九、时序、页驻留与差分侧信道",
+      "detect": "以“系统调用参数页被额外读取”为判据的侧信道。检测器把目标调用的参数/缓冲区放在一块受监控的用户页上，测量调用前后该页被内核读取的页数（kB）：\n- `No-read control`：一个“内核按语义不应读取该页”的调用 → 期望 `0→0 kB`；\n- `Read control`：一个“内核应当读取该页”的调用 → 期望 `0→4 kB`；\n- `Target call`：目标调用 → 若出现 `0→4 kB, unexpected read`，说明内核在该 syscall 路径上多读了一次用户内存，即该路径被内核补丁（KernelPatch / APatch 的鉴权路径）额外处理。\n\n该条目同时会输出 `Argument layouts`（内核读取系统调用参数的寄存器布局探测）、多轮一致性 `Consistency: n/n`、`Page size` 与 `Probe durat…",
+      "cause": "该条目在英文界面下目前没有对应的英文标题（仅中文显示）。",
+      "fix": [
+        "新版 KernelPatch 已调整鉴权路径，旧版“只能等待上游修复”的说明不再适用于所有版本：",
+        "更新 APatch：使用已集成该改动的新版 APatch（https://github.com/bmax121/APatch）。关键条件是实际运行的 KernelPatch 已包含新逻辑，且修补镜像未预置 SuperKey；仅安装新版管理器 APK 不等于内核补丁已更新。按对应版本的官方升级流程更新内核补丁并重启，再复测。",
+        "也可考虑 Aster（https://github.com/LyraVoid/Aster）：由 FolkPatch 作者有希（Matsuzaka Yuki）开发、基于 APatch 能力链的管理器。项目采用现代化 Miuix 界面；按项目介绍与作者反馈，其方向是改动克制、稳定优先。希望尝试这一方向的用户可从仓库了解并获取适配版本。使用它同样需要确认运行中的 KernelPatch 和无预置…",
+        "版本提醒：据维护者提供的版本反馈，FolkPatch 115032 尚未换用包含此改动的 KernelPatch，因此仍可能命中本项；这不是对后续 FolkPatch 版本的结论。",
+        "新版在 `has_preset_superkey()` 成立时才读取首参并执行 `auth_superkey()`。未预置 SuperKey 时跳过该读取：可信管理器 UID 获得完整授权，已授权的普通 UID 仅标为可信调用者，受限操作仍需进一步授权。因此，新逻辑 + 无预置 SuperKey可消除本条所针对的这一路额外读页行为；若仍预置了 SuperKey，相关读取路径仍然存在。这不等于删除…",
+        "源码依据（https://github.com/bmax121/KernelPatch/blob/997b687f19d150642d56a5c4a49dc06143d33422/kernel/patch/common/supercall.c#L395-L434）。APatch 的“最新版本”需区分正式 Release、CI 构建及其内置 KernelPatch：不能仅凭版本名认定已包含改动…"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "miscellaneous-check-12",
+      "title": "Miscellaneous Check(12)",
+      "aliases": [
+        "Miscellaneous Check(12)",
+        "smaps",
+        "Referenced",
+        "MADV_COLD",
+        "clear_refs"
+      ],
+      "chapter": "九、时序、页驻留与差分侧信道",
+      "detect": "用 `smaps` 的页面驻留（`Referenced`）配合 `MADV_COLD` / `clear_refs` 做启发式扫描，探测隐藏映射或 Zygisk 类实现；当前实现存在问题，可能失效或误报。\n\n通过扫描 smaps 启发式探测 Zygisk 实现（特别是 Zygisk 实现模块），但目前的实现方式存在问题，导致检测失效。",
+      "cause": "",
+      "fix": [
+        "在检测方法被修复或移除前请忽略此条目。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "jian-ce-dao-scene-duan-kou-zhan-yong",
+      "title": "检测到Scene端口占用",
+      "aliases": [
+        "检测到Scene端口占用",
+        "Scene"
+      ],
+      "chapter": "十、本地服务与终端形态",
+      "detect": "检查 Scene 使用的本地端口 / 服务是否在监听。",
+      "cause": "",
+      "fix": [
+        "请查看此项目（https://github.com/Andrea-lyz/Scene-Port-Hider-by-eBPF）并尝试解决。",
+        "无视此检测项，或者关闭 scene 的无障碍权限，或将 scene 更新到 9.3.1 以上。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "thanox-service-detected",
+      "title": "Thanox service detected",
+      "aliases": [
+        "Thanox service detected"
+      ],
+      "chapter": "十、本地服务与终端形态",
+      "detect": "检查 Thanox 相关服务。\n\n检测到 Thanox 服务。",
+      "cause": "",
+      "fix": [
+        "可以使用这个 xp 模块来隐藏：hideThanox（https://t.me/Suxiaomingpd/125）。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "zhong-duan-huan-jing-cun-yi",
+      "title": "终端环境存疑",
+      "aliases": [
+        "终端环境存疑"
+      ],
+      "chapter": "十、本地服务与终端形态",
+      "detect": "检查是否存在 pty（终端模拟）痕迹。\n\n检测 Pty。",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "something-wrong",
+      "title": "Something wrong",
+      "aliases": [
+        "Something wrong"
+      ],
+      "chapter": "附：未归入上述判据的词条",
+      "detect": "内部异常 / 未分类命中。\n\n未知",
+      "cause": "",
+      "fix": [
+        "手册未给出独立解决办法；建议按「通用排查方法」最小集二分定位后逐项排除。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "huan-jing-cun-yi-1-shi-yan-xing-jian-ce",
+      "title": "环境存疑1（实验性检测）",
+      "aliases": [
+        "环境存疑1（实验性检测）",
+        "环境存疑1",
+        "实验性检测"
+      ],
+      "chapter": "附：未归入上述判据的词条",
+      "detect": "实验性环境一致性判定（社区反馈：应用隐藏模块 黑名单模式 + 勾选“输入法”预设时出现）。",
+      "cause": "",
+      "fix": [
+        "在 应用隐藏模块 中对检测器开启黑名单模式隐藏后，若勾选了设置预设中的“输入法”选项后，此检测项就会出现？"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "wu-xiao-de-wei-zao-xin-xi-1",
+      "title": "无效的伪造信息(1)",
+      "aliases": [
+        "无效的伪造信息(1)",
+        "无效的伪造信息",
+        "MediaDrm",
+        "securityLevel = L1",
+        "openSession()",
+        "NotProvisionedException",
+        "getProvisionRequest().getData()",
+        "keybox.xml",
+        "假回锁设备",
+        "免解设备"
+      ],
+      "chapter": "附：未归入上述判据的词条",
+      "detect": "Widevine（`MediaDrm`）报告 `securityLevel = L1`、`openSession()` 抛 `NotProvisionedException`、且 `getProvisionRequest().getData()` 返回长度 0 的数据时命中。\n\n说明：当设备报告为 L3 时，此检测点会被直接略过（只有在 `securityLevel = L1` 时才会继续后续判定）。",
+      "cause": "设备显示 Widevine L1（DRM Info 与检测器“设备信息”都会显示 L1），但本条目仍判定“与 L1 不符”。该条目在界面上没有展开详情（属摘要型条目）。\n\n3. 只在最后才考虑“远程 RKP 密钥（RKPConfig）”：本机若已是 RKP（远程密钥下发）通常无效，目前小米机型普遍无效。",
+      "fix": [
+        "第一步：先判断是不是误报 1. 播放必须 L1 才能解码的内容（Netflix / Disney+ / Prime 等的 HD / 1080p+）： - 能 HD / 1080p+ 正常播放 ⇒ L1 本体正常，本条大概率是误报（已知小米设备、含未解锁的原厂设备也会稳定命中），可先忽略并等待版本更新； - 只能播放 SD ⇒ 继续第 2 步。",
+        "2. 排查“伪装 L1 状态”的模块：密钥模块的 target 列表、`keybox.xml`、安全补丁同步，以及各类 PIF / 属性伪装模块；逐项关闭后重启复测。",
+        "⚠️ 安全提示：RKPConfig 类应用会让设备向 Google 请求 RKP 密钥下发，会改变设备的密钥供应 / 认证状态；安装前请确认来源可信与可撤销性。 社区实测补充：假回锁 / 免解 / 完全没有 root 的机器也会概率命中，可直接忽略；若要尝试，仍建议先按上面的「第一步」判断 L1 是否真的可用。"
+      ],
+      "deviceTypes": [
+        "fake-relock",
+        "ramdisk"
+      ],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    },
+    {
+      "id": "miscellaneous-check-4-5-6-7-8-9",
+      "title": "Miscellaneous Check(4/5/6/7/8/9)",
+      "aliases": [
+        "Miscellaneous Check(4/5/6/7/8/9)"
+      ],
+      "chapter": "附：未归入上述判据的词条",
+      "detect": "模拟器 / 虚拟机、改机行为、三方与移植 ROM 等一组检测；部分机型（如国外设备的 Poco / 三星）存在误报。\n\n一些有关模拟器虚拟机/模拟器的检测/改机行为检测/三方&移植 ROM。",
+      "cause": "",
+      "fix": [
+        "在国外设备 Poco/三星误报情况（待修复）。 社区反馈：海外机型 Poco / 三星有误报；部分设备使用 Scene 也会报。 卸载改机模块后仍报，多是模块残留/行为不可逆导致。"
+      ],
+      "deviceTypes": [],
+      "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/"
+    }
+  ]
+}
