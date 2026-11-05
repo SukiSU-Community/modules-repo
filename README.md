@@ -18,7 +18,8 @@ repo/
 ├── json/
 │   ├── modules.json      # 模块索引，GitHub Pages 直接托管，必须始终合法 JSON
 │   ├── columns.json      # 商店「专栏」内容（人工维护，见下文），app 侧展示 + 按可执行字段执行
-│   └── proxies.json      # 商店 GitHub 下载代理列表（人工维护，App 侧可远程更新）
+│   ├── proxies.json      # 商店 GitHub 下载代理列表（人工维护，App 侧可远程更新）
+│   └── chunqiu-answers.json  # 春秋检测红项的「判据 / 原因 / 修法」解释层（生成自第三方手册）
 ├── pending/
 │   └── *.json            # 待合并条目，一个文件可含单条对象或数组
 │                         # 以 . 开头的文件（如 .example.json）是模板，不参与合并
@@ -27,6 +28,7 @@ repo/
 │   ├── validate-index.mjs# 校验 json/modules.json
 │   ├── validate-columns.mjs  # 校验 json/columns.json
 │   ├── validate-proxies.mjs  # 校验 json/proxies.json（下载代理列表）
+│   ├── validate-answers.mjs  # 校验 json/chunqiu-answers.json（春秋红项手册）
 │   └── fetch-pending-zip.mjs  # 读 pending 元数据 -> 下载 zip，供 audit 扫描
 ├── test/
 │   └── build-index.test.mjs
@@ -157,28 +159,56 @@ node scripts/fetch-pending-zip.mjs pending/ --out-dir /tmp/zips \
 
 ```
 columns[]                    专栏
+├── guide[]                  可选。「怎么选」引导：一条一档（tier: day / integrity / game + title + body）
 └── topics[]                 专题（一个专题 = 一套可验证的配置方案）
+    ├── tier                 可选。档位标签（day / integrity / game / tool），界面上显示成徽章
     ├── evidence             必填。没有证据的专题不允许上架
     ├── keybox               可选。keybox 直链登记：url / sha256 / lastVerifiedAt（没有可信来源就别写）
     ├── verifyHints[]        验收提示（人话，App 直接展示）
-    └── steps[]              步骤（kind: installModule / writeConfig / writeFile / runCommand / verify / reboot / askUser）
-        ├── source           upstream{repo, assetPattern, pinnedVersion, sha256} / store{moduleId} / askUser
-        └── 可执行字段        command / filePath / fileContent / checkId / confirm
+    └── steps[]              步骤（kind: installModule / installApp / writeConfig / writeFile / writeHmaConfig / runCommand / verify / reboot / askUser）
+        ├── source           upstream{repo, assetPattern, pinnedVersion, sha256} / updateJson{url, moduleId} / direct{url, sha256} / store{moduleId} / askUser
+        └── 可执行字段        command / filePath / fileContent / checkId / confirm / link / optIn
 ```
 
 四条硬规则：
 
 1. **每个 topic 必须有 `evidence`**（`verifiedAt` / `device` / `kernel` / `source` / `note`）。App 端按
    `verifiedAt` 算时效：≤90 天绿标、91–180 天黄标、>180 天灰标。缺证据的专题校验直接报错，不是警告。
-2. **`source.kind = upstream` 记的是「我们锁定并核对过的上游版本」**，不是绿标 —— 上游模块不在本仓的
-   来源／绿标体系里（见契约 §9.2）。`kind = askUser` 的步骤必须把「去哪拿」写进 `note`。
-3. **步骤除了「说」还能「做」**：`runCommand` 必须有 `command`；`writeFile` / `writeConfig` 必须有
+2. **`source.kind = upstream` 每次取最新 release**，不是绿标 —— 上游模块不在本仓的来源／绿标体系里
+   （见契约 §9.2）。`pinnedVersion` 留空 = 跟随最新（当前默认），写了才锁到某个 tag；`sha256` 留空时
+   用 GitHub API 直连返回的 asset digest 校验，索引里不必也不该写死哈希 —— 否则官方一发新版就会卡住
+   等人核对。`kind = updateJson` 用于「不在 GitHub 发版但官方提供 update.json」的模块（如 LSPosed）：
+   `url` 指向 update.json，App 读它的 `zipUrl` 下载、按 `versionCode` 命名。`kind = direct` 用于
+   **固定直链**（第三方网盘、官方网盘，或我们自己在 Releases 里做的镜像，例如春秋检测）：这里没有任何上游版本信息可查，
+   所以 `sha256` 是硬要求——没登记哈希，App 直接拒绝下载，链接被换成别的包时也无从发现。这类地址
+   不在商店的来源体系里，`note` 必须写明「是不是官方渠道、要不要自己核对」，链接失效时用户还有
+   `link` 那条路。`kind = askUser` 的步骤必须把「去哪拿」写进 `note`。
+3. **步骤除了「说」还能「做」**：`installModule` 刷模块 zip，`installApp` 下 APK 并交给系统安装器
+   （商店不代点确认）；`runCommand` 必须有 `command`；`writeFile` / `writeConfig` 必须有
    绝对路径 `filePath` 与非空 `fileContent`（支持 `${keybox}` 占位符，由用户选中的本地文件替换）；
+   `writeHmaConfig` 的 `fileContent` 是一份 **HMA-OSS 配置包**（`templateName` + `template.appList`
+   + `scope` + 可选 `globals` / `disabledHooks`），App 会把它**合并**进设备上
+   `/data/misc/hide_my_applist_*/config.json`——`configVersion` 一律沿用设备上那份的值（版本不符
+   HMA 会静默不加载），已有模板 / 已配过的目标应用 / 用户改过的全局开关全部保留，只补缺失项；
    `verify` 可选 `checkId`（九个自动检查项之一，见下表）；任何步骤都可带 `confirm`，App 执行前先弹
-   二次确认。**没填可执行字段的步骤仍然只是展示 + 手动操作**，所以「不确定就退化 `askUser`」永远是
-   安全的写法。
+   二次确认。任何步骤也可带 `link`（https 官方渠道地址）：界面会给一个「打开」按钮，点了只开浏览器，
+   用于「官方只肯走群/网盘发、拿不到可编程直链」的东西（例如春秋检测）。带 `optIn: true` 的步骤
+   默认不执行，向导里会显示勾选框，勾了才进一键执行。**没填可执行字段的步骤仍然只是展示 + 手动操作**，
+   所以「不确定就退化 `askUser`」永远是安全的写法。
 4. **`command` 与 `fileContent` 等同远程下发可执行内容，必须人工 review**：禁止通配删除、写块设备、
    `mkfs`、`reboot -f`、把根目录权限改成 777 —— 这几类已进校验器的危险命令黑名单，命中即报错。
+5. **已装即跳过；上游有新版时提示升级**。`installModule` / `installApp` 先看设备上有没有（模块看
+   `/data/adb/modules/<moduleId>`，APK 看包名），已装就跳过而不是重装 —— 重装会覆盖用户在模块 WebUI
+   里的配置。跳过时 App 会顺手查一次上游版本（8 秒超时，查不到就按「不知道」处理）：有新版就在这一步
+   摆一个「升级到 vX」按钮，用户点了才带 `force` 覆盖安装。所以 `source.moduleId` 请写模块的**真实 id**
+   （zip 内 `module.prop` 的 `id=`），不要写显示名；留空不会出错，但 App 得先把整个包下载下来才认得出
+   已装，白费一次流量。
+
+6. **`guide` 与 `tier` 只影响「看得懂」，不影响「能不能装」**。`guide` 是专栏顶部的「怎么选」说明，
+   一条一档，文案要写给完全不懂的人看：装什么、能过什么、代价是什么，别写实现细节。`topic.tier`
+   是专题卡上的档位徽章，取值 `day`（日用级，过银行）/ `integrity`（三绿，过 Google 认证）/
+   `game`（游戏，本店不推荐也不提供）/ `tool`（工具，例如检测器）。两者都不参与执行，写错只会
+   界面上难看，不会让向导跑错；校验器只拦取值非法与 `guide` 档位重复。
 
 步骤可执行字段（与 App 侧 `RepoColumnStep` / `RepoColumnKeybox` 一一对应）：
 
@@ -187,8 +217,10 @@ columns[]                    专栏
 | `command` | `runCommand`（必填） | 非空字符串；多条命令用 `&&` 串联；命中危险命令黑名单即报错 | 由 root shell 原样执行 |
 | `filePath` | `writeFile` / `writeConfig`（必填） | 必须以 `/` 开头；不许 `..`、通配符、根目录 `/`、以 `/` 结尾 | 目标文件绝对路径 |
 | `fileContent` | `writeFile` / `writeConfig`（必填） | 非空字符串；支持 `${keybox}` 占位符 | 原样写入，不做换行／转义加工 |
+| `fileContent` | `writeHmaConfig`（必填） | 合法 JSON 对象；必须带 `templateName` 与非空 `template.appList`；`scope` 的每个值都要是对象 | 合并进设备上的 HMA 配置，不是整体覆盖 |
 | `checkId` | `verify`（可选） | 九选一：`root-manager` / `zygisk-next` / `denylist-policy` / `hma-config` / `target-list` / `keybox-valid` / `hybrid-mount` / `pathmask` / `adb-disabled` | 让 App 自动跑对应检查，省掉人工对照 |
 | `confirm` | 任意 kind（可选） | 非空字符串 | 执行前的二次确认文案；空串等于没确认，校验会报错 |
+| `optIn` | 任意 kind（可选） | 布尔；缺省 `false` | `true` = 默认不装，用户在向导里勾选后才执行。用在「装哪些工具由用户自己定」的步骤（自检检测器）；勾选状态按专题存在本地，不勾视为已完成而不是失败 |
 | `keybox` | topic 级（可选） | `url` 必须 `https://`；`sha256` 64 位小写十六进制；`lastVerifiedAt` 真实 `yyyy-MM-dd`；可选 `providerNote` / `disclaimer` | 只在有可信直链 + 能校验时才登记；没有就别写这个字段 |
 
 校验：
@@ -253,6 +285,87 @@ App 里没变化，先查 CDN 缓存（见「合并之后：CDN 必须失效」�
 node scripts/validate-proxies.mjs                # 校验 json/proxies.json
 node scripts/validate-proxies.mjs path/to.json   # 校验指定文件
 node scripts/validate-proxies.mjs --selftest     # 跑内置负例自测（不读文件）
+```
+
+### json/chunqiu-answers.json（春秋红项手册）
+
+`json/chunqiu-answers.json` 是 App 侧 AI 的**解释层**：用户在春秋检测里看到一个红项，App 拿红项名
+（或 `aliases` 里的关键词）在这一份里找一条，再把「它在查什么 / 为什么红 / 怎么修」讲给他听。
+它和 `columns.json` 是两条不同的轴，别互相替代：
+
+- `columns.json` 是**操作步骤** —— 先装什么、再刷什么、哪一步可以跳过，回答「我该做哪些事」；
+- `chunqiu-answers.json` 是**解释** —— 这一条判据查的是什么、为什么会被点亮、按手册该怎么处理，
+  回答「我为什么红了、这一条怎么弄」。
+
+两者都是人工整理的内容，都不参与 `modules.json` 的索引构建，App 从同一层 CDN 路径拉取：
+
+```text
+https://cdn.jsdelivr.net/gh/SukiSU-Community/modules-repo@main/json/chunqiu-answers.json
+```
+
+**数据来源与许可**：内容摘自第三方开源手册
+[`mingzun09/Chunqiu-Detector-Problem-solution`](https://github.com/mingzun09/Chunqiu-Detector-Problem-solution)
+（MIT）。措辞一律按原文摘录，不改判据、不替作者补充结论 —— 这份数据的价值就在于「它跟手册说的是
+同一件事」。**作者要求删除时整份移除**（本文件、本节文档、App 内置兜底一起走），不做「保留一部分」
+的协商。
+
+结构（`schemaVersion: 1`）：
+
+| 字段 | 类型 | 必填 | 约束 | 说明 |
+| --- | --- | --- | --- | --- |
+| `schemaVersion` | number | 是 | 必须等于 `1` | 结构版本，当前只认 `1` |
+| `source` | string | 是 | `https://` 地址 | 上游手册仓库，删改时要能追回去 |
+| `sourceUpdatedAt` | string | 是 | 真实日期 `yyyy-MM-dd` | 手册最后一次改动日期 |
+| `updatedAt` | string | 是 | 真实日期，且不早于 `sourceUpdatedAt` | 本次生成日期 |
+| `entries` | array | 是 | 1–1000 条 | 一条红项一条，按手册章节顺序排列 |
+| `entries[].id` | string | 是 | kebab-case，全局唯一 | 稳定标识，App 深链 / 缓存键用它（改文案别改 id） |
+| `entries[].title` | string | 是 | 非空、≤ 120 字符、全局不重复 | 手册里的检测项名，用户看到的就是它 |
+| `entries[].aliases` | string[] | 是 | 1–32 条、**全仓唯一**、单条 4–80 字符、不能是纯数字、不能是自身 title 的碎片 | AI 检索入口：英文名、属性名、包名、中文关键词。同一 alias 全仓只能出现一次（冲突时留给 title 最接近的那条）；太短的缩写（USB / apps / 2222）和 title 里已有的碎词不要写，它们检索不到东西，只会把无关条目拉进结果 |
+| `entries[].chapter` | string | 是 | **只能是手册的 11 个大章之一** | 手册大章（如「一、属性、构建信息与文本配置」）。写错一个字，App 分组里就会多出一个空章、少一整章 |
+| `entries[].detect` | string | 是 | 可为空，≤ 400 字符 | 检测方式 / 判据的原文摘录 |
+| `entries[].cause` | string | 是 | 可为空，≤ 400 字符 | 异常原因的原文摘录 |
+| `entries[].fix` | string[] | 是 | 至少 1 条、**长度不设上限、不得含截断标记 `…`** | 排查与解决办法，按手册原文分点记全。原文多长就记多长：截断会停在半句话上，拆成多条又会改 id 与匹配语义，两者都不接受 |
+| `entries[].fixKind` | string | 否 | `specific` / `generic`，缺省视为 `specific` | 修法口径：`specific` = 手册给了针对本条的修法；`generic` = 手册只有「通用排查方法」（这时 `fix` 里是那句如实标注的模板话） |
+| `entries[].deviceTypes` | string[] | 是 | 只能取 `unlocked` / `fake-relock` / `ramdisk` / `self-signed` | 设备型（真解锁 / 假回锁 / 免解 / 自签），原文没区分就留空数组 |
+| `entries[].link` | string | 是 | `https://` 地址 | 手册站点，App 里是「查看完整说明」的跳转 |
+
+当前共 **136 条**、422 个 alias，`chapter` 只取手册这 11 个大章（顺序即手册正文顺序）：
+
+```text
+一、属性、构建信息与文本配置
+二、挂载视图与文件系统一致性
+三、进程、命名空间与权限状态
+四、内核接口直调与反调试 / 反注入行为
+五、二进制与内存映射完整性
+六、SELinux 策略、AVC 与审计通道
+七、Keystore / KeyMint / TEE
+八、包管理、应用可见性与安装痕迹
+九、时序、页驻留与差分侧信道
+十、本地服务与终端形态
+附：未归入上述判据的词条
+```
+
+两条读法约定，避免 AI 把「手册没写」讲成「没有风险」：
+
+1. **`cause` 为空是正常的，不是数据缺失**：手册有一半条目只写判据、不单列原因（例如「可执行段
+   CRC 与磁盘不符」——判据本身就是原因）。App 侧提示词要按「`cause` 为空则用 `detect` 解释」处理。
+2. **`fix` 里的「手册未给出独立解决办法…」是如实标注**：手册对这些条目就是空白或写「待补充」。
+   这类条目带 `"fixKind": "generic"`（目前 47 条），其余条目缺省 `specific`。我们记下这句话，
+   而不是让模型自由发挥；AI 回答时应说明「手册没给具体修法」，再给通用排查路径。
+
+更新方式：手册改动后，重跑仓库外的解析脚本（`build_answers.py`，**不入库**）覆盖本文件，同时改
+`sourceUpdatedAt` / `updatedAt`，跑一遍下面的校验，最后按「合并之后：CDN 必须失效」清缓存。
+**不要手改生成物** —— 下次重跑会被原样冲掉；要改口径就改脚本。
+（例外：2026-11 这次是对生成物的一次性人工修订 —— 补全被 200 字符截断的 `fix`、清掉 168 条噪声
+ alias、收敛 38 组重复 alias、给 47 条模板句加 `fixKind`、给 8 条 `su -c` 修法补「传统 SU 命令支持」
+ 提示。已有 `build_answers.py` 照旧按老口径跑的话会把这些改动冲回去，重跑前先同步脚本口径。）
+
+校验：
+
+```bash
+node scripts/validate-answers.mjs                # 校验 json/chunqiu-answers.json
+node scripts/validate-answers.mjs path/to.json   # 校验指定文件
+node scripts/validate-answers.mjs --selftest     # 跑内置负例自测（不读文件）
 ```
 
 ### pending 条目格式
@@ -721,12 +834,16 @@ node scripts/validate-columns.mjs path/to.json   # 校验指定文件
 检查项：顶层 `schemaVersion/name/updatedAt`、每个专栏的 `id/title/subtitle/description/accent/icon/order`、
 `accent` 与 `icon` 必须在白名单内（与 App 侧枚举一一对应）、每个专题必须有 `evidence` 且 `verifiedAt`
 是真实日期、`riskLevel` / `layers` / 步骤 `kind` / `source.kind` 取值合法、`upstream` 步骤的
-`repo` 必须是 `owner/repo` 形状且带 `assetPattern`、`store` 步骤必须带 `moduleId`、
+`repo` 必须是 `owner/repo` 形状且带 `assetPattern`、`updateJson` 步骤必须有 https 的 `url`、`direct` 步骤必须有 https 直链且 `sha256` 是 64 位小写十六进制、`store` 步骤必须带 `moduleId`、`installApp` 必须有可下载的来源（不能是 `askUser`）、`link` 必须是 https 地址、
 `askUser` 步骤必须把获取方式写进 `note`。可执行字段另有几条硬检查：`runCommand` 必须有非空 `command`，
 且不命中危险命令黑名单（通配删除根目录、`dd if=` 写设备、`mkfs`、写 `/dev/block`、`reboot -f`、
 `chmod -R 777 /`）；`writeFile` / `writeConfig` 必须有绝对路径 `filePath`（不许 `..`、通配符、根目录）
-与非空 `fileContent`；`checkId` 必须在九项白名单内且只允许出现在 `verify` 步骤；`confirm` 给了就不能
-是空串；topic 级 `keybox` 的 `url` / `sha256` / `lastVerifiedAt` 形状不对直接报错。退出码 0 通过，1 失败。
+与非空 `fileContent`；`writeHmaConfig` 的 `fileContent` 必须能解析成对象、带 `templateName` 与
+非空 `template.appList`、`scope` 的每个值都是对象、`disabledHooks` 每项都有 `className` + `methodName`；
+`checkId` 必须在九项白名单内且只允许出现在 `verify` 步骤；`confirm` 给了就不能
+是空串；topic 级 `keybox` 的 `url` / `sha256` / `lastVerifiedAt` 形状不对直接报错；`guide` 必须是数组、
+每条都有 `title` 与 `body`、`tier` 不重复；`topic.tier` 与 `guide[].tier` 取值必须在
+`day / integrity / game / tool` 内。退出码 0 通过，1 失败。
 
 ### 校验代理列表
 
@@ -920,9 +1037,10 @@ node scripts/revoke.mjs --id <探针id> --version-code <n> --sha256 <64hex> \
 
 ### 合并之后：CDN 必须失效
 
-`merge-index` 在 `gh pr merge` 之后紧跟一步 `node scripts/purge-cdn.mjs`。默认清四份下游会按
+`merge-index` 在 `gh pr merge` 之后紧跟一步 `node scripts/purge-cdn.mjs`。默认清五份下游会按
 `@main` 远程读取的手改数据：`json/modules.json`、`json/dispositions.json`、`json/proxies.json`、
-`json/columns.json` —— 清单就是脚本里的 `DEFAULT_FILES`，以后新增这类文件改那里，别只在 CI 里写死。
+`json/columns.json`、`json/chunqiu-answers.json` —— 清单就是脚本里的 `DEFAULT_FILES`，以后新增这类
+文件改那里，别只在 CI 里写死。
 理由是一条实测：**下架的生效速度由 CDN 的 TTL 决定，而不是由 main 决定** ——
 索引 PR #34 把 `json/modules.json` 推空之后近 50 分钟，
 `https://cdn.jsdelivr.net/gh/SukiSU-Community/modules-repo@main/json/modules.json`

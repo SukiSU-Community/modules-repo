@@ -1851,6 +1851,17 @@ jobs:
       - name: 代理列表校验器自测（内置负例必须仍被挡住）
         shell: bash
         run: node scripts/validate-proxies.mjs --selftest
+      # 专栏数据同样要过：columns.json 里的 source / filePath / checkId 会被 App 下发到用户设备上
+      # 真的执行，写错格式在校验时看不见、到设备上才炸。下面两步同样是「真实数据 + 规则自测」。
+      - name: 校验 json/columns.json（App 专栏步骤的数据契约）
+        shell: bash
+        run: node scripts/validate-columns.mjs
+      - name: 专栏数据校验器自测（内置负例必须仍被挡住）
+        shell: bash
+        run: node scripts/validate-columns.mjs --selftest
+      - name: 校验 json/chunqiu-answers.json（春秋检测器答疑的数据契约）
+        shell: bash
+        run: node scripts/validate-answers.mjs
 
   # -------------------------------------------------------------------
   # 批准闸：把「扫完了」和「可以合并」拆成两个 check。

@@ -20,7 +20,7 @@
  *   node scripts/purge-cdn.mjs [--repo owner/name] [--branch main]
  *        [--file <path>]... [--extra <csv>] [--dry-run]
  *
- * 不给 --file 时清「下游会按 @main 远程读取的那四份手改数据」，清单见 DEFAULT_FILES。
+ * 不给 --file 时清「下游会按 @main 远程读取的那五份手改数据」，清单见 DEFAULT_FILES。
  *
  * 只用 node: 内置模块（本仓库硬约束）。
  */
@@ -32,13 +32,15 @@ const JSDELIVR_CDN = 'cdn.jsdelivr.net';
 const JSDELIVR_PURGE = 'purge.jsdelivr.net';
 
 /**
- * 默认要清的四份公开数据。
+ * 默认要清的五份公开数据。
  *
  * 判据不是「仓库里有哪些 json」，而是「哪些文件会被下游按 @main 直接读、读旧了会出事」：
  *   - modules.json / dispositions.json：索引与处置台账（下架生效速度由 CDN 决定，见文件头）；
  *   - proxies.json：代理列表由 App 远程拉取，远程非空就整份替换内置。漏清缓存时
  *     「删掉一条失效代理」在用户手里最长要等到 TTL 过期才生效，维护者会误以为改错了；
- *   - columns.json：商店专栏同理，改完步骤却看到旧内容最容易被误判成「没发布」。
+ *   - columns.json：商店专栏同理，改完步骤却看到旧内容最容易被误判成「没发布」；
+ *   - chunqiu-answers.json：春秋红项的解释层，App 侧 AI 直接按 @main 读。它比上面四份
+ *     更隐蔽 —— 用户看到的是「AI 对某个红项的解释」，解释还是旧的，没人会想到去怀疑缓存。
  *
  * 新增这类文件时**加在这里**，别只在 CI 里写死路径：merge-index 调的就是不带参数的脚本。
  */
@@ -47,6 +49,7 @@ export const DEFAULT_FILES = [
   'json/dispositions.json',
   'json/proxies.json',
   'json/columns.json',
+  'json/chunqiu-answers.json',
 ];
 
 /**
