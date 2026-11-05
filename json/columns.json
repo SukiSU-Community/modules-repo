@@ -17,7 +17,7 @@
         {
           "tier": "integrity",
           "title": "三绿：Google Play 认证报错，或者银行硬要三项全绿",
-          "body": "在日用级之上再加一层密钥伪造（TEESimulator + keybox + 指纹模块）。代价是 keybox 属于泄露的 Google 认证材料，随时可能被吊销；商店不提供、不托管、不代下，来源要你自己找。"
+          "body": "在日用级之上再加一层密钥伪造（TEESimulator + keybox + 指纹模块）。代价是 keybox 属于泄露的 Google 认证材料，随时可能被 Google 吊销。商店会从公开镜像自动取一份并校验结构（取不到才让你自选本地文件），但不对「这份密钥还能不能过检测」负责。"
         },
         {
           "tier": "game",
@@ -38,7 +38,7 @@
           "layers": [],
           "requires": ["能安装第三方 APK"],
           "evidence": {
-            "verifiedAt": "2026-08-17",
+            "verifiedAt": "2026-08-17", "label": "依据 2026-08 的社区实测帖",
             "device": "多机型",
             "kernel": "不限定",
             "source": "酷安 @泛彼柏舟y 73287937、@JeTeeZnTmaxQwQ 的春秋检测点文档、TG 频道 @Suxiaomingpd",
@@ -112,7 +112,7 @@
           "layers": ["L1", "L2", "L5"],
           "requires": ["已 root（KernelSU / SukiSU / APatch）", "Android 13 及以上", "能安装 LSPosed"],
           "evidence": {
-            "verifiedAt": "2026-08-17",
+            "verifiedAt": "2026-08-17", "label": "依据 2026-08 的社区实测帖",
             "device": "小米 8e5 平台 / 红米",
             "kernel": "6.1.x",
             "source": "酷安 @泛彼柏舟y 73287937、@小青泽 70938266 与 71026412",
@@ -311,7 +311,7 @@
           "layers": ["L3"],
           "requires": ["已通过「过银行」或至少完成 L1 隐藏", "接受密钥随时可能失效"],
           "evidence": {
-            "verifiedAt": "2026-08-17",
+            "verifiedAt": "2026-08-17", "label": "依据 2026-08 的社区实测帖",
             "device": "小米 8e5 平台",
             "kernel": "6.1.x",
             "source": "酷安 @泛彼柏舟y 73287937、@小青泽 70938266",
@@ -433,7 +433,7 @@
           "layers": ["L2", "L5"],
           "requires": ["已完成前面的隐藏"],
           "evidence": {
-            "verifiedAt": "2026-08-17",
+            "verifiedAt": "2026-08-17", "label": "依据 2026-08 的社区实测帖",
             "device": "小米 8e5 平台",
             "kernel": "6.1.x",
             "source": "酷安 @小青泽 70938266",
