@@ -33,7 +33,7 @@
           "id": "self-check",
           "title": "环境自检",
           "tier": "tool",
-          "summary": "先搞清楚现在到底漏在哪。商店默认一个检测器都不装——清单里勾选你想要的，点一键执行就会装（Duck 能直接装；春秋闭源、官方只走群和网盘，只能点「打开官方页面」自己取包）。推荐两个都装：春秋查得最细，Duck 专查路径和端口。",
+          "summary": "先搞清楚现在到底漏在哪。商店默认一个检测器都不装——清单里勾选你想要的，点一键执行就会装（Duck 能直接装；春秋闭源、官方只走群和网盘，只能点「打开官方页面」自己取包）。春秋是必装的主检测，AI 排障目前只认春秋的截图；Duck 可选，专查路径和端口。",
           "riskLevel": "low",
           "layers": [],
           "requires": ["能安装第三方 APK"],
@@ -65,10 +65,10 @@
             },
             {
               "id": "install-duck",
-              "title": "安装 Duck Detector（官方开源版）",
+              "title": "安装 Duck Detector（可选补充）",
               "kind": "installApp",
-              "optional": false,
-              "note": "Duck Detector 开源在 GitHub（eltavine/Duck-Detector-Refactoring），商店直接取它的最新 nightly 构建并交给系统安装器，你只需在弹窗里确认。它补的是春秋覆盖不到的路径与端口专项，Scene 一类工具的痕迹主要靠它暴露。",
+              "optional": true,
+              "note": "可选补充，不装不影响春秋截图排障。Duck Detector 开源在 GitHub（eltavine/Duck-Detector-Refactoring），商店直接取它的最新 nightly 构建并交给系统安装器，你只需在弹窗里确认。它补的是春秋覆盖不到的路径与端口专项，Scene 一类工具的痕迹主要靠它暴露。",
             "optIn": true,
               "source": {
                 "kind": "upstream",
@@ -81,10 +81,10 @@
             },
             {
               "id": "run-check",
-              "title": "两个都跑一遍，把红项截图",
+              "title": "跑春秋检测，把红项截图",
               "kind": "verify",
               "optional": false,
-              "note": "先跑春秋再跑 Duck。红项就是这次要补的地方；全绿说明这套环境已经能过绝大多数 App 的检测。有红项时点下面的按钮打开《春秋检测器问题解决方案》，按红项名字找「检测方式 / 异常原因 / 排查与解决办法」，它按设备类型（真解锁 / 假回锁 / 免解 / 自签）分开写。",
+              "note": "只跑春秋就行。红项就是这次要补的地方；全绿说明这套环境已经能过绝大多数 App 的检测。有红项时把春秋的结果截图发给 AI 助手，它能按红项名字对照《春秋检测器问题解决方案》找「检测方式 / 异常原因 / 排查与解决办法」（按设备类型：真解锁 / 假回锁 / 免解 / 自签）——截图排障目前只支持春秋，Duck 的结果要自己对着手册看。",
               "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/",
               "checkId": "root-manager",
               "source": {
@@ -100,7 +100,7 @@
           "verifyHints": [
             "春秋全绿 = 当前最严的一关过了",
             "Duck 只报路径/端口，路径红项靠 pathmask 补",
-            "两个都装完再重启一次，结果才稳"
+            "春秋截图发给 AI 助手即可排查红项，Duck 是可选补充"
           ]
         },
         {
