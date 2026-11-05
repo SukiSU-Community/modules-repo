@@ -6,7 +6,7 @@
     {
       "id": "hide-env",
       "title": "隐藏环境必刷",
-      "subtitle": "把 root 和 Bootloader 藏干净，银行与游戏才肯放行",
+      "subtitle": "隐藏 root 和 BL 解锁痕迹",
       "description": "一套经过社区实测的隐藏环境配置。每一项都能单独看、单独装；商店不打包整合包，也不替你点确认。",
       "guide": [
         {
