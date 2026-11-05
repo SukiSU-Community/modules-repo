@@ -25,8 +25,8 @@
           "body": "反作弊每天都在更新，没有任何配置能长期稳定；本商店也不做规避封禁、修改设备指纹这类事。想打游戏，回锁 Bootloader 是最省心的答案。"
         }
       ],
-      "accent": "root",
-      "icon": "shield",
+      "accent": "hide",
+      "icon": "eye-off",
       "order": 1,
       "topics": [
         {

@@ -50,7 +50,8 @@ export const DEFAULT_COLUMNS = path.join(REPO_ROOT, 'json', 'columns.json');
 
 /** 与 App 侧 RepoColumnParser / UI 的白名单一一对应，改一侧必须同步改另一侧。 */
 export const ACCENTS = ['root', 'hide', 'integrity', 'tool'];
-export const ICONS = ['shield', 'list', 'key', 'tool'];
+// eye-off：隐藏类专栏用「闭眼」，和详情页 header 图标一致（App 侧 columnGlyph 的 hide 分支）。
+export const ICONS = ['shield', 'eye-off', 'list', 'key', 'tool'];
 export const RISK_LEVELS = ['low', 'medium', 'high'];
 export const LAYERS = ['L1', 'L2', 'L3', 'L4', 'L5'];
 /** 档位：day = 日用级，integrity = 三绿，game = 游戏（不推荐），tool = 工具。 */
