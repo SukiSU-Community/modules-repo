@@ -508,8 +508,11 @@ export function validateColumns(doc) {
             if (typeof step.link !== 'string') {
               push(`${sat}.link 必须是字符串`);
             } else if (nonEmpty(step.link)) {
-              if (!/^https:\/\/[^\s]+$/i.test(step.link)) {
-                push(`${sat}.link 必须是 https 地址，实际是 ${JSON.stringify(step.link)}`);
+              // 除了外部网页，还允许 sukisu:// 站内入口（目前只有 sukisu://ai = 打开管理器里的 AI 助手）。
+              if (!/^(https:\/\/[^\s]+|sukisu:\/\/[a-z][a-z0-9-]*)$/i.test(step.link)) {
+                push(
+                  `${sat}.link 必须是 https 地址或 sukisu:// 站内入口，实际是 ${JSON.stringify(step.link)}`,
+                );
               } else if (step.link.length > 512) {
                 push(`${sat}.link 太长（上限 512 字符）`);
               }
