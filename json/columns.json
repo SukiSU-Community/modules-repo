@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "name": "SukiSU 精选专栏",
-  "updatedAt": "2026-11-05",
+  "updatedAt": "2026-11-06",
   "columns": [
     {
       "id": "hide-env",
@@ -11,12 +11,12 @@
       "guide": [
         {
           "tier": "day",
-          "title": "日用级：只想让银行、支付、交管这类 App 不再因为 root 退出",
+          "title": "日用级：银行、支付、交管 App 不再因 root 退出",
           "body": "装三个模块、写两份配置、重启两次。不碰密钥材料，也不需要你准备任何文件。绝大多数人做到这一档就够用了，做完请先跑一遍自检。"
         },
         {
           "tier": "integrity",
-          "title": "三绿：Google Play 认证报错，或者银行硬要三项全绿",
+          "title": "三绿：Play 认证报错，或银行要求三项全绿",
           "body": "在日用级之上再加一层密钥伪造（TEESimulator + keybox + 指纹模块）。代价是 keybox 属于泄露的 Google 认证材料，随时可能被 Google 吊销。商店会从公开镜像自动取一份并校验结构（取不到才让你自选本地文件），但不对「这份密钥还能不能过检测」负责。"
         },
         {
@@ -33,12 +33,15 @@
           "id": "self-check",
           "title": "环境自检",
           "tier": "tool",
-          "summary": "先搞清楚现在到底漏在哪。商店默认一个检测器都不装——清单里勾选你想要的，点一键执行就会装——两个商店都能直接装：Duck 开源直取最新版，春秋闭源、商店转存了同版本整包并核对 sha256，介意就点「打开官方页面」自己取。春秋是必装的主检测，AI 排障目前只认春秋的截图；Duck 可选，专查路径和端口。",
+          "summary": "先搞清楚现在到底漏在哪。商店默认一个检测器都不装，清单里勾选你想要的、点一键执行就会装。春秋是必装的主检测，AI 排障只认它的截图；Duck 可选，专查路径和端口。",
           "riskLevel": "low",
           "layers": [],
-          "requires": ["能安装第三方 APK"],
+          "requires": [
+            "能安装第三方 APK"
+          ],
           "evidence": {
-            "verifiedAt": "2026-08-17", "label": "依据 2026-08 的社区实测帖",
+            "verifiedAt": "2026-08-17",
+            "label": "依据 2026-08 的社区实测帖",
             "device": "多机型",
             "kernel": "不限定",
             "source": "酷安 @泛彼柏舟y 73287937、@JeTeeZnTmaxQwQ 的春秋检测点文档、TG 频道 @Suxiaomingpd",
@@ -47,11 +50,11 @@
           "steps": [
             {
               "id": "install-chunqiu",
-              "title": "安装春秋 Native Check",
+              "title": "装春秋检测",
               "kind": "installApp",
               "optional": false,
               "optIn": true,
-              "note": "春秋闭源，官方只走 Telegram 频道 @Suxiaomingpd（当前 4.6.2 / 2026-10-23）和官方迅雷网盘。商店这里转存了同一版本的整包（GitHub Releases，可走下载加速），下载后会先核对 sha256，字节对不上就中止、不会装。这不是官方渠道，介意就点下面的「打开官方页面」自己去官方取。包名 com.chunqiunativecheck；同一频道还发 Luna 检测器（luna.safe.luna），别下错。",
+              "note": "装主检测器春秋，后面所有红项都靠它说话。商店给的是同版本整包，装之前会核对文件没被改过；不放心就点「打开官方页面」自己去官方下载。装的时候系统会弹一次安装确认。",
               "link": "https://t.me/Suxiaomingpd",
               "source": {
                 "kind": "direct",
@@ -60,32 +63,34 @@
                 "pinnedVersion": "",
                 "sha256": "1ca92901b74ff658988a4859d8cd2c6f20e45f722a88bc0361e9d33ee5a72866",
                 "moduleId": "",
-                "url": "https://github.com/SukiSU-Community/modules-repo/releases/download/mirror-chunqiu-4.6.2/ChunqiuNativeCheck-4.6.2.apk"
+                "url": "https://github.com/SukiSU-Community/modules-repo/releases/download/mirror-chunqiu-4.6.2/ChunqiuNativeCheck-4.6.2.apk",
+                "packageName": "com.chunqiunativecheck"
               }
             },
             {
               "id": "install-duck",
-              "title": "安装 Duck Detector（可选补充）",
+              "title": "装 Duck 检测器（可选补充）",
               "kind": "installApp",
               "optional": true,
-              "note": "可选补充，不装不影响春秋截图排障。Duck Detector 开源在 GitHub（eltavine/Duck-Detector-Refactoring），商店直接取它的最新 nightly 构建并交给系统安装器，你只需在弹窗里确认。它补的是春秋覆盖不到的路径与端口专项，Scene 一类工具的痕迹主要靠它暴露。",
-            "optIn": true,
+              "note": "可选补充，不装也不影响排障。它专查路径和端口这类春秋覆盖不到的项，想查得更细就装。商店直接取它的最新构建，弹安装确认时点允许即可。",
+              "optIn": true,
               "source": {
                 "kind": "upstream",
                 "repo": "eltavine/Duck-Detector-Refactoring",
                 "assetPattern": "Duck.Detector-*.apk",
                 "pinnedVersion": "",
                 "sha256": "",
-                "moduleId": ""
+                "moduleId": "",
+                "packageName": "com.eltavine.duckdetector"
               }
             },
             {
               "id": "run-check",
-              "title": "跑春秋检测，把红项截图",
+              "title": "跑一遍春秋",
               "kind": "verify",
               "optional": false,
-              "note": "只跑春秋就行。红项就是这次要补的地方；全绿说明这套环境已经能过绝大多数 App 的检测。有红项时把春秋的结果截图发给 AI 助手，它能按红项名字对照《春秋检测器问题解决方案》找「检测方式 / 异常原因 / 排查与解决办法」（按设备类型：真解锁 / 假回锁 / 免解 / 自签）——截图排障目前只支持春秋，Duck 的结果要自己对着手册看。",
-              "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/",
+              "note": "跑一遍春秋，看看现在能不能过。全绿说明这套环境能过绝大多数 App；有红项就是这次要补的地方。点下面「进入 AI 助手」，把结果截图发过去，它会按红项给解法。截图排障目前只认春秋，Duck 的结果要自己对着手册看。",
+              "link": "sukisu://ai",
               "checkId": "root-manager",
               "source": {
                 "kind": "askUser",
@@ -109,10 +114,19 @@
           "tier": "day",
           "summary": "银行主要查三样：root 在不在、应用列表里有没有可疑工具、系统属性完不完整。这一套按白名单思路做，默认全机看不见 root，只给需要 root 的工具开后门。",
           "riskLevel": "medium",
-          "layers": ["L1", "L2", "L5"],
-          "requires": ["已 root（KernelSU / SukiSU / APatch）", "Android 13 及以上", "能安装 LSPosed"],
+          "layers": [
+            "L1",
+            "L2",
+            "L5"
+          ],
+          "requires": [
+            "已 root（KernelSU / SukiSU / APatch）",
+            "Android 13 及以上",
+            "能安装 LSPosed"
+          ],
           "evidence": {
-            "verifiedAt": "2026-08-17", "label": "依据 2026-08 的社区实测帖",
+            "verifiedAt": "2026-08-17",
+            "label": "依据 2026-08 的社区实测帖",
             "device": "小米 8e5 平台 / 红米",
             "kernel": "6.1.x",
             "source": "酷安 @泛彼柏舟y 73287937、@小青泽 70938266 与 71026412",
@@ -121,10 +135,10 @@
           "steps": [
             {
               "id": "zygisk-next",
-              "title": "安装 ZygiskNext",
+              "title": "装 Zygisk Next",
               "kind": "installModule",
               "optional": false,
-              "note": "后面所有隐藏都建立在 Zygisk 之上。如果管理器自带的 Zygisk 已经开着，先关掉它再装，别两个同时跑。",
+              "note": "装 Zygisk，后面所有隐藏功能都靠它生效。管理器自带的 Zygisk 如果已经开着，先关掉再装，别两个一起跑。不用现在重启，后面几步做完一起重启。",
               "source": {
                 "kind": "upstream",
                 "repo": "Dr-TSNG/ZygiskNext",
@@ -136,10 +150,10 @@
             },
             {
               "id": "lsposed",
-              "title": "安装 LSPosed",
+              "title": "装 LSPosed",
               "kind": "installModule",
               "optional": false,
-              "note": "必备步骤。LSPosed 2.x 不在 GitHub 发版（那边停在 2023-10 的 v1.9.2），只通过官方 Telegram 频道公告；但官方维护了 update.json（https://lsposed.zip/update.json），商店读它就能直接装最新版，不用你手动下载。装完重启，在框架设置里打开「点按劫持缓解」和「Xposed API 调用保护」。HMA-OSS 本身是 Zygisk 模块、不需要 Xposed，但 FuseFixer 这类模块要。",
+              "note": "装框架，HMA 这类模块要靠它才能改 App 行为。商店会自动取最新版，你只要在弹窗里确认。装完要重启，重启后进框架设置，打开「点按劫持缓解」和「Xposed API 调用保护」——这两项默认是关的。",
               "source": {
                 "kind": "updateJson",
                 "repo": "",
@@ -152,10 +166,10 @@
             },
             {
               "id": "hma-oss",
-              "title": "安装 HMA-OSS",
+              "title": "装 HMA-OSS",
               "kind": "installModule",
               "optional": false,
-              "note": "负责隐藏应用列表。它是 Zygisk 模块（不是 Xposed 模块），刷入后由 ZygiskNext 加载；配置走它自己的 WebUI，用 KsuWebUI 打开，导入配置 json 的入口叫「还原配置」，不是「备份」。",
+              "note": "装 HMA，用它把应用列表藏起来，检测器就看不到你装了哪些工具。配置走它自己的网页界面（用 KsuWebUI 打开）。导入配置的入口叫「还原配置」，不是「备份」，别点错。装完先别配，重启之后再导入。",
               "source": {
                 "kind": "upstream",
                 "repo": "frknkrc44/HMA-OSS",
@@ -167,10 +181,10 @@
             },
             {
               "id": "configure-zygisk",
-              "title": "配置 ZygiskNext 的排除策略",
+              "title": "设置排除策略",
               "kind": "writeFile",
               "optional": false,
-              "note": "打开 ZygiskNext 模块页：排除列表策略选「仅还原挂载」，开启「使用匿名内存」；如果你的版本有「使用 Zygisk Next 链接器（实验性）」，也一起打开。这两项在模块自己的页面上没有独立开关时，就靠下面的「默认卸载模块」和这一步的配置文件生效：全机默认读不到模块挂载，只有你在超级用户里放行的应用例外。下面这次写入就是把「排除列表策略」落到配置文件上（2 = 仅还原挂载，1 = 使用排除列表，0 = 关闭）；「使用匿名内存」这类开关仍然要在模块页里手动打开。",
+              "note": "把排除策略设成「仅还原挂载」。这样全机默认看不到模块改动，只有你在超级用户里放行的 App 例外；这一步会把它写进配置文件。模块页里如果还有「使用匿名内存」这类开关，记得进去手动打开。",
               "filePath": "/data/adb/zygisksu/denylist_enforce",
               "fileContent": "2\n",
               "source": {
@@ -184,10 +198,10 @@
             },
             {
               "id": "harden-manager",
-              "title": "核对并打开管理器的隐藏开关",
+              "title": "打开管理器的隐藏开关",
               "kind": "runCommand",
               "optional": false,
-              "note": "把管理器自己的隐藏开关拨到位：内核级卸载模块、隐藏 SELinux、AVC 伪装、隐藏可疑挂载要开；SU 日志、ADB Root、只允许 ADB 拿 root、传统 SU 命令要关。命令先读当前值，已经是目标值的就不动，所以重复执行没有副作用。隐藏 SELinux 和隐藏可疑挂载改完要重启才生效。",
+              "note": "打开管理器的隐藏开关。具体是：隐藏 SELinux、隐藏挂载、AVC 伪装、内核级卸载模块打开，SU 日志、ADB Root 这类会留痕迹的关掉。命令会先读当前值，已经是目标值的就不动，重复执行没有副作用。隐藏 SELinux 和隐藏挂载这两项要重启后才生效。",
               "command": "set_f() { cur=$(ksud feature get \"$1\" 2>/dev/null | grep \"^Value:\" | cut -d\" \" -f2); [ \"$cur\" = \"$2\" ] || ksud feature set \"$1\" \"$2\" >/dev/null 2>&1; }\nset_f kernel_umount 1\nset_f selinux_hide 1\nset_f avc_spoof 1\nset_f mount_hide 1\nset_f sulog 0\nset_f adb_root 0\nset_f shell_su_adb_only 0\nset_f su_compat 0\nksud feature save\necho \"manager features aligned (reboot required for selinux_hide / mount_hide)\"",
               "confirm": "这会修改管理器的功能开关：把隐藏相关四项打开，把会留痕迹的四项关掉（其中「传统 SU 命令」关掉后，依赖 /system/bin/su 的老应用会失效）。继续？",
               "source": {
@@ -204,7 +218,7 @@
               "title": "打开「默认卸载模块」",
               "kind": "askUser",
               "optional": false,
-              "note": "ZygiskNext 的设置页里没有「将非 Root 应用视为排除列表」这个开关，那是 Magisk 时代的旧说法。KernelSU 系（含 SukiSU）的排除列表就是 App Profile 里勾了「卸载模块」的应用，所以去设置 →「模块行为」→ 打开「默认卸载模块」：没单独配过 Profile 的应用都会还原模块对系统的修改，检测软件就看不到痕迹。需要 root 的工具（MT 管理器、Scene、终端）在「超级用户」里单独放行即可。这一步只做指引：这个开关存在管理器自己的配置里，绕过界面去改容易把超级用户列表弄坏，所以不下发文件写入。",
+              "note": "去设置 →「模块行为」→ 打开「默认卸载模块」。没单独配过的 App 都会还原模块改动，检测软件就看不到痕迹。需要 root 的工具（MT 管理器、Scene、终端）在「超级用户」里单独放行即可。这一步只给指引、不替你改配置——绕过界面改容易弄坏超级用户列表。",
               "source": {
                 "kind": "askUser",
                 "repo": "",
@@ -216,10 +230,10 @@
             },
             {
               "id": "fuse-fixer",
-              "title": "安装 FuseFixer（可选）",
+              "title": "装 FuseFixer（可选）",
               "kind": "askUser",
               "optional": true,
-              "note": "Xposed 模块，专门隐藏软件本身，仓库暂未收录。装了以后在 LSPosed 里启用，勾默认作用域，参数不用改。不装也能过大部分银行。",
+              "note": "可选加装，用来隐藏软件本身。商店暂未收录，要你自己找包；装了就在框架里启用、勾默认作用域，参数不用改。不装也能过大部分银行。",
               "source": {
                 "kind": "askUser",
                 "repo": "",
@@ -234,7 +248,7 @@
               "title": "关掉 ADB 与 USB 调试",
               "kind": "runCommand",
               "optional": false,
-              "note": "执行 settings put global adb_enabled 0 和 setprop persist.sys.usb.config none。部分银行会检查调试通道是否开着。",
+              "note": "关掉 ADB 和 USB 调试，部分银行会检查调试通道有没有开着。关掉后 adb 连接会立刻断开、USB 退成仅充电，要用时得回开发者选项重新打开。",
               "command": "settings put global adb_enabled 0 && setprop persist.sys.usb.config none",
               "confirm": "关掉后 adb 连接（含有线/无线调试）会立刻断开，USB 也会退成仅充电，需要重新去开发者选项里打开。确认执行？",
               "source": {
@@ -251,7 +265,7 @@
               "title": "重启",
               "kind": "reboot",
               "optional": false,
-              "note": "Zygisk 模块和 LSPosed 作用域都要重启才生效。管理器类应用配完记得从后台划掉，不然它自己会带着 root 痕迹挂在后台。重启回来再打开这个专题，向导会自动恢复进度，点底部「一键执行剩余步骤」把重启后才允许做的几步跑完。",
+              "note": "重启一次，Zygisk 模块和框架的作用域都要重启才生效。管理器这类 App 配完记得从后台划掉，不然它会带着 root 痕迹挂在后台。回来打开这个专题，向导会自动恢复进度。",
               "confirm": "重启会中断当前所有任务与连接（下载、通话、没保存的编辑都会丢），并需要重新解锁。确认现在重启？",
               "source": {
                 "kind": "askUser",
@@ -264,10 +278,10 @@
             },
             {
               "id": "configure-hma",
-              "title": "写入 HMA 隐藏配置",
+              "title": "导入 HMA 隐藏配置",
               "kind": "writeHmaConfig",
               "optional": false,
-              "note": "重启之后再执行这一步（它排在重启后面就是为此）：HMA 第一次装完要重启一次才会生成配置目录。这一步会自动把「隐藏环境必刷」模板写进 HMA：黑名单里 289 个包名（MT、终端、各类 root 工具与检测器），并配到 36 个检测器和游戏上。设备上已有的 HMA 配置会被合并——你自己加的模板、目标应用、开关一律保留，只补缺的部分。写完要重启才生效，所以这一步后面还有最后一次重启。",
+              "note": "一定要在第一次重启之后再执行——HMA 装完要重启一次才会生成配置目录。它把「隐藏环境必刷」模板导进 HMA，黑名单里是各类 root 工具和检测器。设备上已有的配置会合并：你自己的模板、目标、开关都保留，只补缺的部分。写完要重启才生效，所以下一步还是重启。",
               "fileContent": "{\"configVersion\":93,\"templateName\":\"隐藏环境必刷\",\"template\":{\"isWhitelist\":false,\"appList\":[\"Hook.JiuWu.Xp\",\"aidepro.top\",\"bin.mt\",\"bin.mt.plus\",\"bin.mt.plus.canary\",\"bin.mt.plus.mtz\",\"bin.mt.plus.pro\",\"cc.aoeiuv020.iamnotdisabled.hook\",\"chunqiu.safe\",\"cn.android.x\",\"cn.aodlyric.xiaowine\",\"cn.fuckhome.xiaowine\",\"cn.geektang.privacyspace\",\"cn.kwaiching.hook\",\"cn.lyric.getter\",\"cn.myflv.monitor.noactive\",\"cn.myflv.noactive\",\"com.Longze.detector.pro2\",\"com.OrangeEnvironment.Detector\",\"com.adb.shell\",\"com.amphoras.hidemyroot\",\"com.amphoras.hidemyrootadfree\",\"com.android.hook\",\"com.android.nativetest\",\"com.android.vm\",\"com.antivm.detector\",\"com.apocalua.run\",\"com.attestation.checker\",\"com.bignox.app\",\"com.bluestacks.rootchecker\",\"com.bug.hookvip\",\"com.byxiaorun.detector\",\"com.byyoung.setting\",\"com.coderstory.toolkit\",\"com.crossprofile.work\",\"com.cshlolss.vipkill\",\"com.ddm.qute\",\"com.demo.serendipity\",\"com.dergoogler.mmrl\",\"com.dergoogler.mmrl.debug\",\"com.dergoogler.mmrl.wx\",\"com.dergoogler.mmrl.wx.alpha\",\"com.devadvance.rootcloak\",\"com.devadvance.rootcloakplus\",\"com.didikee.rootcheck\",\"com.didjdk.adbhelper\",\"com.dna.tools\",\"com.dualspace.superapp\",\"com.example.emulatordetector\",\"com.example.memcheck\",\"com.example.nativelibtest\",\"com.example.ourom\",\"com.example.syscallchecker\",\"com.excelliance.dualaid\",\"com.excelliance.multi\",\"com.excelliance.multiaccount\",\"com.fankes.enforcehighrefreshrate\",\"com.fankes.tsbattery\",\"com.fde.xposed.detector\",\"com.fkzhang.wechatxposed\",\"com.formyhm.hideroot\",\"com.fox2code.mmm\",\"com.freeandroidtools.rootchecker\",\"com.fuck.android.rimet\",\"com.github.tianma8023.xposed.smscode\",\"com.google.snet.test\",\"com.guardian.detect\",\"com.hchai.rescueplan\",\"com.hchen.appretention\",\"com.hchen.switchfreeform\",\"com.houvven.guise\",\"com.houvven.impad\",\"com.integrity.attestation\",\"com.integrity.check\",\"com.integrity.checker\",\"com.jingmatrix.vector\",\"com.joeykrim.rootcheck\",\"com.jrummyapps.rootchecker\",\"com.junge.algorithmAidePro\",\"com.kimchangyoun.magiskdetector\",\"com.kimchangyoun.rootbeerfresh\",\"com.kingouser.com\",\"com.kooritea.fcmfix\",\"com.koushikdutta.superuser\",\"com.lbe.parallel\",\"com.lbe.parallel.intl\",\"com.lenovo.hyperengine\",\"com.lenovo.legionzone\",\"com.lenovo.minigamelauncher\",\"com.lenovo.tbengine\",\"com.lerist.fakelocation\",\"com.lingqing.detector\",\"com.linux.permissionmanager\",\"com.linux.skroot.next\",\"com.lody.virtual\",\"com.lody.virtual.client\",\"com.lody.virtual.server\",\"com.lody.whale\",\"com.luckyzyx.luckytool\",\"com.ludashi.dual\",\"com.memory.scan\",\"com.mio.kitchen\",\"com.modify.installer\",\"com.moonshine.checker\",\"com.my.televip\",\"com.native.checker\",\"com.nnnen.plusne\",\"com.noshufou.android.su\",\"com.oasisfeng.greenify\",\"com.oasisfeng.island\",\"com.oasisfeng.island.fdroid\",\"com.omarea\",\"com.omarea.adj\",\"com.omarea.boot\",\"com.omarea.cpu\",\"com.omarea.gpu\",\"com.omarea.heart\",\"com.omarea.ifw\",\"com.omarea.installer\",\"com.omarea.io\",\"com.omarea.monitor\",\"com.omarea.net\",\"com.omarea.perf\",\"com.omarea.pro\",\"com.omarea.scene\",\"com.omarea.store\",\"com.omarea.thermal\",\"com.omarea.toolkit\",\"com.omarea.vm\",\"com.omarea.vtools\",\"com.omarea.xtask\",\"com.padi.hook.hookqq\",\"com.parallel.space\",\"com.parallel.space.lite\",\"com.parallel.space.pro\",\"com.parallelc.micts\",\"com.ps.ga\",\"com.qihoo.magic\",\"com.qq.qcxm\",\"com.qrj.apexsu\",\"com.ramdroid.appdetector\",\"com.resukisu.resukisu\",\"com.reveny.environmentchecker\",\"com.reveny.nativecheck\",\"com.reveny.nativechecker\",\"com.reveny.rootchecker\",\"com.rifsxd.ksunext\",\"com.rkg.IAMRKG\",\"com.sakisu.sakisu\",\"com.saurik.substrate\",\"com.scene\",\"com.scene.assistant\",\"com.scene.manager\",\"com.scottyab.rootbeer\",\"com.scottyab.rootbeer.sample\",\"com.security.environmentchecker\",\"com.sevtinge.hyperceiler\",\"com.shatyuka.zhiliao\",\"com.silverlab.app.deviceidchanger.free\",\"com.smlj.rootcheck\",\"com.solohsu.android.edxp.manager\",\"com.solohsu.xposed.manager\",\"com.studio.duckdetector\",\"com.sukisu.ultra\",\"com.sukisu.ultra.pr\",\"com.suqi8.oshin\",\"com.syscall.detector\",\"com.syyf.quickpay\",\"com.taichi.dreamland\",\"com.tencent.JYNB\",\"com.tencent.jingshi\",\"com.termux\",\"com.termux.api\",\"com.thirdparty.superuser\",\"com.topjohnwu.magisk\",\"com.topjohnwu.magisk.alpha\",\"com.topjohnwu.magisk.delta\",\"com.topjohnwu.magisk.detector\",\"com.topmiaohan.hidebllist\",\"com.tsng.apptoolkit\",\"com.tsng.hideapplist\",\"com.tsng.hidemyapplist\",\"com.tsng.pzyhrx.hma\",\"com.twifucker.hachidori\",\"com.twj.wksu\",\"com.virtual.checker\",\"com.virtualapp\",\"com.vmcheck.detector\",\"com.vmos.assistant\",\"com.vmos.ggp\",\"com.vmos.glb\",\"com.vmos.pro\",\"com.vmos.root\",\"com.vmos.x\",\"com.vphonegaga.titan\",\"com.wei.vip\",\"com.wn.app.np\",\"com.xayah.databackup.foss\",\"com.xposed.checker\",\"com.yuanwofei.cardemulator.pro\",\"com.yxer.packageinstalles\",\"com.zachspong.modxposed\",\"com.zhenxi.checker\",\"com.zhenxi.hunter\",\"com.zhufucdev.motion_emulator\",\"com.zui.game.service\",\"de.robv.android.xposed.installer\",\"dev.upatch.manager\",\"dialog.box\",\"dknb.coo8\",\"edxp.manager\",\"es.chiteroman.bootloaderspoofer\",\"eu.chainfire.supersu\",\"eu.faircode.xlua\",\"github.com.tornaco.android.thanox\",\"github.com.tornaco.android.thanox.pro\",\"github.com.tsng.hidemyapplist\",\"github.tornaco.android.thanos\",\"icu.nullptr.applistdetector\",\"icu.nullptr.hidemyapplist\",\"icu.nullptr.nativetest\",\"info.cloneapp.app\",\"io.github.Retmon403.oppotheme\",\"io.github.a13e300.ksuwebui\",\"io.github.huskydg.magisk\",\"io.github.huskydg.memorydetector\",\"io.github.libxposed\",\"io.github.qauxv\",\"io.github.vvb2060.keyattestation\",\"io.github.vvb2060.magisk\",\"io.github.vvb2060.mahoshojo\",\"io.liankong.riskdetector\",\"io.va.exposed\",\"io.virtual\",\"jackpal.androidterm\",\"kk.dk.anqu\",\"lin.xposed\",\"luna.safe.luna\",\"me.bingyue.IceCore\",\"me.bmax.apatch\",\"me.garfieldhan.apatch.next\",\"me.garfieldhan.holmes\",\"me.gm.cleaner\",\"me.hd.wauxv\",\"me.iacn.biliroaming\",\"me.jfenn.alpinedroidterm\",\"me.plusne\",\"me.simpleHook\",\"me.teble.xposed.autodaily\",\"me.weishu.exp\",\"me.weishu.kernelsu\",\"me.weishu.kernelsu.dev\",\"me.weishu.kernelsu.pr\",\"me.weishu.taichi\",\"me.yuki.folk\",\"miko.client\",\"moe.fuqiuluo.portal\",\"moe.shizuku.privileged.api\",\"moe.shizuku.redirectstorage\",\"mt.plus\",\"name.monwf.customiuizer\",\"nep.timeline.freezer\",\"nep.timeline.re_telegram\",\"net.typeblog.shelter\",\"o.dyoo\",\"one.yufz.hmspush\",\"org.frknkrc44.hma_oss\",\"org.lsposed.dirtysepolicy\",\"org.lsposed.lspatch\",\"org.lsposed.lspd\",\"org.lsposed.manager\",\"org.meowcat.edxposed.manager\",\"org.meowcat.telehook\",\"re.frida.server\",\"rikka.safetynetchecker\",\"ru.maximoff.apktool\",\"self.visibility\",\"stericson.busybox\",\"tmgp.atlas.toolbox\",\"top.bienvenido.saas.i18n\",\"top.hookvip.pro\",\"top.sacz.timtool\",\"tornaco.apps.shortx\",\"tornaco.apps.shortx.ext\",\"vn.kwaiching.tao\",\"web1n.stopapp\",\"xzr.hkf\",\"xzr.konabess\",\"zako.zako.zako\"]},\"scope\":{\"com.chunqiunativecheck\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"wu.Zygisk.Detector\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.eltavine.duckdetector\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.youhu.laifu\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.tencent.tmgp.sgame\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.tencent.tmgp.pubgmhd\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.tencent.tmgp.dfm\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.tencent.mf.uam\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.tencent.tmgp.cod\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.tencent.tmgp.codev\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.tencent.tmgp.cf\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.tencent.lolm\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.tencent.rmcn\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.proximabeta.mf.uamo\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.garena.game.df\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.proxima.dfm\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"wu.keyChain.test\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.OrangeEnvironment.Detector\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"org.akanework.checker\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.byxiaorun.detector\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"io.liankong.riskdetector\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"wu.Rookie.Detector\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.godevelopers.OprekCek\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.reveny.nativecheck\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.android.nativetest\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"icu.nullptr.nativetest\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"io.github.vvb2060.mahoshojo\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"io.github.huskydg.memorydetector\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"luna.safe.luna\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"io.github.vvb2060.keyattestation\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.xff.launch\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.zhenxi.hunter\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"wu.futiletest\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"me.garfieldhan.holmes\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.maple.detect\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]},\"com.envdetector\":{\"useWhitelist\":false,\"excludeSystemApps\":true,\"hideInstallationSource\":true,\"hideSystemInstallationSource\":false,\"excludeTargetInstallationSource\":false,\"invertActivityLaunchProtection\":true,\"excludeVoldIsolation\":false,\"restrictedZygotePermissions\":[9997,3009],\"applyTemplates\":[\"隐藏环境必刷\"],\"applyPresets\":[],\"applySettingTemplates\":[],\"applySettingsPresets\":[],\"extraAppList\":[],\"extraOppositeAppList\":[]}},\"disabledHooks\":[{\"className\":\"com.android.server.pm.ComputerEngine\",\"methodName\":\"getApplicationInfoInternal\",\"argumentCount\":-1},{\"className\":\"com.android.server.pm.ComputerEngine\",\"methodName\":\"getInstallerPackageName\",\"argumentCount\":-1}],\"globals\":{\"forceMountData\":true,\"disableActivityLaunchProtection\":true,\"altAppDataIsolation\":true,\"altVoldAppDataIsolation\":false,\"skipSystemAppDataIsolation\":true,\"webViewProtection\":true}}",
               "source": {
                 "kind": "askUser",
@@ -283,8 +297,25 @@
               "title": "最后一次重启",
               "kind": "reboot",
               "optional": false,
-              "note": "HMA 配置写完要重启才生效。重启回来，这个专题就完成了，可以跑一遍自检验收。",
+              "note": "再重启一次，HMA 的配置才会生效。回来这个专题就做完了，可以跑一遍自检验收。",
               "confirm": "重启会中断当前所有任务与连接（下载、通话、没保存的编辑都会丢），并需要重新解锁。确认现在重启？",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
+              "id": "clean-traces",
+              "title": "清掉残留痕迹",
+              "kind": "runCommand",
+              "optional": true,
+              "note": "清掉可能暴露你的残留文件。自动执行只删本工具自己的工作目录，不碰相册、下载和回滚账本。手机存储里的旧脚本、MT 备份、下载的模块包要你自己逐个确认再删——那是你的数据区，一键清理容易误删。",
+              "command": "rm -rf /data/local/tmp/hide_env",
+              "confirm": "只会删除一个明确目录：/data/local/tmp/hide_env，不会碰 /sdcard，也不会动回滚账本。删前请确认里面没有你还需要的文件。继续？",
               "source": {
                 "kind": "askUser",
                 "repo": "",
@@ -306,12 +337,18 @@
           "id": "pass-integrity",
           "title": "谷歌三绿 / Play Integrity",
           "tier": "integrity",
-          "summary": "这一层要动密钥材料。商店自己不存 keybox（那是别人的 Google 认证材料），但向导会试着从公开镜像自动取一份并校验结构，取不到才让你自选本地文件——所以多数人不需要自己去搜。这一层也是全网唯一没人敢给你打包票的：Google 吊销随时生效。",
+          "summary": "这一层要碰密钥材料。商店自己不存 keybox，但向导会试着从公开镜像自动取一份，取不到才让你自选本地文件——多数人不用自己去搜。也是全网没人敢打包票的一层：Google 吊销随时生效。",
           "riskLevel": "high",
-          "layers": ["L3"],
-          "requires": ["已通过「过银行」或至少完成 L1 隐藏", "接受密钥随时可能失效"],
+          "layers": [
+            "L3"
+          ],
+          "requires": [
+            "已通过「过银行」或至少完成 L1 隐藏",
+            "接受密钥随时可能失效"
+          ],
           "evidence": {
-            "verifiedAt": "2026-08-17", "label": "依据 2026-08 的社区实测帖",
+            "verifiedAt": "2026-08-17",
+            "label": "依据 2026-08 的社区实测帖",
             "device": "小米 8e5 平台",
             "kernel": "6.1.x",
             "source": "酷安 @泛彼柏舟y 73287937、@小青泽 70938266",
@@ -320,10 +357,10 @@
           "steps": [
             {
               "id": "tee-simulator",
-              "title": "安装 TEESimulator",
+              "title": "装 TEESimulator",
               "kind": "installModule",
               "optional": false,
-              "note": "这一层只需要一个密钥模块。TEESimulator 走 Keystore Binder 拦截做完整 TEE 模拟，更新更活跃（最新 v4.0，2026-08），作者声明它会取代 TrickyStore。注意 v4.0 的模块 id 是 teesim、数据目录是 /data/adb/teesim，和 TrickyStore（tricky_store / /data/adb/tricky_store）是两套独立安装——不会互相覆盖，所以「两个都装」真的会同时存在、互相抢 Keystore 请求，别这么干：这一层只需要一个密钥模块。",
+              "note": "装密钥模块，让系统看起来有正规的 Google 认证。这一层只装一个：它和 TrickyStore 会抢同一件事，两个都装反而都不灵。作者说它取代 TrickyStore，新机型先用它。",
               "source": {
                 "kind": "upstream",
                 "repo": "JingMatrix/TEESimulator",
@@ -338,7 +375,7 @@
               "title": "可选：换成 TrickyStore",
               "kind": "installModule",
               "optional": true,
-              "note": "只在 TEESimulator 于你机型上不工作时再试。TrickyStore 已停更（最新 1.4.1，2025-11，且 1.1.0 起闭源），靠 leaf 证书 hack 实现。它是独立安装（模块 id tricky_store、目录 /data/adb/tricky_store），和 TEESimulator 并存会互相抢 Keystore 请求——换用它之前，先在管理器里停用或删除 TEESimulator，这一层只留一个密钥模块。后面的 keybox 与 target.txt 两步对两者通用。",
+              "note": "只在 TEESimulator 于你机型上不工作时才换。它已经停更，但有些老机型反而更认它。换之前先在管理器里停用或删掉 TEESimulator——两个同时开会互相抢，这一层只留一个。后面的 keybox 和 target.txt 两步对两者通用。",
               "source": {
                 "kind": "upstream",
                 "repo": "5ec1cff/TrickyStore",
@@ -353,7 +390,7 @@
               "title": "导入 keybox",
               "kind": "writeFile",
               "optional": false,
-              "note": "向导会先自动取一份：从 MeowDump 的 GitHub Release 镜像下载（走商店的下载加速），解码后校验结构（AndroidAttestation 根节点、Keybox、DeviceID、ecdsa/rsa 密钥对），不合格就换下一条路，全都不行才要求你选本地文件。keybox 是泄露的 Google 认证材料，随时可能被吊销——这条路只能保证「取到一份结构完整且没被中间人改过」的，不保证明天还能过检测。默认写 /data/adb/teesim/keybox.xml（TEESimulator v4.0 的路径）；如果你在这一层选的是 TrickyStore，它在 /data/adb/tricky_store/keybox.xml 或自己的 WebUI 里找密钥，那就把路径换成那处，或者用 TEESimulator 的 WebUI 让它把 keybox 拖进去。装的是 TEESimulator 时它安装期会顺手从 tricky_store 目录 adopt 一份，所以先写哪一处都不至于白写。",
+              "note": "给设备一份认证材料，让 Play Integrity 认得出你。它是泄露的 Google 认证数据，随时可能被吊销。向导会先从公开镜像自动取一份并检查格式，取不到才让你选本地文件，只能保证文件完整、没被改过，不保证明天还能过检测。默认写 TEESimulator 的位置；选了 TrickyStore 就换到它那边，两边都写不算白写。",
               "filePath": "/data/adb/teesim/keybox.xml",
               "fileContent": "${keybox}",
               "confirm": "将把 keybox.xml 内容写到 /data/adb/teesim/keybox.xml，覆盖原文件（会先备份到回滚账本）。自动获取的内容已经过结构校验；如果你是自己选的文件，请确认来源可信，再继续。",
@@ -368,10 +405,10 @@
             },
             {
               "id": "target-txt",
-              "title": "配 target.txt",
+              "title": "可选：指定要过认证的 App",
               "kind": "writeFile",
               "optional": true,
-              "note": "只在你选的是 TrickyStore 时需要：把要过认证的应用包名写进 /data/adb/tricky_store/target.txt，包名后加「!」表示强制走生成流程（适合 TEE 已损坏的设备）。装的是 TEESimulator v4.0 的话它不读这个文件——应用清单在 /data/adb/teesim/config.json 的 profiles[].apps 里，用它的 WebUI 勾选，所以这一步可以跳过。",
+              "note": "只有选 TrickyStore 才需要。把要过认证的 App 包名写进它的目标清单；包名后加「!」表示强制走模拟流程，适合 TEE 已损坏的设备。用 TEESimulator 的话它不读这个文件，在它的网页界面里勾 App 就行，这一步可以跳过。",
               "filePath": "/data/adb/tricky_store/target.txt",
               "fileContent": "com.google.android.gms\ncom.android.vending\n",
               "confirm": "将把 /data/adb/tricky_store/target.txt 覆盖为 GMS + Play 商店两行（原文件会先备份）。如果你之前在这里写过别的包名，请先记下来，写完后手动补回去。继续？",
@@ -386,10 +423,10 @@
             },
             {
               "id": "pif",
-              "title": "安装 PlayIntegrityFork",
+              "title": "装指纹模块",
               "kind": "installModule",
               "optional": false,
-              "note": "补设备指纹（PIF）。注意它和旧的 PlayIntegrityFix 冲突，两个只能留一个。",
+              "note": "装指纹模块，补一份骗得过检测的设备信息。它和旧的 PlayIntegrityFix 冲突，两个只能留一个；以前装过就先卸掉。装完要重启。",
               "source": {
                 "kind": "upstream",
                 "repo": "osm0sis/PlayIntegrityFork",
@@ -401,10 +438,10 @@
             },
             {
               "id": "verify-integrity",
-              "title": "用 Play Integrity API Checker 验收",
+              "title": "验收：三项全绿",
               "kind": "verify",
               "optional": false,
-              "note": "三项全绿（MEETS_BASIC_INTEGRITY / MEETS_DEVICE_INTEGRITY / MEETS_STRONG_INTEGRITY）才算过。密钥有效期一般到 2033 年，但设备指纹和补丁日期会先过期。哪一项红就去《春秋检测器问题解决方案》的「七、Keystore / KeyMint / TEE」一章对照排查——那边把「avb 校验异常」这类红项的成因点名到具体文件和属性。",
+              "note": "三项全绿才算过：基础、设备、强完整性。哪一项红就先看它——通常是指纹太旧或 keybox 失效。密钥一般能用到 2033 年，但设备指纹和补丁日期会先过期。红项可以点下面的链接按章节排查。",
               "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/",
               "checkId": "keybox-valid",
               "source": {
@@ -422,62 +459,6 @@
             "keybox 向导会自动取一份并校验结构，取不到才要求你自选本地文件",
             "只有一绿且提示安装包信息不符，通常是 PIF 没装或版本太旧",
             "改 keybox 和 target.txt 不用重启，装完模块才要"
-          ]
-        },
-        {
-          "id": "hide-manager",
-          "title": "藏掉管理器本体",
-          "tier": "day",
-          "summary": "最后一步，也最容易被忘：root 管理器自己就是一个显眼的证据。先说清楚：SukiSU 没有改包名、藏图标这类马甲功能（那是 Magisk Alpha 的做法），能做的是把它从 HMA 的可见名单里抹掉，再清掉它留下的痕迹。",
-          "riskLevel": "low",
-          "layers": ["L2", "L5"],
-          "requires": ["已完成前面的隐藏"],
-          "evidence": {
-            "verifiedAt": "2026-08-17", "label": "依据 2026-08 的社区实测帖",
-            "device": "小米 8e5 平台",
-            "kernel": "6.1.x",
-            "source": "酷安 @小青泽 70938266",
-            "note": "社区实测汇总，非本站验证"
-          },
-          "steps": [
-            {
-              "id": "hma-hide-manager",
-              "title": "把管理器从 HMA 的可见名单里抹掉",
-              "kind": "askUser",
-              "optional": false,
-              "note": "SukiSU Ultra 的设置里没有「随机包名 / 隐藏图标」，不用去找——那是 Magisk Alpha 的马甲方案。这里要做的相反：打开 HMA-OSS 的 WebUI，把检测器加进作用域，让它们读到的应用列表里没有 SukiSU 管理器。这一步不是可选项：com.sukisu.ultra 本身就在春秋检测器的风险包名单里（《春秋检测器问题解决方案》附录 A 列了 85 个包名，管理器、KsuWebUI、HMA 本体、Termux 全在），光装管理器就会被记一笔。做完回退出来重进一次 HMA 让它生效。",
-              "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/",
-              "source": {
-                "kind": "askUser",
-                "repo": "",
-                "assetPattern": "",
-                "pinnedVersion": "",
-                "sha256": "",
-                "moduleId": ""
-              }
-            },
-            {
-              "id": "clean-traces",
-              "title": "清掉残留痕迹",
-              "kind": "runCommand",
-              "optional": true,
-              "note": "常见的漏点：/sdcard 和 /data/local/tmp 下的 .sh/.json/.xml 文件、MT 管理器的备份配置、以及管理器自己留下的日志目录。检查一遍，别让检测器顺着文件找到你。自动执行只会清掉本工具自己的工作目录（回滚账本保留）；/sdcard 下的历史脚本、MT 备份和下载目录里的模块包请自己逐个确认后再删——那是用户数据区，任何一键清理都可能误删，本专栏不下发通配删除。",
-              "command": "rm -rf /data/local/tmp/hide_env",
-              "confirm": "只会删除一个明确目录：/data/local/tmp/hide_env，不会碰 /sdcard，也不会动回滚账本。删前请确认里面没有你还需要的文件。继续？",
-              "source": {
-                "kind": "askUser",
-                "repo": "",
-                "assetPattern": "",
-                "pinnedVersion": "",
-                "sha256": "",
-                "moduleId": ""
-              }
-            }
-          ],
-          "verifyHints": [
-            "在应用列表里已经找不到管理器的原名",
-            "春秋的「应用列表」一项不再报管理器包名",
-            "/sdcard 根目录没有明显的脚本残留"
           ]
         }
       ]
