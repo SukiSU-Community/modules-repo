@@ -33,7 +33,9 @@
  *     installApp 反过来必须是 .apk，否则要等 ksud 读 module.prop / 系统安装器读包时才炸；
  *   - direct 的 sha256 按原样匹配小写 hex（不再先 toLowerCase），大写 hex 直接拒绝；
  *   - verify 的 checkId 必填且只能取 App 侧 ColumnCheckIds 的九个值之一，且只允许出现在
- *     verify 步骤上；confirm 给了就不能是空串（空串等于没确认）。
+ *     verify 步骤上；confirm 给了就不能是空串（空串等于没确认）；
+ *   - step.link 只允许 https 或精确的 sukisu://ai，且 sukisu://ai 只能出现在 verify 步骤；
+ *   - note 首句（按「。」切分）不超过 40 字、总长不超过 200 字（列表里直接展示给用户）。
  *
  * 用法：node scripts/validate-columns.mjs [文件路径]
  *       node scripts/validate-columns.mjs --selftest   # 跑内置负例自测（不读文件）
@@ -453,7 +455,21 @@ export function validateColumns(doc) {
             push(`${sat} kind 必须是 ${STEP_KINDS.join(' / ')} 之一，实际是 ${JSON.stringify(step.kind)}`);
           }
           if (typeof step.optional !== 'boolean') push(`${sat} optional 必须是布尔值`);
-          if (typeof step.note !== 'string') push(`${sat} note 必须是字符串（没有补充说明就写空串）`);
+          if (typeof step.note !== 'string') {
+            push(`${sat} note 必须是字符串（没有补充说明就写空串）`);
+          } else {
+            // note 是列表里直接展示给用户的一句话：首句要短，整段也不能变成一篇小作文。
+            // 按 code point 计数，避免 emoji 之类的代理对把长度算成两倍。
+            const firstSentence = step.note.split('。')[0].trim();
+            const firstLen = [...firstSentence].length;
+            if (firstLen > 40) {
+              push(`${sat}.note 首句过长（${firstLen} 字，上限 40）：${JSON.stringify(firstSentence)}`);
+            }
+            const totalLen = [...step.note].length;
+            if (totalLen > 200) {
+              push(`${sat}.note 总长过长（${totalLen} 字，上限 200）`);
+            }
+          }
 
           // —— 可执行字段：这些内容会被 App 下发到设备上真的执行，校验必须比展示字段更严 ——
           if (step.kind === 'runCommand' && !nonEmpty(step.command)) {
@@ -508,11 +524,14 @@ export function validateColumns(doc) {
             if (typeof step.link !== 'string') {
               push(`${sat}.link 必须是字符串`);
             } else if (nonEmpty(step.link)) {
-              // 除了外部网页，还允许 sukisu:// 站内入口（目前只有 sukisu://ai = 打开管理器里的 AI 助手）。
-              if (!/^(https:\/\/[^\s]+|sukisu:\/\/[a-z][a-z0-9-]*)$/i.test(step.link)) {
+              // 站内入口目前只有 sukisu://ai（打开管理器里的 AI 助手），App 侧用精确字符串匹配；
+              // 写成别的 sukisu://xxx 会被当成外部 URI 打开，等于死链，所以这里只认这一个值。
+              if (!/^(https:\/\/[^\s]+|sukisu:\/\/ai)$/.test(step.link)) {
                 push(
-                  `${sat}.link 必须是 https 地址或 sukisu:// 站内入口，实际是 ${JSON.stringify(step.link)}`,
+                  `${sat}.link 必须是 https 地址或 sukisu://ai 站内入口，实际是 ${JSON.stringify(step.link)}`,
                 );
+              } else if (step.link === 'sukisu://ai' && step.kind !== 'verify') {
+                push(`${sat}.link 只有 verify 步骤才能使用 sukisu://ai（打开 AI 助手做检测确认）`);
               } else if (step.link.length > 512) {
                 push(`${sat}.link 太长（上限 512 字符）`);
               }
@@ -720,6 +739,7 @@ function selfTestBase() {
                 kind: 'verify',
                 optional: false,
                 note: '自测用',
+                link: 'sukisu://ai',
                 checkId: 'root-manager',
                 source: askUserSource(),
               },
@@ -788,6 +808,34 @@ const SELF_TEST_CASES = [
     expect: /是 verify，checkId 必填/,
     mutate(doc) {
       delete doc.columns[0].topics[0].steps[4].checkId;
+    },
+  },
+  {
+    label: 'link 使用非 sukisu://ai 的站内入口',
+    expect: /link 必须是 https 地址或 sukisu:\/\/ai 站内入口/,
+    mutate(doc) {
+      doc.columns[0].topics[0].steps[0].link = 'sukisu://settings';
+    },
+  },
+  {
+    label: 'sukisu://ai 用在非 verify 步骤',
+    expect: /只有 verify 步骤才能使用 sukisu:\/\/ai/,
+    mutate(doc) {
+      doc.columns[0].topics[0].steps[0].link = 'sukisu://ai';
+    },
+  },
+  {
+    label: 'note 首句超过 40 字',
+    expect: /note 首句过长/,
+    mutate(doc) {
+      doc.columns[0].topics[0].steps[0].note = '一'.repeat(41);
+    },
+  },
+  {
+    label: 'note 总长超过 200 字',
+    expect: /note 总长过长/,
+    mutate(doc) {
+      doc.columns[0].topics[0].steps[0].note = '短句。' + '一'.repeat(200);
     },
   },
 ];
