@@ -430,7 +430,7 @@
               "source": {
                 "kind": "upstream",
                 "repo": "osm0sis/PlayIntegrityFork",
-                "assetPattern": "*.zip",
+                "assetPattern": "PlayIntegrityFork-*.zip",
                 "pinnedVersion": "",
                 "sha256": "",
                 "moduleId": "playintegrityfix"
