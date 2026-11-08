@@ -56,6 +56,7 @@
               "optIn": true,
               "note": "安装主检测器春秋，后续红项排查依赖它。商店提供同版本整包并核对文件完整性；如需官方渠道，可打开官方页面自行下载。安装时系统会弹出一次确认。",
               "link": "https://t.me/Suxiaomingpd",
+              "linkLabel": "去 Telegram 频道",
               "source": {
                 "kind": "direct",
                 "repo": "",
@@ -261,6 +262,23 @@
               }
             },
             {
+              "id": "spoof-bl",
+              "title": "伪装 BL 锁状态",
+              "kind": "runCommand",
+              "optional": false,
+              "note": "写一个开机模块，把 BL 相关属性改成「已锁定」，并自动关 USB 调试。",
+              "command": "mkdir -p /data/adb/modules/hide_aux\ncat > /data/adb/modules/hide_aux/module.prop <<'EOF'\nid=hide_aux\nname=辅助隐藏（BL 属性 + ADB 自动关）\nversion=v1.0\nversionCode=1\nauthor=SukiSU 模块商店\ndescription=开机伪造 BL 属性并自动关闭 USB 调试\nEOF\ncat > /data/adb/modules/hide_aux/system.prop <<'EOF'\nro.boot.flash.locked=1\nro.boot.verifiedbootstate=green\nro.secureboot.lockstate=locked\nro.boot.vbmeta.device_state=locked\nEOF\ncat > /data/adb/modules/hide_aux/service.sh <<'EOF'\n#!/system/bin/sh\nuntil [ \"$(getprop sys.boot_completed)\" = \"1\" ]; do sleep 2; done\nsettings put global adb_enabled 0\nsetprop persist.sys.usb.config none\nEOF\nchmod 755 /data/adb/modules/hide_aux/service.sh\necho \"hide_aux module written\"",
+              "confirm": "会在 /data/adb/modules/hide_aux 写一个模块（system.prop + service.sh），重启后生效。它会把 BL 状态伪造成已锁定，并让每次开机自动关闭 USB 调试。确认写入？",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            },
+            {
               "id": "reboot",
               "title": "重启",
               "kind": "reboot",
@@ -363,11 +381,26 @@
               "note": "安装 TEESimulator 密钥模块，为后续认证提供密钥环境。",
               "source": {
                 "kind": "upstream",
-                "repo": "JingMatrix/TEESimulator",
-                "assetPattern": "TEESimulator-*-release.zip",
+                "repo": "Enginex0/TEESimulator-RS",
+                "assetPattern": "TEESimulator-RS-*-Release.zip",
                 "pinnedVersion": "",
                 "sha256": "",
                 "moduleId": "teesim"
+              }
+            },
+            {
+              "id": "ohmykeymint",
+              "title": "换用 OhMyKeymint（可选备选）",
+              "kind": "installModule",
+              "optional": true,
+              "note": "TEESimulator 装不上或认证不过时，可以换成 OhMyKeymint。",
+              "source": {
+                "kind": "upstream",
+                "repo": "qwq233/OhMyKeymint",
+                "assetPattern": "OhMyKeymint-release-*.zip",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": "oh_my_keymint"
               }
             },
             {
@@ -410,6 +443,7 @@
               "optional": false,
               "note": "验收三项完整性：基础、设备、强完整性。任一红项需优先排查，通常为指纹过旧或 keybox 失效；密钥有效期约至 2033 年，但设备指纹与补丁日期会更早过期。点击下方链接可按章节排查。",
               "link": "https://mingzun09.github.io/Chunqiu-Detector-Problem-solution/",
+              "linkLabel": "查看问题解答",
               "checkId": "keybox-valid",
               "source": {
                 "kind": "askUser",
