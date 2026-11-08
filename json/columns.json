@@ -30,86 +30,6 @@
       "order": 1,
       "topics": [
         {
-          "id": "self-check",
-          "title": "环境自检",
-          "tier": "tool",
-          "summary": "确认当前环境存在的检测项。商店默认不安装检测器，勾选所需项后一键执行即可安装。春秋为必装主检测器，AI 排障仅识别其截图；Duck 可选，用于补充路径与端口检测。",
-          "riskLevel": "low",
-          "layers": [],
-          "requires": [
-            "能安装第三方 APK"
-          ],
-          "evidence": {
-            "verifiedAt": "2026-08-17",
-            "label": "依据 2026-08 的社区实测帖",
-            "device": "多机型",
-            "kernel": "不限定",
-            "source": "酷安 @泛彼柏舟y 73287937、@JeTeeZnTmaxQwQ 的春秋检测点文档、TG 频道 @Suxiaomingpd",
-            "note": "社区实测汇总，非本站验证"
-          },
-          "steps": [
-            {
-              "id": "install-chunqiu",
-              "title": "装春秋检测",
-              "kind": "installApp",
-              "optional": false,
-              "optIn": true,
-              "note": "安装主检测器春秋，后续红项排查依赖它。商店提供同版本整包并核对文件完整性；如需官方渠道，可打开官方页面自行下载。安装时系统会弹出一次确认。",
-              "link": "https://t.me/Suxiaomingpd",
-              "linkLabel": "去 Telegram 频道",
-              "source": {
-                "kind": "direct",
-                "repo": "",
-                "assetPattern": "",
-                "pinnedVersion": "",
-                "sha256": "1ca92901b74ff658988a4859d8cd2c6f20e45f722a88bc0361e9d33ee5a72866",
-                "moduleId": "",
-                "url": "https://github.com/SukiSU-Community/modules-repo/releases/download/mirror-chunqiu-4.6.2/ChunqiuNativeCheck-4.6.2.apk",
-                "packageName": "com.chunqiunativecheck"
-              }
-            },
-            {
-              "id": "install-duck",
-              "title": "装 Duck 检测器（可选补充）",
-              "kind": "installApp",
-              "optional": true,
-              "note": "可选安装 Duck 检测器，用于补充路径与端口检测。不安装不影响春秋排障；商店直接获取最新构建，安装确认时允许即可。",
-              "optIn": true,
-              "source": {
-                "kind": "upstream",
-                "repo": "eltavine/Duck-Detector-Refactoring",
-                "assetPattern": "Duck.Detector-*.apk",
-                "pinnedVersion": "",
-                "sha256": "",
-                "moduleId": "",
-                "packageName": "com.eltavine.duckdetector"
-              }
-            },
-            {
-              "id": "run-check",
-              "title": "跑一遍春秋",
-              "kind": "verify",
-              "optional": false,
-              "note": "运行春秋检测，确认当前环境状态。全部通过说明可覆盖多数 App；出现红项即为本次需修复项。点击「进入 AI 助手」并上传截图可按红项获取方案；截图排障仅支持春秋。",
-              "link": "sukisu://ai",
-              "checkId": "root-manager",
-              "source": {
-                "kind": "askUser",
-                "repo": "",
-                "assetPattern": "",
-                "pinnedVersion": "",
-                "sha256": "",
-                "moduleId": ""
-              }
-            }
-          ],
-          "verifyHints": [
-            "春秋全绿 = 当前最严的一关过了",
-            "Duck 只报路径/端口，路径红项靠 pathmask 补",
-            "春秋截图发给 AI 助手即可排查红项，Duck 是可选补充"
-          ]
-        },
-        {
           "id": "pass-bank",
           "title": "过银行 / 金融 App",
           "tier": "day",
@@ -460,6 +380,86 @@
             "keybox 向导会自动取一份并校验结构，取不到才要求你自选本地文件",
             "只有一绿且提示安装包信息不符，通常是 PIF 没装或版本太旧",
             "改 keybox 和 target.txt 不用重启，装完模块才要"
+          ]
+        },
+        {
+          "id": "self-check",
+          "title": "环境自检",
+          "tier": "tool",
+          "summary": "确认当前环境存在的检测项。商店默认不安装检测器，勾选所需项后一键执行即可安装。春秋为必装主检测器，AI 排障仅识别其截图；Duck 可选，用于补充路径与端口检测。",
+          "riskLevel": "low",
+          "layers": [],
+          "requires": [
+            "能安装第三方 APK"
+          ],
+          "evidence": {
+            "verifiedAt": "2026-08-17",
+            "label": "依据 2026-08 的社区实测帖",
+            "device": "多机型",
+            "kernel": "不限定",
+            "source": "酷安 @泛彼柏舟y 73287937、@JeTeeZnTmaxQwQ 的春秋检测点文档、TG 频道 @Suxiaomingpd",
+            "note": "社区实测汇总，非本站验证"
+          },
+          "steps": [
+            {
+              "id": "install-chunqiu",
+              "title": "装春秋检测",
+              "kind": "installApp",
+              "optional": false,
+              "optIn": true,
+              "note": "安装主检测器春秋，后续红项排查依赖它。商店提供同版本整包并核对文件完整性；安装时系统会弹出一次确认。",
+              "link": "https://t.me/Suxiaomingpd",
+              "linkLabel": "去 Telegram 频道",
+              "source": {
+                "kind": "direct",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "1ca92901b74ff658988a4859d8cd2c6f20e45f722a88bc0361e9d33ee5a72866",
+                "moduleId": "",
+                "url": "https://github.com/SukiSU-Community/modules-repo/releases/download/mirror-chunqiu-4.6.2/ChunqiuNativeCheck-4.6.2.apk",
+                "packageName": "com.chunqiunativecheck"
+              }
+            },
+            {
+              "id": "install-duck",
+              "title": "装 Duck 检测器（可选补充）",
+              "kind": "installApp",
+              "optional": true,
+              "note": "可选安装 Duck 检测器，用于补充路径与端口检测。不安装不影响春秋排障；商店直接获取最新构建，安装确认时允许即可。",
+              "optIn": true,
+              "source": {
+                "kind": "upstream",
+                "repo": "eltavine/Duck-Detector-Refactoring",
+                "assetPattern": "Duck.Detector-*.apk",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": "",
+                "packageName": "com.eltavine.duckdetector"
+              }
+            },
+            {
+              "id": "run-check",
+              "title": "跑一遍春秋",
+              "kind": "verify",
+              "optional": false,
+              "note": "运行春秋检测，确认当前环境状态。全部通过说明可覆盖多数 App；出现红项即为本次需修复项。点击「进入 AI 助手」并上传截图可按红项获取方案；截图排障仅支持春秋。",
+              "link": "sukisu://ai",
+              "checkId": "root-manager",
+              "source": {
+                "kind": "askUser",
+                "repo": "",
+                "assetPattern": "",
+                "pinnedVersion": "",
+                "sha256": "",
+                "moduleId": ""
+              }
+            }
+          ],
+          "verifyHints": [
+            "春秋全绿 = 当前最严的一关过了",
+            "Duck 只报路径/端口，路径红项靠 pathmask 补",
+            "春秋截图发给 AI 助手即可排查红项，Duck 是可选补充"
           ]
         }
       ]
