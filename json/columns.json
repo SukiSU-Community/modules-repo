@@ -360,7 +360,7 @@
               "title": "装 TEESimulator",
               "kind": "installModule",
               "optional": false,
-              "note": "安装 TEESimulator 密钥模块。本层只安装一个：它与 TrickyStore 功能冲突，同时安装会互相干扰；新机型优先使用。",
+              "note": "安装 TEESimulator 密钥模块，为后续认证提供密钥环境。",
               "source": {
                 "kind": "upstream",
                 "repo": "JingMatrix/TEESimulator",
@@ -371,47 +371,14 @@
               }
             },
             {
-              "id": "tricky-store",
-              "title": "可选：换成 TrickyStore",
-              "kind": "installModule",
-              "optional": true,
-              "note": "改用 TrickyStore 适配老机型。该项目已停止更新，但部分老机型兼容性更好；切换前需在管理器中停用或删除 TEESimulator，本层只保留一个。后续 keybox 与 target.txt 对两者通用。",
-              "source": {
-                "kind": "upstream",
-                "repo": "5ec1cff/TrickyStore",
-                "assetPattern": "Tricky-Store-*-release.zip",
-                "pinnedVersion": "",
-                "sha256": "",
-                "moduleId": "tricky_store"
-              }
-            },
-            {
               "id": "keybox",
               "title": "导入 keybox",
               "kind": "writeFile",
               "optional": false,
-              "note": "为设备写入认证材料，供 Play Integrity 识别。材料为泄露的 Google 数据，随时可能失效；向导会从公开镜像自动获取并校验，失败才需自选文件。默认写入 TEESimulator 路径，选 TrickyStore 则写其路径。",
+              "note": "为设备写入认证材料，供 Play Integrity 识别。材料为泄露的 Google 数据，随时可能失效；向导会从公开镜像自动获取并校验，失败才需自选文件。",
               "filePath": "/data/adb/teesim/keybox.xml",
               "fileContent": "${keybox}",
               "confirm": "将把 keybox.xml 内容写到 /data/adb/teesim/keybox.xml，覆盖原文件（会先备份到回滚账本）。自动获取的内容已经过结构校验；如果你是自己选的文件，请确认来源可信，再继续。",
-              "source": {
-                "kind": "askUser",
-                "repo": "",
-                "assetPattern": "",
-                "pinnedVersion": "",
-                "sha256": "",
-                "moduleId": ""
-              }
-            },
-            {
-              "id": "target-txt",
-              "title": "可选：指定要过认证的 App",
-              "kind": "writeFile",
-              "optional": true,
-              "note": "仅在使用 TrickyStore 时需要。将需通过认证的 App 包名写入目标清单，包名后加「!」表示强制模拟流程，适用于 TEE 已损坏的设备。使用 TEESimulator 时不读取此文件，可在其网页界面勾选 App，本步骤跳过。",
-              "filePath": "/data/adb/tricky_store/target.txt",
-              "fileContent": "com.google.android.gms\ncom.android.vending\n",
-              "confirm": "将把 /data/adb/tricky_store/target.txt 覆盖为 GMS + Play 商店两行（原文件会先备份）。如果你之前在这里写过别的包名，请先记下来，写完后手动补回去。继续？",
               "source": {
                 "kind": "askUser",
                 "repo": "",
