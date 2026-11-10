@@ -307,7 +307,7 @@
                 "assetPattern": "TEESimulator-RS-*-Release.zip",
                 "pinnedVersion": "",
                 "sha256": "",
-                "moduleId": "teesim"
+                "moduleId": "tricky_store"
               }
             },
             {
@@ -331,9 +331,9 @@
               "kind": "writeFile",
               "optional": false,
               "note": "为设备写入认证材料，供 Play Integrity 识别。材料为泄露的 Google 数据，随时可能失效；向导会从公开镜像自动获取并校验，失败才需自选文件。",
-              "filePath": "/data/adb/teesim/keybox.xml",
+              "filePath": "/data/adb/tricky_store/keybox.xml",
               "fileContent": "${keybox}",
-              "confirm": "将把 keybox.xml 内容写到 /data/adb/teesim/keybox.xml，覆盖原文件（会先备份到回滚账本）。自动获取的内容已经过结构校验；如果你是自己选的文件，请确认来源可信，再继续。",
+              "confirm": "将把 keybox.xml 内容写到 /data/adb/tricky_store/keybox.xml。设备上已有可用的密钥材料时本步会跳过、不覆盖原文件；要强制覆盖请先回滚这次改动。自动获取的内容经过结构校验；自选文件请确认来源可信。",
               "source": {
                 "kind": "askUser",
                 "repo": "",
