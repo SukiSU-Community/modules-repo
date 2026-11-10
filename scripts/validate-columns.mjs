@@ -13,6 +13,7 @@
  *   column { id, title, subtitle, description, accent, icon, order, topics[] }
  *   topic  { id, title, summary, riskLevel, layers[], requires[], evidence, steps[], verifyHints[] }
  *   topic  可选 keybox { url(https), sha256(64 位小写), lastVerifiedAt(yyyy-MM-dd), providerNote, disclaimer }
+ *   topic  可选 celebrate(boolean) —— 专题全部完成后是否弹庆祝动画；缺省容忍，出现即必须为布尔
  *   step   { id, title, kind, optional, note, source{ kind, repo, assetPattern, pinnedVersion, sha256, moduleId } }
  *   step  可选可执行字段 { command, filePath, fileContent, checkId, confirm }
  * 外加：column/topic/step 的 id 在本作用域内唯一、枚举取值合法、evidence 必须存在且
@@ -386,6 +387,11 @@ export function validateColumns(doc) {
       // tier 只是展示用的档位标签，可以不写；写了就必须是白名单里的值。
       if (topic.tier !== undefined && topic.tier !== '' && !TIERS.includes(topic.tier)) {
         push(`${tat}.tier 必须是 ${TIERS.join(' / ')} 之一，实际是 ${JSON.stringify(topic.tier)}`);
+      }
+      // celebrate 决定「专题跑完是否弹庆祝动画」，缺省容忍（App 按 false 处理）；
+      // 一旦出现就必须是布尔，"yes" / 1 这类值会被 App 侧当作真值而误触发庆祝。
+      if (topic.celebrate !== undefined && typeof topic.celebrate !== 'boolean') {
+        push(`${tat}.celebrate 必须是布尔值（true/false），实际是 ${JSON.stringify(topic.celebrate)}`);
       }
       if (!Array.isArray(topic.layers)) {
         push(`${tat} layers 必须是数组（没有可写空数组）`);
@@ -836,6 +842,13 @@ const SELF_TEST_CASES = [
     expect: /note 总长过长/,
     mutate(doc) {
       doc.columns[0].topics[0].steps[0].note = '短句。' + '一'.repeat(200);
+    },
+  },
+  {
+    label: 'celebrate 不是布尔值',
+    expect: /celebrate 必须是布尔值/,
+    mutate(doc) {
+      doc.columns[0].topics[0].celebrate = 'yes';
     },
   },
 ];

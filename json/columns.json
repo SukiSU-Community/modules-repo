@@ -33,6 +33,7 @@
           "id": "pass-bank",
           "title": "过银行 / 金融 App",
           "tier": "day",
+          "celebrate": true,
           "summary": "银行主要检测三项：root 状态、应用列表中的可疑工具、系统属性完整性。本专题采用白名单策略：全机默认不可见 root，仅为需要 root 的工具单独放行。",
           "riskLevel": "medium",
           "layers": [
@@ -275,6 +276,7 @@
           "id": "pass-integrity",
           "title": "谷歌三绿 / Play Integrity",
           "tier": "integrity",
+          "celebrate": true,
           "summary": "本专题涉及密钥材料。商店不存储 keybox，向导会尝试从公开镜像自动获取，获取失败时才需自选本地文件。该层无法长期保证：Google 吊销随时可能生效。",
           "riskLevel": "high",
           "layers": [
@@ -386,6 +388,7 @@
           "id": "self-check",
           "title": "环境自检",
           "tier": "tool",
+          "celebrate": false,
           "summary": "确认当前环境存在的检测项。商店默认不安装检测器，勾选所需项后一键执行即可安装。春秋为必装主检测器，AI 排障仅识别其截图；Duck 可选，用于补充路径与端口检测。",
           "riskLevel": "low",
           "layers": [],
