@@ -16,6 +16,7 @@
  *   topic  可选 celebrate(boolean) —— 专题全部完成后是否弹庆祝动画；缺省容忍，出现即必须为布尔
  *   step   { id, title, kind, optional, note, source{ kind, repo, assetPattern, pinnedVersion, sha256, moduleId } }
  *   step  可选可执行字段 { command, filePath, fileContent, checkId, confirm }
+ *   step  可选 setDefaultUmount(boolean) —— 该步由 App 调内部 API 设置「默认卸载模块」，缺省容忍、出现必须为布尔
  * 外加：column/topic/step 的 id 在本作用域内唯一、枚举取值合法、evidence 必须存在且
  * verifiedAt 是真日期 —— 「没有证据的专题不上架」是契约写死的规则，校验端要和 App
  * 一样严格，否则一条缺证据的专题会在评审通过后悄悄上线。
@@ -461,6 +462,11 @@ export function validateColumns(doc) {
             push(`${sat} kind 必须是 ${STEP_KINDS.join(' / ')} 之一，实际是 ${JSON.stringify(step.kind)}`);
           }
           if (typeof step.optional !== 'boolean') push(`${sat} optional 必须是布尔值`);
+          // setDefaultUmount 是给 App 执行器的开关（执行该步时调内部 API 打开「默认卸载模块」），
+          // 与 celebrate 同理：缺省容忍，出现就必须是布尔，避免字符串真值误开。
+          if (step.setDefaultUmount !== undefined && typeof step.setDefaultUmount !== 'boolean') {
+            push(`${sat}.setDefaultUmount 必须是布尔值（true/false），实际是 ${JSON.stringify(step.setDefaultUmount)}`);
+          }
           if (typeof step.note !== 'string') {
             push(`${sat} note 必须是字符串（没有补充说明就写空串）`);
           } else {
@@ -849,6 +855,13 @@ const SELF_TEST_CASES = [
     expect: /celebrate 必须是布尔值/,
     mutate(doc) {
       doc.columns[0].topics[0].celebrate = 'yes';
+    },
+  },
+  {
+    label: 'setDefaultUmount 不是布尔值',
+    expect: /setDefaultUmount 必须是布尔值/,
+    mutate(doc) {
+      doc.columns[0].topics[0].steps[0].setDefaultUmount = 1;
     },
   },
 ];

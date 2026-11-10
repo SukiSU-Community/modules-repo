@@ -12,17 +12,17 @@
         {
           "tier": "day",
           "title": "日用级：银行、支付、交管 App 不因 root 退出",
-          "body": "装三个模块、写两份配置、重启两次。不碰密钥材料，也不需要你准备任何文件。绝大多数人做到这一档就够用了，做完请先跑一遍自检。"
+          "body": "装模块、写配置、重启两次，不碰密钥材料。"
         },
         {
           "tier": "integrity",
           "title": "三项全绿：Play 认证报错或银行要求全部通过",
-          "body": "在日用级之上再加一层密钥伪造（TEESimulator + keybox + 指纹模块）。代价是 keybox 属于泄露的 Google 认证材料，随时可能被 Google 吊销。商店会从公开镜像自动取一份并校验结构（取不到才让你自选本地文件），但不对「这份密钥还能不能过检测」负责。"
+          "body": "在日用级基础上加密钥伪造，keybox 随时可能被吊销。"
         },
         {
           "tier": "game",
           "title": "游戏级：本商店不推荐且不提供",
-          "body": "反作弊每天都在更新，没有任何配置能长期稳定；本商店也不做规避封禁、修改设备指纹这类事。想打游戏，回锁 Bootloader 是最省心的答案。"
+          "body": "本商店不提供，回锁 Bootloader 最省心。"
         }
       ],
       "accent": "hide",
@@ -120,59 +120,13 @@
             },
             {
               "id": "harden-manager",
-              "title": "打开管理器的隐藏开关",
+              "title": "配置管理器的隐藏开关",
               "kind": "runCommand",
               "optional": false,
-              "note": "打开管理器的隐藏开关。开启隐藏 SELinux、隐藏挂载、AVC 伪装与内核级卸载模块，关闭 SU 日志与 ADB Root；命令先读当前值，已达标项不变，可重复执行。隐藏 SELinux 与隐藏挂载需重启生效。",
+              "note": "打开隐藏相关的四项、关掉会留痕迹的四项，重启后生效。",
               "command": "set_f() { cur=$(ksud feature get \"$1\" 2>/dev/null | grep \"^Value:\" | cut -d\" \" -f2); [ \"$cur\" = \"$2\" ] || ksud feature set \"$1\" \"$2\" >/dev/null 2>&1; }\nset_f kernel_umount 1\nset_f selinux_hide 1\nset_f avc_spoof 1\nset_f mount_hide 1\nset_f sulog 0\nset_f adb_root 0\nset_f shell_su_adb_only 0\nset_f su_compat 0\nksud feature save\necho \"manager features aligned (reboot required for selinux_hide / mount_hide)\"",
+              "setDefaultUmount": true,
               "confirm": "这会修改管理器的功能开关：把隐藏相关四项打开，把会留痕迹的四项关掉（其中「传统 SU 命令」关掉后，依赖 /system/bin/su 的老应用会失效）。继续？",
-              "source": {
-                "kind": "askUser",
-                "repo": "",
-                "assetPattern": "",
-                "pinnedVersion": "",
-                "sha256": "",
-                "moduleId": ""
-              }
-            },
-            {
-              "id": "zygisk-whitelist",
-              "title": "打开「默认卸载模块」",
-              "kind": "askUser",
-              "optional": false,
-              "note": "进入设置 →「模块行为」→ 开启「默认卸载模块」。未单独配置的 App 将还原模块改动，检测软件不可见痕迹；需要 root 的工具在「超级用户」中单独放行。本步骤仅提供指引，不修改配置。",
-              "source": {
-                "kind": "askUser",
-                "repo": "",
-                "assetPattern": "",
-                "pinnedVersion": "",
-                "sha256": "",
-                "moduleId": ""
-              }
-            },
-            {
-              "id": "fuse-fixer",
-              "title": "装 FuseFixer（可选）",
-              "kind": "askUser",
-              "optional": true,
-              "note": "可选安装 FuseFixer，用于隐藏软件自身。商店暂未收录，需自行获取安装包；安装后在框架中启用并勾选默认作用域，参数无需修改。不安装也可通过多数银行检测。",
-              "source": {
-                "kind": "askUser",
-                "repo": "",
-                "assetPattern": "",
-                "pinnedVersion": "",
-                "sha256": "",
-                "moduleId": ""
-              }
-            },
-            {
-              "id": "close-adb",
-              "title": "关掉 ADB 与 USB 调试",
-              "kind": "runCommand",
-              "optional": false,
-              "note": "关闭 ADB 与 USB 调试，部分银行会检测调试通道。关闭后 adb 连接立即断开、USB 变为仅充电；需要时可在开发者选项中重新开启。",
-              "command": "settings put global adb_enabled 0 && setprop persist.sys.usb.config none",
-              "confirm": "关掉后 adb 连接（含有线/无线调试）会立刻断开，USB 也会退成仅充电，需要重新去开发者选项里打开。确认执行？",
               "source": {
                 "kind": "askUser",
                 "repo": "",
@@ -249,10 +203,10 @@
             },
             {
               "id": "clean-traces",
-              "title": "清掉残留痕迹",
+              "title": "清理残留痕迹",
               "kind": "runCommand",
               "optional": false,
-              "note": "清除可能暴露环境的残留文件。自动执行仅删除本工具工作目录，不涉及相册、下载与回滚记录；手机存储中的旧脚本、MT 备份与模块包需自行确认后删除，避免误删个人数据。",
+              "note": "只删除本工具的工作目录，不碰相册、下载、回滚记录和模块包。",
               "command": "rm -rf /data/local/tmp/hide_env",
               "confirm": "只会删除一个明确目录：/data/local/tmp/hide_env，不会碰 /sdcard，也不会动回滚账本。删前请确认里面没有你还需要的文件。继续？",
               "source": {
@@ -315,6 +269,7 @@
               "title": "换用 OhMyKeymint（可选备选）",
               "kind": "installModule",
               "optional": true,
+              "hidden": true,
               "note": "TEESimulator 装不上或认证不过时，可以换成 OhMyKeymint。",
               "source": {
                 "kind": "upstream",
@@ -389,7 +344,7 @@
           "title": "环境自检",
           "tier": "tool",
           "celebrate": false,
-          "summary": "确认当前环境存在的检测项。商店默认不安装检测器，勾选所需项后一键执行即可安装。春秋为必装主检测器，AI 排障仅识别其截图；Duck 可选，用于补充路径与端口检测。",
+          "summary": "执行完上述隐藏后，安装春秋对环境做一次检测，对于仍爆红的项可借助内置 AI 助手获取解决方案。",
           "riskLevel": "low",
           "layers": [],
           "requires": [
