@@ -107,7 +107,10 @@ import { fileURLToPath } from 'node:url';
  * 改文案就加一个新值，旧值继续有效。刻意不放 actor 白名单之类的部署相关常量：
  * 那些东西属于调用方（workflow 变量），烧进脚本就等于把闸焊死在一次的核实结果上。
  */
-export const PLEDGE_VERSIONS = ['pledge-v1'];
+// pledge-v2 是 2026-10-30 起 App（ModuleContribution.PLEDGE_VERSION）的当前值：
+// 白名单漏了它的话，新投稿在 worker 侧过闸、到这里被 proof 步误拒，PR 永久卡 open。
+// 换代纪律不变：加新值，旧值继续有效，扩的是白名单不是「未知当放行」。
+export const PLEDGE_VERSIONS = ['pledge-v1', 'pledge-v2'];
 
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const PREFIX_RE = /^[0-9a-f]{8}$/;
