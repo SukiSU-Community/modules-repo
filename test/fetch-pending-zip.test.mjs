@@ -5,12 +5,18 @@
 // 运行：node --test test/*.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { createHash } from 'node:crypto';
 import {
   resolveDownloadUrl,
   assertDownloadUrl,
   downloadToBuffer,
   ALLOWED_DOWNLOAD_HOSTS,
   parseArgs,
+  main,
+  ID_SEG_RE,
 } from '../scripts/fetch-pending-zip.mjs';
 
 const ASSET = 'a'.repeat(64) + '.zip';
@@ -220,5 +226,80 @@ test('302 到 release-assets.githubusercontent.com 的签名直链要能跟到�
     assert.equal(seen.length, 2);
   } finally {
     globalThis.fetch = real;
+  }
+});
+
+// ── main() 真跑一遍：id 段白名单必须在「拼本地路径」之前生效 ────────────────
+// 这一组的存在理由是一条真实事故（2026-11-12）：scripts/fetch-pending-zip.mjs 引用了
+// ID_SEG_RE 却没有定义它（注释写了口径、常量没落下来）。当时的测试只覆盖这个文件导出的
+// 纯函数、从不调用 main()，所以本地与 CI 全绿；而**每一个真实投稿 PR**都在「定位投稿元数据」
+// 那一步抛 `ReferenceError: ID_SEG_RE is not defined`，audit 红 → approve 红 →
+// 没有任何投稿能合并进索引。纯函数测不到的路径，必须有一条真跑 main() 的用例守着。
+test('main() 对安全 id 正常落盘（并证明 ID_SEG_RE 真的存在）', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fpz-'));
+  const bytes = new Uint8Array([0x50, 0x4b, 0x05, 0x06]);
+  const sha = createHash('sha256').update(bytes).digest('hex');
+  const url = `https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/${sha}.zip`;
+  const pending = path.join(tmp, 'pending.json');
+  fs.writeFileSync(pending, JSON.stringify({
+    id: 'demo_mod',
+    releaseTag: 'assets-v1',
+    assetName: `${sha}.zip`,
+    versions: [{ version: 'v1', versionCode: 7, zipUrl: url, sha256: sha, size: bytes.length }],
+  }));
+  const outDir = path.join(tmp, 'zips');
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => new Response(bytes, { status: 200 });
+  let code;
+  try {
+    code = await main([pending, '--out-dir', outDir]);
+  } finally {
+    globalThis.fetch = real;
+  }
+  assert.equal(code, 0, '一条成功且无失败时必须返回 0');
+  const manifest = JSON.parse(fs.readFileSync(path.join(outDir, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.length, 1);
+  assert.equal(manifest[0].error, null);
+  assert.equal(manifest[0].zip, path.join(outDir, 'demo_mod-7.zip'));
+  assert.equal(manifest[0].sha256, sha);
+});
+
+test('main() 对危险 id 记 error 跳过，且在拼路径前就挡住（不发任何请求）', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fpz-'));
+  const bad = ['../evil', 'a/b', '.', '..', 'x'.repeat(65)];
+  const asset = `${'a'.repeat(64)}.zip`;
+  const pending = path.join(tmp, 'pending.json');
+  fs.writeFileSync(pending, JSON.stringify(bad.map((id, i) => ({
+    id,
+    releaseTag: 'assets-v1',
+    assetName: asset,
+    versions: [{ version: 'v1', versionCode: i + 1, zipUrl: `https://github.com/o/r/releases/download/assets-v1/${asset}` }],
+  }))));
+  const outDir = path.join(tmp, 'zips');
+  const real = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (u) => { seen.push(String(u)); return new Response(null, { status: 404 }); };
+  let code;
+  try {
+    code = await main([pending, '--out-dir', outDir]);
+  } finally {
+    globalThis.fetch = real;
+  }
+  assert.equal(code, 1, '一条都没成功时返回 1');
+  const manifest = JSON.parse(fs.readFileSync(path.join(outDir, 'manifest.json'), 'utf8'));
+  assert.equal(manifest.length, bad.length);
+  for (const rec of manifest) {
+    assert.equal(rec.zip, null);
+    assert.match(rec.error, /id 段不安全/);
+  }
+  assert.deepEqual(seen, [], '危险 id 必须在拼本地路径之前被挡住，绝不发出请求');
+});
+
+test('ID_SEG_RE 的口径与 worker pendingPathSegment 同源', () => {
+  for (const ok of ['demo', 'a_b.c-d', 'A1', 'canary-bside-20261113', 'x'.repeat(64)]) {
+    assert.equal(ID_SEG_RE.test(ok), true, ok);
+  }
+  for (const no of ['', 'a/b', 'a b', 'x'.repeat(65), 'a\\b']) {
+    assert.equal(ID_SEG_RE.test(no), false, JSON.stringify(no));
   }
 });
