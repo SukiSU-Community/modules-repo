@@ -1,0 +1,99 @@
+{
+  "schema": "sukisu-evidence-v1",
+  "capturedBy": "scripts/harvest-evidence.mjs",
+  "integrity": {
+    "algorithm": "sha256-of-file-bytes",
+    "note": "文件名 = 本文件字节的 SHA-256。字节定义：JSON.stringify(对象,null,2) + 一个换行，UTF-8。"
+  },
+  "subject": {
+    "coolapkUid": "0",
+    "username": "pipeline-probe"
+  },
+  "package": {
+    "id": "canary-bside-20261113",
+    "versionCode": 1,
+    "sha256": "780c8e299f624e98fbb632b832e3ba77f64870d388926ba8a5272e692f1bd356",
+    "size": 516,
+    "zipUrl": "https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/780c8e299f624e98fbb632b832e3ba77f64870d388926ba8a5272e692f1bd356.zip",
+    "releaseTag": "assets-v1",
+    "assetName": "780c8e299f624e98fbb632b832e3ba77f64870d388926ba8a5272e692f1bd356.zip",
+    "source": "https://www.coolapk.com/feed/65432100",
+    "submittedAt": "2026-11-12T16:30:49.688Z"
+  },
+  "pending": {
+    "path": "pending/canary-bside-20261113/1.json",
+    "commitSha": "749848edad080c543bea796fadcfbd689c586c92",
+    "commitSubject": "test(probe): canary-bside-20261113 链路探针（验证投稿→索引→酷安源可见性，跑完即下架） (#106)",
+    "record": {
+      "id": "canary-bside-20261113",
+      "name": "Canary B-side probe",
+      "author": "pipeline-probe",
+      "description": "链路探针：验证一次投稿通过静态审核后，另一个用户能否在酷安源看到它。包内什么也不做。",
+      "versions": [
+        {
+          "version": "v0.0.1",
+          "versionCode": 1,
+          "zipUrl": "https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/780c8e299f624e98fbb632b832e3ba77f64870d388926ba8a5272e692f1bd356.zip",
+          "size": 516,
+          "time": 1794501049688,
+          "sha256": "780c8e299f624e98fbb632b832e3ba77f64870d388926ba8a5272e692f1bd356"
+        }
+      ],
+      "source": "https://www.coolapk.com/feed/65432100",
+      "sourceCheck": {
+        "verdict": "unreadable",
+        "via": [],
+        "evidence": [],
+        "reason": "探针包：来源核对不适用（流水线自造，不来自酷安投稿入口）"
+      },
+      "uploader": "pipeline-probe",
+      "coolapkUid": "0",
+      "pledge": {
+        "version": "pledge-v2",
+        "atMs": 1794501049688
+      },
+      "ownership": {
+        "nonce": "b5f4cb",
+        "proofPrefix": "b1c8fd33a4ac",
+        "via": "bio-set",
+        "verifiedAt": 1794501049688
+      },
+      "identity": {
+        "capturedAt": 1794501049688,
+        "username": "pipeline-probe",
+        "displayUsername": "pipeline-probe",
+        "level": 0,
+        "bio": "b1c8fd33a4ac-b5f4cb",
+        "regdate": 0,
+        "logintime": 0,
+        "userAvatar": "",
+        "userBigAvatar": "",
+        "cover": "",
+        "follow": 0,
+        "fans": 0,
+        "be_like_num": 0
+      },
+      "storage": "github-release-asset",
+      "releaseTag": "assets-v1",
+      "assetName": "780c8e299f624e98fbb632b832e3ba77f64870d388926ba8a5272e692f1bd356.zip",
+      "submittedAt": "2026-11-12T16:30:49.688Z"
+    }
+  },
+  "pr": {
+    "number": 106,
+    "url": "https://github.com/SukiSU-Community/modules-repo/pull/106"
+  },
+  "report": {
+    "commentId": 6829633411,
+    "commentUrl": "https://github.com/SukiSU-Community/modules-repo/pull/106#issuecomment-6829633411",
+    "packages": [
+      {
+        "name": "canary-bside-20261113-1.zip",
+        "staticMarkdown": "# 模块投稿安全审核报告\n\n- 目标文件：`canary-bside-20261113-1.zip`\n- zip 读取方式：内置解析器\n- 生成时间：2026-11-12T16:36:11.473Z\n- 规则版本：静态规则表 `risk-rules.mjs`，共 26 条内容规则\n\n## 结论\n\n**风险等级：LOW**\n\n- 变更类型：**首次收录**\n- 处置：**`auto-approve`** / 标签 `auto-approved`\n- 依据：未命中上架拦截名单（名单共 11 条 armed / 11 条定案）—— 等级不再决定上不上架；风险等级 low 在本模型里只是标注输入，不再拦上架\n- 命中统计：high 0 / medium 0 / low 0 / info 0\n- 恶意行为链：未命中（名单共 11 条 armed / 11 条定案）\n- 标注（不影响上架）：危险能力 0 项；覆盖不全 0 项；上下文题 0 项\n\n## 元数据\n\n| 字段 | module.prop | 投稿表单声明 | 是否一致 |\n|---|---|---|---|\n| id | `canary-bside-20261113` | `canary-bside-20261113` | ✅ 一致 |\n| version | `v0.0.1` | `v0.0.1` | ✅ 一致 |\n\n- name：Canary B-side probe\n- author：pipeline-probe\n- description：链路探针：验证一次投稿通过静态审核后，另一个用户能否在酷安源看到它。包内什么也不做。\n- module.prop 路径：`module.prop`\n\n## 文件清单\n\nzip 内成功读出 2 个文件条目，压缩后 0.5 KB，声明解压后 0.00 MB。\n\n| 类别 | 文件 | 大小 | 行数 |\n|---|---|---:|---:|\n| 规范脚本 | `customize.sh` | 56 B | 3 |\n| 属性文件(.prop) | `module.prop` | 240 B | 7 |\n\n## 包结构与审核覆盖度\n\n- 条目总数：2（文件 2 / 目录 0），阈值 3000\n- 最高声明压缩比：1:1（`module.prop`），阈值 200:1\n- 符号链接条目：无\n- 越界/绝对路径条目：无\n- 重名条目：无\n- 加密条目：无\n- 不支持的压缩方式：无\n- 反斜杠路径条目：无\n- 解压失败的条目：无\n- 行级规则的输入上限：24 KB/条目（超出只把前缀喂给规则，并逐条记 `AUDIT_COVERAGE_TRUNCATED`：哪个条目、原文多少字节、实扫多少字节）\n- 报告内嵌全文的上限：512 KB/文件（Markdown 只贴前缀，全文在 JSON 产物里；上限之外的字节连规则也没读过，见上一条）\n\n## 风险发现\n\n未命中任何风险规则。\n## 投稿者隐私提示（不计入风险等级）\n\n未发现需要提醒的隐私信息。\n\n## 逐行扫过的文件全文（人工复核用）\n\n### `customize.sh` — 56 B / 3 行\n\n```sh\n#!/system/bin/sh\nui_print \"- canary bside probe: no-op\"\n```\n\n### `module.prop` — 240 B / 7 行\n\n```sh\nid=canary-bside-20261113\nname=Canary B-side probe\nversion=v0.0.1\nversionCode=1\nauthor=pipeline-probe\ndescription=链路探针：验证一次投稿通过静态审核后，另一个用户能否在酷安源看到它。包内什么也不做。\n```\n\n---\n\n_本报告由 `contrib/audit/scan.mjs` 生成；**未经人工审核** —— 上不上架由一次可复验的机器运行判定（判据：`risk-rules.mjs` 的上架拦截名单 ∪ AI 恶意结论，§2）；本模块可自动进入索引，随附上面的能力与覆盖标注。_",
+        "aiRaw": "本轮没有 AI 产物 —— 状态 disabled（AI 未启用：已按开关下线，AI_REVIEW_ENABLED 不是 on）。",
+        "ai": null,
+        "aiParseFailed": true
+      }
+    ]
+  }
+}
