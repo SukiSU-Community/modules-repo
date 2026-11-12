@@ -1,6 +1,6 @@
 {
   "schema": "sukisu-dispositions-v2",
-  "lastUpdate": 1792779080800,
+  "lastUpdate": 1794502251073,
   "dispositions": [
     {
       "kind": "revoke",
@@ -81,6 +81,22 @@
           "file": "evidence/359eafd9053f51fd609fce44cbe11d3b20bc41ab3f3d97d1dcf94b836b13e8ff.json",
           "pr": 73,
           "at": "2026-10-23T18:11:20.800Z"
+        }
+      ]
+    },
+    {
+      "kind": "revoke",
+      "reason": "test-probe",
+      "by": "ci:audit@8f9f59864af810c57431b39197ef48b382732cf2",
+      "at": "2026-11-12T16:50:51.073Z",
+      "note": "B 侧可见性链路探针，验证完成后立即下架",
+      "id": "canary-bside-20261113",
+      "sha256": "780c8e299f624e98fbb632b832e3ba77f64870d388926ba8a5272e692f1bd356",
+      "evidence": [
+        {
+          "file": "evidence/2a146334ffeb96a62286d8095f98b7aafa00208f62f5e8d11f2a4832fb813029.json",
+          "pr": 106,
+          "at": "2026-11-12T16:43:09.726Z"
         }
       ]
     }

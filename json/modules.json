@@ -1,28 +1,7 @@
 {
   "name": "SukiSU-Ultra Modules",
-  "lastUpdate": 1794501413311,
+  "lastUpdate": 1794502251137,
   "modules": [
-    {
-      "id": "canary-bside-20261113",
-      "name": "Canary B-side probe",
-      "author": "pipeline-probe",
-      "description": "链路探针：验证一次投稿通过静态审核后，另一个用户能否在酷安源看到它。包内什么也不做。",
-      "source": "https://www.coolapk.com/feed/65432100",
-      "uploader": "pipeline-probe",
-      "coolapkUid": "0",
-      "submittedAt": 1794501049688,
-      "versions": [
-        {
-          "version": "v0.0.1",
-          "versionCode": 1,
-          "zipUrl": "https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/780c8e299f624e98fbb632b832e3ba77f64870d388926ba8a5272e692f1bd356.zip",
-          "size": 516,
-          "time": 1794501049688,
-          "sha256": "780c8e299f624e98fbb632b832e3ba77f64870d388926ba8a5272e692f1bd356"
-        }
-      ],
-      "verified": false
-    },
     {
       "id": "device_faker",
       "name": "Device Faker",
