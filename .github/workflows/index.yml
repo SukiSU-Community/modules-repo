@@ -373,3 +373,38 @@ jobs:
           echo "::error::publish-from-main 拒绝盖章：原因见上一步与 PR 上的说明。"
           echo "模块不会进正式索引 —— 这不是可以忽略的告警。"
           exit 1
+
+  # -------------------------------------------------------------------------
+  # 「这一发没重建索引」必须有人看得见 —— 这是本项修复的另一半。
+  #
+  # 正常路径：投稿 PR 合并成功后，audit.yml 的 publish 会**显式 dispatch** 本 workflow
+  #（gh workflow run，带合并提交作为 sha）。为什么不能只靠 push / workflow_run 自动接，那边写了原因；
+  # 一句话：用仓库 GITHUB_TOKEN 干的事不会触发新的 workflow run，而 workflow_dispatch 是官方明列的
+  # 例外，所以合并侧必须自己叫这一声。
+  #
+  # 但上面那个 job 的 if 会在「审核 run 的结论不是 success」时整条跳过（跳过本身是安全的：
+  # 不盖章、不改索引、不开 PR，什么都不做）。危险的不是跳过，而是**跳过不留痕**：
+  # 界面上只多一个 skipped，没人能从中看出「这个模块合进 main 了、索引却没人重建」。
+  # 所以这里补一个只做说明的作业，把后果与人工兜底命令原样打进日志（::notice::）。
+  #
+  # 这一格**故意不做补偿动作**：补偿已经在合并侧做了。在这里再 dispatch 一次会开出第二条索引 PR ——
+  # Worker 那边的幂等键是分支名，而分支名带 run id（index/rebuild-<run_id>），两次触发必然是两条分支、
+  # 两个内容相同的 PR，各自还要跑一整轮审核与 AI 复核。
+  explain-skip:
+    name: 说明：这一发没重建索引（留痕）
+    runs-on: ubuntu-latest
+    # 与 jobs.index 的闸互斥：那边只在「不是 workflow_run，或结论是 success」时才跑。
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion != 'success'
+    steps:
+      - name: 把「索引没重建」的后果与兜底命令打进日志
+        shell: bash
+        env:
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          echo "::notice::上游「Module Submission Audit」这次 run 的结论是「${CONCLUSION:-未知}」（${RUN_URL:-无链接}），本次索引重建没有走 workflow_run 那条路（跳过 = 没盖章、没改索引、没开 PR）。"
+          echo "::notice::跳过不等于索引不需要重建：合并过的投稿正常由 publish 里「确保索引重建被触发」那一步显式 dispatch 负责，请去 Actions 里确认对应的 Rebuild Index From Main run 是绿的。"
+          echo "::notice::只有在「合并成功之后、那一步 dispatch 之前这次 run 就被取消/终止」的窗口里才会真的漏一次，人工兜底：gh workflow run index.yml -R ${GITHUB_REPOSITORY}（不带 sha 时它取 main 的当前 head，也就是那次合并提交）"
+

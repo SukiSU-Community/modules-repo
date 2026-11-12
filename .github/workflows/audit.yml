@@ -2066,8 +2066,13 @@ jobs:
       # 合并与「把结果贴回 PR」都要写 PR；job 级 permissions 会整体覆盖顶层，
       # 少这一行 gh pr merge 与 createComment 都会 403。
       pull-requests: write
+      # 合并成功之后那一步要用 gh workflow run 显式 dispatch index.yml，而 workflow_dispatch 属 actions 权限。
+      # ⚠️ 只往文件顶层的 permissions 里补是**不管用**的：**job 级 permissions 会整体覆盖顶层**，
+      #    这个作业写了 job 级那一份，顶层补 actions: write 也到不了它手上 —— 少这一行 gh workflow run 直接 403。
+      actions: write
     steps:
       - name: 合并
+        id: merge
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2084,9 +2089,71 @@ jobs:
           # 合并失败最常见的原因是保护/规则不允许 Actions 这个 actor 合并，报错直接抛出来，
           # 不要静默：模块没进索引时必须看得见。
           gh pr merge "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --squash
-          echo "已 squash 合并 #${PR_NUMBER}（${MODULE_ID:-?}），索引由 push 触发的 Rebuild Index From Main 生成"
 
+          # 取合并产生的那个提交：下一步要把它当 sha 交给 index.yml（那份 workflow 用它认定「本次提交带进 main 的 pending」）。
+          # 合并返回与 ref 可读之间有传播窗口，所以有界重试；取不到不让本步红 —— 下一步会不带 sha 兜底 dispatch
+          #（那时 index.yml 取 main 的当前 head，通常就是同一个合并提交）。
+          MERGE_SHA=""
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            MERGE_SHA=$(gh pr view "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --json mergeCommit --jq '.mergeCommit.oid // empty' 2>/dev/null || true)
+            if [ -n "$MERGE_SHA" ]; then break; fi
+            sleep 3
+          done
+          echo "merge_sha=${MERGE_SHA}" >> "$GITHUB_OUTPUT"
+          if [ -z "$MERGE_SHA" ]; then
+            echo "::warning::合并成功但 30 秒内没读回 merge commit；索引重建将不带 sha dispatch（取 main 的当前 head）。"
+          fi
+          # 旧的这句文案是错的（「索引由 push 触发的 Rebuild Index From Main 生成」），改对了再留着 ——
+          # 错的说法会让下一个人照样去等一个永远不会来的 push 触发：
+          # **用仓库 GITHUB_TOKEN 干的事不会触发新的 workflow run**（GitHub 刻意切断这条链），
+          # 所以这次合并推出来的提交对 index.yml 的 push 触发是死的；真正接上链的是下一步的显式 dispatch。
+          echo "已 squash 合并 #${PR_NUMBER}（${MODULE_ID:-?}），合并提交 ${MERGE_SHA:0:8}"
+
+      - name: 确保索引重建被触发（显式 dispatch index.yml）
+        # 为什么必须显式 dispatch，而不是等 push / workflow_run 自动接上：
+        #   · 用仓库 GITHUB_TOKEN 干的事不会创建新的 workflow run —— gh pr merge --squash 推出来的
+        #     那个提交对 index.yml 的 push 触发是死的（实测：投稿 PR #4 合并后只有 pages 构建在跑，
+        #     Rebuild Index From Main 一次都没启动）。官方文档明列了两个例外：workflow_dispatch 与
+        #     repository_dispatch —— 用 GITHUB_TOKEN 调它们**会**正常创建 workflow run。
+        #     所以这里用 gh workflow run：这是这条链上唯一不依赖「那次审核 run 绿不绿」的触发方式。
+        #   · 现有的自动路径挂在 index.yml 的 workflow_run（types: [completed]）上，而它读的是
+        #     整条审核 run 的结论：publish 之后的任何一个非关键步骤报错、或这次 run 被取消，结论就
+        #     不是 success，index.yml 会被它自己的 if 跳过 —— 索引从此不会自动重建，也没有补偿。
+        #   · 失败不判红：合并已经成功、模块已经在 main 上了，这一步失手只是「索引晚一点重建」，
+        #     用 ::warning:: 把人工兜底的命令打出来就够。判红反而有害：红 run 会让上面那条
+        #     workflow_run 路径也走不通 —— 那正是本步要修的形状。
+        #   ⚠️ 这一步需要 actions: write，而 job 级 permissions 整体覆盖顶层，所以补在本作业那一份里（见上）。
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ steps.merge.outputs.merge_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -uo pipefail
+          ARGS=(--repo "${GITHUB_REPOSITORY}" --ref "${DEFAULT_BRANCH:-main}")
+          # 带上合并产生的那个 sha：index.yml 用它认定「本次提交带进 main 的 pending」。
+          # 没带上时它退到本次 dispatch 的 ref 的 head，也就是同一个合并提交。
+          if [ -n "${MERGE_SHA:-}" ]; then ARGS+=(-f "sha=${MERGE_SHA}"); fi
+          for i in 1 2 3; do
+            if gh workflow run index.yml "${ARGS[@]}"; then
+              echo "已 dispatch Rebuild Index From Main（sha=${MERGE_SHA:-main 的当前 head}）—— 索引重建不再依赖本次审核 run 的结论。"
+              exit 0
+            fi
+            echo "第 ${i} 次 gh workflow run 失败，5 秒后重试"
+            sleep 5
+          done
+          echo "::warning::索引重建没能自动触发（gh workflow run 三次都失败）。索引此刻不会重建，人工兜底："
+          echo "::warning::gh workflow run index.yml -R ${GITHUB_REPOSITORY} -f sha=${MERGE_SHA:-<这次合并的提交>}"
+          exit 0
       - name: 告知合并结果
+        # 这一步是**通知**，不是判据：它写的只是 PR 上的一条评论。评论失败不该把整条链判红 ——
+        # 一旦判红，那次 run 的结论就不是 success，index.yml 的 workflow_run 闸就会跳过索引重建
+        #（「索引永不自动重建」的触发条件之一正是它）。所以这一格显式 continue-on-error。
+        # ⚠️ 与上面那条「不许 continue-on-error」不冲突，两者性质相反：
+        #    · pending 凭据与来源复核（id: proof，§14.2）是**正确性闸门**，它失败必须红；
+        #    · 这一步只负责「把结果告诉投稿人」，让它影响判据等于把通知升格成闸门。
+        continue-on-error: true
         uses: actions/github-script@v7
         env:
           MODULE_ID: ${{ needs.audit.outputs.module_id }}
@@ -2098,7 +2165,8 @@ jobs:
             const body = `## 已合并，索引稍后重建\n\n`
               + `本 PR 已由审核流水线 squash 合并进 \`${branch}\`（批准依据：\`approve\` check 在该 head sha 上为 success）。\n\n`
               + `- 模块 id：\`${process.env.MODULE_ID || '(未知)'}\`\n`
-              + `- 索引条目由 **Rebuild Index From Main** 这个 run 生成，它由本次合并触发的 push 启动；\n`
+              + `- 索引条目由 **Rebuild Index From Main** 这个 run 生成；它由合并成功后那一步**显式触发**（gh workflow run）：`
+              + `本次合并是用仓库令牌推的，不会触发新的 workflow，所以索引不靠 push 接；\n`
               + `- 那一步会在 main 上回查 \`approve\` 的结论才盖审核章，所以它失败时模块**不会**进索引，`
               + `原因写在那个 run 的日志里，也会贴回本 PR。\n`;
             await github.rest.issues.createComment({

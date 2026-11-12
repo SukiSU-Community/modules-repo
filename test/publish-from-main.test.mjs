@@ -547,6 +547,60 @@ test('不传 --changed 就是全部 pending：所以 workflow 必须在空列表
     'changed_count 为 0 时必须整步跳过，不能靠省略 --changed');
 });
 
+test('合并成功之后必须显式 dispatch index.yml：push 那条路对机器人合并是死的', () => {
+  for (const f of AUDIT_COPIES) {
+    const yml = fs.readFileSync(f, 'utf8');
+    const at = yml.indexOf('  publish:');
+    assert.ok(at > 0, path.basename(f) + ' 里得有 publish 作业');
+    const rest = yml.slice(at + 2);
+    const next = rest.search(/^ {2}[A-Za-z_-]+:$/m);
+    const job = next < 0 ? yml.slice(at) : yml.slice(at, at + 2 + next);
+    // ① 合并成功之后必须真的有人叫醒索引那条 workflow：用仓库 GITHUB_TOKEN 推出来的那个提交
+    //    不会触发 push 触发的 workflow，所以「等 push」就是等一个永远不会来的事件。
+    assert.match(job, /gh workflow run index\.yml/, '模块合进了 main 却没人叫索引重建 = 本项要修的断点');
+    // ② 要带上合并产生的那个提交：index.yml 用它认定「本次提交带进 main 的 pending」。
+    assert.match(job, /--json mergeCommit/);
+    assert.match(job, /-f "sha=\$\{MERGE_SHA\}"/);
+    // ③ actions: write 必须写在 job 级 permissions 里 —— job 级整体覆盖顶层，补顶层到不了这一步手上。
+    const perm = job.slice(job.indexOf('permissions:'), job.indexOf('steps:'));
+    assert.match(perm, /actions: write/, 'gh workflow run 走 actions 权限，少它直接 403');
+    // ④ 这一格失手不许把整条 run 判红：红了会把 workflow_run 那条路也堵死。
+    assert.match(job, /continue-on-error: true/);
+  }
+});
+
+test('被 workflow_run 闸跳过的那一发必须留下 ::notice::（跳过安全，但不能没人知道索引没重建）', () => {
+  for (const f of INDEX_COPIES) {
+    const yml = fs.readFileSync(f, 'utf8');
+    const at = yml.indexOf('  explain-skip:');
+    assert.ok(at > 0, path.basename(f) + ' 里得有为「跳过」留痕的说明作业');
+    const job = yml.slice(at);
+    // 它的 if 必须正好是 jobs.index 那个闸的反面，否则被跳过的那些 run 依然不留痕。
+    assert.match(job, /if: >-[\s\S]{0,120}github\.event_name == 'workflow_run' &&[\s\S]{0,40}github\.event\.workflow_run\.conclusion != 'success'/);
+    assert.match(job, /::notice::/);
+    // 补偿已经在合并侧做过：这里再 dispatch 一次会开出第二条索引 PR
+    //（Worker 的幂等键是分支名，而分支名带 run id：index/rebuild-<run_id>）。
+    const code = job.split(/\r?\n/).filter((l) => !/^\s*#/.test(l)).join('\n');
+    assert.doesNotMatch(code, /^\s*gh (workflow run|pr|api|issue)/m, '说明作业只许打印说明，不许做补偿动作');
+  }
+});
+
+test('ai_status 不许再被说成「由 CI 回填」：回执与 PR 锚点都要写明它恒为 unknown', (t) => {
+  const src = path.resolve(import.meta.dirname, '../../worker/src/index.ts');
+  if (!fs.existsSync(src)) return t.skip('worker/src/index.ts 不在这个 checkout 里');
+  const text = fs.readFileSync(src, 'utf8');
+  for (const lie of ['留给 CI 回填的占位', '由 CI 在 audit 步回填', '这一格由 CI 的 audit 步回填']) {
+    assert.ok(!text.includes(lie), '没有任何地方回填这一格，这句是假的：' + lie);
+  }
+  const lines = text.split(/\r?\n/);
+  const anchor = lines.find((l) => l.includes('ai_status: unknown'));
+  assert.ok(anchor, 'aiStatusCommentLine 的锚点还得在');
+  assert.match(anchor, /没有回填者/, '锚点必须自己说清：这一格没有人回填');
+  assert.match(anchor, /approve/, '并且指出真实证据在哪：投稿 PR head sha 上的 approve check');
+  // 两条上传路径（批量 / 单条）各有一处回执字段：改一处别忘了另一处。
+  assert.equal(lines.filter((l) => l.includes("ai_status: 'unknown',")).length, 2);
+});
+
 test('index.yml 不开 PR 也不推 main：改动交给 App，自己只等绿并合并', () => {
   const yml = fs.readFileSync(WF_INDEX, 'utf8');
   // 注释里必须能写「为什么不用 gh pr create / 不 git push」，所以「不许出现」那两条
