@@ -35,6 +35,13 @@ const SHA256_RE = /^[0-9a-fA-F]{64}$/;
 // 并显式拒 '.'/'..'（GitHub/本地路径都会把这两段归一成「上一级/当前目录」）。
 // 与 worker 的差异是**处置**：worker 那侧把非法段收口成 _，这里选择记 error 跳过——
 // 静默改名会让 manifest 里的 id 与 zip 文件名对不上，审查台面上出现两套事实。
+//
+// ⚠️ 2026-11-12 事故留档：这段注释写下了口径，但常量本身漏了定义 —— main() 里引用
+// ID_SEG_RE，于是**每一个真实投稿 PR** 都在「定位投稿元数据」那一步抛
+// `ReferenceError: ID_SEG_RE is not defined`，audit 红 → approve 红 → 没有任何投稿能合并进索引。
+// 当时的测试只覆盖本文件导出的纯函数、从不调用 main()，所以全绿。现在
+// test/fetch-pending-zip.test.mjs 里有一组真跑 main() 的用例守着这件事。
+export const ID_SEG_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
 /** 一个 pending 条目里可能带多个版本；取「待审版本」用于下载。 */
 export function pickVersion(raw) {
