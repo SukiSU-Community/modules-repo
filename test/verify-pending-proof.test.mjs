@@ -101,6 +101,15 @@ test('缺 pledge → 拒，文案点名 pledge；pledge.version 不在已发布�
   // 形状都不对的 pledge（裸字符串，没有 version）也是拒，不是「读不到就当没要求」
   assert.match(checkPendingProof(entry({ pledge: 'pledge-v1' })).error, /pledge/);
   assert.ok(PLEDGE_VERSIONS.includes('pledge-v1'));
+  // v2 是 App 2026-10-30 起的当前值；这条与下面那条正例就是钉「白名单不许再漂」的。
+  assert.ok(PLEDGE_VERSIONS.includes('pledge-v2'));
+});
+
+test('pledge-v2 → ok：App 当前值那一支（白名单扩到 v2，复算路径不变）', () => {
+  assert.deepEqual(
+    checkPendingProof(entry({ pledge: { version: 'pledge-v2', atMs: 1791600000000 } })),
+    { ok: true },
+  );
 });
 
 test('缺 ownership / via 不是 bio / ownership 畸形 → 一律拒（畸形是被跳过还是被拒，就是这条在盯）', () => {

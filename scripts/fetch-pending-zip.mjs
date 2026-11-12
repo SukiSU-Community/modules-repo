@@ -30,6 +30,11 @@ export const REPO_ROOT = path.resolve(__dirname, '..');
 const MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024; // 单 zip 硬上限，防 OOM
 const FETCH_TIMEOUT_MS = 120_000;
 const SHA256_RE = /^[0-9a-fA-F]{64}$/;
+// pending JSON 里的 id 是攻击者可控字节，它要直接拼进本地路径（`<id>-<vc>.zip`）。
+// 口径与 worker 的 handleAutoPr / pendingPathSegment 同源：只允许 [A-Za-z0-9._-]{1,64}，
+// 并显式拒 '.'/'..'（GitHub/本地路径都会把这两段归一成「上一级/当前目录」）。
+// 与 worker 的差异是**处置**：worker 那侧把非法段收口成 _，这里选择记 error 跳过——
+// 静默改名会让 manifest 里的 id 与 zip 文件名对不上，审查台面上出现两套事实。
 
 /** 一个 pending 条目里可能带多个版本；取「待审版本」用于下载。 */
 export function pickVersion(raw) {
@@ -284,7 +289,27 @@ export async function main(argv = process.argv.slice(2)) {
       const id = String((raw && raw.id) || 'unknown');
       const v = pickVersion(raw);
       const vc = v && Number.isFinite(Number(v.versionCode)) ? Number(v.versionCode) : 0;
-      const target = path.join(outDir, `${id}-${vc}.zip`);
+      const idSeg = ID_SEG_RE.test(id) && id !== '.' && id !== '..' ? id : null;
+      if (idSeg === null) {
+        const why = `id 段不安全（只允许 [A-Za-z0-9._-]{1,64}，且不能是 . 或 ..）：${JSON.stringify(id.slice(0, 80))}`;
+        manifest.push({
+          pending: input.file,
+          id,
+          version: (v && v.version) || '',
+          versionCode: vc,
+          declaredSha256: (v && v.sha256) || '',
+          declaredSize: (v && v.size) || 0,
+          zip: null,
+          zipUrl: '',
+          sha256: '',
+          size: 0,
+          error: why,
+        });
+        failed += 1;
+        console.error(`[fetch-pending-zip] ✗ ${id} ${vc}：${why}`);
+        continue;
+      }
+      const target = path.join(outDir, `${idSeg}-${vc}.zip`);
 
       const rec = {
         pending: input.file,
