@@ -859,6 +859,12 @@ jobs:
           QCA_AGENT_VERSION: ${{ vars.QCA_AGENT_VERSION }}
           QCA_ENVIRONMENT_ID: ${{ vars.QCA_ENVIRONMENT_ID }}
           QCA_PROMPT_SHA: ${{ vars.QCA_PROMPT_SHA }}
+          # 下线开关（2026-11-12 加）：仓库变量 AI_REVIEW_ENABLED 不是 on 时，这一层不调用模型，
+          # 逐包写 disabled 走纯静态规则（额度不足时的下线手段：`gh variable set AI_REVIEW_ENABLED --body off`，
+          # 恢复 = 删掉该变量或设为 on，不用改代码）。默认 on 是为了不改动「有凭据就跑」的原语义。
+          # 用显式开关而不是删步骤 / 加 if:false：跳步就不会有「未运行」的状态文件，triage 会把沉默
+          # 渲染成 CI 故障红。开关 off 与凭据缺失在最终状态上同为 disabled（降级放行），只在文案上分开。
+          AI_REVIEW_ENABLED: ${{ vars.AI_REVIEW_ENABLED || 'on' }}
         run: |
           # 本步的规矩是「非 ok 不在这里开火」（工单 §0.2-2）：ai-review.mjs 对任何非 ok（failed /
           # untrusted / over-budget 都算）一律 exit 1，而下面 分流决策 的 if 是 found=='true'、没有
@@ -898,6 +904,18 @@ jobs:
           for k in QODER_PAT QCA_AGENT_ID QCA_AGENT_VERSION QCA_ENVIRONMENT_ID; do
             [ -n "${!k:-}" ] || CRED_MISSING="$CRED_MISSING $k"
           done
+          # 下线开关（2026-11-12）：不是 on 就并进同一个闸 —— 下游状态仍是 disabled（降级放行，
+          # 不会把「我们没查」渲染成 CI 故障），但额外落一个 audit-out/ai.mode 让文案能分清
+          # 「主动下线」与「配置缺一」：前者要去打开开关，后者要去补变量，处理方向相反。
+          # bash 兜底默认必须与上面 env 的默认一致（2026-11-12 实测）：夹具/手工起这段脚本时
+          # 环境里没有 AI_REVIEW_ENABLED，兜底写 off 就会让「运行器给 on、裸脚本给 off」两套语义分叉，
+          # 线上能跑、切出来单独跑的判据全红 —— 那正是本仓最贵的那类漂移。
+          if [ "${AI_REVIEW_ENABLED:-on}" = "on" ]; then
+            printf 'on\n' > audit-out/ai.mode
+          else
+            CRED_MISSING="$CRED_MISSING${CRED_MISSING:+ }AI_REVIEW_ENABLED!=on"
+            printf 'off\n' > audit-out/ai.mode
+          fi
           if [ -n "$CRED_MISSING" ]; then
             echo "AI 安全员未启用（缺：${CRED_MISSING# }）—— 逐包写 disabled，不调用脚本。"
           fi
@@ -1107,6 +1125,12 @@ jobs:
             //   ② 拒该包（untrusted / over-budget）：这一包不许放行，action=block / label=auto-rejected。
             // 仍然整步红的只剩「判据自己跑不成」：上面那几道闸（没有报告 / riskLevel 缺或越界 /
             // 状态值不在五态 / 口径对不上）。**那是我们的故障，不是这次投稿的结论。**
+            // 下线开关的落点（AI 步写 audit-out/ai.mode）：off = 我们按开关主动下线，与
+            // 「凭据四件缺一」必须分开说 —— 前者要去打开开关，后者要去补变量。读不到（手工
+            // dispatch 的旧 run / 本地夹具）就按凭据缺失口径，不红也不猜。
+            let aiMode="";
+            try { aiMode=fs.readFileSync(`${dir}/ai.mode`,"utf8").trim(); } catch { /* 没有这个文件 = 开关语义缺席 */ }
+            const aiOffBySwitch=aiMode==="off";
             const whyOf=(p)=>{
               let a=null; try { a=JSON.parse(fs.readFileSync(`${dir}/ai-${p}.json`,"utf8")); } catch { /* 读不到原因就只报状态 */ }
               return (a && typeof a.reason === "string") ? a.reason.slice(0,200) : "";
@@ -1124,7 +1148,9 @@ jobs:
             const degradedWhyOf=(p)=>{
               const head=ai[p]==="failed"
                 ? "AI 未跑成（模型调用失败 / 输入读不到 / 产物写不出去）"
-                : "AI 未启用（QCA 四件配置缺一：PAT / agent id / agent version / environment id）";
+                : aiOffBySwitch
+                  ? "AI 未启用（已按开关下线：AI_REVIEW_ENABLED 不是 on）"
+                  : "AI 未启用（QCA 四件配置缺一：PAT / agent id / agent version / environment id）";
               const r=whyOf(p);
               return `${p}：${head}${r?`（${r}）`:""}`;
             };
@@ -1194,7 +1220,9 @@ jobs:
                 ? "本次 AI 安全员未参与（判据不成立）：只过了静态恶意名单"
                 : failedPkgs.length
                   ? "本次 AI 安全员未参与（AI 未跑成）：只过了静态恶意名单"
-                  : "AI 安全员未启用（QCA 四件配置缺一：PAT / agent id / agent version / environment id）：本轮只有静态扫描，等级不由 AI 参与";
+                  : `AI 安全员未启用（${aiOffBySwitch
+                      ? "已按开关下线：AI_REVIEW_ENABLED 不是 on"
+                      : "QCA 四件配置缺一：PAT / agent id / agent version / environment id"}）：本轮只有静态扫描，等级不由 AI 参与`;
             } else {
               const changed=okPkgs.some((p)=>order[aiLevel[p]]>order[riskOf(repByPkg[p])]);
               // 立场与效果是两件事，不能共用一个分支（2026-10-16 CI run 38890758068 实测）：
@@ -1420,6 +1448,10 @@ jobs:
           script: |
             const fs = require('fs');
             const dir = 'audit-out';
+            // 与 triage 同一口径：开关 off 与凭据缺失都写 disabled，文案分开。
+            let aiMode = '';
+            try { aiMode = fs.readFileSync(dir + '/ai.mode', 'utf8').trim(); } catch { /* 没有就按凭据缺失口径 */ }
+            const aiOffBySwitch = aiMode === 'off';
             const FENCE = '`'.repeat(3);
             const namesOf = (suffix) => (fs.existsSync(dir)
               ? fs.readdirSync(dir).filter((f) => f.endsWith(suffix)).sort()
@@ -1559,7 +1591,9 @@ jobs:
               if (!fs.existsSync(`${dir}/${artFile}`)) {
                 // 没有产物也要有一句话说清「为什么没有」—— 留白会被读成「AI 看了但没意见」。
                 const why = st === null ? '没有 ai-*.status：AI 安全员这一步没有产物'
-                  : st === 'disabled' ? '状态 disabled（QCA 四件配置缺一，未启用）'
+                  : st === 'disabled' ? (aiOffBySwitch
+                      ? '状态 disabled（AI 未启用：已按开关下线，AI_REVIEW_ENABLED 不是 on）'
+                      : '状态 disabled（AI 未启用：QCA 四件配置缺一）')
                     : `状态 ${st}：这一发没有写出产物 JSON`;
                 return `${head}本轮没有 AI 产物 —— ${why}。\n\n</details>\n`;
               }
@@ -2032,8 +2066,13 @@ jobs:
       # 合并与「把结果贴回 PR」都要写 PR；job 级 permissions 会整体覆盖顶层，
       # 少这一行 gh pr merge 与 createComment 都会 403。
       pull-requests: write
+      # 合并成功之后那一步要用 gh workflow run 显式 dispatch index.yml，而 workflow_dispatch 属 actions 权限。
+      # ⚠️ 只往文件顶层的 permissions 里补是**不管用**的：**job 级 permissions 会整体覆盖顶层**，
+      #    这个作业写了 job 级那一份，顶层补 actions: write 也到不了它手上 —— 少这一行 gh workflow run 直接 403。
+      actions: write
     steps:
       - name: 合并
+        id: merge
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2050,9 +2089,71 @@ jobs:
           # 合并失败最常见的原因是保护/规则不允许 Actions 这个 actor 合并，报错直接抛出来，
           # 不要静默：模块没进索引时必须看得见。
           gh pr merge "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --squash
-          echo "已 squash 合并 #${PR_NUMBER}（${MODULE_ID:-?}），索引由 push 触发的 Rebuild Index From Main 生成"
 
+          # 取合并产生的那个提交：下一步要把它当 sha 交给 index.yml（那份 workflow 用它认定「本次提交带进 main 的 pending」）。
+          # 合并返回与 ref 可读之间有传播窗口，所以有界重试；取不到不让本步红 —— 下一步会不带 sha 兜底 dispatch
+          #（那时 index.yml 取 main 的当前 head，通常就是同一个合并提交）。
+          MERGE_SHA=""
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            MERGE_SHA=$(gh pr view "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --json mergeCommit --jq '.mergeCommit.oid // empty' 2>/dev/null || true)
+            if [ -n "$MERGE_SHA" ]; then break; fi
+            sleep 3
+          done
+          echo "merge_sha=${MERGE_SHA}" >> "$GITHUB_OUTPUT"
+          if [ -z "$MERGE_SHA" ]; then
+            echo "::warning::合并成功但 30 秒内没读回 merge commit；索引重建将不带 sha dispatch（取 main 的当前 head）。"
+          fi
+          # 旧的这句文案是错的（「索引由 push 触发的 Rebuild Index From Main 生成」），改对了再留着 ——
+          # 错的说法会让下一个人照样去等一个永远不会来的 push 触发：
+          # **用仓库 GITHUB_TOKEN 干的事不会触发新的 workflow run**（GitHub 刻意切断这条链），
+          # 所以这次合并推出来的提交对 index.yml 的 push 触发是死的；真正接上链的是下一步的显式 dispatch。
+          echo "已 squash 合并 #${PR_NUMBER}（${MODULE_ID:-?}），合并提交 ${MERGE_SHA:0:8}"
+
+      - name: 确保索引重建被触发（显式 dispatch index.yml）
+        # 为什么必须显式 dispatch，而不是等 push / workflow_run 自动接上：
+        #   · 用仓库 GITHUB_TOKEN 干的事不会创建新的 workflow run —— gh pr merge --squash 推出来的
+        #     那个提交对 index.yml 的 push 触发是死的（实测：投稿 PR #4 合并后只有 pages 构建在跑，
+        #     Rebuild Index From Main 一次都没启动）。官方文档明列了两个例外：workflow_dispatch 与
+        #     repository_dispatch —— 用 GITHUB_TOKEN 调它们**会**正常创建 workflow run。
+        #     所以这里用 gh workflow run：这是这条链上唯一不依赖「那次审核 run 绿不绿」的触发方式。
+        #   · 现有的自动路径挂在 index.yml 的 workflow_run（types: [completed]）上，而它读的是
+        #     整条审核 run 的结论：publish 之后的任何一个非关键步骤报错、或这次 run 被取消，结论就
+        #     不是 success，index.yml 会被它自己的 if 跳过 —— 索引从此不会自动重建，也没有补偿。
+        #   · 失败不判红：合并已经成功、模块已经在 main 上了，这一步失手只是「索引晚一点重建」，
+        #     用 ::warning:: 把人工兜底的命令打出来就够。判红反而有害：红 run 会让上面那条
+        #     workflow_run 路径也走不通 —— 那正是本步要修的形状。
+        #   ⚠️ 这一步需要 actions: write，而 job 级 permissions 整体覆盖顶层，所以补在本作业那一份里（见上）。
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ steps.merge.outputs.merge_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -uo pipefail
+          ARGS=(--repo "${GITHUB_REPOSITORY}" --ref "${DEFAULT_BRANCH:-main}")
+          # 带上合并产生的那个 sha：index.yml 用它认定「本次提交带进 main 的 pending」。
+          # 没带上时它退到本次 dispatch 的 ref 的 head，也就是同一个合并提交。
+          if [ -n "${MERGE_SHA:-}" ]; then ARGS+=(-f "sha=${MERGE_SHA}"); fi
+          for i in 1 2 3; do
+            if gh workflow run index.yml "${ARGS[@]}"; then
+              echo "已 dispatch Rebuild Index From Main（sha=${MERGE_SHA:-main 的当前 head}）—— 索引重建不再依赖本次审核 run 的结论。"
+              exit 0
+            fi
+            echo "第 ${i} 次 gh workflow run 失败，5 秒后重试"
+            sleep 5
+          done
+          echo "::warning::索引重建没能自动触发（gh workflow run 三次都失败）。索引此刻不会重建，人工兜底："
+          echo "::warning::gh workflow run index.yml -R ${GITHUB_REPOSITORY} -f sha=${MERGE_SHA:-<这次合并的提交>}"
+          exit 0
       - name: 告知合并结果
+        # 这一步是**通知**，不是判据：它写的只是 PR 上的一条评论。评论失败不该把整条链判红 ——
+        # 一旦判红，那次 run 的结论就不是 success，index.yml 的 workflow_run 闸就会跳过索引重建
+        #（「索引永不自动重建」的触发条件之一正是它）。所以这一格显式 continue-on-error。
+        # ⚠️ 与上面那条「不许 continue-on-error」不冲突，两者性质相反：
+        #    · pending 凭据与来源复核（id: proof，§14.2）是**正确性闸门**，它失败必须红；
+        #    · 这一步只负责「把结果告诉投稿人」，让它影响判据等于把通知升格成闸门。
+        continue-on-error: true
         uses: actions/github-script@v7
         env:
           MODULE_ID: ${{ needs.audit.outputs.module_id }}
@@ -2064,7 +2165,8 @@ jobs:
             const body = `## 已合并，索引稍后重建\n\n`
               + `本 PR 已由审核流水线 squash 合并进 \`${branch}\`（批准依据：\`approve\` check 在该 head sha 上为 success）。\n\n`
               + `- 模块 id：\`${process.env.MODULE_ID || '(未知)'}\`\n`
-              + `- 索引条目由 **Rebuild Index From Main** 这个 run 生成，它由本次合并触发的 push 启动；\n`
+              + `- 索引条目由 **Rebuild Index From Main** 这个 run 生成；它由合并成功后那一步**显式触发**（gh workflow run）：`
+              + `本次合并是用仓库令牌推的，不会触发新的 workflow，所以索引不靠 push 接；\n`
               + `- 那一步会在 main 上回查 \`approve\` 的结论才盖审核章，所以它失败时模块**不会**进索引，`
               + `原因写在那个 run 的日志里，也会贴回本 PR。\n`;
             await github.rest.issues.createComment({

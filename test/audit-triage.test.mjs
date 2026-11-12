@@ -10,7 +10,7 @@
 // 运行：node --test test/audit-triage.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -320,6 +320,8 @@ function runAiStep(opts = {}) {
     : Array.isArray(opts.creds) ? opts.creds : [];
   for (const [k, v] of Object.entries(CREDS)) if (!missing.includes(k)) env[k] = v;
   if (opts.promptSha) env.QCA_PROMPT_SHA = opts.promptSha;
+  // 用例专用变量显式给：别赌 process.env 里恰好有什么（开关那一发就是踩这个）。
+  if (opts.env) Object.assign(env, opts.env);
 
   let err = null;
   let stdout = '';
@@ -329,11 +331,17 @@ function runAiStep(opts = {}) {
     // `bash --noprofile --norc -e -o pipefail` —— **那个 `-e` 是 runner 给的，脚本里写 `set -uo pipefail`
     // 撤不掉它**。旧夹具用 `bash ai-step.sh`（没有 -e），跑这段 bash 的用例就全在比线上宽松一档的壳里：
     // 同一个缺陷（把 `|| CODE=$?` 退回裸 `node` + `CODE=$?`）在旧夹具下 57/57 全绿，在忠实夹具下 5 红。
-    const r = execFileSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', 'ai-step.sh'], {
-      cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env,
+    // 起法不变（仍是 runner 那份 `-e -o pipefail`），但换 spawnSync：`execFileSync` 只要显式给了 `stdio`
+    // 成功路径就返回 null，于是 `r.stdout` 恒 undefined、`out` 恒等于 "undefined\nundefined" —— 夹具只能看见
+    // **失败**运行的输出，对成功路径 stdout 的断言（例如开关下线那句「AI 安全员未启用」日志）永远无从命中
+    // （2026-11-12 实测确认）。spawnSync 成功/失败都收 stdout/stderr，失败时把 status 带进 err，
+    // 保持 `code: err ? (err.status ?? 1) : 0` 与既有红路径用例的口径不变。
+    const r = spawnSync('bash', ['--noprofile', '--norc', '-e', '-o', 'pipefail', 'ai-step.sh'], {
+      cwd: dir, encoding: 'utf8', env,
     });
-    stdout = r.stdout;
-    stderr = r.stderr;
+    stdout = String(r.stdout || '');
+    stderr = String(r.stderr || '');
+    if (r.status !== 0) err = { status: r.status, stdout, stderr };
   } catch (e) { err = e; stdout = String(e.stdout || ''); stderr = String(e.stderr || ''); }
 
   const outDir = path.join(dir, 'audit-out');
@@ -350,7 +358,10 @@ function runAiStep(opts = {}) {
   // 所以断言从合并输出里挑出 error 行，而不是赌它落在哪条流上。
   const out = `${stdout}\n${stderr}`;
   const errors = out.split('\n').filter((l) => l.includes('::error::')).join('\n');
-  return { code: err ? (err.status ?? 1) : 0, stdout, stderr, out, errors, dir, files, status, calls };
+  // ai.mode 是 2026-11-12 加的开关落点（off/on）：下游文案靠它分清「主动下线」与「凭据缺一」。
+  const modePath = path.join(outDir, 'ai.mode');
+  const mode = fs.existsSync(modePath) ? fs.readFileSync(modePath, 'utf8').trim() : null;
+  return { code: err ? (err.status ?? 1) : 0, stdout, stderr, out, errors, dir, files, status, calls, mode };
 }
 
 /** 从调用 argv 里取某个 flag 的值。 */
@@ -799,6 +810,36 @@ test('AI 步：脚本 exit 2 且没写状态文件 → 这一步自己红，文�
   assert.doesNotMatch(r.errors, /没跑成/, '「没跑成」是分流里 failed 那句串，AI 步不许提前用掉它');
 });
 
+test('AI 步·下线开关：AI_REVIEW_ENABLED 不是 on → 逐包 disabled、一次脚本都不调、ai.mode=off', () => {
+  // 「额度不足先下线 AI」的开关落在这里（2026-11-12 加）：off 走的是**与凭据缺失同一支**的降级放行
+  // 路径（逐包写 disabled），不是把这一步整体跳过 —— 跳步就没有状态文件，分流那一步的收口闸
+  // 会把「我们没查」渲染成 CI 故障红。
+  const r = runAiStep({ env: { AI_REVIEW_ENABLED: 'off' } });
+  assert.equal(r.code, 0, `下线不是失败：红该由分流按既有判据开火。stderr=${r.stderr}`);
+  assert.equal(r.calls.length, 0, '开关 off 时一次都不许调模型（额度不足的下线手段就是它）');
+  assert.deepEqual(Object.values(r.status), ['disabled', 'disabled'], '与凭据缺失同一条降级路径，一份一包照写');
+  assert.equal(r.mode, 'off', 'ai.mode 是开关的落点：下游文案靠它分清「主动下线」与「凭据缺一」');
+  assert.doesNotMatch(r.out, /::error::/, '下线不许在 stdout 打 ::error::');
+  assert.match(r.out, /未启用/, '这一步的说法要与分流那两句同口径');
+});
+
+test('AI 步·开关兜底：env 里没有 AI_REVIEW_ENABLED 时按 on（= 原语义），不许静默变下线', () => {
+  // bash 兜底默认必须与 YAML env 的默认一致：夹具/手工起这段脚本时环境里没有这个变量，兜底写 off
+  // 就会「运行器给 on、切出来单独跑给 off」两套语义分叉 —— 线上能跑、切出来的判据全红。
+  const on = runAiStep({ env: { AI_REVIEW_ENABLED: 'on' }, plan: { 'demo.zip': { status: 'ok' } }, zips: ['demo.zip'] });
+  assert.equal(on.mode, 'on');
+  assert.equal(on.calls.length, 1, '开关 on = 原语义：逐包真调脚本');
+  const bare = runAiStep({ plan: { 'demo.zip': { status: 'ok' } }, zips: ['demo.zip'] });
+  assert.equal(bare.mode, 'on', '变量不在环境里时兜底是 on');
+  assert.equal(bare.calls.length, 1, '兜底 on 才不改变「有凭据就跑」的原语义');
+});
+
+test('AI 步·结构钉子：下线靠关闸，不靠 if:false 跳步', () => {
+  const { region } = extractStep(AI_STEP);
+  assert.match(region, /AI_REVIEW_ENABLED/, '开关要经 env 传入（不许把 ${{ }} 拼进命令文本）');
+  assert.doesNotMatch(region, /^\s*if:\s*false\s*$/m, '跳步会让分流读不到状态文件，把「没查」渲染成故障红');
+});
+
 test('AI 步：脚本崩溃（非 0 也非 2、没写状态）→ 同一条收口红，但不许说成 prompt 分叉', () => {
   const r = runAiStep({ plan: { 'demo.zip': { noWrite: true, exit: 1 }, 'evil.zip': { status: 'ok' } } });
   assert.notEqual(r.code, 0);
@@ -881,6 +922,20 @@ test('矩阵·disabled：等级不动、action 不变、文案是「未启用」
   assert.equal(kv.action, 'auto-approve');
   assert.match(kv.ai_note, /未启用/);
   assert.doesNotMatch(kv.ai_note, /同意|复验/, '没跑过的层不许冒充跑过');
+  assert.match(kv.ai_note, /QCA 四件/, '没有 ai.mode 的旧 run / 手工 dispatch：文案回到凭据口径');
+});
+
+test('矩阵·下线开关：ai.mode=off ⇒ 文案说「已按开关下线」，仍是 degraded 降级放行', () => {
+  // 「额度不足先下线」这件事在产物上必须看得见，而且不许与「凭据没配」混成一句：
+  // 前者要人去动开关，后者要人去补变量 —— 指错了就白查一轮（§3.5 那两句的分工）。
+  const { kv, err } = runTriage({ 'demo.zip': rep('low', 'first') },
+    { 'demo.zip': 'disabled' }, { rawStatus: { 'ai.mode': 'off\n' } });
+  assert.equal(err, null, err && err.stderr);
+  assert.match(kv.ai_note, /已按开关下线/, '开关下的线要自报家门');
+  assert.doesNotMatch(kv.ai_note, /QCA 四件/, '开关下线时不许把原因指到凭据上：那会让人去补一个不该补的变量');
+  assert.match(kv.ai_note, /未启用/, '仍然要说清这一层没参与');
+  assert.equal(kv.ai_status, 'degraded', '下线 = 降级放行（只走静态名单），不是 rejected');
+  assert.equal(kv.action, 'auto-approve', '静态名单未命中 ⇒ 照旧放行');
 });
 
 test('矩阵·failed：**降级放行**（不是红），文案「没跑成」，等级不动且明写 AI 未参与', () => {
@@ -1545,6 +1600,23 @@ test('T6.2·没有 AI 产物（disabled 与压根没状态两种）都必须写�
   const never = runCommentFrom({ reports: { 'demo.zip': rep('low', 'first') } });
   assert.match(never.body, /本轮没有 AI 产物/);
   assert.doesNotMatch(never.body, new RegExp(`${FENCE}json\\n\\s*\\n${FENCE}`), '空的 json 围栏比没有更糟：像是「有产物但没内容」');
+});
+
+test('T6.2·评论步·下线开关：ai.mode=off ⇒ 正文说「已按开关下线」，不把原因指到凭据上', () => {
+  // 与 triage 的矩阵用例同口径，但量的是**给投稿者看的那段正文**（评论步自己有 aiBlock 分叉）。
+  const switched = runCommentFrom({
+    reports: { 'demo.zip': rep('low', 'first') },
+    ai: { 'demo.zip': { status: 'disabled', artifact: null } },
+    rawStatus: { 'ai.mode': 'off\n' },
+  });
+  assert.equal(switched.triageErr, null, switched.triageStderr);
+  assert.match(switched.body, /已按开关下线/, '开关下的线要在正文里自报家门，别让人去猜');
+  assert.doesNotMatch(switched.body, /QCA 四件/, '开关下线时不许把原因指到凭据上：那会让人去补一个不该补的变量');
+  const creds = runCommentFrom({
+    reports: { 'demo.zip': rep('low', 'first') },
+    ai: { 'demo.zip': { status: 'disabled', artifact: null } },
+  });
+  assert.match(creds.body, /QCA 四件/, '没有 ai.mode 的旧 run / 手工 dispatch：正文回到凭据口径');
 });
 
 /* --------------------------------------------------------------- ③ 字段白名单（本轮唯一新攻击面） */
