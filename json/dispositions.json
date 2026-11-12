@@ -87,7 +87,7 @@
     {
       "kind": "revoke",
       "reason": "test-probe",
-      "by": "ci:audit@pending",
+      "by": "ci:audit@8f9f59864af810c57431b39197ef48b382732cf2",
       "at": "2026-11-12T16:50:51.073Z",
       "note": "B 侧可见性链路探针，验证完成后立即下架",
       "id": "canary-bside-20261113",
