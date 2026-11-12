@@ -859,6 +859,12 @@ jobs:
           QCA_AGENT_VERSION: ${{ vars.QCA_AGENT_VERSION }}
           QCA_ENVIRONMENT_ID: ${{ vars.QCA_ENVIRONMENT_ID }}
           QCA_PROMPT_SHA: ${{ vars.QCA_PROMPT_SHA }}
+          # 下线开关（2026-11-12 加）：仓库变量 AI_REVIEW_ENABLED 不是 on 时，这一层不调用模型，
+          # 逐包写 disabled 走纯静态规则（额度不足时的下线手段：`gh variable set AI_REVIEW_ENABLED --body off`，
+          # 恢复 = 删掉该变量或设为 on，不用改代码）。默认 on 是为了不改动「有凭据就跑」的原语义。
+          # 用显式开关而不是删步骤 / 加 if:false：跳步就不会有「未运行」的状态文件，triage 会把沉默
+          # 渲染成 CI 故障红。开关 off 与凭据缺失在最终状态上同为 disabled（降级放行），只在文案上分开。
+          AI_REVIEW_ENABLED: ${{ vars.AI_REVIEW_ENABLED || 'on' }}
         run: |
           # 本步的规矩是「非 ok 不在这里开火」（工单 §0.2-2）：ai-review.mjs 对任何非 ok（failed /
           # untrusted / over-budget 都算）一律 exit 1，而下面 分流决策 的 if 是 found=='true'、没有
@@ -898,6 +904,18 @@ jobs:
           for k in QODER_PAT QCA_AGENT_ID QCA_AGENT_VERSION QCA_ENVIRONMENT_ID; do
             [ -n "${!k:-}" ] || CRED_MISSING="$CRED_MISSING $k"
           done
+          # 下线开关（2026-11-12）：不是 on 就并进同一个闸 —— 下游状态仍是 disabled（降级放行，
+          # 不会把「我们没查」渲染成 CI 故障），但额外落一个 audit-out/ai.mode 让文案能分清
+          # 「主动下线」与「配置缺一」：前者要去打开开关，后者要去补变量，处理方向相反。
+          # bash 兜底默认必须与上面 env 的默认一致（2026-11-12 实测）：夹具/手工起这段脚本时
+          # 环境里没有 AI_REVIEW_ENABLED，兜底写 off 就会让「运行器给 on、裸脚本给 off」两套语义分叉，
+          # 线上能跑、切出来单独跑的判据全红 —— 那正是本仓最贵的那类漂移。
+          if [ "${AI_REVIEW_ENABLED:-on}" = "on" ]; then
+            printf 'on\n' > audit-out/ai.mode
+          else
+            CRED_MISSING="$CRED_MISSING${CRED_MISSING:+ }AI_REVIEW_ENABLED!=on"
+            printf 'off\n' > audit-out/ai.mode
+          fi
           if [ -n "$CRED_MISSING" ]; then
             echo "AI 安全员未启用（缺：${CRED_MISSING# }）—— 逐包写 disabled，不调用脚本。"
           fi
@@ -1107,6 +1125,12 @@ jobs:
             //   ② 拒该包（untrusted / over-budget）：这一包不许放行，action=block / label=auto-rejected。
             // 仍然整步红的只剩「判据自己跑不成」：上面那几道闸（没有报告 / riskLevel 缺或越界 /
             // 状态值不在五态 / 口径对不上）。**那是我们的故障，不是这次投稿的结论。**
+            // 下线开关的落点（AI 步写 audit-out/ai.mode）：off = 我们按开关主动下线，与
+            // 「凭据四件缺一」必须分开说 —— 前者要去打开开关，后者要去补变量。读不到（手工
+            // dispatch 的旧 run / 本地夹具）就按凭据缺失口径，不红也不猜。
+            let aiMode="";
+            try { aiMode=fs.readFileSync(`${dir}/ai.mode`,"utf8").trim(); } catch { /* 没有这个文件 = 开关语义缺席 */ }
+            const aiOffBySwitch=aiMode==="off";
             const whyOf=(p)=>{
               let a=null; try { a=JSON.parse(fs.readFileSync(`${dir}/ai-${p}.json`,"utf8")); } catch { /* 读不到原因就只报状态 */ }
               return (a && typeof a.reason === "string") ? a.reason.slice(0,200) : "";
@@ -1124,7 +1148,9 @@ jobs:
             const degradedWhyOf=(p)=>{
               const head=ai[p]==="failed"
                 ? "AI 未跑成（模型调用失败 / 输入读不到 / 产物写不出去）"
-                : "AI 未启用（QCA 四件配置缺一：PAT / agent id / agent version / environment id）";
+                : aiOffBySwitch
+                  ? "AI 未启用（已按开关下线：AI_REVIEW_ENABLED 不是 on）"
+                  : "AI 未启用（QCA 四件配置缺一：PAT / agent id / agent version / environment id）";
               const r=whyOf(p);
               return `${p}：${head}${r?`（${r}）`:""}`;
             };
@@ -1194,7 +1220,9 @@ jobs:
                 ? "本次 AI 安全员未参与（判据不成立）：只过了静态恶意名单"
                 : failedPkgs.length
                   ? "本次 AI 安全员未参与（AI 未跑成）：只过了静态恶意名单"
-                  : "AI 安全员未启用（QCA 四件配置缺一：PAT / agent id / agent version / environment id）：本轮只有静态扫描，等级不由 AI 参与";
+                  : `AI 安全员未启用（${aiOffBySwitch
+                      ? "已按开关下线：AI_REVIEW_ENABLED 不是 on"
+                      : "QCA 四件配置缺一：PAT / agent id / agent version / environment id"}）：本轮只有静态扫描，等级不由 AI 参与`;
             } else {
               const changed=okPkgs.some((p)=>order[aiLevel[p]]>order[riskOf(repByPkg[p])]);
               // 立场与效果是两件事，不能共用一个分支（2026-10-16 CI run 38890758068 实测）：
@@ -1420,6 +1448,10 @@ jobs:
           script: |
             const fs = require('fs');
             const dir = 'audit-out';
+            // 与 triage 同一口径：开关 off 与凭据缺失都写 disabled，文案分开。
+            let aiMode = '';
+            try { aiMode = fs.readFileSync(dir + '/ai.mode', 'utf8').trim(); } catch { /* 没有就按凭据缺失口径 */ }
+            const aiOffBySwitch = aiMode === 'off';
             const FENCE = '`'.repeat(3);
             const namesOf = (suffix) => (fs.existsSync(dir)
               ? fs.readdirSync(dir).filter((f) => f.endsWith(suffix)).sort()
@@ -1559,7 +1591,9 @@ jobs:
               if (!fs.existsSync(`${dir}/${artFile}`)) {
                 // 没有产物也要有一句话说清「为什么没有」—— 留白会被读成「AI 看了但没意见」。
                 const why = st === null ? '没有 ai-*.status：AI 安全员这一步没有产物'
-                  : st === 'disabled' ? '状态 disabled（QCA 四件配置缺一，未启用）'
+                  : st === 'disabled' ? (aiOffBySwitch
+                      ? '状态 disabled（AI 未启用：已按开关下线，AI_REVIEW_ENABLED 不是 on）'
+                      : '状态 disabled（AI 未启用：QCA 四件配置缺一）')
                     : `状态 ${st}：这一发没有写出产物 JSON`;
                 return `${head}本轮没有 AI 产物 —— ${why}。\n\n</details>\n`;
               }
