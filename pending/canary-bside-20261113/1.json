@@ -1,0 +1,54 @@
+{
+  "id": "canary-bside-20261113",
+  "name": "Canary B-side probe",
+  "author": "pipeline-probe",
+  "description": "链路探针：验证一次投稿通过静态审核后，另一个用户能否在酷安源看到它。包内什么也不做。",
+  "versions": [
+    {
+      "version": "v0.0.1",
+      "versionCode": 1,
+      "zipUrl": "https://github.com/SukiSU-Community/modules-repo/releases/download/assets-v1/780c8e299f624e98fbb632b832e3ba77f64870d388926ba8a5272e692f1bd356.zip",
+      "size": 516,
+      "time": 1794501049688,
+      "sha256": "780c8e299f624e98fbb632b832e3ba77f64870d388926ba8a5272e692f1bd356"
+    }
+  ],
+  "source": "https://www.coolapk.com/feed/65432100",
+  "sourceCheck": {
+    "verdict": "unreadable",
+    "via": [],
+    "evidence": [],
+    "reason": "探针包：来源核对不适用（流水线自造，不来自酷安投稿入口）"
+  },
+  "uploader": "pipeline-probe",
+  "coolapkUid": "0",
+  "pledge": {
+    "version": "pledge-v2",
+    "atMs": 1794501049688
+  },
+  "ownership": {
+    "nonce": "b5f4cb",
+    "proofPrefix": "b1c8fd33a4ac",
+    "via": "bio-set",
+    "verifiedAt": 1794501049688
+  },
+  "identity": {
+    "capturedAt": 1794501049688,
+    "username": "pipeline-probe",
+    "displayUsername": "pipeline-probe",
+    "level": 0,
+    "bio": "b1c8fd33a4ac-b5f4cb",
+    "regdate": 0,
+    "logintime": 0,
+    "userAvatar": "",
+    "userBigAvatar": "",
+    "cover": "",
+    "follow": 0,
+    "fans": 0,
+    "be_like_num": 0
+  },
+  "storage": "github-release-asset",
+  "releaseTag": "assets-v1",
+  "assetName": "780c8e299f624e98fbb632b832e3ba77f64870d388926ba8a5272e692f1bd356.zip",
+  "submittedAt": "2026-11-12T16:30:49.688Z"
+}
