@@ -17,7 +17,7 @@
 # 用 vars.MODULE_REPO_PREFIX 覆盖，或让下面的探测逻辑自己认。
 #
 # 分流判据（2026-10-21 换轴：设计文档 §2 / §4 / §13.5；等级不再当判决）：
-#   命中上架拦截名单（**任一**包；静态 11 条 ∪ AI 恶意结论且引用逐字复验过）-> block，不进索引
+#   命中上架拦截名单（**任一**包；静态 13 条 ∪ 组合判据 ∪ AI 恶意结论且引用逐字复验过）-> block，不进索引
 #   名单外的一切，含 root 模块正当功能本身那批 high                        -> auto-approved，自动合入索引
 #   判据是**二值**（2026-10-26 去人工化，契约 §1.1）：只有 block 与 auto-approve 两值。
 #   曾经的 request-review 态在 CI 里的后果与 block 完全一样（approve 红、PR 挂着、没人能签），
@@ -1323,7 +1323,10 @@ jobs:
             // 这里只按 scan.mjs 同一个口径把 revokedBundledRefs 汇成输入；多包汇总次数 ⇒ 只会更严不会更松。
             const revoked=reports.flatMap((x)=>(Array.isArray(x.r.revokedBundledRefs)?x.r.revokedBundledRefs:[]));
             const coverage={ revokedCount:revoked.length,
-              revokedEntries:[...new Set(revoked.map((e)=>e&&e.resolvedEntry).filter((s)=>typeof s==="string"&&s))] };
+              revokedEntries:[...new Set(revoked.map((e)=>e&&e.resolvedEntry).filter((s)=>typeof s==="string"&&s))],
+              // 覆盖缺口只进文案（2026-11-19，fix9）：读数早在各自报告的 annotation.coverageGaps 里，这一发让
+              // 「逐包汇总之后」的结论文案也不许把它吞掉；判决仍只由名单 ∪ AI 恶意结论定（§3.2 ③）。
+              coverageGaps:[...new Set(reports.flatMap((x)=>(x.r.annotation&&Array.isArray(x.r.annotation.coverageGaps))?x.r.annotation.coverageGaps:[]))] };
             const d=decide(risk,changeType,coverage,malice);
             // 命中名单却给出非 block ⇒ 「取严」这一格在被改宽。红，不猜。
             if (malice.malicious && d.action!=="block") {

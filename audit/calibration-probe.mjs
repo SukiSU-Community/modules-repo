@@ -25,7 +25,7 @@ import { writeFileSync, mkdirSync } from 'node:fs';
 import { deflateRawSync } from 'node:zlib';
 import { dirname, resolve } from 'node:path';
 
-// 单条目进料的硬上限（audit/scan.mjs 的 MAX_SCAN_BYTES_PER_ENTRY = 24 KiB，也是
+// 单条目进料的硬上限（audit/scan.mjs 的 MAX_SCAN_BYTES_PER_ENTRY = 128 KiB（2026-11-19 起；换引擎前 24 KiB），也是
 // ai-review.mjs 的 TEXT_FEED_CAP_BYTES）。摊到 12000 B 一个文件：留足余量，
 // 且让行号前缀的开销也被如实算进 neededBytes。
 const PER_FILE = 12000;

