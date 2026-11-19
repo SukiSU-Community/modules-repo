@@ -105,7 +105,7 @@ import { fileURLToPath } from 'node:url';
 //   isNonTextContent —— 静态层自己「这条不进人看得见的全文」的判据（魔数 ∨ 正文含 NUL）。
 //                      进料分类复用同一个谓据，AI 与人看见的形状才不会分叉（Task M1 §1）。
 //   MAX_SCAN_BYTES_PER_ENTRY —— 静态每条目实喂上限；②/③ 的「静态读到哪」文案要说这个数，
-//                      不许在这里另写一个 24 KB。
+//                      不许在这里另写一个数。
 //   trimSnippet      —— 展示用片段的长度与空白归一上限，与静态规则同一口径。
 // 注意：这里**不**导入 mask/redactText。输入侧零脱敏是 D5b 的定义，不是遗漏。
 import { readZip, isCliEntry, isNonTextContent, MAX_SCAN_BYTES_PER_ENTRY } from './scan.mjs';

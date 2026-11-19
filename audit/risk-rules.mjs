@@ -218,7 +218,13 @@ function makeLineRule(spec) {
     maxPerFile = 20,       // 同一文件同一规则最多报多少条，防止刷屏
     anchor = 'anywhere',   // fix4-P14：'line-start' | 'anywhere'，见上面工厂前的说明与 scan.test.mjs 的锚点闭包表
     anchorSibling = null,  // anchor === 'line-start' 时必填：覆盖行中形态的那一条规则（同规则里的另一支就写自己的 id）
+    textGuard = null,      // (text) => boolean：整篇**不可能**命中时直接跳过（只许放「证否」型判据，不许放宽窄判据）
   } = spec;
+  // 正则在工厂里编译一次。旧实现每行 new RegExp(pattern.source, flags)：26 条规则 × N 行 = 百万次构造，
+  // 1 MB 文本实测 2110 ms 里约 630 ms 花在这里；单线程复用同一条正则只需每次复位 lastIndex。
+  const compiled = pattern
+    ? new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g')
+    : null;
   // 这里**不抛**：判「声明合不合法、sibling 给没给」的活儿归 audit/scan.test.mjs 的锚点闭包表。
   // 工厂抛错会让整条审核链在 import 时崩掉（扫描器停摆比一条规则红更糟），而闭包表既拦得住
   // 缺声明、也拦得住谎报声明（变异 (c)/(d) 实测都判红），所以默认值住在这里、执法住在那里。
@@ -228,15 +234,23 @@ function makeLineRule(spec) {
     anchor, anchorSibling,
     // 暴露 pattern 供报告渲染时对脚本全文做隐私脱敏（见 scan.mjs redactText）
     pattern,
-    scan(file, text) {
+    scan(file, text, shared) {
       const findings = [];
-      const lines = String(text == null ? '' : text).split(/\r?\n/);
-      const contexts = buildLineContexts(lines); // fix6-F1：见上面 buildLineContexts 的说明
-      const flags = pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g';
+      const src = String(text == null ? '' : text);
+      // 前置门：整篇连「必要条件」都不含就不逐行跑。唯一用例是 PRIVACY_EMAIL ——
+      // 它的 [A-Za-z0-9._%+-]+@ 在 a×N 这种行上从每个起点试到行尾（平方级，
+      // 32 KB 单行实测 1266 ms，占了旧 24 KB 档整包 1429 ms 的 88%；上限 2026-11-19 抬到
+      // 128 KB 之后这道门照旧留着 —— 它挡的是平方级本身，不是某一档字节数）；
+      // 没有 @ 就一个邮箱都匹配不出来，所以这道门是**证否**，不是放宽。
+      if (typeof textGuard === 'function' && !textGuard(src)) return findings;
+      // 行与逻辑行上下文只算一次：scanContent 把同一份 shared 传给每条规则。
+      // 旧实现每条规则各 split 一次、各 buildLineContexts 一次：1 MB 文本里后者单次 49.2 ms × 26 条 = 1279 ms（占 60%）。
+      const { lines, contexts } = shared && shared.contexts ? shared : buildScanContext(text);
       for (let i = 0; i < lines.length && findings.length < maxPerFile; i++) {
         const line = lines[i];
         const ctx = contexts[i];
-        const re = new RegExp(pattern.source, flags);
+        const re = compiled;
+        re.lastIndex = 0;
         // fix3-P7：一行要看**全部**匹配。旧写法只取第一个匹配，然后拿这一个匹配去判豁免与定档，
         // 于是「写在前面的那半行」替后面的真载荷决定了一切 —— 审批闸里的 fail-open：
         //   echo "resetprop -w ro.boot.verifiedbootstate green"; resetprop -w ro.boot.verifiedbootstate green
@@ -310,6 +324,31 @@ function isBroadRmTarget(p) {
   return false;
 }
 
+/**
+ * rm 的选项串里有没有「递归 + 强制」两件事。
+ * 融合短选项（-rf / -fr）、分开写（-r -f）、长选项（--recursive --force）在这条判据下是同一件事；
+ * 旧正则只认融合短选项，`rm -r -f /data`、`rm --recursive --force /data` 实测 0 命中。
+ * 长选项只在**全等**时算（`--interactive` 不含 r 语义，不许按字母猜）。
+ */
+function rmFlags(optsText) {
+  const toks = String(optsText == null ? '' : optsText).trim().split(/\s+/).filter(Boolean);
+  let recursive = false;
+  let force = false;
+  for (const t of toks) {
+    if (t === 'rm') continue;
+    if (t.startsWith('--')) {
+      if (t === '--recursive') recursive = true;
+      if (t === '--force') force = true;
+      continue;
+    }
+    if (!t.startsWith('-')) continue;
+    const letters = t.replace(/^-+/, '');
+    if (/[rR]/.test(letters)) recursive = true;
+    if (/f/.test(letters)) force = true;
+  }
+  return { recursive, force };
+}
+
 export const RM_RF_MUTABLE = makeLineRule({
   anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'RM_RF_MUTABLE',
@@ -317,11 +356,17 @@ export const RM_RF_MUTABLE = makeLineRule({
   severity: 'medium',
   title: 'rm -rf 作用于 /data、/system 等可变分区',
   advice: '确认为何需要删除：作用域必须是模块自有目录。命中宽泛路径（/data/* 、分区根）视为高风险，需人工确认。',
-  pattern: /\brm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\b/,
+  // 先把 `rm + 选项串` 整体认下来，再由 rmFlags 判是不是「递归 + 强制」这一对 —— 旧写法把两个短选项的
+  // 融合顺序写死在正则里，分开写与长选项两条路都漏（实测 0 命中）。
+  pattern: /\brm\b(?:\s+-{1,2}[A-Za-z][A-Za-z-]*)+/,
   // 只删模块自身目录/临时目录是模块刷写中的正常操作，不报。
   // 必须用函数判断“rm 的目标 token 从头是否就是安全目录”，不能用整行正则：
   // 否则 /data/local/tmp/leftover 会因行内含 "/tmp/" 而被误判安全（假阴性）。
-  exclude(m, line) { return isSafeRmToken(rmTarget(line, m)); },
+  exclude(m, line) {
+    const f = rmFlags(m[0]);
+    if (!f.recursive || !f.force) return true;   // 不是「递归 + 强制」就不构成 rm -rf 这件事
+    return isSafeRmToken(rmTarget(line, m));
+  },
   severityFor(m, line) {
     const t = rmTarget(line, m);
     if (!t) return 'medium';
@@ -403,7 +448,10 @@ export const WRITE_SYSTEM_VENDOR = makeLineRule({
   severity: 'high',
   title: '直接写入或重挂载 /system、/vendor 分区',
   advice: 'Magisk/KernelSU 模块应通过 $MODPATH/system 覆盖层修改，不得直接写真实分区；直接写会破坏 dm-verity 与 OTA。',
-  pattern: /(?:\btouch\b|\bcp\b|\bmv\b|\bdd\b|\bmkdir\b|\bsed\s+-i\b|\btee\b|>>?)[^\n]*\/(?:system|vendor|product|system_ext|odm)\/|\bmount\b[^\n]*-o[^\n]*\b(?:rw|remount)\b|\bremount\b|\bmount\s+-o\s+rw[^\n]*\/(?:system|vendor)\b/,
+  // 动词表补 chmod / chown / ln / install：`chmod 777 /system/bin/sh`、`chown root:root /vendor/etc/hosts`、
+  // `ln -s … /system/bin/…` 实测都 0 命中，而它们与 cp/mv 是同一件事（直接动真实分区）。
+  // 覆盖层目标（`$MODPATH/system/…`）仍由 overlayOnlyMatch 放行，判据不变。
+  pattern: /(?:\btouch\b|\bcp\b|\bmv\b|\bdd\b|\bmkdir\b|\bsed\s+-i\b|\btee\b|\bchmod\b|\bchown\b|\bln\b|\binstall\b|>>?)[^\n]*\/(?:system|vendor|product|system_ext|odm)\/|\bmount\b[^\n]*-o[^\n]*\b(?:rw|remount)\b|\bremount\b|\bmount\s+-o\s+rw[^\n]*\/(?:system|vendor)\b/,
   // 注释行那支语义照旧（`^\s*#`），分串那一支换成按匹配判
   exclude: (m, line) => /^\s*#/.test(line) || overlayOnlyMatch(m[0]),
 });
@@ -425,7 +473,10 @@ export const HOSTS_MODIFY = makeLineRule({
   severity: 'medium',
   title: '修改 /system/etc/hosts',
   advice: '改 hosts 会全局劫持域名解析。广告屏蔽类模块属合法用途，但仍需人工确认拦截清单。',
-  pattern: /(?:\btouch\b|\bcp\b|\bcat\b|\bsed\b|\becho\b|>>?|\bmount\b)[^\n]*\bhosts\b|\bhosts\b[^\n]*(?:>>?|\bsed\s+-i\b)/,
+  // 收窄（实测误报）：旧判据只认 “hosts” 这个词，`echo "127.0.0.1 localhost" > "$MODPATH/hosts"` 也发 medium。
+  // 这条规则主张的是「改 /system/etc/hosts 这份解析表」，所以目标必须真的是 `etc/hosts`；
+  // 广告拦截类模块写 `$MODPATH/system/etc/hosts` 仍然命中（覆盖层那份就是最终生效的那份）。
+  pattern: /(?:\btouch\b|\bcp\b|\bcat\b|\bsed\b|\becho\b|>>?|\bmount\b)[^\n]*\betc\/hosts\b|\betc\/hosts\b[^\n]*(?:>>?|\bsed\s+-i\b)/,
 });
 
 // ---------------------------------------------------------------------------
@@ -927,10 +978,38 @@ function dteGroups(lines, contexts) {
     }
     if (cur.length) g.segments.push(cur);
   }
+  // 段序号：一条逻辑行会被切成多个命令段（`wget -O /tmp/x U && sh /tmp/x` 就是两段）。
+  // 行号相等时，先后关系只能靠这个序号说话 —— 旧写法只比行号，同行链整条沉默。
+  let seq = 0;
+  for (const g of order) for (const seg of g.segments) seg.seq = seq++;
   return order;
 }
 
-/** 下载段里的落盘动作（-o/-O/--output 与其短选项簇形态、-P/--directory-prefix、> 与 >>），逐个写进 sinks。 */
+/**
+ * 跨行规则的两份公共输入：字面量表、命令段分组、以及 sink/执行/chmod 三张表。
+ *
+ * 为什么要在快照上缓存（2026-11-19）：DOWNLOAD_THEN_EXEC 与 DOWNLOAD_TO_MODULE_EXEC 吃的是**同一批**
+ * 输入（前者用 sinks+execs+chmods，后者用 sinks+chmods），旧实现各算一遍 —— 1.69 MB 混合文本上两条规则
+ * 合计 940 ms，占整包的 40%，其中一半是同一件事做第二次。缓存挂在 scanContent 传下来的 shared 上，
+ * 那份快照的生命周期就是一次 scanContent 调用，所以不存在跨文本串味。
+ * 口径不变：三张表的内容与分离计算时逐字相同（同一份 dteCollectSinks / dteCollectExecs）。
+ */
+function dteSharedInputs(snap, lines, contexts) {
+  if (snap.dte) return snap.dte;
+  const assign = dteLiteralAssignments(lines);
+  const groups = dteGroups(lines, contexts);
+  const sinks = new Map();   // 归一化路径 -> { line, seq }（首个落地点）
+  const execs = new Map();   // 归一化路径 -> [{ path, line, seq, kind }]
+  const chmods = new Map();  // 归一化路径 -> [{ path, line, seq, mode }]
+  for (const g of groups) {
+    dteCollectSinks(g.segments, assign, sinks);
+    dteCollectExecs(g, assign, execs, chmods);
+  }
+  snap.dte = { assign, groups, sinks, execs, chmods };
+  return snap.dte;
+}
+
+/** 下载段里的落盘动作（-o/-O/--output 与其短选项簇形态、P/--directory-prefix、> 与 >>），逐个写进 sinks。 */
 function dteCollectSinks(segments, assign, sinks) {
   for (const seg of segments) {
     const head = dteWord(seg[0].tok);
@@ -972,11 +1051,11 @@ function dteCollectSinks(segments, assign, sinks) {
         const base = urlTok ? dteUrlBasename(urlTok.tok) : null;
         if (!base) continue;                                  // 没有 basename 就不产生 sink，不猜
         const p = `${dir.replace(/\/+$/, '')}/${base}`;
-        if (!sinks.has(p)) sinks.set(p, opLine);
+        if (!sinks.has(p)) sinks.set(p, { line: opLine, seq: seg.seq });
         continue;
       }
       const p = dteNormalize(operand, assign);                // `-o -` 在这里返回 null：标准输出不是落盘
-      if (p && !DTE_STDOUT_PATH.test(p) && !sinks.has(p)) sinks.set(p, opLine);
+      if (p && !DTE_STDOUT_PATH.test(p) && !sinks.has(p)) sinks.set(p, { line: opLine, seq: seg.seq });
     }
   }
 }
@@ -1001,13 +1080,13 @@ function dteCollectExecs(group, assign, execs, chmods) {
       seenWord.add(word);
       const line = seg[0].line;
       const asPath = dteNormalize(word, assign);
-      if (asPath) { add(execs, asPath, { path: asPath, line, kind: 'bare' }); continue; }
+      if (asPath) { add(execs, asPath, { path: asPath, line, seq: seg.seq, kind: 'bare' }); continue; }
       if (DTE_EXEC_VERBS.has(word)) {
         for (let k = 1; k < seg.length; k++) {
           const w = dteWord(seg[k].tok);
           if (!w || w.startsWith('-')) continue;              // 选项位（`sh -x /p`）
           const p = dteNormalize(seg[k].tok, assign);
-          if (p) { add(execs, p, { path: p, line: seg[k].line, kind: 'interp' }); break; }
+          if (p) { add(execs, p, { path: p, line: seg[k].line, seq: seg.seq, kind: 'interp' }); break; }
         }
         continue;
       }
@@ -1018,7 +1097,7 @@ function dteCollectExecs(group, assign, execs, chmods) {
           if (!w || w.startsWith('-')) continue;
           if (mode === null && /^(?:[0-7]{3,4}|[ugoa]*[+-=][rwxXa]+)$/.test(w)) { mode = w; continue; }
           const p = dteNormalize(seg[k].tok, assign);
-          if (p) { add(chmods, p, { path: p, line: seg[k].line, mode }); break; }
+          if (p) { add(chmods, p, { path: p, line: seg[k].line, seq: seg.seq, mode }); break; }
         }
       }
     }
@@ -1041,31 +1120,34 @@ export const DOWNLOAD_THEN_EXEC = {
   anchorSibling: null,
   pattern: null, // 见上面那段：跨行规则的匹配不住在单个正则上，null 是有意为之
   advice: DOWNLOAD_THEN_EXEC_ADVICE,
-  scan(file, text) {
+  scan(file, text, shared) {
     const src = String(text == null ? '' : text);
-    const lines = src.split(/\r?\n/);
-    const contexts = buildLineContexts(lines); // fix6-F1 那份命令位实现，本规则复用（导出的唯一理由）
-    const assign = dteLiteralAssignments(lines);
-    const groups = dteGroups(lines, contexts);
-    const sinks = new Map();   // downloadSinks：归一化路径 -> 首个落地行
-    const execs = new Map();   // executedPaths：归一化路径 -> [{ path, line, kind }]
-    const chmods = new Map();  // 同一条链的 chmod 证据：路径 -> [{ path, line }]
-    for (const g of groups) {
-      dteCollectSinks(g.segments, assign, sinks);
-      dteCollectExecs(g, assign, execs, chmods);
-    }
+    // 上下文来自 scanContent 的共享快照：本规则原先自己再 split + 建一次，
+    // 与「26 条规则各建一次上下文」是同一笔账（1 MB 文本 26 份 = 1279 ms）。
+    // 前置门（2026-11-19，证否型）：整篇没有 curl/wget 这两个字面量，命令位就不可能是下载器 ——
+    // dteDownloader 认的每一形（`curl` / `$curl` / `$MODPATH/addon/curl` / `/system/bin/wget`）都含这两个
+    // 子串之一，所以「没有 sink ⇒ 没有链」成立，这道门只省时间、不改判据（同 PRIVACY_EMAIL 的 `@` 门）。
+    if (!src.includes('curl') && !src.includes('wget')) return [];
+    // 上下文、字面量表、命令段与三张表全部来自同一份共享快照：DOWNLOAD_TO_MODULE_EXEC 用的是同一批输入，
+    // 缓存挂在 shared 上（见 dteSharedInputs），两条规则不再各算一遍。
+    const snap = shared && shared.contexts ? shared : buildScanContext(src);
+    const { lines } = snap;
+    const { sinks, execs, chmods } = dteSharedInputs(snap, lines, snap.contexts);
     // 与 PIPE_TO_SHELL 的硬约束（工单 §2）：某条链的「执行行」同时是管道直连的命中行时，本规则在那一行不出。
     // 两条规则的分工是「管道那一行归 PIPE_TO_SHELL」，所以这里让位而不是双报；
     // 与 EXEC_BUNDLED_FILE 相反 —— 那一格两条都要出（包内引用被执行 / 远程内容落盘后执行是两个事实）。
     const pipeLines = new Set();
-    for (const f of PIPE_TO_SHELL.scan(file, src)) pipeLines.add(f.line);
+    for (const f of PIPE_TO_SHELL.scan(file, src, shared)) pipeLines.add(f.line);
     const chains = [];
-    for (const [path, sinkLine] of sinks) {
+    for (const [path, sink] of sinks) {
       const list = (execs.get(path) || [])
-        .filter((e) => e.line > sinkLine && !pipeLines.has(e.line))
+        // 同行链：sink 与执行分属**不同命令段**时按段序号判先后（`wget -O /tmp/x U && sh /tmp/x` 是两段）。
+        // 旧写法要求「执行行号 > 落地行号」，同一逻辑行里的链因此整条沉默（实测 0 命中，只剩 NETWORK_FETCH/low）。
+        .filter((e) => (e.line > sink.line || (e.line === sink.line && e.seq > sink.seq))
+          && !pipeLines.has(e.line))
         .sort((a, b) => a.line - b.line);
       if (!list.length) continue;                 // 只下载不执行 / 执行早于落地：都不构成链
-      chains.push({ path, sinkLine, exec: list[0] }); // 一条链只报一次：同一个 sink 的多种执行形态取最早那行
+      chains.push({ path, sinkLine: sink.line, exec: list[0] }); // 一条链只报一次：同一个 sink 的多种执行形态取最早那行
     }
     chains.sort((a, b) => (a.exec.line - b.exec.line) || (a.sinkLine - b.sinkLine)
       || (a.path < b.path ? -1 : (a.path > b.path ? 1 : 0)));
@@ -1166,26 +1248,24 @@ export const DOWNLOAD_TO_MODULE_EXEC = {
   anchorSibling: null,
   pattern: null, // 同族口径：跨行规则的匹配不住在单个正则上，null 是有意为之（redactText 走 !r.pattern 分支）
   advice: DOWNLOAD_TO_MODULE_EXEC_ADVICE,
-  scan(file, text) {
+  scan(file, text, shared) {
     const src = String(text == null ? '' : text);
-    const lines = src.split(/\r?\n/);
-    const contexts = buildLineContexts(lines); // 与 DOWNLOAD_THEN_EXEC 同一份命令位实现，不写第二套口径
-    const assign = dteLiteralAssignments(lines);
-    const groups = dteGroups(lines, contexts);
-    const sinks = new Map();   // 归一化路径 -> 首个落地行（下载段的识别与老规则共用同一份代码）
-    const chmods = new Map();  // 归一化路径 -> [{ path, line, mode }]
-    for (const g of groups) {
-      dteCollectSinks(g.segments, assign, sinks);
-      dteCollectExecs(g, assign, new Map(), chmods); // 执行形态这一半本规则用不上，chmod 证据才用
-    }
+    // 与 DOWNLOAD_THEN_EXEC 同一份命令位实现，也共用同一份共享上下文，不写第二套口径
+    // 前置门与 DOWNLOAD_THEN_EXEC 同一道（证否型，同样只看「整篇有没有下载动词」）
+    if (!src.includes('curl') && !src.includes('wget')) return [];
+    const snap = shared && shared.contexts ? shared : buildScanContext(src);
+    const { lines } = snap;
+    // 与 DOWNLOAD_THEN_EXEC 同一份缓存：sink 与 chmod 两张表示同一次遍历的产物，本规则不重算
+    const { sinks, chmods } = dteSharedInputs(snap, lines, snap.contexts);
     const pairs = [];
-    for (const [path, sinkLine] of sinks) {
+    for (const [path, sink] of sinks) {
       if (!dtmeVisibleModulePath(path)) continue;                 // 条件①
       const grants = (chmods.get(path) || [])
-        .filter((c) => c.line > sinkLine && dtmeGrantsExec(c.mode)) // 条件②（顺序与老规则同向：先落地后加位）
+        // 条件②（顺序与老规则同向：先落地后加位，同行则按段序号）
+        .filter((c) => (c.line > sink.line || (c.line === sink.line && c.seq > sink.seq)) && dtmeGrantsExec(c.mode))
         .sort((a, b) => a.line - b.line);
       if (!grants.length) continue;                               // 缺任何一个条件都不报
-      pairs.push({ path, sinkLine, chmod: grants[0] });            // 一条落地只报一次：取最早那次加执行位
+      pairs.push({ path, sinkLine: sink.line, chmod: grants[0] });  // 一条落地只报一次：取最早那次加执行位
     }
     pairs.sort((a, b) => (a.chmod.line - b.chmod.line) || (a.sinkLine - b.sinkLine)
       || (a.path < b.path ? -1 : (a.path > b.path ? 1 : 0)));
@@ -1473,6 +1553,10 @@ export const PROP_SECURITY_WEAKEN = makeLineRule({
 
 const PRIVATE_IP = /^(?:127\.|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|0\.0\.0\.0$|255\.255\.255\.255$)/;
 
+// 硬编码 IP 的「取用上下文」：只有这些形状才把四段数字当主机用。
+// 这条表是收窄用的（不放进来的上下文一律不报），所以每一项都要有真包里的实证。
+const IP_USE_CONTEXT = /(?:\bcurl\b|\bwget\b|\bping\b|\bnc\b|\bncat\b|\bsocat\b|\bssh\b|\bscp\b|\badb\b|\bconnect\b|\bhost\b|\bserver\b|\bproxy\b|--connect|_ip\s*=|\bip\s*=|\bIP\s*=|\bhost\s*=|\bserver\s*=)/i;   // *_ip=SERVER 这类赋值也算（SERVER_IP 的 ip 前是下划线，\b 不成立）
+
 export const HARDCODED_IP = makeLineRule({
   anchor: 'anywhere', // fix4-P14：载荷出现在一行里任何位置都算（闭包表会用「x=1; 」前缀逐条验证）
   id: 'HARDCODED_IP',
@@ -1482,8 +1566,17 @@ export const HARDCODED_IP = makeLineRule({
   advice: '应改用域名。硬编码 IP（尤其公网 IP）常意味着无法追溯的 C2 或自建分发点。',
   pattern: /(?:\d{1,3}\.){3}\d{1,3}(?::\d{1,5})?/,
   exclude: /^\s*#|versionCode|versionName|version\s*=/,
-  severityFor(m) {
-    return PRIVATE_IP.test(m[0]) ? 'low' : 'medium';
+  severityFor(m, line) {
+    const ip = m[0];
+    const octets = ip.split(':')[0].split('.').map(Number);
+    // 四段都在 0–255 才可能是地址；`1.2.3.4` 之外的版本号/串号形状一律不报。
+    if (octets.length !== 4 || octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+    // 「有没有被当主机用」：带端口、在 URL 里、或整行出现取用动词才算。
+    // 旧判据对任何四段数字都发 medium —— 实测把文案/注释里的版本号 1.2.3.4 也拦了，
+    // 而没有任何取用上下文的裸数字并不构成「硬编码 C2」这件事。
+    const used = /:\d{1,5}$/.test(ip) || /https?:\/\//i.test(line) || IP_USE_CONTEXT.test(line);
+    if (!used) return null;
+    return PRIVATE_IP.test(ip) ? 'low' : 'medium';
   },
 });
 
@@ -1649,6 +1742,11 @@ export const PRIVACY_EMAIL = makeLineRule({
   title: '疑似邮箱地址',
   advice: '如非必要请移除或使用公共联系邮箱。',
   pattern: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/,
+  // 证否型前置门：整篇没有 @ 就一个邮箱都匹配不出来。省 CPU 是附带收益，主因是安全 ——
+  // 这条正则在 a×N 这种单行上是平方级（8 KB=80.4ms、16 KB=312.1ms、32 KB=1266 ms，
+  // 占同档整包 1429 ms 的 88%），旧上限 24 KB 就是被它顶出来的；门一加同一形状 0.1 ms。
+  // 2026-11-19 换引擎后上限已抬到 128 KB，这道门照旧留着：它挡的是平方级本身。
+  textGuard: (text) => text.includes('@'),
   // 仅排除“明显是占位/机器人”的地址；真实邮箱（哪怕域名是 example.com）仍提示投稿者
   exclude: /@users\.noreply\.github\.com|@localhost|@example\.(?:invalid|test)|@(?:noreply|no-reply)\./,
 });
@@ -1668,6 +1766,72 @@ export const PRIVACY_SECRET = makeLineRule({
 // 规则表
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// ①-补 2026-11-19：实测 0 命中的五条路
+// 逐条都是「真包里有写法、旧 26 条规则一条都不发」的形状。判定口径与老规则一致
+// （载荷出现在一行里任何位置都算），加进来的都是**加严**方向：只在既有判据之外补洞。
+// ---------------------------------------------------------------------------
+
+export const INLINE_REMOTE_EXEC = makeLineRule({
+  anchor: 'anywhere',
+  id: 'INLINE_REMOTE_EXEC',
+  category: 'execution',
+  severity: 'high',
+  title: '远程内容经命令替换直接交给解释器（不落盘执行）',
+  advice: '`sh -c "$(curl …)"` 与 `curl | sh` 是同一件事的第三种写法：字节同样没进过审核面，'
+    + '区别只在于连落盘文件都不留，事后复核无物可查。要求作者把要执行的内容一并提交，或给出可复核的校验和。',
+  // 三支：解释器 -c 里套命令替换、eval 里套命令替换、python -c 里直接开网络。
+  // `sh -x file`、`eval "$LOCAL"`、`python -c "print(1)"` 都不命中（要求替换体/网络调用在场）。
+  pattern: /(?:\b(?:ba|da|k|z|a)?sh\b[^\n]*\s-c\s[^\n]*\$\(\s*(?:curl|wget|fetch)\b|\beval\b[^\n]*\$\(\s*(?:curl|wget|fetch)\b|\bpython[0-9.]*\b[^\n]*\s-c\b[^\n]*(?:urlopen|urlretrieve|requests\.(?:get|post)|http\.client)\b)/i,
+});
+
+export const RAW_BLOCK_WRITE = makeLineRule({
+  anchor: 'anywhere',
+  id: 'RAW_BLOCK_WRITE',
+  category: 'dangerous',
+  severity: 'high',
+  title: '直接写裸块设备 / 引导分区',
+  advice: '模块往分区里写字节（dd 前端镜像、清文件系统、重写 boot）不该由投稿包完成：写错一处分区就是变砖，'
+    + '而且这类写入完全绕过 A/B 与校验链。要求作者给出工具化做法的替代路径。',
+  // `dd of=`、裸重定向、格式化工具、flash_image 四支同一件事：落点在 by-name/block 设备节点上。
+  pattern: /(?:\bdd\b[^\n]*\bof=[^\n]*\/dev\/(?:block|by-name)\/|>>?\s*\/dev\/(?:block|by-name)\/|\b(?:mke2fs|mkfs(?:\.\w+)?|wipefs)\b[^\n]*\/dev\/(?:block|by-name)\/|\bflash_image\b)/,
+});
+
+export const PERSIST_DROP = makeLineRule({
+  anchor: 'anywhere',
+  id: 'PERSIST_DROP',
+  category: 'dangerous',
+  severity: 'medium',
+  title: '往开机钩子目录投放文件（service.d / post-fs-data.d / ksu/bin）',
+  advice: '这几个目录里的东西由 root 在开机早期执行，绕开模块框架自身的生命周期。正经模块也常用它们起守护进程，'
+    + '所以这条只标注、不拦；但报告必须点名落点，让上架的人知道装完会发生什么。',
+  // 两支：写/拷贝进 service.d 与 post-fs-data.d；以及覆盖 ksud 这类框架自身二进制。
+  pattern: /(?:>>?\s*|\b(?:cp|mv|install|ln|tee|cat)\b[^\n]*)\/data\/adb\/(?:service\.d|post-fs-data\.d)\/|\b(?:cp|mv|dd|install)\b[^\n]*\/data\/adb\/ksu\/bin\//,
+});
+
+export const NET_REDIRECT = makeLineRule({
+  anchor: 'anywhere',
+  id: 'NET_REDIRECT',
+  category: 'network',
+  severity: 'medium',
+  title: '防火墙规则把流量重定向到本机端口',
+  advice: 'REDIRECT / DNAT / MASQUERADE / TPROXY 会把整机流量改道：广告拦截与抓包用它，流量劫持也用它。'
+    + '标注里要说清目标端口与规则来源，别让「去广告」这三个字替一条 nat 规则背书。',
+  // iptables / ip6tables / nft 三套语法各一支目标动作；纯 `-j ACCEPT` 与 `-L` 不算。
+  pattern: /\b(?:iptables|ip6tables|nft)\b[^\n]*(?:-j\s+(?:REDIRECT|DNAT|MASQUERADE|TPROXY)\b|add\s+rule[^\n]*\b(?:dnat|redirect|masquerade|tproxy)\b)/i,
+});
+
+export const KERNEL_SYSCTL_WRITE = makeLineRule({
+  anchor: 'anywhere',
+  id: 'KERNEL_SYSCTL_WRITE',
+  category: 'dangerous',
+  severity: 'medium',
+  title: '修改内核参数（/proc/sys 或 sysctl -w）',
+  advice: '内核参数影响整机而不是这个模块：ip_forward、vm.* 之类改完之后没有模块级回滚路径。'
+    + '确实需要时请在标注里写明键名与新值。',
+  // 重定向进 /proc/sys 与 `sysctl -w` 两支；只读（`cat /proc/sys/...`）与 `sysctl -a` 不算。
+  pattern: /(?:>>?\s*\/proc\/sys\/|\bsysctl\s+-[a-zA-Z]*w\b)/,
+});
 export const CONTENT_RULES = [
   RM_RF_MUTABLE,
   PIPE_TO_SHELL,
@@ -1695,14 +1859,33 @@ export const CONTENT_RULES = [
   PRIVACY_HOME_USER,
   PRIVACY_EMAIL,
   PRIVACY_SECRET,
+  INLINE_REMOTE_EXEC,
+  RAW_BLOCK_WRITE,
+  PERSIST_DROP,
+  NET_REDIRECT,
+  KERNEL_SYSCTL_WRITE,
 ];
 
 export const RULES_BY_ID = Object.fromEntries(CONTENT_RULES.map((r) => [r.id, r]));
 
+/**
+ * 一份文本的「物理行 + 逻辑行上下文」，整篇只算一次。
+ * 为什么单独抽出来：26 条规则都要它，而 buildLineContexts 是 scanContent 里最贵的一段
+ * （1 MB 文本单次 49.2 ms；旧实现每条规则各建一次 ⇒ 1279 ms）。自建基准实测
+ * 「上下文复用 + 正则预编译」把 1 MB shell 文本从 2110 ms 压到 204 ms（−90.3%），
+ * 命中数与改造前一致（同一份 pattern、同一份行序）。
+ * @param {string} text
+ */
+function buildScanContext(text) {
+  const lines = String(text == null ? '' : text).split(/\r?\n/);
+  return { lines, contexts: buildLineContexts(lines) };
+}
+
 /** 对单个文件跑全部内容规则 */
 export function scanContent(file, text, rules = CONTENT_RULES) {
+  const shared = buildScanContext(text);
   const out = [];
-  for (const r of rules) out.push(...r.scan(file, text));
+  for (const r of rules) out.push(...r.scan(file, text, shared));
   return out;
 }
 
@@ -2494,7 +2677,8 @@ export function scoreRisk(findings) {
 // 正当功能本身就长得像能力），于是「用它当拦截条件 = 这个生态几乎全灭」（§1 第 3 条）。
 // 新分流吃的是**恶意定性**：一张小而可证的规则名单，命中 ⇒ 不上架；名单外的一切 ⇒ 上架 + 标注。
 //
-// 名单不是文案，是 §3.2 那张定案表（用户 2026-10-21 拍：按 §3.2 末尾那张表定案，11 条）。
+// 名单不是文案，是 §3.2 那张定案表（用户 2026-10-21 拍：按 §3.2 末尾那张表定案，11 条；
+// 2026-11-19 用户「确实查出来是恶意模块的必须拦」之后再加 2 条，理由见下面那段）。
 // 每一条都必须在 audit/malice-axis.test.mjs 里有一枚「这个形状命中并 block」的夹具证人；
 // 名单外的高等级规则一律退成标注（`summarizeCoverage`），它们不再有拦上架的权力。
 //
@@ -2513,6 +2697,18 @@ export const MALICE_LIST = Object.freeze([
   { id: 'STRUCT_UNSAFE_PATH', armed: true, note: '绝对路径/穿越写法的条目：安装时落点不由审核面决定' },
   { id: 'STRUCT_DUPLICATE_NAME', armed: true, note: '重名条目：解包顺序决定谁覆盖谁，审核结论对不上被安装的那一份' },
   { id: 'STRUCT_ZIP_BOMB', armed: true, note: '压缩比异常：故意让逐行审核读不完，本身就是绕闸动作' },
+  // ── 2026-11-19 第三发：本轮新补里「没有正当读法」的那两条接进名单 ─────────────────────
+  // 用户 2026-11-19 定调：「确实查出来是恶意模块的必须拦」。这两条进得来，是因为它们的形状
+  // **没有正当读法**（与 §3.2 那 11 条同一个理由），不是为了抬高命中率：
+  //   * INLINE_REMOTE_EXEC —— `sh -c "$(curl …)"` / `eval "$(curl …)"`：字节从不落盘，
+  //     审核面连「下载了什么」都不留痕，与 PIPE_TO_SHELL 是同一件事的两种写法。
+  //   * RAW_BLOCK_WRITE —— 直接对 `/dev/block/**` 写 dd/mkfs：模块没有任何理由碰裸分区，
+  //     它绕过的是 AVB 与分区表本身（写错就是变砖）；正经模块走的是覆盖层。
+  // 另外三条（PERSIST_DROP / NET_REDIRECT / KERNEL_SYSCTL_WRITE）**故意不进**：开机钩子、流量
+  // 转发、sysctl 在正经模块里都常见 —— 单看是能力，不是恶意。它们「合起来才恶意」的那一格
+  // 由 MALICE_COMBOS 单独判（下面那张表），不进名单。
+  { id: 'INLINE_REMOTE_EXEC', armed: true, note: '不落盘就直接执行远程字节（sh -c/eval 套命令替换）：与 PIPE_TO_SHELL 同一类，审核面读不到载荷' },
+  { id: 'RAW_BLOCK_WRITE', armed: true, note: '直接写裸分区 /dev/block（dd/mkfs/wipefs）：绕过 AVB 与分区表，模块没有正当用法' },
 ]);
 
 /** 名单里「今天真的有拦截力」的那几条（armed=true）。scan/分流只认这个集合。 */
@@ -2523,6 +2719,30 @@ export const MALICE_RULE_IDS = Object.freeze(
 export const MALICE_DEFERRED = Object.freeze(
   MALICE_LIST.filter((m) => !m.armed).map((m) => ({ id: m.id, closesWhen: m.closesWhen })),
 );
+
+/**
+ * 组合判据（2026-11-19 新增）：**单条是能力、合起来才是恶意**的那几格。
+ *
+ * 为什么要有第二张表：名单里那 13 条的共同理由是「形状本身没有正当读法」，而 NET_REDIRECT
+ * （iptables REDIRECT/DNAT/TPROXY）单独看就是个代理模块会做的事、SELINUX_* 放松单独看是 root 模块
+ * 常见写法 —— 按单条进名单就是拿误伤换命中（§0.1 的反面）。但这两族同时出现时只有一种读法：
+ * 把设备上**别人的流量**改道，同时把系统的 MAC 关掉，让本机再也拦不住它。
+ *
+ * 形状：`requires` 是「组的数组」，**组内取或、组间取与**；命中记 source='static-combo'，
+ * 与单条同一套取严口径（只加 hits，不减）。组合规则名不在 MALICE_RULE_IDS 里 ——
+ * 它不是一条扫描规则，没有 findings 产出，所以也不该出现在「名单成员都要有证人」的那张表里。
+ */
+export const MALICE_COMBOS = Object.freeze([
+  {
+    id: 'NET_REDIRECT_WITH_MAC_RELAX',
+    requires: [
+      ['NET_REDIRECT'],
+      ['SELINUX_DISABLE', 'SELINUX_TYPE_PERMISSIVE', 'SELINUX_POLICY_RELAX', 'MAGISK_POLICY_LIVE'],
+    ],
+    note: '流量被改道（REDIRECT/DNAT/TPROXY）同时 MAC 被放松：中间人或常驻代理的典型组合 —— ',
+    reason: '命中组合：网络流量被改道 + SELinux 被放松。单看一条都可能出现在正经模块里，两条一起出现时只有一种读法：把别人的流量拿走，同时让系统拦不住（取严：任一命中就不上架）',
+  },
+]);
 
 /**
  * 「同形那一族」= 能力与恶意长得一样的那 5 条（§13.6 拍：降档 + 给 AI 一道上下文题）。
@@ -2579,8 +2799,23 @@ export function classifyMalice(findings, aiMalice = null) {
         line: Number.isFinite(f.line) ? f.line : 0, message: typeof f.message === 'string' ? f.message : '' });
     }
   }
+  // 组合判据（2026-11-19）：组内取或、组间取与；命中与单条同一套取严口径（只加不减）。
+  // 证人记在「最后一个组命中的那一条发现」上 —— 报告里要能点出是哪一行让它落进组合。
+  const present = new Set(findings.filter((f) => f && typeof f.ruleId === 'string').map((f) => f.ruleId));
+  for (const combo of MALICE_COMBOS) {
+    if (!combo.requires.every((group) => group.some((id) => present.has(id)))) continue;
+    const lastGroup = combo.requires[combo.requires.length - 1];
+    const witness = findings.find((f) => f && lastGroup.includes(f.ruleId)) || {};
+    hits.push({
+      source: 'static-combo', ruleId: combo.id,
+      file: typeof witness.file === 'string' ? witness.file : '',
+      line: Number.isFinite(witness.line) ? witness.line : 0,
+      message: typeof combo.reason === 'string' ? combo.reason : (combo.note || combo.id),
+    });
+  }
   const basis = [];
-  if (hits.length) basis.push('static-malice-list');
+  if (hits.some((h) => h.source === 'static')) basis.push('static-malice-list');
+  if (hits.some((h) => h.source === 'static-combo')) basis.push('static-malice-combo');
   if (aiMalice && typeof aiMalice === 'object' && aiMalice.malicious === true) {
     const verified = Array.isArray(aiMalice.verified) ? aiMalice.verified.filter((e) => e && typeof e === 'object') : [];
     if (verified.length) {
@@ -2595,7 +2830,15 @@ export function classifyMalice(findings, aiMalice = null) {
     }
   }
   const uniq = [...new Set(hits.map((h) => h.source === 'ai' ? `ai:${h.file}:${h.line}` : `static:${h.ruleId}`))];
-  const names = [...new Set(hits.filter((h) => h.source === 'static').map((h) => h.ruleId))];
+  // 组合也属于静态判据：它的名字要进 reason，否则「命中却说不清命中什么」。
+  // 但两种命中要分开写：`…名单：A、B` 是 §3.2 的措辞钉（拿它当「这套判据在说话」的读数），
+  // 组合是另一格 —— 写成 `…组合：NET_REDIRECT_WITH_MAC_RELAX（命中组合：流量改道 + SELinux 放松…）`，
+  // 人和机器都能看出「拦的不是某一条规则，而是这一对」。
+  const staticNames = [...new Set(hits.filter((h) => h.source === 'static').map((h) => h.ruleId))];
+  const comboHits = hits.filter((h) => h.source === 'static-combo');
+  const comboNames = [...new Set(comboHits.map((h) => h.ruleId))];
+  const names = [...staticNames, ...comboNames];
+  const comboNote = comboNames.length ? `（${comboHits.map((h) => h.message).join('；')}）` : '';
   // 措辞纪律（计划 §2.7；scan.test.mjs 里那两条钉子读的就是 decision.reason，不许把它们改成放行）：
   // **没命中**那一句里不许出现「恶意」——那是一条关于名单的读数，不是对投稿人的评价；
   // 轴的名字仍然叫恶意行为轴（节标题与报告里「恶意行为链」那一行），只有**命中**的 reason 才点名它。
@@ -2605,7 +2848,7 @@ export function classifyMalice(findings, aiMalice = null) {
     basis,
     reason: hits.length
       ? (names.length
-        ? `命中恶意行为链名单：${names.join('、')}（取严：任一命中就不上架）`
+        ? `命中恶意行为链${staticNames.length ? '名单' : '组合'}：${names.join('、')}${comboNote}（取严：任一命中就不上架）`
         : 'AI 安全员给出恶意结论且引用在送出去的原文里逐字复验通过（取严：任一命中就不上架）')
       : `未命中上架拦截名单（名单共 ${MALICE_RULE_IDS.length} 条 armed / ${MALICE_LIST.length} 条定案）—— 等级不再决定上不上架`,
     distinct: uniq,
@@ -2678,7 +2921,7 @@ export function summarizeCoverage(findings, extras = {}) {
  * 措辞纪律：只有**命中**那一句可以说「恶意」，其余说的是「上架拦截名单」。
  * @param {'low'|'medium'|'high'} level
  * @param {'first'|'update'|'unknown'} changeType
- * @param {{ revokedCount?:number, revokedEntries?:string[] }|null} [coverage] 撤销覆盖度
+ * @param {{ revokedCount?:number, revokedEntries?:string[], coverageGaps?:string[] }|null} [coverage] 撤销覆盖度 + 覆盖缺口（后者只进文案，不参与判决）
  * @param {ReturnType<typeof classifyMalice>|null} [malice] 恶意定性；undefined/显式 legacy ⇒ 走老轴
  */
 export function decide(level, changeType, coverage = null, malice = undefined) {
@@ -2699,6 +2942,15 @@ export function decide(level, changeType, coverage = null, malice = undefined) {
         reason: '未命中上架拦截名单，但无法判定是首次收录还是版本更新（未提供索引），'
           + '按不可上架处理' };
     }
+    // ③-补 fix9（2026-11-19）：覆盖度**没有拦截力**（§3.2 ③ 定案），但不许在结论文案里静默 ——
+    //   `coverage.coverageGaps` 只用来把「读到哪」写进 reason，判决本身一个字节都不动。
+    //   为什么补：auto-approve 的原话是「未命中上架拦截名单」，读的人看不见「有一条结构没读懂/
+    //   没读完」，于是「放行」与「干净」在文案上等价了 —— 这正是 §10「不许静默」要堵的那一格。
+    const gapIds = coverage && Array.isArray(coverage.coverageGaps)
+      ? [...new Set(coverage.coverageGaps.filter((x) => typeof x === 'string' && x))].sort() : [];
+    const gapsNote = gapIds.length
+      ? `；另有 ${gapIds.length} 处覆盖不全（${gapIds.join('、')}），按 §3.2 ③ 不据此拦下，读数见 annotation.coverageGaps`
+      : '';
     // ③ fix8-E：撤销过 ⇒ 机器不替它作证（措辞：说的是「不予自动放行」，不写「需人工确认」）。
     const revokedCount = coverage && Number(coverage.revokedCount) > 0 ? Number(coverage.revokedCount) : 0;
     if (revokedCount > 0) {
@@ -2709,7 +2961,7 @@ export function decide(level, changeType, coverage = null, malice = undefined) {
       return { action: 'block', label: 'auto-rejected', needsHumanReview: false,
         axis: 'malice',
         reason: `未命中上架拦截名单，但它执行了模块自带的 ${shown}；${noun}已读且行级规则无命中，`
-          + '机器不替它作证，不予自动放行' };
+          + `机器不替它作证，不予自动放行${gapsNote}` };
     }
     // ④ 名单外 ⇒ 上架 + 标注。「未经人工审核」这句话由 annotation 与呈现层落（§10）。
     //    update 要额外说明「版本更新与首次收录适用同一套判据」—— 那句「按规则需要人工审核」
@@ -2717,7 +2969,7 @@ export function decide(level, changeType, coverage = null, malice = undefined) {
     const isUpdate = changeParts.includes('update');
     return { action: 'auto-approve', label: 'auto-approved', needsHumanReview: false, axis: 'malice',
       reason: `${malice.reason || '未命中上架拦截名单'}；风险等级 ${level} 在本模型里只是标注输入，不再拦上架`
-        + (isUpdate ? '；版本更新与首次收录适用同一套判据' : '') };
+        + (isUpdate ? '；版本更新与首次收录适用同一套判据' : '') + gapsNote };
   }
 
   // ── 老轴（等级 + changeType）：malice 缺省时逐字保留 ──

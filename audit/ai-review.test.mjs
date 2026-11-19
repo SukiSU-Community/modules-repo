@@ -1247,7 +1247,7 @@ test('契约 §2.3：优先级 --max-bytes > AI_BRIEF_MAX_BYTES > 默认值（�
 });
 
 test('F4b：over-budget 的文案说「需要」多少字节，不是说「装下了」多少', async () => {
-  const big = [file('payload.json', 'z'.repeat(60000) + '\n'), file('x.sh', 'echo hi\n')];
+  const big = [file('payload.json', 'z'.repeat(200000) + '\n'), file('x.sh', 'echo hi\n')];
   let called = 0;
   const r = await runMain({ report: R, entries: big, argvExtra: ['--backend', 'workers-ai', '--max-bytes', '2400'],
     env: { AI_API_BASE: 'https://x/v1', AI_API_KEY: 'k', AI_MODEL: 'm' },
@@ -1255,13 +1255,13 @@ test('F4b：over-budget 的文案说「需要」多少字节，不是说「装�
   assert.equal(r.status, 'over-budget');
   assert.equal(called, 0);
   // 评审实测的误导形态：报 704/2400 而真实需要更多 ⇒ 「需要」那一列永远按**完整装配**算。
-  // ㉚ 之后这一档的完整装配是「截过的」：那条 60,001 B 的单行现在只送到上限，
+  // ㉚ 之后这一档的完整装配是「截过的」：那条 200,001 B 的单行现在只送到上限（2026-11-19 上限 128 KB），
   // 所以这里钉的是两件事 —— neededBytes 仍然远大于 byteSize，且**截断这件事本身进了产物**。
   assert.ok(r.payload.brief.neededBytes > TEXT_FEED_CAP_BYTES,
     `neededBytes 要按整条送满的量级算，实测=${r.payload.brief.neededBytes}`);
   assert.ok(r.payload.brief.neededBytes > r.payload.brief.byteSize, '「需要」必须大于「装下的」，否则复核会以为差一点点');
   assert.deepEqual(r.payload.brief.shaped.map((s) => [s.name, s.bytes, s.lineCut]),
-    [['payload.json', 60001, true]], '超上限的条目要在产物里逐条留下「原文多少 / 送了多少 / 是不是连第一行都没送满」');
+    [['payload.json', 200001, true]], '超上限的条目要在产物里逐条留下「原文多少 / 送了多少 / 是不是连第一行都没送满」');
   assert.match(r.payload.reason, /需要 \d+ B/);
   assert.doesNotMatch(r.payload.reason, /装不进预算（\d+ \/ \d+ B/, '旧口径（byteSize / maxBytes）会把人工复核带偏');
   // 2026-10-27：依据从「未标定的保守代理」变成了「实测」，所以这里钉的是**依据必须出现在文案里**
@@ -2141,7 +2141,8 @@ test('fitTextEntry 的三条边界：不超限原样、按行边界切、第一�
 test('上限就是静态自己那一个数，不新发明；产物里逐条留下字节账', () => {
   assert.equal(TEXT_FEED_CAP_BYTES, MAX_SCAN_BYTES_PER_ENTRY,
     '进料上限复用 MAX_SCAN_BYTES_PER_ENTRY —— 换掉静态那一个，这一层要跟着动，不许两处各自漂');
-  const body = Array.from({ length: 4000 }, (_, i) => `echo ${i}`).join('\n');
+  // 4000 行只有 ~36 KB，抬到 128 KB 上限之后就截不到了 —— 夹具按「必须真的越界」重算。
+  const body = Array.from({ length: 24000 }, (_, i) => `echo ${i}`).join('\n');
   const b = buildBrief({ report: R, entries: [file('service.sh', body)], maxBytes: DEFAULT_MAX_BRIEF_BYTES });
   assert.equal(b.shapes.textClipped, 1);
   assert.equal(b.shaped.length, 1);
@@ -2155,7 +2156,7 @@ test('上限就是静态自己那一个数，不新发明；产物里逐条留�
 });
 
 test('截断之后复验仍然逐字：送出去那一段引得到，落在未送部分外面判造假', () => {
-  const body = `echo one\n${Array.from({ length: 4000 }, (_, i) => `echo ${i}`).join('\n')}\necho tail`;
+  const body = `echo one\n${Array.from({ length: 24000 }, (_, i) => `echo ${i}`).join('\n')}\necho tail`;
   const b = buildBrief({ report: R, entries: [file('s.sh', body)], maxBytes: DEFAULT_MAX_BRIEF_BYTES });
   // 先确认这一发真的被截过 —— 否则「越界判造假」在「整条都送出去了」的世界上也成立，
   // 那一格就成了永绿的假成功（变异 A 就是这么被抓住的）。
@@ -2173,17 +2174,18 @@ test('截断之后复验仍然逐字：送出去那一段引得到，落在未�
 test('㉚ 买到的那一格：越界的唯一原因是若干条超上限的原文时，形状改完发得出去（常数没动）', () => {
   const fat = (n) => Array.from({ length: n }, (_, i) => `k${i}: "${'y'.repeat(24)}",`).join('\n');
   // 夹具要**真的**越过默认预算，否则「形状改完装得下」在「本来就装得下」的世界上永远成立，
-  // 这一格就成了永绿的假成功。单条 fat(1000) = 33889 B，15 条 + service.sh ≈ 508 KB > 480000。
+  // 这一格就成了永绿的假成功。上限 128 KB 之后，单条必须**自己就越界**才算「截过」：
+  // fat(7000) ≈ 210 KB > 128 KB，3 条 + service.sh ≈ 630 KB > 480000，截完 ≈ 393 KB 装得下。
   // 注意：这里的内容不含任何热点关键词 ⇒ 走的是**前缀**那一档（windowedEntries 应为 0），
   // 也就是说这条用例钉的仍然是「截前缀」那一半，没有被新增的窗口化顺手改成另一回事。
   const entries = [
-    ...Array.from({ length: 15 }, (_, i) => file(`assets/chunk-${i}.js`, fat(1000))),   // 15 × ~33 KB
+    ...Array.from({ length: 3 }, (_, i) => file(`assets/chunk-${i}.js`, fat(7000))),   // 3 × ~210 KB
     file('service.sh', 'echo hi\n'),
   ];
   const raw = entries.reduce((s, e) => s + Buffer.byteLength(e.content, 'utf8'), 0);
   assert.ok(raw > DEFAULT_MAX_BRIEF_BYTES, `夹具：全量原文 ${raw} B 本来就越过 ${DEFAULT_MAX_BRIEF_BYTES}`);
   const b = buildBrief({ report: R, entries, maxBytes: DEFAULT_MAX_BRIEF_BYTES });
-  assert.equal(b.shapes.textClipped, 15);
+  assert.equal(b.shapes.textClipped, 3);
   assert.equal(b.shapes.windowedEntries, 0, '没有热点就回退前缀那一档，不许悄悄变成窗口化');
   assert.equal(b.omitted.length, 0, '一条都不该被略掉');
   assert.equal(b.overBudget, false, `改完形状要装得下：needed=${b.neededBytes} / 预算 ${DEFAULT_MAX_BRIEF_BYTES}`);
@@ -2203,7 +2205,7 @@ test('形状改完仍然装不下的那一类照旧红 —— 这不是放宽，
 });
 
 test('shaped 清单有上限：条目再多也只列 MAX_SHAPED_ROWS 条，剩下的报条数', () => {
-  const fat = Array.from({ length: 100 }, (_, i) => `line ${i} ${'w'.repeat(300)}`).join('\n');
+  const fat = Array.from({ length: 500 }, (_, i) => `line ${i} ${'w'.repeat(300)}`).join('\n');  // ~154 KB，越过 128 KB 上限
   const entries = Array.from({ length: MAX_SHAPED_ROWS + 5 }, (_, i) => file(`nested/f${i}.sh`, fat));
   const b = buildBrief({ report: R, entries, maxBytes: DEFAULT_MAX_BRIEF_BYTES });
   assert.equal(b.shaped.length, MAX_SHAPED_ROWS, '清单本身进产物与 PR 评论，不许无界');

