@@ -199,8 +199,9 @@ Worker 的定时器是自动那一条（每 30 分钟捞一批成立的举报，
   提交过这条举报」——CI 读不到 Worker 的 KV，而包是公开的，攻击者自己就能从里面挑一段文字出来。
   所以凭据泄露的爆炸半径仍然是「公开指控具体的人」，只是从「任何包」降到「已上架的包」。
 - 机器章**不是**「有人看过」的替身，而是「有一次运行把证据钉死了」的替身。
-  那次运行的正确性取决于扫描器与规则本身 —— 所以 `audit/` 三棵树在每个 PR 里都从 base 的
-  commit 恢复（投稿改不到给它自己打分的代码），这一条写在 `audit.yml` 开头。
+  那次运行的正确性取决于扫描器与规则本身 —— `audit/` 已迁移到私有 `modules-backend`：每个 PR 的
+  `audit.yml` 都先用 `REBUILD_TOKEN` 从 Worker 的 `/audit-bundle` 拉取受保护的规则代码，投稿改不到
+  给自己打分的代码；公开仓的 `scripts/` 与 `json/` 仍从 base commit 恢复。这一条写在 `audit.yml` 开头。
 - 索引仓库的 ruleset 只有 `approve` 一条 required check、`bypass_actors` 为空
   （2026-10-21 实测 `protect-main-v2` id 24842685）。也就是说**改了这条 ruleset 就等于改了治理**，
   而这件事不留台账记录 —— 它是 GitHub 的组织设置，不在这个仓库的 diff 里。
@@ -229,9 +230,10 @@ Worker 的定时器是自动那一条（每 30 分钟捞一批成立的举报，
 它自己的那一份判据。反过来，`untrusted`（判据不可采信）与 `over-budget`（没看全）都不放行：
 「没看全」不是「看过了没事」。
 
-换代只有三句，顺序不许变（`repo/` 下执行）：
+换代只有三句，顺序不许变（在私有 modules-backend 仓库根执行）：
 
 ```sh
+# 公开仓不再包含 audit/，下面这行在私有 modules-backend 仓库根执行
 node -e "import('./audit/ai-review.mjs').then(m=>console.log(m.PROMPT_SHA256))"   # 现算，别抄任何文档里的旧值
 # 用脚本 import 同一份 SYSTEM_PROMPT 更新 agent（POST /agents/<id> 带当前 version），再取回显算第二遍：
 # 两次 sha 必须相等，也要等于上面那行；然后才改 QCA_PROMPT_SHA / QCA_AGENT_VERSION 这一对。

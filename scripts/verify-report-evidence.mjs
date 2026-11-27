@@ -27,16 +27,28 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { parseDispositions, DEFAULT_DISPOSITIONS_FILE } from './dispositions.mjs';
 import { ledgerTouched, parseSeal } from './verify-index-pr.mjs';
 import { assertDownloadUrl, downloadToBuffer, sha256Hex } from './fetch-pending-zip.mjs';
-import { isNonTextContent, readZip, readZipEntryBytes } from '../audit/scan.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(__dirname, '..');
+
+// 审核引擎已迁到私有 modules-backend：CI 里由 audit-bundle 落到仓库根 audit/；
+// 本地 monorepo（modules-backend 的 contrib/repo）里则在同一层的 ../../audit/。
+// 两种布局都认，都找不到就明确失败，绝不静默跳过证据校验。
+const SCAN_CANDIDATES = [
+  path.resolve(__dirname, '../audit/scan.mjs'),
+  path.resolve(__dirname, '../../audit/scan.mjs'),
+];
+const scanPath = SCAN_CANDIDATES.find((p) => fs.existsSync(p));
+if (!scanPath) {
+  throw new Error(`找不到审核引擎 audit/scan.mjs，尝试过：${SCAN_CANDIDATES.join('、')}`);
+}
+const { isNonTextContent, readZip, readZipEntryBytes } = await import(pathToFileURL(scanPath).href);
 
 export const REPORT_EVIDENCE_SCHEMA = 'sukisu-report-evidence-v1';
 
