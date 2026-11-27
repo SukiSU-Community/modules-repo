@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "name": "SukiSU 精选专栏",
-  "updatedAt": "2026-11-06",
+  "updatedAt": "2026-11-28",
   "columns": [
     {
       "id": "hide-env",
@@ -365,7 +365,7 @@
               "kind": "installApp",
               "optional": false,
               "optIn": true,
-              "note": "安装主检测器春秋，后续红项排查依赖它。商店提供同版本整包并核对文件完整性；安装时系统会弹出一次确认。",
+              "note": "安装主检测器春秋 4.6.4 (77)，后续红项排查依赖它。商店提供同版本整包并核对文件完整性；安装时系统会弹出一次确认。",
               "link": "https://t.me/Suxiaomingpd",
               "linkLabel": "去 Telegram 频道",
               "source": {
@@ -373,9 +373,9 @@
                 "repo": "",
                 "assetPattern": "",
                 "pinnedVersion": "",
-                "sha256": "1ca92901b74ff658988a4859d8cd2c6f20e45f722a88bc0361e9d33ee5a72866",
+                "sha256": "79a5cdf59484ce3e2758c39a6638dd26a0e373758c9a56d66e95bc26707d24e9",
                 "moduleId": "",
-                "url": "https://github.com/SukiSU-Community/modules-repo/releases/download/mirror-chunqiu-4.6.2/ChunqiuNativeCheck-4.6.2.apk",
+                "url": "https://github.com/SukiSU-Community/modules-repo/releases/download/mirror-chunqiu-4.6.4/ChunqiuNativeCheck-4.6.4.apk",
                 "packageName": "com.chunqiunativecheck"
               }
             },
