@@ -22,7 +22,7 @@
  *   8. `json/repo-state.json`（每日复验结论，可选输入）在**合并与下架之后**贴回模块头：
  *      只有 `repoUrl` 完全相等才贴，只贴结论（不动版本、不改已有的 `updateJson`）。
  *
- * 审核标记契约（与 contrib/audit/workflows/audit.yml 的唯一约定面）：
+ * 审核标记契约（与私有 modules-backend 的 audit/workflows/audit.yml 的唯一约定面）：
  *   APPROVAL_FIELD / APPROVED_STATUS 两个常量就是契约本身 —— audit.yml 的
  *   publish 步骤把 audit.yml 的 triage 结论写成 { audit: { status: "auto-approved", ... } }，
  *   本文件的 isApproved() 认这个 status 放行。改任一侧都必须同步改这两个常量。
@@ -194,7 +194,7 @@ function submittedAtMs(raw) {
  * 删它的安全方向要说清 —— 它只影响**读**：main 上若残留一枚 `human-approved` 的旧章，
  * 现在会被当成没批准，那一条不会进索引（保守 = 不放行），而不是被当成章继续生效。
  *
- * 改这里必须同步改 contrib/audit/workflows/audit.yml 与本仓库 .github/workflows/audit.yml。
+ * 改这里必须同步改私有 modules-backend 的 audit/workflows/audit.yml 与本仓库 .github/workflows/audit.yml。
  */
 export const APPROVAL_FIELD = 'audit';
 export const APPROVED_STATUS = 'auto-approved';

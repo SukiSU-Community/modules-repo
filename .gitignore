@@ -5,3 +5,8 @@ node_modules/
 
 # build-index.mjs 每次跑都会写/删的冲突清单（REPO_ROOT 下），属于运行产物，不入库
 conflicts.json
+
+# 审核引擎由 Worker /audit-bundle 临时落盘，绝不入库
+audit/
+audit-bundle.json
+.audit-bundle-staging/

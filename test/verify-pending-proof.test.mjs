@@ -772,7 +772,8 @@ test('pin 只挂在 pull_request 上：dispatch 用自己这一份扫描器，�
     'pin 必须只在 PR 事件上跑；否则 dispatch 会撞在闸门一（base_ref 为空）上，这条路今天就是这样死的');
   assert.match(block, /闸门一/);
   assert.match(block, /git fetch --no-tags --depth=200 origin "\$BASE_REF"/);
-  assert.match(block, /git diff --quiet "\$BASE_SHA" -- audit scripts json/);
+  assert.match(block, /git diff --quiet "\$BASE_SHA" -- scripts json/);
+  assert.match(block, /rm -rf audit/, 'PR 自带的 audit/ 必须先删掉，否则投稿者能塞一份假扫描器');
   // 开了这条路不等于顺手开了合并：publish 仍然只认 audit 自己产出的 auto-approve。
   const pub = wf.slice(wf.indexOf('  publish:'));
   assert.match(pub, /if: needs\.audit\.outputs\.found == 'true' && needs\.audit\.outputs\.action == 'auto-approve'/,

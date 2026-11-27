@@ -71,6 +71,24 @@ jobs:
         with:
           node-version: '22'
 
+      # 审核引擎在私有 modules-backend，公开仓不再保存 audit/。
+      # 标定必须用与线上同一份 scan.mjs / ai-review.mjs / calibration-*.mjs。
+      - name: 拉取私有审核引擎
+        env:
+          WORKER_BASE: ${{ vars.WORKER_BASE || 'https://sukisu-module-submit.lyfsearch.workers.dev' }}
+          AUDIT_BUNDLE_TOKEN: ${{ secrets.REBUILD_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "${AUDIT_BUNDLE_TOKEN:-}" ] || { echo "::error::缺少 REBUILD_TOKEN，无法拉取私有审核引擎。"; exit 1; }
+          curl --fail --silent --show-error --retry 3 --retry-delay 2 \
+            -H "x-audit-token: ${AUDIT_BUNDLE_TOKEN}" \
+            "${WORKER_BASE%/}/audit-bundle" -o audit-bundle.json
+          node scripts/apply-audit-bundle.mjs audit-bundle.json .
+          test -f audit/scan.mjs
+          test -f audit/ai-review.mjs
+          test -f audit/calibration-probe.mjs
+          test -f audit/calibration-budget.mjs
+
       # 标定的前提是凭据齐。缺任何一件就直接红 —— 这一发的产物就是那个比值，
       # 没有凭据就没有比值，「跳过」在这里等于什么都没做却显示成功。
       - name: 检查凭据
@@ -90,7 +108,7 @@ jobs:
             exit 1
           fi
 
-      # 标定要一枚真包。zip 不在仓库里（`.gitignore` 有 `*.zip`，`scripts/audit-corpus.mjs:18`
+      # 标定要一枚真包。zip 不在仓库里（`.gitignore` 有 `*.zip`，私有 `modules-backend` 的 `tools/audit-corpus.mjs`
       # 写明下载的 zip 一律落在仓库外），所以默认**现场生成**一枚体量对位的探针：
       #   · 不为这一次运行往 git 历史里塞一个几百 KB 的二进制；
       #   · 也不必为它开一条 `!calibration/*.zip` 的 ignore 例外（开了例外，以后「哪个 zip

@@ -171,8 +171,8 @@ jobs:
       #    而「版本更新不自动放行」正是防「fork 热门模块加几行恶意代码伪装成更新」
       #    的唯一一道防线。索引取自 PR 分支，就等于让投稿人自己声明这是首次收录。
       #
-      #    做法是删掉这三棵树再从 base 的 commit 恢复 —— 连 PR 新塞进 audit/ 的
-      #    额外文件也一起清掉，而不是只覆盖几个已知路径。
+      #    做法是 scripts/ 与 json/ 两棵树从 base 的 commit 恢复；audit/ 整棵删掉，
+      #    随后从私有 modules-backend 拉取 —— PR 新塞进来的任何扫描器都活不过这个 rm。
       #    pending/ 保持来自 PR（那才是要审的投稿内容）。
       # ---------------------------------------------------------------
       - name: 把扫描器、合并逻辑与索引钉回 base 版本
@@ -210,8 +210,8 @@ jobs:
           # 开单文件 PR 的机器人，它不会 rebase，模块就永远进不了索引。
           #
           # 这道闸真正要防的是「拿一条古老分支当基准，用旧扫描器/旧索引给自己定罪」，
-          # 而那个东西已经被上面的钉定 + 下面的复核挡住了：audit/、scripts/、json/ 一律
-          # 取自 BASE_SHA。所以这里改成：把当前 base 合进工作树（不提交），
+          # 而那个东西已经被上面的钉定 + 下面的复核挡住了：scripts/、json/ 一律取自
+          # BASE_SHA，audit/ 则取自私有 modules-backend。所以这里改成：把当前 base 合进工作树（不提交），
           # 只有真的**合不动**才拒绝 —— 那才是必须让投稿者处理的情况。
           #
           # 2026-10-17 一条对自己人说的话：这一格原来写的是 `... >/dev/null 2>&1`，把 git 的原话
@@ -243,7 +243,10 @@ jobs:
             exit 1
           fi
 
-          for d in audit scripts json; do
+          # audit/ 已迁到私有 modules-backend：base 里没有这棵树，不能走下面的钉定循环。
+          # 先彻底删掉（包括 PR 自带的任何 audit/），随后由「拉取私有审核引擎」从 Worker 取。
+          rm -rf audit
+          for d in scripts json; do
             if git ls-tree -r --name-only "$BASE_SHA" -- "$d" | grep -q .; then
               rm -rf "$d"
               git checkout "$BASE_SHA" -- "$d"
@@ -252,13 +255,60 @@ jobs:
             fi
           done
 
-          # 复核：这三棵树此刻必须与 base 完全一致（有出入就是钉定没生效）
-          if ! git diff --quiet "$BASE_SHA" -- audit scripts json; then
-            echo "::error::钉定后 audit/scripts/json 仍与 base 不一致，审核结论不可信。"
-            git diff --stat "$BASE_SHA" -- audit scripts json || true
+          # 复核：scripts/json 此刻必须与 base 完全一致（有出入就是钉定没生效）。
+          # audit/ 不在 base，也不参与这条 diff；它由下一步从私有仓拉取后再执行。
+          if ! git diff --quiet "$BASE_SHA" -- scripts json; then
+            echo "::error::钉定后 scripts/json 仍与 base 不一致，审核结论不可信。"
+            git diff --stat "$BASE_SHA" -- scripts json || true
             exit 1
           fi
-          echo "已钉回 base：$BASE_SHA（audit/ scripts/ json/ 与之一致）"
+
+          # 首次迁移引导：base 还没有 scripts/apply-audit-bundle.mjs 时，本 PR 必须自带它。
+          # 这个例外只在 base 缺文件时触发；一旦文件进了 main，后续每个 PR 都只认 base 版本。
+          if ! git cat-file -e "$BASE_SHA:scripts/apply-audit-bundle.mjs" 2>/dev/null; then
+            if git cat-file -e "HEAD:scripts/apply-audit-bundle.mjs" 2>/dev/null; then
+              git checkout HEAD -- scripts/apply-audit-bundle.mjs
+            else
+              echo "::error::base 与 PR 都没有 scripts/apply-audit-bundle.mjs，无法拉取私有审核引擎。"
+              exit 1
+            fi
+          fi
+          echo "已钉回 base：$BASE_SHA（scripts/ json/ 与之一致；audit/ 已清空）"
+
+      # ---------------------------------------------------------------
+      # 0.5 拉取私有审核引擎
+      #
+      # 公开仓不再保存 audit/（scan.mjs / risk-rules.mjs / AI prompt 都在私有
+      # modules-backend）。这里用 REBUILD_TOKEN 向 Worker 的 /audit-bundle 取一份
+      # 只含 audit/ 的 JSON，校验后落到仓库根 audit/，后面的步骤完全照旧。
+      # ---------------------------------------------------------------
+      - name: 拉取私有审核引擎
+        id: auditbundle
+        shell: bash
+        env:
+          WORKER_BASE: ${{ vars.WORKER_BASE || 'https://sukisu-module-submit.lyfsearch.workers.dev' }}
+          AUDIT_BUNDLE_TOKEN: ${{ secrets.REBUILD_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AUDIT_BUNDLE_TOKEN:-}" ]; then
+            echo "::error::缺少 secrets.REBUILD_TOKEN，无法拉取私有审核引擎。"
+            exit 1
+          fi
+          rm -rf audit audit-bundle.json
+          HTTP_CODE=$(curl -sS -o audit-bundle.json -w '%{http_code}' \
+            -H "x-audit-token: ${AUDIT_BUNDLE_TOKEN}" \
+            "${WORKER_BASE%/}/audit-bundle")
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::拉取私有审核引擎失败：HTTP ${HTTP_CODE}"
+            head -c 800 audit-bundle.json || true
+            exit 1
+          fi
+          node scripts/apply-audit-bundle.mjs audit-bundle.json .
+          rm -f audit-bundle.json
+          test -f audit/scan.mjs
+          test -f audit/risk-rules.mjs
+          node --check audit/scan.mjs
+          node --check audit/ai-review.mjs
 
       # ---------------------------------------------------------------
       # 1. 定位投稿：从 PR 新增/修改的 pending/**/*.json 入手
@@ -1877,7 +1927,7 @@ jobs:
         with:
           # 与 audit 作业同一个大版本：这里跑的就是 audit 作业将要执行的那些脚本。
           node-version: '20'
-      - name: 跑仓库单测（test/ 与 audit/ 下的 *.test.mjs）
+      - name: 跑仓库单测（test/ 下的 *.test.mjs）
         shell: bash
         run: node --test
       # 单测锁的是「校验器规则」；下面两步是拿仓库里那份真实 json 跑一遍 + 跑内置负例自测。
