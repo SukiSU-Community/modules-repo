@@ -44,11 +44,17 @@ const SCAN_CANDIDATES = [
   path.resolve(__dirname, '../audit/scan.mjs'),
   path.resolve(__dirname, '../../audit/scan.mjs'),
 ];
-const scanPath = SCAN_CANDIDATES.find((p) => fs.existsSync(p));
-if (!scanPath) {
-  throw new Error(`找不到审核引擎 audit/scan.mjs，尝试过：${SCAN_CANDIDATES.join('、')}`);
+let scanApiPromise = null;
+async function loadScanApi() {
+  if (!scanApiPromise) {
+    const found = SCAN_CANDIDATES.find((p) => fs.existsSync(p));
+    if (!found) {
+      throw new Error(`找不到审核引擎 audit/scan.mjs，尝试过：${SCAN_CANDIDATES.join('、')}`);
+    }
+    scanApiPromise = import(pathToFileURL(found).href);
+  }
+  return scanApiPromise;
 }
-const { isNonTextContent, readZip, readZipEntryBytes } = await import(pathToFileURL(scanPath).href);
 
 export const REPORT_EVIDENCE_SCHEMA = 'sukisu-report-evidence-v1';
 
@@ -260,7 +266,17 @@ export function verifyReportEvidenceDoc(ev, { openPackage, readEntry }) {
  *
  * 这一层只吃 `readZip` 的产物，不下载、不解压，所以每条失效方向都能离线逐条打到。
  */
-export function judgeProbePackage({ d = {}, size = 0, files = [], unread = [] } = {}) {
+function defaultIsNonTextContent(f) {
+  if (!f) return false;
+  const head = f.head;
+  if (head && head.length) {
+    const magic = Buffer.from(head).subarray(0, 4).toString('hex');
+    if (['7f454c46', '4d5a', 'feedface', 'feedfacf', 'cefaedfe', 'cffaedfe', '6465780a', '504b0304'].includes(magic)) return true;
+  }
+  return String(f.content == null ? '' : f.content).includes('\0');
+}
+
+export function judgeProbePackage({ d = {}, size = 0, files = [], unread = [], isNonTextContent = defaultIsNonTextContent } = {}) {
   const who = d.id || '(无 id)';
   const problems = [];
   if (!Number.isInteger(size) || size <= 0) {
@@ -350,6 +366,15 @@ export async function reviewLedgerPr({
   cwd = ROOT, baseRef = 'origin/main', headRef = 'HEAD', dispFile = DEFAULT_DISPOSITIONS_FILE,
   indexFile = DEFAULT_INDEX_FILE, deps = {},
 } = {}) {
+  let scanApi = null;
+  if (!deps.readEntry || !deps.readAll) {
+    try {
+      scanApi = await loadScanApi();
+    } catch (e) {
+      return { reviews: {}, notes: [String((e && e.message) || e)], packagesUsed: 0, touched: null, fatal: '审核引擎不可用' };
+    }
+  }
+
   const download = deps.download || ((pkg) => {
     const checked = assertDownloadUrl(pkg.assetUrl || '', {
       assetName: pkg.assetName, sha256: pkg.sha256, releaseTag: pkg.releaseTag,
@@ -365,10 +390,10 @@ export async function reviewLedgerPr({
     fs.writeFileSync(p, bytes);
     return { path: p, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
   });
-  const readEntry = deps.readEntry || ((zipPath, name) => readZipEntryBytes(zipPath, name, ENTRY_LIMIT));
+  const readEntry = deps.readEntry || ((zipPath, name) => scanApi.readZipEntryBytes(zipPath, name, ENTRY_LIMIT));
   // 探针档要看整包（条目名 + 全文），所以另开一个「读全部条目」的接缝；默认走同一份 zip 解析，
   // 不在这里再写第二个解析器。
-  const readAll = deps.readAll || ((zipPath) => readZip(zipPath, ENTRY_LIMIT));
+  const readAll = deps.readAll || ((zipPath) => scanApi.readZip(zipPath, ENTRY_LIMIT));
 
   let base, head;
   try {
@@ -521,7 +546,7 @@ export async function reviewLedgerPr({
         } else {
           try {
             const z = readAll(handle.path);
-            r = judgeProbePackage({ d, size: handle.bytes.length, files: z.files, unread: z.unread });
+            r = judgeProbePackage({ d, size: handle.bytes.length, files: z.files, unread: z.unread, isNonTextContent: scanApi ? scanApi.isNonTextContent : undefined });
           } catch (e) {
             r = { ok: false, problems: [`读整包失败：${String((e && e.message) || e)}`], checked: 0 };
           }
